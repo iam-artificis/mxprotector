@@ -1,0 +1,142 @@
+/**
+ * @file protection_config.hpp
+ * @brief [BUILDER] Конфигурация защиты — набор параметров для пайплайна протектора.
+ *
+ * @details ProtectionConfig описывает все настройки процесса защиты PE-файла:
+ *          пути ввода/вывода, уровень защиты, включённые/отключённые проходы,
+ *          глубину VM-вложенности и т.д. Может быть создана фабричным методом
+ *          from_level() или заполнена вручную из CLI-аргументов.
+ *
+ * @note Выходной путь (output_path) автоматически генерируется как file.mx.ext
+ *       если не задан явно.
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <string_view>
+
+#include "mxprotector/core/types.hpp"
+
+namespace mx {
+
+/**
+ * @brief Конфигурация защиты PE-файла.
+ *
+ * @details Агрегат всех параметров, управляющих пайплайном защиты.
+ *          Каждый булевый флаг включает/отключает конкретный проход.
+ *          Уровень защиты (ProtectionLevel) определяет предустановку.
+ */
+struct ProtectionConfig {
+    std::filesystem::path input_path;     ///< Путь к входному PE-файлу
+    std::filesystem::path output_path;    ///< Путь к выходному файлу (auto: file.mx.ext)
+
+    ProtectionLevel level = ProtectionLevel::standard; ///< Уровень защиты
+
+    bool enable_vm              = true;   ///< Виртуализация маркированного кода
+    bool enable_mutation        = true;   ///< Мутация инструкций
+    bool enable_obfuscation     = true;   ///< Обфускация (opaque predicates, MBA)
+    bool enable_cfg_flattening  = true;   ///< Выравнивание потока управления (CFG flattening)
+    bool enable_anti_debug      = true;   ///< Анти-отладка
+    bool enable_anti_sandbox    = true;   ///< Анти-песочница / анти-VM
+    bool enable_encryption      = true;   ///< Шифрование секций/кода
+    bool enable_nanomites       = false;  ///< Наномиты (только maximum)
+    bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)
+    bool strip_debug_info       = true;   ///< Удаление отладочной информации
+
+    uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
+
+    /**
+     * @brief Фабричный метод: создаёт конфигурацию по уровню защиты.
+     * @param level Уровень защиты.
+     * @return ProtectionConfig с предустановленными параметрами.
+     *
+     * @details Отображение уровней:
+     *          - minimal:  мутация + шифрование, остальное выключено
+     *          - standard: + обфускация + CFG flattening
+     *          - strong:   + VM + anti-debug + anti-sandbox
+     *          - maximum:  все проходы, VM nesting=2, nanomites, code interleaving
+     */
+    [[nodiscard]] static ProtectionConfig from_level(ProtectionLevel level) {
+        ProtectionConfig cfg;
+        cfg.level = level;
+
+        switch (level) {
+            case ProtectionLevel::minimal:
+                cfg.enable_vm              = false;
+                cfg.enable_mutation        = true;
+                cfg.enable_obfuscation     = false;
+                cfg.enable_cfg_flattening  = false;
+                cfg.enable_anti_debug      = false;
+                cfg.enable_anti_sandbox    = false;
+                cfg.enable_encryption      = true;
+                cfg.enable_nanomites       = false;
+                cfg.enable_code_interleaving = false;
+                cfg.strip_debug_info       = true;
+                cfg.vm_nesting_depth       = 1;
+                break;
+
+            case ProtectionLevel::standard:
+                cfg.enable_vm              = false;
+                cfg.enable_mutation        = true;
+                cfg.enable_obfuscation     = true;
+                cfg.enable_cfg_flattening  = true;
+                cfg.enable_anti_debug      = false;
+                cfg.enable_anti_sandbox    = false;
+                cfg.enable_encryption      = true;
+                cfg.enable_nanomites       = false;
+                cfg.enable_code_interleaving = false;
+                cfg.strip_debug_info       = true;
+                cfg.vm_nesting_depth       = 1;
+                break;
+
+            case ProtectionLevel::strong:
+                cfg.enable_vm              = true;
+                cfg.enable_mutation        = true;
+                cfg.enable_obfuscation     = true;
+                cfg.enable_cfg_flattening  = true;
+                cfg.enable_anti_debug      = true;
+                cfg.enable_anti_sandbox    = true;
+                cfg.enable_encryption      = true;
+                cfg.enable_nanomites       = false;
+                cfg.enable_code_interleaving = false;
+                cfg.strip_debug_info       = true;
+                cfg.vm_nesting_depth       = 1;
+                break;
+
+            case ProtectionLevel::maximum:
+                cfg.enable_vm              = true;
+                cfg.enable_mutation        = true;
+                cfg.enable_obfuscation     = true;
+                cfg.enable_cfg_flattening  = true;
+                cfg.enable_anti_debug      = true;
+                cfg.enable_anti_sandbox    = true;
+                cfg.enable_encryption      = true;
+                cfg.enable_nanomites       = true;
+                cfg.enable_code_interleaving = true;
+                cfg.strip_debug_info       = true;
+                cfg.vm_nesting_depth       = 2;
+                break;
+        }
+
+        return cfg;
+    }
+
+    /**
+     * @brief Возвращает строковое представление уровня защиты.
+     * @return Строка с названием уровня.
+     */
+    [[nodiscard]] std::string_view level_name() const noexcept {
+        switch (level) {
+            case ProtectionLevel::minimal:  return "minimal";
+            case ProtectionLevel::standard: return "standard";
+            case ProtectionLevel::strong:   return "strong";
+            case ProtectionLevel::maximum:  return "maximum";
+            default:                        return "unknown";
+        }
+    }
+};
+
+} // namespace mx

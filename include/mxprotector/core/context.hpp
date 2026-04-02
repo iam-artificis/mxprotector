@@ -1,0 +1,172 @@
+/**
+ * @file context.hpp
+ * @brief [BUILDER] Контекст пайплайна защиты — разделяемое мутабельное состояние.
+ *
+ * @details ProtectionContext объединяет все данные, необходимые проходам защиты:
+ *          PE-образ (PeImage), конфигурацию, найденные маркеры, дизассемблер,
+ *          CFG (опционально) и журнал сообщений. Передаётся в каждый IProtectionPass
+ *          при выполнении. Проходы читают и модифицируют контекст.
+ *
+ * @note ProtectionContext владеет PeImage через unique_ptr, дизассемблером через
+ *       shared_ptr (разделяется с CfgBuilder и другими модулями).
+ *       CFG хранится в optional — строится по необходимости.
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "mxprotector/core/types.hpp"
+#include "mxprotector/core/result.hpp"
+#include "mxprotector/config/protection_config.hpp"
+#include "mxprotector/pe/pe_image.hpp"
+#include "mxprotector/analysis/cfg.hpp"
+#include "mxprotector/analysis/disassembler.hpp"
+
+namespace mx {
+
+/**
+ * @brief Контекст пайплайна защиты — агрегирует все разделяемые данные.
+ *
+ * @details Создаётся один раз в main, наполняется данными (PeImage, маркеры,
+ *          конфигурация, дизассемблер) и передаётся последовательно в каждый
+ *          проход защиты через PassManager.
+ *
+ *          SOLID (SRP): контекст только хранит данные и предоставляет доступ.
+ *          Логика обработки — в проходах (IProtectionPass).
+ */
+class ProtectionContext final {
+public:
+    /**
+     * @brief Конструктор с обязательными компонентами.
+     * @param image PE-образ (владение передаётся).
+     * @param config Конфигурация защиты.
+     * @param disasm Дизассемблер (разделяемый).
+     */
+    ProtectionContext(std::unique_ptr<PeImage> image,
+                      ProtectionConfig config,
+                      std::shared_ptr<analysis::IDisassembler> disasm)
+        : image_(std::move(image))
+        , config_(std::move(config))
+        , disasm_(std::move(disasm))
+    {}
+
+    ~ProtectionContext() = default;
+
+    ProtectionContext(const ProtectionContext&) = delete;
+    ProtectionContext& operator=(const ProtectionContext&) = delete;
+    ProtectionContext(ProtectionContext&&) noexcept = default;
+    ProtectionContext& operator=(ProtectionContext&&) noexcept = default;
+
+    // ====================================================================
+    // PE-образ
+    // ====================================================================
+
+    /// @brief Константный доступ к PE-образу.
+    [[nodiscard]] const PeImage& pe_image() const noexcept { return *image_; }
+
+    /// @brief Изменяемый доступ к PE-образу.
+    [[nodiscard]] PeImage& pe_image() noexcept { return *image_; }
+
+    // ====================================================================
+    // Конфигурация
+    // ====================================================================
+
+    /// @brief Константный доступ к конфигурации защиты.
+    [[nodiscard]] const ProtectionConfig& config() const noexcept { return config_; }
+
+    /// @brief Изменяемый доступ к конфигурации защиты.
+    [[nodiscard]] ProtectionConfig& config() noexcept { return config_; }
+
+    // ====================================================================
+    // Маркеры
+    // ====================================================================
+
+    /// @brief Константный доступ к маркированным регионам.
+    [[nodiscard]] const std::vector<MarkedRegion>& markers() const noexcept { return markers_; }
+
+    /// @brief Изменяемый доступ к маркированным регионам.
+    [[nodiscard]] std::vector<MarkedRegion>& markers() noexcept { return markers_; }
+
+    /**
+     * @brief Устанавливает список маркированных регионов.
+     * @param markers Вектор маркированных регионов.
+     */
+    void set_markers(std::vector<MarkedRegion> markers) { markers_ = std::move(markers); }
+
+    // ====================================================================
+    // Дизассемблер
+    // ====================================================================
+
+    /// @brief Константный доступ к дизассемблеру.
+    [[nodiscard]] const std::shared_ptr<analysis::IDisassembler>& disassembler() const noexcept {
+        return disasm_;
+    }
+
+    /// @brief Изменяемый доступ к дизассемблеру.
+    [[nodiscard]] std::shared_ptr<analysis::IDisassembler>& disassembler() noexcept {
+        return disasm_;
+    }
+
+    // ====================================================================
+    // Граф потока управления (опциональный)
+    // ====================================================================
+
+    /// @brief Проверяет, построен ли CFG.
+    [[nodiscard]] bool has_cfg() const noexcept { return cfg_.has_value(); }
+
+    /// @brief Константный доступ к CFG (UB если не построен — проверяйте has_cfg()).
+    [[nodiscard]] const analysis::ControlFlowGraph& cfg() const noexcept { return *cfg_; }
+
+    /// @brief Изменяемый доступ к CFG.
+    [[nodiscard]] analysis::ControlFlowGraph& cfg() noexcept { return *cfg_; }
+
+    /**
+     * @brief Устанавливает CFG.
+     * @param cfg Построенный граф потока управления.
+     */
+    void set_cfg(analysis::ControlFlowGraph cfg) { cfg_ = std::move(cfg); }
+
+    // ====================================================================
+    // Журнал сообщений
+    // ====================================================================
+
+    /// @brief Константный доступ к журналу сообщений.
+    [[nodiscard]] const std::vector<std::string>& log_messages() const noexcept {
+        return log_messages_;
+    }
+
+    /**
+     * @brief Добавляет сообщение в журнал.
+     * @param message Текст сообщения.
+     */
+    void log(std::string_view message) {
+        log_messages_.emplace_back(message);
+    }
+
+    /**
+     * @brief Добавляет форматированное сообщение в журнал.
+     * @tparam Args Типы аргументов форматирования.
+     * @param fmt Строка формата.
+     * @param args Аргументы.
+     */
+    template <typename... Args>
+    void log_fmt(std::format_string<Args...> fmt, Args&&... args) {
+        log_messages_.push_back(std::format(fmt, std::forward<Args>(args)...));
+    }
+
+private:
+    std::unique_ptr<PeImage>                         image_;        ///< PE-образ
+    ProtectionConfig                                 config_;       ///< Конфигурация
+    std::vector<MarkedRegion>                        markers_;      ///< Маркированные регионы
+    std::shared_ptr<analysis::IDisassembler>         disasm_;       ///< Дизассемблер
+    std::optional<analysis::ControlFlowGraph>        cfg_;          ///< CFG (опционально)
+    std::vector<std::string>                         log_messages_; ///< Журнал
+};
+
+} // namespace mx

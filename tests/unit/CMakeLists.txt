@@ -1,0 +1,60 @@
+# ==============================================================================
+# [TESTS] unit/CMakeLists.txt — модульные тесты Phase 2.
+#
+# Тесты: подстановка инструкций, junk-генератор, constant unfolding,
+#         opaque predicates, x86 encoding helpers.
+# ==============================================================================
+
+cmake_minimum_required(VERSION 3.20)
+
+# ==============================================================================
+# Исходные файлы тестов
+# ==============================================================================
+
+set(TEST_SOURCES
+    mutation_engine_test.cpp
+)
+
+# ==============================================================================
+# Исходные файлы мутации/обфускации (нужны для линковки)
+# ==============================================================================
+
+set(MUTATION_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_substitution.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/opaque_predicates.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp
+)
+
+# ==============================================================================
+# Цель: mxprotector_tests
+# ==============================================================================
+
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES})
+
+target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
+
+target_include_directories(mxprotector_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/external/zydis/include
+    ${CMAKE_SOURCE_DIR}/external/zydis/dependencies/zycore/include
+    ${CMAKE_SOURCE_DIR}/src/builder
+)
+
+target_link_libraries(mxprotector_tests PRIVATE
+    GTest::gtest_main
+    Zydis
+)
+
+if(MSVC)
+    target_compile_options(mxprotector_tests PRIVATE
+        /W4
+        /utf-8
+        /Zc:__cplusplus
+        /permissive-
+    )
+endif()
+
+include(GoogleTest)
+gtest_discover_tests(mxprotector_tests)
