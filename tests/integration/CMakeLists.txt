@@ -23,6 +23,7 @@ enable_language(ASM_MASM)
 
 add_executable(syscall_live_test
     syscall_live_test.cpp
+    test_helpers.asm
     ${CMAKE_SOURCE_DIR}/src/stub/syscall/gate.asm
 )
 

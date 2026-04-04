@@ -1,14 +1,15 @@
 /**
  * @file syscall_live_test.cpp
- * @brief [INTEGRATION] Live-тест indirect syscall: NtProtectVirtualMemory через gate.asm.
+ * @brief [INTEGRATION] Live-тест indirect syscall через gate.asm.
  *
  * @details Standalone интеграционный тест для верификации полной цепочки:
  *          1. get_peb() — получение PEB из ASM
  *          2. Hell's Gate — извлечение SSN из ntdll
  *          3. Поиск `syscall; ret` гаджета в ntdll
  *          4. indirect_syscall → NtProtectVirtualMemory (5 Nt-аргументов)
- *          5. Проверка через VirtualQuery, что защита реально изменилась
- *          6. Обратная смена защиты (валидация стабильности)
+ *          5. indirect_syscall → NtAllocateVirtualMemory (6 Nt-аргументов)
+ *          6. Проверка через VirtualQuery, что результат реальный
+ *          7. Обратная смена / освобождение (валидация стабильности)
  *
  *          Этот тест линкуется с gate.asm напрямую. Он НЕ зависит от
  *          GoogleTest и может компилироваться standalone:
@@ -37,15 +38,42 @@
 // ============================================================================
 
 extern "C" uint64_t indirect_syscall(
-    uint32_t ssn,          // ECX -> EAX
-    uint64_t syscall_addr, // RDX -> R11
-    uint64_t arg1,         // R8  -> R10
-    uint64_t arg2,         // R9  -> RDX
+    uint32_t ssn,          // ECX  -> EAX
+    uint64_t syscall_addr, // RDX  -> R11
+    uint64_t arg1,         // R8   -> R10
+    uint64_t arg2,         // R9   -> RDX
     uint64_t arg3,         // [RSP+28h] -> R8
     uint64_t arg4,         // [RSP+30h] -> R9
-    uint64_t arg5);        // [RSP+38h] -> [RSP+28h] (сдвигается)
+    uint64_t arg5,         // [RSP+38h] -> [RSP+28h]
+    uint64_t arg6 = 0,     // [RSP+40h] -> [RSP+30h]
+    uint64_t arg7 = 0,     // [RSP+48h] -> [RSP+38h]
+    uint64_t arg8 = 0,     // [RSP+50h] -> [RSP+40h]
+    uint64_t arg9 = 0,     // [RSP+58h] -> [RSP+48h]
+    uint64_t arg10 = 0,    // [RSP+60h] -> [RSP+50h]
+    uint64_t arg11 = 0);   // [RSP+68h] -> [RSP+58h]
 
 extern "C" void* get_peb();
+
+// ============================================================================
+// Внешние функции из test_helpers.asm
+// ============================================================================
+
+/// @brief Clobber test: выполняет NtClose(handle) через indirect_syscall,
+///        проверяя сохранность всех non-volatile GPR (RBX, RBP, RDI, RSI, R12-R15).
+///        Возвращает 0 при успехе, bitmask повреждённых регистров при провале.
+extern "C" uint64_t nonvolatile_check_syscall(
+    uint32_t ssn,
+    uint64_t syscall_addr,
+    uint64_t handle);
+
+/// @brief Проверка 16-byte выравнивания стека для 13-параметровых вызовов.
+///        Сигнатура идентична indirect_syscall — валидирует поведение компилятора.
+///        Возвращает 0 при корректном выравнивании.
+extern "C" uint64_t alignment_check_13args(
+    uint32_t p1,  uint64_t p2,  uint64_t p3,  uint64_t p4,
+    uint64_t p5,  uint64_t p6,  uint64_t p7,  uint64_t p8,
+    uint64_t p9,  uint64_t p10, uint64_t p11, uint64_t p12,
+    uint64_t p13);
 
 // ============================================================================
 // Структуры PE для парсинга ntdll
@@ -136,6 +164,9 @@ uint64_t find_syscall_ret_in_ntdll(const uint8_t* ntdll_base) {
 }
 
 } // anonymous namespace
+
+/// @brief Минимальная thread-процедура для тестирования NtCreateThreadEx.
+static DWORD WINAPI dummy_thread_proc(LPVOID) { return 0; }
 
 // ============================================================================
 // Тесты
@@ -382,6 +413,306 @@ int main() {
             if (mbi.Protect != target) { all_ok = false; break; }
         }
         check(all_ok, "100 rapid protection changes all succeeded");
+    }
+    std::printf("\n");
+
+    // -----------------------------------------------------------------------
+    // Test 9: NtAllocateVirtualMemory (6 Nt args — верификация расширенного стека)
+    // -----------------------------------------------------------------------
+    std::printf("[Test 9] indirect_syscall -> NtAllocateVirtualMemory (6 Nt args)\n");
+    {
+        auto* nt_alloc_raw = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "NtAllocateVirtualMemory"));
+        check(nt_alloc_raw != nullptr, "NtAllocateVirtualMemory found in ntdll");
+
+        uint32_t alloc_ssn = 0;
+        bool alloc_ssn_ok = extract_ssn(nt_alloc_raw, alloc_ssn);
+        {
+            char detail[64];
+            std::snprintf(detail, sizeof(detail), "SSN = 0x%X", alloc_ssn);
+            check(alloc_ssn_ok, "NtAllocateVirtualMemory SSN extracted", detail);
+        }
+
+        if (alloc_ssn_ok) {
+            void*  alloc_base = nullptr;
+            SIZE_T alloc_size = 8192;
+
+            uint64_t alloc_status = indirect_syscall(
+                alloc_ssn, syscall_addr,
+                static_cast<uint64_t>(~static_cast<uint64_t>(0)),  // ProcessHandle = -1
+                reinterpret_cast<uint64_t>(&alloc_base),            // &BaseAddress
+                static_cast<uint64_t>(0),                           // ZeroBits
+                reinterpret_cast<uint64_t>(&alloc_size),            // &RegionSize
+                static_cast<uint64_t>(MEM_COMMIT | MEM_RESERVE),    // AllocationType (5th)
+                static_cast<uint64_t>(PAGE_READWRITE));              // Protect (6th)
+
+            {
+                char detail[128];
+                std::snprintf(detail, sizeof(detail),
+                    "NTSTATUS=0x%08llX, base=%p, size=0x%llX",
+                    alloc_status, alloc_base, static_cast<uint64_t>(alloc_size));
+                check(alloc_status == 0, "NtAllocateVirtualMemory STATUS_SUCCESS", detail);
+            }
+            check(alloc_base != nullptr, "Allocated base is non-null");
+
+            if (alloc_status == 0 && alloc_base != nullptr) {
+                MEMORY_BASIC_INFORMATION alloc_mbi{};
+                VirtualQuery(alloc_base, &alloc_mbi, sizeof(alloc_mbi));
+                check(alloc_mbi.Protect == PAGE_READWRITE,
+                    "Allocated region has PAGE_READWRITE protection");
+                check(alloc_mbi.RegionSize >= 8192,
+                    "Allocated region size >= requested 8192");
+
+                // Запись/чтение для проверки доступности
+                auto* ptr = static_cast<volatile uint8_t*>(alloc_base);
+                ptr[0] = 0xAA;
+                ptr[4095] = 0xBB;
+                check(ptr[0] == 0xAA && ptr[4095] == 0xBB,
+                    "Read/write to allocated memory succeeds");
+
+                // Освобождение через NtFreeVirtualMemory (4 Nt args)
+                auto* nt_free_raw = reinterpret_cast<const uint8_t*>(
+                    GetProcAddress(ntdll, "NtFreeVirtualMemory"));
+                uint32_t free_ssn = 0;
+
+                if (nt_free_raw && extract_ssn(nt_free_raw, free_ssn)) {
+                    void*  free_base = alloc_base;
+                    SIZE_T free_size = 0;
+
+                    uint64_t free_status = indirect_syscall(
+                        free_ssn, syscall_addr,
+                        static_cast<uint64_t>(~static_cast<uint64_t>(0)),
+                        reinterpret_cast<uint64_t>(&free_base),
+                        reinterpret_cast<uint64_t>(&free_size),
+                        static_cast<uint64_t>(MEM_RELEASE),
+                        0);
+
+                    check(free_status == 0, "NtFreeVirtualMemory STATUS_SUCCESS");
+                } else {
+                    VirtualFree(alloc_base, 0, MEM_RELEASE);
+                }
+            }
+        }
+    }
+    std::printf("\n");
+
+    // -----------------------------------------------------------------------
+    // Test 10: NtAllocateVirtualMemory — rapid alloc/free stability (6 Nt args)
+    // -----------------------------------------------------------------------
+    std::printf("[Test 10] Stability: 50 rapid NtAllocateVirtualMemory + NtFreeVirtualMemory\n");
+    {
+        auto* nt_alloc_raw = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "NtAllocateVirtualMemory"));
+        auto* nt_free_raw = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "NtFreeVirtualMemory"));
+
+        uint32_t alloc_ssn = 0, free_ssn = 0;
+        bool ssns_ok = nt_alloc_raw && nt_free_raw &&
+                       extract_ssn(nt_alloc_raw, alloc_ssn) &&
+                       extract_ssn(nt_free_raw, free_ssn);
+
+        if (ssns_ok) {
+            bool all_ok = true;
+            for (int i = 0; i < 50; ++i) {
+                void*  base = nullptr;
+                SIZE_T size = 4096;
+
+                uint64_t st = indirect_syscall(
+                    alloc_ssn, syscall_addr,
+                    static_cast<uint64_t>(~static_cast<uint64_t>(0)),
+                    reinterpret_cast<uint64_t>(&base),
+                    0,
+                    reinterpret_cast<uint64_t>(&size),
+                    static_cast<uint64_t>(MEM_COMMIT | MEM_RESERVE),
+                    static_cast<uint64_t>(PAGE_READWRITE));
+
+                if (st != 0 || base == nullptr) { all_ok = false; break; }
+
+                SIZE_T free_size = 0;
+                st = indirect_syscall(
+                    free_ssn, syscall_addr,
+                    static_cast<uint64_t>(~static_cast<uint64_t>(0)),
+                    reinterpret_cast<uint64_t>(&base),
+                    reinterpret_cast<uint64_t>(&free_size),
+                    static_cast<uint64_t>(MEM_RELEASE),
+                    0);
+
+                if (st != 0) { all_ok = false; break; }
+            }
+            check(all_ok, "50 rapid alloc/free cycles all succeeded");
+        } else {
+            check(false, "SSN extraction failed — skipped rapid test");
+        }
+    }
+    std::printf("\n");
+
+    // -----------------------------------------------------------------------
+    // Test 11: NtCreateThreadEx — 11 Nt-аргументов (critical: max arg count)
+    // -----------------------------------------------------------------------
+    std::printf("[Test 11] indirect_syscall -> NtCreateThreadEx (11 Nt args)\n");
+    {
+        auto* nt_create_thread_raw = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "NtCreateThreadEx"));
+        check(nt_create_thread_raw != nullptr, "NtCreateThreadEx found in ntdll");
+
+        uint32_t ct_ssn = 0;
+        bool ct_ssn_ok = nt_create_thread_raw &&
+                         extract_ssn(nt_create_thread_raw, ct_ssn);
+        if (ct_ssn_ok) {
+            char detail[64];
+            std::snprintf(detail, sizeof(detail), "SSN = 0x%X", ct_ssn);
+            check(true, "NtCreateThreadEx SSN extracted", detail);
+        }
+
+        if (ct_ssn_ok) {
+            HANDLE thread_handle = nullptr;
+
+            // NtCreateThreadEx: все 11 Nt-аргументов через indirect_syscall.
+            // Если ядро корректно прочитало ВСЕ 11 сдвинутых аргументов,
+            // получаем STATUS_SUCCESS и валидный handle.
+            uint64_t ct_status = indirect_syscall(
+                ct_ssn, syscall_addr,
+                reinterpret_cast<uint64_t>(&thread_handle),           // arg1:  &ThreadHandle (OUT)
+                static_cast<uint64_t>(0x1FFFFF),                      // arg2:  THREAD_ALL_ACCESS
+                0,                                                     // arg3:  ObjectAttributes = NULL
+                static_cast<uint64_t>(~static_cast<uint64_t>(0)),     // arg4:  ProcessHandle = -1
+                reinterpret_cast<uint64_t>(&dummy_thread_proc),       // arg5:  StartRoutine
+                0,                                                     // arg6:  Argument = NULL
+                static_cast<uint64_t>(1),                             // arg7:  THREAD_CREATE_FLAGS_CREATE_SUSPENDED
+                0,                                                     // arg8:  ZeroBits
+                0,                                                     // arg9:  StackSize (default)
+                0,                                                     // arg10: MaximumStackSize (default)
+                0);                                                    // arg11: AttributeList = NULL
+
+            {
+                char detail[128];
+                std::snprintf(detail, sizeof(detail),
+                    "NTSTATUS=0x%08llX, handle=%p", ct_status, thread_handle);
+                check(ct_status == 0,
+                    "NtCreateThreadEx returned STATUS_SUCCESS", detail);
+            }
+            check(thread_handle != nullptr && thread_handle != INVALID_HANDLE_VALUE,
+                "Thread handle is valid");
+
+            if (ct_status == 0 && thread_handle) {
+                ResumeThread(thread_handle);
+                WaitForSingleObject(thread_handle, 5000);
+                CloseHandle(thread_handle);
+                check(true, "Suspended thread resumed, completed, handle closed");
+            }
+        } else {
+            check(false,
+                "NtCreateThreadEx SSN extraction failed (function may be hooked)");
+        }
+    }
+    std::printf("\n");
+
+    // -----------------------------------------------------------------------
+    // Test 12: Non-volatile register preservation (clobber test)
+    // -----------------------------------------------------------------------
+    std::printf("[Test 12] Non-volatile GPR preservation across indirect syscall\n");
+    {
+        auto* nt_close_raw = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "NtClose"));
+        check(nt_close_raw != nullptr, "NtClose found in ntdll");
+
+        uint32_t close_ssn = 0;
+        bool close_ssn_ok = nt_close_raw && extract_ssn(nt_close_raw, close_ssn);
+        {
+            char detail[64];
+            std::snprintf(detail, sizeof(detail), "SSN = 0x%X", close_ssn);
+            check(close_ssn_ok, "NtClose SSN extracted", detail);
+        }
+
+        if (close_ssn_ok) {
+            // Однократная проверка: sentinel-значения в RBX, RBP, RDI, RSI, R12-R15
+            HANDLE evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+            check(evt != nullptr, "Test event created");
+
+            if (evt) {
+                uint64_t clobber_mask = nonvolatile_check_syscall(
+                    close_ssn, syscall_addr,
+                    reinterpret_cast<uint64_t>(evt));
+
+                if (clobber_mask != 0) {
+                    const char* reg_names[] = {
+                        "RBX", "RDI", "RSI", "R12", "R13", "R14", "R15", "RBP"
+                    };
+                    char detail[128];
+                    char* p = detail;
+                    p += std::snprintf(p, sizeof(detail), "mask=0x%02llX, corrupted:",
+                                       clobber_mask);
+                    for (int i = 0; i < 8; ++i) {
+                        if (clobber_mask & (1ull << i)) {
+                            p += std::snprintf(p,
+                                static_cast<size_t>(detail + sizeof(detail) - p),
+                                " %s", reg_names[i]);
+                        }
+                    }
+                    check(false, "Non-volatile GPRs preserved (single call)", detail);
+                } else {
+                    check(true, "Non-volatile GPRs preserved (single call)");
+                }
+            }
+
+            // Многократная проверка: 100 итераций
+            bool all_clobber_ok = true;
+            uint64_t fail_mask = 0;
+            for (int i = 0; i < 100; ++i) {
+                HANDLE h = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+                if (!h) { all_clobber_ok = false; break; }
+
+                uint64_t mask = nonvolatile_check_syscall(
+                    close_ssn, syscall_addr,
+                    reinterpret_cast<uint64_t>(h));
+
+                if (mask != 0) {
+                    all_clobber_ok = false;
+                    fail_mask = mask;
+                    break;
+                }
+            }
+            {
+                char detail[64];
+                std::snprintf(detail, sizeof(detail),
+                    all_clobber_ok ? "all clean" : "fail mask=0x%02llX", fail_mask);
+                check(all_clobber_ok,
+                    "100 rapid clobber tests: all non-volatile GPRs preserved", detail);
+            }
+        }
+    }
+    std::printf("\n");
+
+    // -----------------------------------------------------------------------
+    // Test 13: Stack alignment — 16-byte для 13-параметровых вызовов
+    // -----------------------------------------------------------------------
+    std::printf("[Test 13] Stack alignment for 13-parameter calls\n");
+    {
+        // alignment_check_13args имеет ту же сигнатуру, что и indirect_syscall.
+        // Проверяет, что компилятор корректно выравнивает RSP перед CALL
+        // при передаче 13 параметров (4 в регистрах + 9 на стеке).
+        uint64_t align_result = alignment_check_13args(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
+
+        {
+            char detail[64];
+            std::snprintf(detail, sizeof(detail),
+                "RSP mod 16 - 8 = %lld (expect 0)", static_cast<long long>(align_result));
+            check(align_result == 0,
+                "RSP aligned correctly for 13-param call (RSP %% 16 == 8)", detail);
+        }
+
+        // Повторная проверка из другого контекста вызова (вложенный scope)
+        auto run_alignment = [&]() {
+            volatile uint64_t padding = 0x42;
+            (void)padding;
+            return alignment_check_13args(
+                0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77);
+        };
+        uint64_t align_result2 = run_alignment();
+        check(align_result2 == 0,
+            "RSP aligned in nested scope with local variables");
     }
     std::printf("\n");
 

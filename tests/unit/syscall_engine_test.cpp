@@ -294,21 +294,27 @@ TEST(GateAsmStackMath, StackShiftOffset) {
     // Причина: SSN и syscall_addr "съедают" 2 регистровых слота (RCX, RDX),
     // сдвигая стековые аргументы на 2 позиции = 16 байт.
 
-    constexpr uint32_t arg5_original = 0x38;
-    constexpr uint32_t arg5_target   = 0x28;
-    constexpr uint32_t shift         = arg5_original - arg5_target;
+    constexpr uint32_t SHIFT = 0x10;
 
-    EXPECT_EQ(shift, 0x10u) << "Stack shift for 5th+ args must be 16 bytes";
+    struct ArgShift {
+        uint32_t original;
+        uint32_t target;
+    };
 
-    // arg6: [RSP+40h] -> [RSP+30h]
-    constexpr uint32_t arg6_original = 0x40;
-    constexpr uint32_t arg6_target   = 0x30;
-    EXPECT_EQ(arg6_original - arg6_target, shift);
+    constexpr ArgShift shifts[] = {
+        { 0x38, 0x28 },   // arg5
+        { 0x40, 0x30 },   // arg6
+        { 0x48, 0x38 },   // arg7
+        { 0x50, 0x40 },   // arg8
+        { 0x58, 0x48 },   // arg9
+        { 0x60, 0x50 },   // arg10
+        { 0x68, 0x58 },   // arg11
+    };
 
-    // arg7: [RSP+48h] -> [RSP+38h]
-    constexpr uint32_t arg7_original = 0x48;
-    constexpr uint32_t arg7_target   = 0x38;
-    EXPECT_EQ(arg7_original - arg7_target, shift);
+    for (int i = 0; i < 7; ++i) {
+        EXPECT_EQ(shifts[i].original - shifts[i].target, SHIFT)
+            << "Stack shift for arg" << (i + 5) << " must be 0x10";
+    }
 }
 
 TEST(GateAsmStackMath, NtProtectVirtualMemoryLayout) {
@@ -346,9 +352,51 @@ TEST(GateAsmStackMath, NtAllocateVirtualMemoryLayout) {
 
     constexpr int total_nt_params = 6;
     constexpr int register_params = 4;
-    constexpr int stack_params = total_nt_params - register_params; // 2
+    constexpr int stack_params = total_nt_params - register_params;
 
     EXPECT_EQ(stack_params, 2);
+
+    constexpr uint32_t alloc_type_nt_position = 0x28;  // 5th Nt arg on stack
+    constexpr uint32_t protect_nt_position    = 0x30;  // 6th Nt arg on stack
+    EXPECT_EQ(alloc_type_nt_position, 0x28u);
+    EXPECT_EQ(protect_nt_position, 0x30u);
+}
+
+TEST(GateAsmStackMath, NtCreateThreadExLayout) {
+    // NtCreateThreadEx — 11 Nt-аргументов (максимум среди известных Nt*):
+    //   arg1  ThreadHandle       R10
+    //   arg2  DesiredAccess      RDX
+    //   arg3  ObjectAttributes   R8
+    //   arg4  ProcessHandle      R9
+    //   arg5  StartRoutine       [RSP+28h]
+    //   arg6  Argument           [RSP+30h]
+    //   arg7  CreateFlags        [RSP+38h]
+    //   arg8  ZeroBits           [RSP+40h]
+    //   arg9  StackSize          [RSP+48h]
+    //   arg10 MaximumStackSize   [RSP+50h]
+    //   arg11 AttributeList      [RSP+58h]
+    //
+    // indirect_syscall C++ params: ssn, addr, arg1..arg11 = 13 параметров
+    //   4 в регистрах (ECX, RDX, R8, R9) + 9 на стеке [RSP+28h..RSP+68h]
+    //   gate.asm сдвигает [RSP+38h..RSP+68h] -> [RSP+28h..RSP+58h]
+
+    constexpr int total_nt_params = 11;
+    constexpr int register_params = 4;
+    constexpr int stack_nt_params = total_nt_params - register_params;
+
+    EXPECT_EQ(stack_nt_params, 7);
+
+    constexpr int cpp_params = 2 + total_nt_params;
+    constexpr int cpp_register_params = 4;
+    constexpr int cpp_stack_params = cpp_params - cpp_register_params;
+
+    EXPECT_EQ(cpp_params, 13);
+    EXPECT_EQ(cpp_stack_params, 9);
+
+    // Последний аргумент (arg11) после сдвига должен быть на [RSP+58h]
+    constexpr uint32_t arg11_cpp_offset   = 0x68;  // 13-й C++ param
+    constexpr uint32_t arg11_after_shift  = 0x58;  // после -0x10
+    EXPECT_EQ(arg11_cpp_offset - 0x10u, arg11_after_shift);
 }
 
 // ============================================================================
