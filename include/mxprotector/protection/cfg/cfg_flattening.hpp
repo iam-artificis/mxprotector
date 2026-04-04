@@ -43,6 +43,7 @@
 #include "mxprotector/protection/pass.hpp"
 #include "mxprotector/protection/cfg/dispatcher_gen.hpp"
 #include "mxprotector/protection/cfg/bogus_flow.hpp"
+#include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 
 namespace mx {
 
@@ -52,11 +53,12 @@ class ProtectionContext;
  * @brief Конфигурация расплющивания для одной функции.
  */
 struct FlatteningConfig {
-    x86::Reg state_var_reg = x86::Reg::r10;
-    bool     enable_bogus_flow = true;
-    double   bogus_probability = 0.5;
+    x86::Reg state_var_reg         = x86::Reg::r10;
+    bool     enable_bogus_flow     = true;
+    double   bogus_probability     = 0.5;
     bool     enable_mba_transitions = true;
-    uint32_t mba_depth = 1;
+    bool     enable_junk_blocks    = true;
+    double   junk_block_ratio      = 0.12;
 };
 
 /**
@@ -133,14 +135,6 @@ private:
         const analysis::BasicBlock& block,
         ByteView original_code,
         Va base_address) const;
-
-    /**
-     * @brief Строит state transition для блока (обновление state variable).
-     */
-    [[nodiscard]] ByteBuffer build_state_transition(
-        uint32_t next_state_id,
-        x86::Reg state_reg,
-        Randomizer& rng) const;
 };
 
 /**

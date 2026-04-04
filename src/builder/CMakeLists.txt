@@ -57,6 +57,8 @@ set(BUILDER_SOURCES
     protection/cfg/cfg_flattening_pass.cpp
     protection/cfg/dispatcher_gen.cpp
     protection/cfg/bogus_flow.cpp
+    protection/cfg/map_parser.cpp
+    protection/cfg/mba_transition_gen.cpp
 
     # Фаза 3: Шифрование
     protection/encryption/chacha20_encryptor.cpp

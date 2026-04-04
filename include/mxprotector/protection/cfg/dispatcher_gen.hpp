@@ -44,6 +44,17 @@
 namespace mx {
 
 /**
+ * @brief Конфигурация диспетчера.
+ */
+struct DispatcherConfig {
+    bool     enable_mba_transitions = true;
+    bool     enable_junk_blocks     = true;
+    double   junk_block_ratio       = 0.12;  ///< 10–15% ложных путей
+    uint32_t min_junk_insns         = 4;
+    uint32_t max_junk_insns         = 12;
+};
+
+/**
  * @brief Описание одного блока в расплющенной функции.
  */
 struct FlattenedBlock {
@@ -53,6 +64,7 @@ struct FlattenedBlock {
     std::vector<uint32_t> successor_states;
     Va         original_va = 0;
     analysis::ConditionCode branch_cc = analysis::ConditionCode::not_equal;
+    uint32_t   bogus_prefix_size = 0;
 };
 
 /**
@@ -105,17 +117,19 @@ public:
      * @param entry_state_id State ID входного блока.
      * @param state_var_reg Регистр, хранящий state variable.
      * @param rng Генератор случайных чисел.
+     * @param config Конфигурация диспетчера (MBA, junk blocks).
      * @return Полный код функции (диспетчер + все блоки) или ошибка.
      */
     [[nodiscard]] MxResult<DispatcherResult> generate(
         std::vector<FlattenedBlock>& blocks,
         uint32_t entry_state_id,
         x86::Reg state_var_reg,
-        Randomizer& rng);
+        Randomizer& rng,
+        const DispatcherConfig& config = {});
 
     /**
-     * @brief Назначает случайные state ID для блоков.
-     * @param block_count Количество блоков.
+     * @brief Назначает случайные state ID для блоков (31-бит, < 0x80000000).
+     * @param block_ids Идентификаторы блоков.
      * @param rng Генератор случайных чисел.
      * @return Маппинг: original_block_id → state_id.
      */
@@ -129,6 +143,12 @@ private:
     Architecture arch_;
 
     [[nodiscard]] bool is_64bit() const noexcept { return arch_ == Architecture::x64; }
+
+    /**
+     * @brief Генерирует тело мусорного блока для ложного пути.
+     */
+    [[nodiscard]] ByteBuffer generate_junk_block_body(
+        uint32_t insn_count, Randomizer& rng) const;
 };
 
 } // namespace mx

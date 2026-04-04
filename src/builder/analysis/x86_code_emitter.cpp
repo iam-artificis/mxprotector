@@ -341,6 +341,38 @@ X86CodeEmitter& X86CodeEmitter::shr(x86::Reg dst, uint8_t count) {
     return *this;
 }
 
+X86CodeEmitter& X86CodeEmitter::rol(x86::Reg dst, uint8_t count) {
+    const bool ext = static_cast<uint8_t>(dst) >= 8;
+    if (is_64bit_ || ext) {
+        emit_rex(is_64bit_, false, false, ext);
+    }
+    if (count == 1) {
+        emit_byte(0xD1);
+        emit_modrm_reg_reg(0, dst);
+    } else {
+        emit_byte(0xC1);
+        emit_modrm_reg_reg(0, dst);
+        emit_byte(count);
+    }
+    return *this;
+}
+
+X86CodeEmitter& X86CodeEmitter::ror(x86::Reg dst, uint8_t count) {
+    const bool ext = static_cast<uint8_t>(dst) >= 8;
+    if (is_64bit_ || ext) {
+        emit_rex(is_64bit_, false, false, ext);
+    }
+    if (count == 1) {
+        emit_byte(0xD1);
+        emit_modrm_reg_reg(1, dst);
+    } else {
+        emit_byte(0xC1);
+        emit_modrm_reg_reg(1, dst);
+        emit_byte(count);
+    }
+    return *this;
+}
+
 // ============================================================================
 // Comparison / Test
 // ============================================================================

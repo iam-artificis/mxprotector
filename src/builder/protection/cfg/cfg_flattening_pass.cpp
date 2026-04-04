@@ -15,6 +15,8 @@
  */
 
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
+#include "mxprotector/protection/cfg/map_parser.hpp"
+#include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/analysis/cfg.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
@@ -25,9 +27,73 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
+#include <optional>
+#include <queue>
 #include <unordered_set>
 
 namespace mx {
+
+namespace {
+
+bool code_uses_register(ByteView code, ZydisRegister reg) {
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+    const auto matches = [reg](ZydisRegister r) {
+        return ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, r) ==
+               ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+    };
+
+    size_t offset = 0;
+    while (offset < code.size()) {
+        ZydisDecodedInstruction insn{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, code.data() + offset, code.size() - offset,
+                &insn, operands))) {
+            ++offset;
+            continue;
+        }
+
+        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
+            if (operands[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                matches(operands[i].reg.value)) {
+                return true;
+            }
+            if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                if (matches(operands[i].mem.base) ||
+                    matches(operands[i].mem.index)) {
+                    return true;
+                }
+            }
+        }
+
+        offset += insn.length;
+    }
+    return false;
+}
+
+std::optional<x86::Reg> select_state_register(ByteView func_code) {
+    struct Candidate {
+        x86::Reg mx_reg;
+        ZydisRegister zy_reg;
+    };
+
+    static constexpr Candidate candidates[] = {
+        {x86::Reg::r10, ZYDIS_REGISTER_R10},
+        {x86::Reg::r11, ZYDIS_REGISTER_R11},
+    };
+
+    for (const auto& [mx, zy] : candidates) {
+        if (!code_uses_register(func_code, zy)) {
+            return mx;
+        }
+    }
+    return std::nullopt;
+}
+
+} // anonymous namespace
 
 // ============================================================================
 // CfgFlattener
@@ -66,28 +132,6 @@ ByteBuffer CfgFlattener::extract_block_code(
     }
 
     return code;
-}
-
-ByteBuffer CfgFlattener::build_state_transition(
-    uint32_t next_state_id,
-    x86::Reg state_reg,
-    [[maybe_unused]] Randomizer& rng) const
-{
-    analysis::X86CodeEmitter em(is_64bit());
-
-    if (config_.enable_mba_transitions) {
-        const auto mask = rng.next_u32();
-        const auto encoded_state = next_state_id ^ mask;
-
-        em.mov(state_reg, static_cast<uint64_t>(encoded_state));
-        em.xor_(state_reg, static_cast<int32_t>(mask));
-    } else {
-        em.mov(state_reg, static_cast<uint64_t>(next_state_id));
-    }
-
-    auto code = em.build();
-    if (!code) return {};
-    return std::move(*code);
 }
 
 MxResult<FlatteningResult> CfgFlattener::flatten(
@@ -157,11 +201,12 @@ MxResult<FlatteningResult> CfgFlattener::flatten(
 
         for (size_t i = 0; i < flat_blocks.size() && i < bogus_blocks.size(); ++i) {
             if (bogus_blocks[i].total_size > 0) {
-                ByteBuffer augmented;
-                augmented.reserve(
+                const uint32_t prefix_size = static_cast<uint32_t>(
                     bogus_blocks[i].predicate_code.size() +
-                    bogus_blocks[i].junk_code.size() +
-                    flat_blocks[i].code.size());
+                    bogus_blocks[i].junk_code.size());
+
+                ByteBuffer augmented;
+                augmented.reserve(prefix_size + flat_blocks[i].code.size());
 
                 augmented.insert(augmented.end(),
                     bogus_blocks[i].predicate_code.begin(),
@@ -174,6 +219,7 @@ MxResult<FlatteningResult> CfgFlattener::flatten(
                     flat_blocks[i].code.end());
 
                 flat_blocks[i].code = std::move(augmented);
+                flat_blocks[i].bogus_prefix_size = prefix_size;
                 ++bogus_count;
             }
         }
@@ -181,8 +227,13 @@ MxResult<FlatteningResult> CfgFlattener::flatten(
 
     const uint32_t entry_state = state_map[cfg.entry_block_id()];
 
+    DispatcherConfig disp_config;
+    disp_config.enable_mba_transitions = config_.enable_mba_transitions;
+    disp_config.enable_junk_blocks     = config_.enable_junk_blocks;
+    disp_config.junk_block_ratio       = config_.junk_block_ratio;
+
     auto disp_result = disp_gen.generate(
-        flat_blocks, entry_state, config_.state_var_reg, rng);
+        flat_blocks, entry_state, config_.state_var_reg, rng, disp_config);
 
     if (!disp_result) {
         return std::unexpected(disp_result.error());
@@ -323,9 +374,11 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
     Randomizer rng;
 
     FlatteningConfig flat_config;
-    flat_config.enable_bogus_flow = false;
-    flat_config.bogus_probability = 0.0;
+    flat_config.enable_bogus_flow      = true;
+    flat_config.bogus_probability      = 0.5;
     flat_config.enable_mba_transitions = true;
+    flat_config.enable_junk_blocks     = true;
+    flat_config.junk_block_ratio       = 0.12;
 
     uint32_t functions_flattened_inplace = 0;
     uint32_t functions_trampolined = 0;
@@ -351,7 +404,36 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
 
         if (!cfg_result) return {};
 
-        const auto& cfg = *cfg_result;
+        auto& cfg = *cfg_result;
+
+        // Remove unreachable blocks (padding/INT3 after RET)
+        {
+            std::unordered_set<uint32_t> reachable;
+            std::queue<uint32_t> bfs;
+            bfs.push(cfg.entry_block_id());
+            reachable.insert(cfg.entry_block_id());
+            while (!bfs.empty()) {
+                const auto cur = bfs.front();
+                bfs.pop();
+                const auto* blk = cfg.block_by_id(cur);
+                if (!blk) continue;
+                for (const auto succ : blk->successors()) {
+                    if (reachable.insert(succ).second) {
+                        bfs.push(succ);
+                    }
+                }
+            }
+            std::vector<uint32_t> to_remove;
+            for (const auto& [id, _] : cfg.blocks()) {
+                if (!reachable.contains(id)) {
+                    to_remove.push_back(id);
+                }
+            }
+            for (const auto id : to_remove) {
+                cfg.blocks().erase(id);
+            }
+        }
+
         if (cfg.block_count() < 3) return {};
 
         // ==================================================================
@@ -362,16 +444,11 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
             const auto* term = block.terminator();
             if (!term) continue;
 
-            // Indirect jumps (jmp rax, jmp [mem]) → jump tables / switch
             if (term->is_unconditional_jump() && term->branch_targets().empty()) {
                 unsafe = true;
                 break;
             }
 
-            // Indirect calls with no known target within function range
-            // (call rax, call [mem]) are OK — they call external code and return.
-            // But unconditional branches with out-of-range targets indicate
-            // tail calls or thunks that break CFF's state machine.
             if (term->is_unconditional_jump() && !term->branch_targets().empty()) {
                 bool all_external = true;
                 for (const auto target : term->branch_targets()) {
@@ -387,7 +464,6 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
             }
         }
 
-        // Verify blocks cover a reasonable portion of the function body
         uint64_t covered = 0;
         for (const auto& [bid, block] : cfg.blocks()) {
             covered += block.size();
@@ -401,7 +477,22 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
             return {};
         }
 
-        CfgFlattener flattener(ctx.pe_image().architecture(), flat_config);
+        const auto chosen_reg = select_state_register(
+            ByteView{code_snapshot.data(), code_snapshot.size()});
+        if (!chosen_reg) {
+            ctx.log_fmt("  CFF: RVA=0x{:08X} size={} — skipped (no free state register)",
+                func_rva, func_size);
+            ++functions_skipped;
+            return {};
+        }
+        auto func_config = flat_config;
+        func_config.state_var_reg = *chosen_reg;
+
+        const char* reg_name = (*chosen_reg == x86::Reg::r11) ? "R11" : "R10";
+        ctx.log_fmt("  CFF: RVA=0x{:08X} size={} blocks={} state_reg={}",
+            func_rva, func_size, cfg.block_count(), reg_name);
+
+        CfgFlattener flattener(ctx.pe_image().architecture(), func_config);
         auto flat_result = flattener.flatten(
             cfg, ByteView{code_snapshot.data(), code_snapshot.size()}, base_va, rng);
 
@@ -474,60 +565,115 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
                                    region_va, start_rva);
         }
     } else {
-        ctx.log("CfgFlatteningPass: маркеров не найдено, используем .pdata для границ функций");
+        // Try .map file first, then fall back to .pdata
+        bool used_map_file = false;
 
-        struct RuntimeFunction {
-            uint32_t begin_addr;
-            uint32_t end_addr;
-            uint32_t unwind_info;
-        };
+        if (!ctx.config().map_file_path.empty()) {
+            ctx.log_fmt("CfgFlatteningPass: парсинг .map файла: {}",
+                ctx.config().map_file_path.string());
 
-        const pe::SectionInfo* pdata = ctx.pe_image().section_by_name(".pdata");
-        if (!pdata || pdata->data.size() < sizeof(RuntimeFunction)) {
-            ctx.log("CfgFlatteningPass: .pdata не найдена, пропуск CFF");
-        } else {
-            const size_t func_count = pdata->data.size() / sizeof(RuntimeFunction);
-            const auto* funcs = reinterpret_cast<const RuntimeFunction*>(pdata->data.data());
-
-            ctx.log_fmt("CfgFlatteningPass: найдено {} функций в .pdata", func_count);
-
-            // Identify CRT boundary: user code is typically placed
-            // BEFORE the CRT entry point in .text by MSVC linker.
-            const Rva entry_rva = ctx.pe_image().entry_point_rva();
-            size_t entry_idx = func_count;
-            for (size_t j = 0; j < func_count; ++j) {
-                if (funcs[j].begin_addr <= entry_rva &&
-                    funcs[j].end_addr > entry_rva) {
-                    entry_idx = j;
-                    break;
-                }
-            }
-
-            ctx.log_fmt("CfgFlatteningPass: entry point at .pdata[{}] "
-                        "(RVA=0x{:08X}), CFF range: [0..{})",
-                        entry_idx, entry_rva, entry_idx);
-
-            for (size_t i = 0; i < entry_idx; ++i) {
-                const Rva func_rva = funcs[i].begin_addr;
-                const uint32_t func_size = funcs[i].end_addr - funcs[i].begin_addr;
-
-                if (func_size < 32 || func_size > 8192) continue;
-
-                pe::SectionInfo* section = nullptr;
-                for (auto& s : ctx.pe_image().sections()) {
-                    if (s.is_code() && s.contains_rva(func_rva)) {
-                        section = &s;
+            auto map_result = MapParser::parse(ctx.config().map_file_path);
+            if (map_result) {
+                const pe::SectionInfo* text_sec = nullptr;
+                for (const auto& s : ctx.pe_image().sections()) {
+                    if (s.is_code() && s.name == ".text") {
+                        text_sec = &s;
                         break;
                     }
                 }
-                if (!section) continue;
 
-                const uint32_t offset_in_section = func_rva - section->virtual_address;
-                if (offset_in_section + func_size > section->data.size()) continue;
+                if (text_sec) {
+                    ByteView text_code{text_sec->data.data(), text_sec->data.size()};
+                    auto candidates = MapParser::filter_candidates(
+                        map_result->all_functions, text_code,
+                        text_sec->virtual_address, text_sec->virtual_size);
 
-                const Va func_va = ctx.pe_image().image_base() + func_rva;
-                (void)flatten_function(*section, offset_in_section, func_size,
-                                       func_va, func_rva);
+                    ctx.log_fmt("CfgFlatteningPass: .map: {} функций всего, "
+                                "{} кандидатов для CFF",
+                        map_result->all_functions.size(), candidates.size());
+
+                    for (const auto& func : candidates) {
+                        pe::SectionInfo* section = nullptr;
+                        for (auto& s : ctx.pe_image().sections()) {
+                            if (s.is_code() && s.contains_rva(func.rva)) {
+                                section = &s;
+                                break;
+                            }
+                        }
+                        if (!section) continue;
+
+                        const uint32_t offset_in_section =
+                            func.rva - section->virtual_address;
+                        if (offset_in_section + func.size > section->data.size()) continue;
+
+                        const Va func_va = ctx.pe_image().image_base() + func.rva;
+                        (void)flatten_function(*section, offset_in_section, func.size,
+                                               func_va, func.rva);
+                    }
+
+                    used_map_file = true;
+                }
+            } else {
+                ctx.log_fmt("CfgFlatteningPass: ошибка парсинга .map: {}",
+                    map_result.error().message());
+            }
+        }
+
+        if (!used_map_file) {
+            ctx.log("CfgFlatteningPass: используем .pdata для границ функций");
+
+            struct RuntimeFunction {
+                uint32_t begin_addr;
+                uint32_t end_addr;
+                uint32_t unwind_info;
+            };
+
+            const pe::SectionInfo* pdata = ctx.pe_image().section_by_name(".pdata");
+            if (!pdata || pdata->data.size() < sizeof(RuntimeFunction)) {
+                ctx.log("CfgFlatteningPass: .pdata не найдена, пропуск CFF");
+            } else {
+                const size_t func_count = pdata->data.size() / sizeof(RuntimeFunction);
+                const auto* funcs = reinterpret_cast<const RuntimeFunction*>(pdata->data.data());
+
+                ctx.log_fmt("CfgFlatteningPass: найдено {} функций в .pdata", func_count);
+
+                const Rva entry_rva = ctx.pe_image().entry_point_rva();
+                size_t entry_idx = func_count;
+                for (size_t j = 0; j < func_count; ++j) {
+                    if (funcs[j].begin_addr <= entry_rva &&
+                        funcs[j].end_addr > entry_rva) {
+                        entry_idx = j;
+                        break;
+                    }
+                }
+
+                ctx.log_fmt("CfgFlatteningPass: entry point at .pdata[{}] "
+                            "(RVA=0x{:08X}), CFF range: [0..{})",
+                            entry_idx, entry_rva, entry_idx);
+
+                for (size_t i = 0; i < entry_idx; ++i) {
+                    const Rva func_rva = funcs[i].begin_addr;
+                    const uint32_t func_size = funcs[i].end_addr - funcs[i].begin_addr;
+
+                    if (func_size < MapParser::kMinFunctionSize ||
+                        func_size > MapParser::kMaxFunctionSize) continue;
+
+                    pe::SectionInfo* section = nullptr;
+                    for (auto& s : ctx.pe_image().sections()) {
+                        if (s.is_code() && s.contains_rva(func_rva)) {
+                            section = &s;
+                            break;
+                        }
+                    }
+                    if (!section) continue;
+
+                    const uint32_t offset_in_section = func_rva - section->virtual_address;
+                    if (offset_in_section + func_size > section->data.size()) continue;
+
+                    const Va func_va = ctx.pe_image().image_base() + func_rva;
+                    (void)flatten_function(*section, offset_in_section, func_size,
+                                           func_va, func_rva);
+                }
             }
         }
     }

@@ -66,6 +66,11 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
             continue;
         }
 
+        if ((arg == "--map" || arg == "-m") && i + 1 < argc) {
+            config.map_file_path = argv[++i];
+            continue;
+        }
+
         if ((arg == "--level" || arg == "-l") && i + 1 < argc) {
             auto level_result = parse_level(argv[++i]);
             if (!level_result) {
@@ -84,6 +89,9 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
                 }
                 if ((prev_arg == "--output" || prev_arg == "-o") && j + 1 < argc) {
                     config.output_path = argv[j + 1];
+                }
+                if ((prev_arg == "--map" || prev_arg == "-m") && j + 1 < argc) {
+                    config.map_file_path = argv[j + 1];
                 }
             }
             continue;
@@ -163,6 +171,7 @@ void CliHandler::print_usage() {
         "\n"
         "Опциональные:\n"
         "  -o, --output <путь>         Выходной файл (по умолчанию: file.mx.ext)\n"
+        "  -m, --map <путь>            .map файл (MSVC) для точной фильтрации CFF\n"
         "  -l, --level <уровень>       Уровень защиты:\n"
         "                                minimal  — мутация + шифрование\n"
         "                                standard — + обфускация + CFG flattening\n"

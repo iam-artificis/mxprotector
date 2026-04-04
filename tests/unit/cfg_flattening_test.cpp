@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <fstream>
 #include <unordered_set>
 
 #include "mxprotector/core/types.hpp"
@@ -27,6 +28,8 @@
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/cfg/dispatcher_gen.hpp"
 #include "mxprotector/protection/cfg/bogus_flow.hpp"
+#include "mxprotector/protection/cfg/mba_transition_gen.hpp"
+#include "mxprotector/protection/cfg/map_parser.hpp"
 
 namespace {
 
@@ -629,6 +632,436 @@ TEST(CfgFlattener, FlattenWithBogusFlow) {
     ASSERT_TRUE(result.has_value());
     EXPECT_GT(result->bogus_blocks_added, 0u);
     EXPECT_GT(result->flattened_code.size(), original_code.size());
+}
+
+// ============================================================================
+// MbaTransitionGenerator tests
+// ============================================================================
+
+TEST(MbaTransitionGenerator, ProducesNonEmptyCode) {
+    mx::MbaTransitionGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng(42);
+
+    auto code = gen.generate(0x100, 0x200, mx::x86::Reg::r10, rng);
+    EXPECT_FALSE(code.empty());
+    EXPECT_GE(code.size(), 10u);
+}
+
+TEST(MbaTransitionGenerator, SimulationCorrectness) {
+    mx::MbaTransitionGenerator gen(mx::Architecture::x64);
+
+    for (uint64_t seed = 0; seed < 50; ++seed) {
+        mx::Randomizer rng(seed);
+
+        uint32_t current = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+        uint32_t target  = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+
+        auto code = gen.generate(current, target, mx::x86::Reg::r10, rng);
+        EXPECT_FALSE(code.empty())
+            << "Empty code for seed=" << seed;
+
+        // Simulate the chain: first insn is MOV r32, imm32 (sets value),
+        // then arithmetic/bitwise ops transform it to target
+        uint32_t value = 0xDEADBEEF; // garbage, MOV will overwrite
+        size_t offset = 0;
+
+        while (offset < code.size()) {
+            bool has_rex_b = false;
+            if (code[offset] == 0x41) {
+                has_rex_b = true;
+                ++offset;
+            }
+
+            if (offset >= code.size()) break;
+
+            const uint8_t opcode = code[offset++];
+
+            // MOV r32, imm32: opcode B8+rd (B8-BF)
+            if (opcode >= 0xB8 && opcode <= 0xBF) {
+                if (offset + 4 > code.size()) break;
+                uint32_t imm = 0;
+                std::memcpy(&imm, code.data() + offset, 4);
+                offset += 4;
+                value = imm;
+            } else if (opcode == 0x81 && offset < code.size()) {
+                uint8_t modrm = code[offset++];
+                uint8_t reg_field = (modrm >> 3) & 0x07;
+                if (offset + 4 > code.size()) break;
+
+                uint32_t imm = 0;
+                std::memcpy(&imm, code.data() + offset, 4);
+                offset += 4;
+
+                switch (reg_field) {
+                    case 0: value += imm; break;  // ADD
+                    case 5: value -= imm; break;  // SUB
+                    case 6: value ^= imm; break;  // XOR
+                    default: break;
+                }
+            } else if (opcode == 0xF7 && offset < code.size()) {
+                uint8_t modrm = code[offset++];
+                uint8_t reg_field = (modrm >> 3) & 0x07;
+                if (reg_field == 2) {
+                    value = ~value;  // NOT
+                }
+            } else if (opcode == 0xC1 && offset + 1 < code.size()) {
+                uint8_t modrm = code[offset++];
+                uint8_t reg_field = (modrm >> 3) & 0x07;
+                uint8_t count = code[offset++] & 31;
+                if (reg_field == 0) {
+                    value = (value << count) | (value >> (32 - count));  // ROL
+                } else if (reg_field == 1) {
+                    value = (value >> count) | (value << (32 - count));  // ROR
+                }
+            } else if (opcode == 0xD1 && offset < code.size()) {
+                uint8_t modrm = code[offset++];
+                uint8_t reg_field = (modrm >> 3) & 0x07;
+                if (reg_field == 0) {
+                    value = (value << 1) | (value >> 31);  // ROL 1
+                } else if (reg_field == 1) {
+                    value = (value >> 1) | (value << 31);  // ROR 1
+                }
+            } else {
+                // Unknown instruction — skip
+                break;
+            }
+        }
+
+        EXPECT_EQ(value, target)
+            << "MBA chain failed for seed=" << seed
+            << " current=0x" << std::hex << current
+            << " target=0x" << target
+            << " got=0x" << value;
+    }
+}
+
+TEST(MbaTransitionGenerator, PolymorphicOutput) {
+    mx::MbaTransitionGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng1(100);
+    mx::Randomizer rng2(200);
+
+    auto code1 = gen.generate(0x1000, 0x2000, mx::x86::Reg::r10, rng1);
+    auto code2 = gen.generate(0x1000, 0x2000, mx::x86::Reg::r10, rng2);
+
+    EXPECT_NE(code1, code2)
+        << "Different seeds should produce different MBA chains";
+}
+
+TEST(MbaTransitionGenerator, SanitizeStateId) {
+    EXPECT_EQ(mx::MbaTransitionGenerator::sanitize_state_id(0x80000001), 0x00000001u);
+    EXPECT_EQ(mx::MbaTransitionGenerator::sanitize_state_id(0xFFFFFFFF), 0x7FFFFFFFu);
+    EXPECT_EQ(mx::MbaTransitionGenerator::sanitize_state_id(0x12345678), 0x12345678u);
+}
+
+TEST(MbaTransitionGenerator, ChainLengthAtLeast6) {
+    mx::MbaTransitionGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng(42);
+
+    auto code = gen.generate(0x100, 0x200, mx::x86::Reg::r10, rng);
+    // At minimum: 1 initial XOR (6-7 bytes) + 5 chain ops (4-7 bytes each)
+    EXPECT_GE(code.size(), 20u);
+}
+
+// ============================================================================
+// X86CodeEmitter ROL/ROR tests
+// ============================================================================
+
+TEST(X86CodeEmitter, EmitRolRor) {
+    mx::analysis::X86CodeEmitter em(true);
+    em.rol(mx::x86::Reg::rax, 3);
+    em.ror(mx::x86::Reg::rcx, 7);
+    em.rol(mx::x86::Reg::r10, 1);
+    em.ror(mx::x86::Reg::r15, 13);
+    auto code = em.build();
+    ASSERT_TRUE(code.has_value());
+    EXPECT_GE(code->size(), 8u);
+}
+
+// ============================================================================
+// Dispatcher with junk blocks tests
+// ============================================================================
+
+TEST(DispatcherGenerator, GenerateWithJunkBlocks) {
+    mx::DispatcherGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng(42);
+
+    std::vector<mx::FlattenedBlock> blocks;
+
+    mx::FlattenedBlock b0;
+    b0.original_block_id = 0;
+    b0.state_id = 100;
+    b0.code = {0x90};
+    b0.successor_states = {200};
+    b0.original_va = 0x140001000;
+    blocks.push_back(std::move(b0));
+
+    mx::FlattenedBlock b1;
+    b1.original_block_id = 1;
+    b1.state_id = 200;
+    b1.code = {0xC3};
+    b1.original_va = 0x140001001;
+    blocks.push_back(std::move(b1));
+
+    mx::DispatcherConfig config;
+    config.enable_mba_transitions = true;
+    config.enable_junk_blocks = true;
+    config.junk_block_ratio = 0.5;
+
+    auto result = gen.generate(blocks, 100, mx::x86::Reg::r10, rng, config);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->full_function.empty());
+    // With junk blocks and MBA, the code should be significantly larger
+    EXPECT_GT(result->total_size, 50u);
+}
+
+TEST(DispatcherGenerator, GenerateWithMbaTransitions) {
+    mx::DispatcherGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng(42);
+
+    std::vector<mx::FlattenedBlock> blocks;
+
+    mx::FlattenedBlock b0;
+    b0.original_block_id = 0;
+    b0.state_id = 0x1000;
+    b0.code = {0x48, 0x89, 0xE5};
+    b0.successor_states = {0x2000};
+    b0.original_va = 0x140001000;
+    blocks.push_back(std::move(b0));
+
+    mx::FlattenedBlock b1;
+    b1.original_block_id = 1;
+    b1.state_id = 0x2000;
+    b1.code = {0x5D, 0xC3};
+    b1.original_va = 0x140001003;
+    blocks.push_back(std::move(b1));
+
+    mx::DispatcherConfig config;
+    config.enable_mba_transitions = true;
+    config.enable_junk_blocks = false;
+
+    auto result_mba = gen.generate(blocks, 0x1000, mx::x86::Reg::r10, rng, config);
+    ASSERT_TRUE(result_mba.has_value());
+
+    // Compare with non-MBA version
+    mx::Randomizer rng2(42);
+    std::vector<mx::FlattenedBlock> blocks2;
+    blocks2.push_back(mx::FlattenedBlock{0, 0x1000, {0x48, 0x89, 0xE5}, {0x2000}, 0x140001000});
+    blocks2.push_back(mx::FlattenedBlock{1, 0x2000, {0x5D, 0xC3}, {}, 0x140001003});
+
+    mx::DispatcherConfig config_no_mba;
+    config_no_mba.enable_mba_transitions = false;
+    config_no_mba.enable_junk_blocks = false;
+
+    auto result_plain = gen.generate(blocks2, 0x1000, mx::x86::Reg::r10, rng2, config_no_mba);
+    ASSERT_TRUE(result_plain.has_value());
+
+    // MBA version should be significantly larger
+    EXPECT_GT(result_mba->total_size, result_plain->total_size);
+}
+
+TEST(DispatcherGenerator, StateIdsSanitized) {
+    mx::DispatcherGenerator gen(mx::Architecture::x64);
+    mx::Randomizer rng(42);
+
+    std::vector<uint32_t> ids = {0, 1, 2, 3, 4};
+    auto mapping = gen.assign_state_ids(ids, rng);
+
+    for (const auto& [id, state] : mapping) {
+        EXPECT_LT(state, 0x80000000u)
+            << "State ID should be < 0x80000000 for sign-extension compatibility";
+        EXPECT_NE(state, 0u)
+            << "State ID should not be 0";
+    }
+}
+
+// ============================================================================
+// MapParser tests
+// ============================================================================
+
+TEST(MapParser, ParseValidMapFile) {
+    // Create a temporary .map file
+    const std::string map_content =
+        " test_target\n"
+        "\n"
+        " Timestamp is 6823a1b8 (Wed May 14 02:21:28 2025)\n"
+        "\n"
+        " Preferred load address is 0000000140000000\n"
+        "\n"
+        " Start         Length     Name                   Class\n"
+        " 0001:00000000 000082fcH .text$mn                CODE\n"
+        " 0002:00000000 00000428H .rdata                  DATA\n"
+        "\n"
+        "  Address         Publics by Value              Rva+Base               Lib:Object\n"
+        "\n"
+        " 0001:00000000       compute_fibonacci          0000000140001000     test_target.obj\n"
+        " 0001:00000040       compute_hash               0000000140001040     test_target.obj\n"
+        " 0001:00000080       do_arithmetic_work         0000000140001080     test_target.obj\n"
+        " 0001:00000100       main                       0000000140001100     test_target.obj\n"
+        " 0001:00001000       _acrt_init                 0000000140002000     libucrt.lib:init.obj\n"
+        " 0001:00001050       __scrt_startup             0000000140002050     libvcruntime.lib:startup.obj\n"
+        "\n";
+
+    const auto tmp_path = std::filesystem::temp_directory_path() / "test_mxp.map";
+    {
+        std::ofstream f(tmp_path);
+        f << map_content;
+    }
+
+    auto result = mx::MapParser::parse(tmp_path);
+    ASSERT_TRUE(result.has_value());
+
+    EXPECT_EQ(result->image_base, 0x140000000ULL);
+    EXPECT_GE(result->all_functions.size(), 4u);
+
+    // Check that user functions are not marked as library
+    uint32_t user_count = 0;
+    uint32_t lib_count = 0;
+    for (const auto& f : result->all_functions) {
+        if (f.is_library) ++lib_count;
+        else ++user_count;
+    }
+    EXPECT_GE(user_count, 4u);
+    EXPECT_GE(lib_count, 2u);
+
+    // Verify function sizes were computed
+    for (size_t i = 0; i + 1 < result->all_functions.size(); ++i) {
+        EXPECT_GT(result->all_functions[i].size, 0u);
+    }
+
+    std::filesystem::remove(tmp_path);
+}
+
+TEST(MapParser, FilterExcludesLibraryFunctions) {
+    std::vector<mx::MapFunctionEntry> funcs;
+
+    mx::MapFunctionEntry user_func;
+    user_func.name = "compute_fibonacci";
+    user_func.rva = 0x1000;
+    user_func.size = 64;
+    user_func.object_file = "test_target.obj";
+    user_func.is_library = false;
+    funcs.push_back(user_func);
+
+    mx::MapFunctionEntry lib_func;
+    lib_func.name = "_acrt_init";
+    lib_func.rva = 0x2000;
+    lib_func.size = 128;
+    lib_func.object_file = "libucrt.lib:init.obj";
+    lib_func.is_library = true;
+    funcs.push_back(lib_func);
+
+    mx::ByteBuffer fake_code(0x3000, 0x90);
+    auto candidates = mx::MapParser::filter_candidates(
+        funcs, mx::ByteView{fake_code}, 0x1000, 0x3000);
+
+    EXPECT_EQ(candidates.size(), 1u);
+    EXPECT_EQ(candidates[0].name, "compute_fibonacci");
+}
+
+TEST(MapParser, FilterExcludesTooSmallFunctions) {
+    std::vector<mx::MapFunctionEntry> funcs;
+
+    mx::MapFunctionEntry small_func;
+    small_func.name = "tiny_func";
+    small_func.rva = 0x1000;
+    small_func.size = 16;
+    small_func.is_library = false;
+    funcs.push_back(small_func);
+
+    mx::ByteBuffer fake_code(0x2000, 0x90);
+    auto candidates = mx::MapParser::filter_candidates(
+        funcs, mx::ByteView{fake_code}, 0x1000, 0x2000);
+
+    EXPECT_TRUE(candidates.empty());
+}
+
+TEST(MapParser, FilterExcludesThunks) {
+    std::vector<mx::MapFunctionEntry> funcs;
+
+    mx::MapFunctionEntry thunk_func;
+    thunk_func.name = "FlsSetValue";
+    thunk_func.rva = 0x1000;
+    thunk_func.size = 64;
+    thunk_func.is_library = false;
+    funcs.push_back(thunk_func);
+
+    // Build code that starts with jmp [rip+disp32] thunk: 48 FF 25 ...
+    mx::ByteBuffer fake_code(0x2000, 0xCC);
+    fake_code[0] = 0x48;
+    fake_code[1] = 0xFF;
+    fake_code[2] = 0x25;
+
+    auto candidates = mx::MapParser::filter_candidates(
+        funcs, mx::ByteView{fake_code}, 0x1000, 0x2000);
+
+    EXPECT_TRUE(candidates.empty());
+}
+
+TEST(MapParser, FilterExcludesTooLargeFunctions) {
+    std::vector<mx::MapFunctionEntry> funcs;
+
+    mx::MapFunctionEntry large_func;
+    large_func.name = "huge_function";
+    large_func.rva = 0x1000;
+    large_func.size = 10000;
+    large_func.is_library = false;
+    funcs.push_back(large_func);
+
+    mx::ByteBuffer fake_code(0x5000, 0x90);
+    auto candidates = mx::MapParser::filter_candidates(
+        funcs, mx::ByteView{fake_code}, 0x1000, 0x5000);
+
+    EXPECT_TRUE(candidates.empty());
+}
+
+// ============================================================================
+// Full CFF pipeline with all enhancements test
+// ============================================================================
+
+TEST(CfgFlattener, FlattenWithMbaAndJunkBlocks) {
+    mx::analysis::ControlFlowGraph cfg;
+
+    mx::analysis::BasicBlock b0(0, 0x1000);
+    b0.add_instruction(make_insn(0x1000, {0x90}, "nop"));
+    b0.add_instruction(make_insn(0x1001, {0xEB, 0x00}, "jmp", "0x1003",
+        true, false, false, false, true, {0x1003}));
+    b0.add_successor(1);
+
+    mx::analysis::BasicBlock b1(1, 0x1003);
+    b1.add_instruction(make_insn(0x1003, {0x90}, "nop"));
+    b1.add_instruction(make_insn(0x1004, {0xEB, 0x00}, "jmp", "0x1006",
+        true, false, false, false, true, {0x1006}));
+    b1.add_successor(2);
+    b1.add_predecessor(0);
+
+    mx::analysis::BasicBlock b2(2, 0x1006);
+    b2.add_instruction(make_insn(0x1006, {0xC3}, "ret", "",
+        true, false, false, true));
+    b2.add_predecessor(1);
+
+    cfg.add_block(std::move(b0));
+    cfg.add_block(std::move(b1));
+    cfg.add_block(std::move(b2));
+    cfg.set_entry_block_id(0);
+
+    mx::ByteBuffer original_code = {0x90, 0xEB, 0x00, 0x90, 0xEB, 0x00, 0xC3};
+    mx::Randomizer rng(42);
+    mx::FlatteningConfig flat_config;
+    flat_config.enable_bogus_flow      = true;
+    flat_config.bogus_probability      = 0.5;
+    flat_config.enable_mba_transitions = true;
+    flat_config.enable_junk_blocks     = true;
+    flat_config.junk_block_ratio       = 0.3;
+
+    mx::CfgFlattener flattener(mx::Architecture::x64, flat_config);
+    auto result = flattener.flatten(cfg, mx::ByteView{original_code}, 0x1000, rng);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->flattened_code.empty());
+    EXPECT_EQ(result->original_block_count, 3u);
+    // With MBA + junk + bogus, code should be much larger than original
+    EXPECT_GT(result->flattened_code.size(), original_code.size() * 5);
 }
 
 } // anonymous namespace

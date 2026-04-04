@@ -32,6 +32,7 @@ namespace mx {
 struct ProtectionConfig {
     std::filesystem::path input_path;     ///< Путь к входному PE-файлу
     std::filesystem::path output_path;    ///< Путь к выходному файлу (auto: file.mx.ext)
+    std::filesystem::path map_file_path;  ///< Путь к .map файлу (опциональный, для CFF)
 
     ProtectionLevel level = ProtectionLevel::standard; ///< Уровень защиты
 

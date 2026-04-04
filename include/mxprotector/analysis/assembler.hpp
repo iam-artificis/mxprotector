@@ -187,6 +187,8 @@ public:
     X86CodeEmitter& neg(x86::Reg operand);
     X86CodeEmitter& shl(x86::Reg dst, uint8_t count);
     X86CodeEmitter& shr(x86::Reg dst, uint8_t count);
+    X86CodeEmitter& rol(x86::Reg dst, uint8_t count);
+    X86CodeEmitter& ror(x86::Reg dst, uint8_t count);
 
     // ====================================================================
     // Comparison / Test

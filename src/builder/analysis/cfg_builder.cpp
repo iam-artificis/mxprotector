@@ -207,15 +207,17 @@ MxResult<ControlFlowGraph> CfgBuilder::build_function(ByteView code, Va function
 
             const auto& last = block_insns.back();
             if (last.is_terminator()) {
-                for (const auto target : last.branch_targets()) {
-                    if (target >= function_start && target < code_end) {
-                        if (visited_leaders.insert(target).second) {
-                            worklist.push(target);
+                if (!last.is_call()) {
+                    for (const auto target : last.branch_targets()) {
+                        if (target >= function_start && target < code_end) {
+                            if (visited_leaders.insert(target).second) {
+                                worklist.push(target);
+                            }
                         }
                     }
                 }
 
-                if (last.is_conditional_branch()) {
+                if (last.is_conditional_branch() || last.is_call()) {
                     const Va fallthrough = last.next_address();
                     if (fallthrough >= function_start && fallthrough < code_end) {
                         if (visited_leaders.insert(fallthrough).second) {
@@ -270,16 +272,18 @@ MxResult<ControlFlowGraph> CfgBuilder::build_function(ByteView code, Va function
 
         if (term->is_return()) continue;
 
-        for (const auto target : term->branch_targets()) {
-            if (auto it = leader_to_id.find(target); it != leader_to_id.end()) {
-                block.add_successor(it->second);
-                if (auto* succ = const_cast<BasicBlock*>(cfg.block_by_id(it->second))) {
-                    succ->add_predecessor(block.id());
+        if (!term->is_call()) {
+            for (const auto target : term->branch_targets()) {
+                if (auto it = leader_to_id.find(target); it != leader_to_id.end()) {
+                    block.add_successor(it->second);
+                    if (auto* succ = const_cast<BasicBlock*>(cfg.block_by_id(it->second))) {
+                        succ->add_predecessor(block.id());
+                    }
                 }
             }
         }
 
-        if (term->is_conditional_branch()) {
+        if (term->is_conditional_branch() || term->is_call()) {
             const Va fallthrough = term->next_address();
             if (auto it = leader_to_id.find(fallthrough); it != leader_to_id.end()) {
                 block.add_successor(it->second);

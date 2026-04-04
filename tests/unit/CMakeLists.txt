@@ -40,6 +40,8 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/dispatcher_gen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/bogus_flow.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/map_parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/mba_transition_gen.cpp
 )
 
 # Фаза 3: Шифрование (для encryption_test.cpp)
