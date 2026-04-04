@@ -13,6 +13,8 @@ cmake_minimum_required(VERSION 3.20)
 
 set(TEST_SOURCES
     mutation_engine_test.cpp
+    encryption_test.cpp
+    syscall_engine_test.cpp
 )
 
 # ==============================================================================
@@ -27,11 +29,18 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp
 )
 
+# Фаза 3: Шифрование (для encryption_test.cpp)
+set(ENCRYPTION_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/encryption/chacha20_encryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/encryption/aes_encryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/encryption/encryption_pass.cpp
+)
+
 # ==============================================================================
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES})
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${ENCRYPTION_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 
@@ -40,6 +49,8 @@ target_include_directories(mxprotector_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/external/zydis/include
     ${CMAKE_SOURCE_DIR}/external/zydis/dependencies/zycore/include
     ${CMAKE_SOURCE_DIR}/src/builder
+    ${CMAKE_SOURCE_DIR}/src/stub/include
+    ${CMAKE_SOURCE_DIR}/src/stub/syscall
 )
 
 target_link_libraries(mxprotector_tests PRIVATE

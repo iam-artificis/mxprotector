@@ -13,8 +13,9 @@
  *          8. Запись выходного файла с именем .mx.ext
  *          9. Вывод итоговой сводки
  *
- * @note На данный момент проходы не зарегистрированы (инфраструктура готова).
- *       Пайплайн полностью функционален: парсинг → сканирование → сборка.
+ * @note Зарегистрированные проходы (Phase 2+3):
+ *       MutationPass (100), ObfuscationPass (200), EncryptionPass (600).
+ *       Пайплайн: парсинг → маркеры → мутация → обфускация → шифрование → сборка.
  */
 
 #include "cli/cli_handler.hpp"
@@ -31,6 +32,7 @@
 #include "mxprotector/protection/pass_manager.hpp"
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
+#include "mxprotector/protection/encryption/encryption_pass.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -227,6 +229,7 @@ int main(int argc, char** argv) {
     mx::PassManager pass_manager;
     pass_manager.register_pass(std::make_unique<mx::MutationPass>());
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
+    pass_manager.register_pass(std::make_unique<mx::EncryptionPass>());
 
     auto pass_result = pass_manager.execute_all(ctx);
     if (!pass_result) {

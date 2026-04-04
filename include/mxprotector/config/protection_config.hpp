@@ -45,6 +45,8 @@ struct ProtectionConfig {
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)
     bool strip_debug_info       = true;   ///< Удаление отладочной информации
+    bool enable_header_erasure  = true;   ///< Стирание PE-заголовков в рантайме (anti-dump)
+    bool prefer_aes             = false;  ///< Предпочитать AES-NI вместо ChaCha20
 
     uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
 

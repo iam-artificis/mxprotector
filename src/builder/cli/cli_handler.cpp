@@ -99,6 +99,8 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--no-strip-debug")      { config.strip_debug_info = false; continue; }
         if (arg == "--nanomites")           { config.enable_nanomites = true; continue; }
         if (arg == "--code-interleaving")   { config.enable_code_interleaving = true; continue; }
+        if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
+        if (arg == "--prefer-aes")          { config.prefer_aes = true; continue; }
 
         if (arg.starts_with("--vm-depth=") && arg.size() > 11) {
             const auto depth_str = arg.substr(11);
@@ -178,6 +180,8 @@ void CliHandler::print_usage() {
         "  --no-strip-debug            Не удалять отладочную информацию\n"
         "  --nanomites                 Включить наномиты\n"
         "  --code-interleaving         Включить перемешивание кода\n"
+        "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
+        "  --prefer-aes                Предпочитать AES-256-CTR вместо ChaCha20\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
         "\n"
         "Информация:\n"

@@ -24,3 +24,9 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 
 add_subdirectory(unit)
+
+# Интеграционные тесты (требуют MSVC + MASM для gate.asm)
+option(MXPROTECTOR_BUILD_INTEGRATION_TESTS "Собирать live-тесты syscall engine" OFF)
+if(MXPROTECTOR_BUILD_INTEGRATION_TESTS)
+    add_subdirectory(integration)
+endif()

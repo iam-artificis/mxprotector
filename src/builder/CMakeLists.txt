@@ -45,6 +45,11 @@ set(BUILDER_SOURCES
     protection/obfuscation/obfuscation_pass.cpp
     protection/obfuscation/opaque_predicates.cpp
     protection/obfuscation/constant_unfolding.cpp
+
+    # Фаза 3: Шифрование
+    protection/encryption/chacha20_encryptor.cpp
+    protection/encryption/aes_encryptor.cpp
+    protection/encryption/encryption_pass.cpp
 )
 
 # ==============================================================================

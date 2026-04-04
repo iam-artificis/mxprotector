@@ -70,3 +70,7 @@ Desktop.ini
 
 # Cursor IDE plan files
 *.plan.md
+.cursorrules
+
+# Additional build directories
+build_test/

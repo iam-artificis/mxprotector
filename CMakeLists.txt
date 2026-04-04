@@ -40,6 +40,12 @@ add_subdirectory(external/zydis)
 
 add_subdirectory(src/builder)
 
+# STUB runtime (опционально — требует MASM для ASM)
+option(MXPROTECTOR_BUILD_STUB "Собирать STUB runtime payload" OFF)
+if(MXPROTECTOR_BUILD_STUB)
+    add_subdirectory(src/stub)
+endif()
+
 # Тесты (опционально)
 option(MXPROTECTOR_BUILD_TESTS "Собирать модульные тесты" OFF)
 if(MXPROTECTOR_BUILD_TESTS)

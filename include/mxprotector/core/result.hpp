@@ -81,6 +81,22 @@ enum class ProtectionErrorCode : uint16_t {
 };
 
 /**
+ * @brief Коды ошибок шифрования.
+ */
+enum class EncryptionErrorCode : uint16_t {
+    invalid_key_size     = 400, ///< Размер ключа не соответствует алгоритму
+    invalid_iv_size      = 401, ///< Размер IV/nonce не соответствует алгоритму
+    encryption_failed    = 402, ///< Ошибка шифрования данных
+    decryption_failed    = 403, ///< Ошибка расшифровки данных
+    no_sections_to_encrypt = 404, ///< Нет секций для шифрования
+    section_too_large    = 405, ///< Секция превышает максимальный размер
+    key_generation_failed = 406, ///< Ошибка генерации ключа
+    aesni_not_supported  = 407, ///< AES-NI не поддерживается процессором
+    stub_injection_failed = 408, ///< Ошибка инъекции STUB в PE
+    metadata_overflow    = 409  ///< Метаданные превышают лимит
+};
+
+/**
  * @brief Универсальная ошибка проекта MxProtector.
  *
  * @details Хранит категорию (модуль-источник), числовой код ошибки
@@ -113,6 +129,13 @@ public:
     /// @brief Конструктор с кодом защиты.
     MxError(ProtectionErrorCode code, std::string message)
         : category_(ErrorCategory::protection)
+        , code_(static_cast<uint16_t>(code))
+        , message_(std::move(message))
+    {}
+
+    /// @brief Конструктор с кодом шифрования.
+    MxError(EncryptionErrorCode code, std::string message)
+        : category_(ErrorCategory::encryption)
         , code_(static_cast<uint16_t>(code))
         , message_(std::move(message))
     {}
@@ -205,6 +228,17 @@ template <typename... Args>
 /// @brief Создаёт ошибку защиты.
 [[nodiscard]] inline MxError protection(ProtectionErrorCode code, std::string msg) {
     return MxError(code, std::move(msg));
+}
+
+/// @brief Создаёт ошибку шифрования.
+[[nodiscard]] inline MxError encryption(EncryptionErrorCode code, std::string msg) {
+    return MxError(code, std::move(msg));
+}
+
+/// @brief Создаёт ошибку шифрования с форматированием.
+template <typename... Args>
+[[nodiscard]] MxError encryption_fmt(EncryptionErrorCode code, std::format_string<Args...> fmt, Args&&... args) {
+    return MxError(code, std::format(fmt, std::forward<Args>(args)...));
 }
 
 /// @brief Создаёт ошибку ввода-вывода.
