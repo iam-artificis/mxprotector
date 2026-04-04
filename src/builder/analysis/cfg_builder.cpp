@@ -111,18 +111,23 @@ MxResult<ControlFlowGraph> CfgBuilder::build(ByteView code, Va base_address) {
         if (!term) continue;
 
         if (term->is_terminator()) {
-            for (const auto target : term->branch_targets()) {
-                if (auto it = leader_to_block_id.find(target); it != leader_to_block_id.end()) {
-                    block.add_successor(it->second);
-                    if (auto target_block_it = blocks_by_start.find(target);
-                        target_block_it != blocks_by_start.end())
-                    {
-                        target_block_it->second.add_predecessor(block.id());
+            // CALL targets are call-graph edges, not CFG edges —
+            // the call returns and execution continues at the fallthrough.
+            if (!term->is_call()) {
+                for (const auto target : term->branch_targets()) {
+                    if (auto it = leader_to_block_id.find(target); it != leader_to_block_id.end()) {
+                        block.add_successor(it->second);
+                        if (auto target_block_it = blocks_by_start.find(target);
+                            target_block_it != blocks_by_start.end())
+                        {
+                            target_block_it->second.add_predecessor(block.id());
+                        }
                     }
                 }
             }
 
-            if (term->is_conditional_branch()) {
+            // CALL and Jcc both fall through to the next instruction
+            if (term->is_conditional_branch() || term->is_call()) {
                 const Va fallthrough = term->next_address();
                 if (auto it = leader_to_block_id.find(fallthrough); it != leader_to_block_id.end()) {
                     block.add_successor(it->second);

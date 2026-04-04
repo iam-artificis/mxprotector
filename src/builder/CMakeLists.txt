@@ -45,6 +45,18 @@ set(BUILDER_SOURCES
     protection/obfuscation/obfuscation_pass.cpp
     protection/obfuscation/opaque_predicates.cpp
     protection/obfuscation/constant_unfolding.cpp
+    protection/obfuscation/mba_transform.cpp
+
+    # Phase 3: Mutation Strengthening
+    protection/mutation/instruction_splitter.cpp
+
+    # Phase 3: Assembler / Code Emitter
+    analysis/x86_code_emitter.cpp
+
+    # Phase 3: CFG Flattening
+    protection/cfg/cfg_flattening_pass.cpp
+    protection/cfg/dispatcher_gen.cpp
+    protection/cfg/bogus_flow.cpp
 
     # Фаза 3: Шифрование
     protection/encryption/chacha20_encryptor.cpp

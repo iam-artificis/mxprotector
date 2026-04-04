@@ -15,6 +15,7 @@ set(TEST_SOURCES
     mutation_engine_test.cpp
     encryption_test.cpp
     syscall_engine_test.cpp
+    cfg_flattening_test.cpp
 )
 
 # ==============================================================================
@@ -25,8 +26,20 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_substitution.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/opaque_predicates.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/mba_transform.cpp
+)
+
+# Phase 3: CFF + Assembler
+set(CFF_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_code_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/cfg_builder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/section_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/dispatcher_gen.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/bogus_flow.cpp
 )
 
 # Фаза 3: Шифрование (для encryption_test.cpp)
@@ -40,7 +53,7 @@ set(ENCRYPTION_SOURCES
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${ENCRYPTION_SOURCES})
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${ENCRYPTION_SOURCES} ${CFF_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 
