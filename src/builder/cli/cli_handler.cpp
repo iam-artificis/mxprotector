@@ -111,6 +111,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--code-interleaving")   { config.enable_code_interleaving = true; continue; }
         if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
         if (arg == "--prefer-aes")          { config.prefer_aes = true; continue; }
+        if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
 
         if (arg.starts_with("--vm-depth=") && arg.size() > 11) {
             const auto depth_str = arg.substr(11);
@@ -193,6 +194,7 @@ void CliHandler::print_usage() {
         "  --code-interleaving         Включить перемешивание кода\n"
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
         "  --prefer-aes                Предпочитать AES-256-CTR вместо ChaCha20\n"
+        "  --debug-sections            Use fixed section names (.mxvm/.mxprot1)\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
         "\n"
         "Информация:\n"

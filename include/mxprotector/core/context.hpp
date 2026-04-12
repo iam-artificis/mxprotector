@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,6 +30,22 @@
 #include "mxprotector/analysis/disassembler.hpp"
 
 namespace mx {
+
+/**
+ * @brief Runtime names of the sections MxProtector adds to the target PE.
+ *
+ * Names are generated per-build (randomized or hand-picked via --debug-sections)
+ * and stored here so that every pass agrees on what to write and what to look
+ * for. Later passes reference these when they need to locate sections added
+ * by earlier passes (e.g. PackerPass wants to pack the VM blob and CFF
+ * trampolines without hardcoding .mxvm / .mxprot1).
+ */
+struct SectionNameMap {
+    std::string vm;       ///< Virtualization blob section
+    std::string cff;      ///< CFF trampoline section
+    std::string mxrt;     ///< Encryption decrypt-stub section
+    std::string packer;   ///< Packer stub section
+};
 
 /**
  * @brief Контекст пайплайна защиты — агрегирует все разделяемые данные.
@@ -133,6 +150,23 @@ public:
     void set_cfg(analysis::ControlFlowGraph cfg) { cfg_ = std::move(cfg); }
 
     // ====================================================================
+    // Имена добавляемых секций (рандомизированные per-build)
+    // ====================================================================
+
+    /// @brief Константный доступ к map имён добавленных MxProtector секций.
+    [[nodiscard]] const SectionNameMap& section_names() const noexcept {
+        return section_names_;
+    }
+
+    /// @brief Изменяемый доступ к map имён.
+    [[nodiscard]] SectionNameMap& section_names() noexcept { return section_names_; }
+
+    /**
+     * @brief Устанавливает map имён секций.
+     */
+    void set_section_names(SectionNameMap names) { section_names_ = std::move(names); }
+
+    // ====================================================================
     // Журнал сообщений
     // ====================================================================
 
@@ -166,6 +200,7 @@ private:
     std::vector<MarkedRegion>                        markers_;      ///< Маркированные регионы
     std::shared_ptr<analysis::IDisassembler>         disasm_;       ///< Дизассемблер
     std::optional<analysis::ControlFlowGraph>        cfg_;          ///< CFG (опционально)
+    SectionNameMap                                   section_names_;///< Имена добавленных секций
     std::vector<std::string>                         log_messages_; ///< Журнал
 };
 

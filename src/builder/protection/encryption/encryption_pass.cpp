@@ -55,13 +55,14 @@ uint32_t EncryptionPass::compute_crc32(ByteView data) noexcept {
 // Фильтрация секций
 // ============================================================================
 
-bool EncryptionPass::should_encrypt_section(const pe::SectionInfo& section) noexcept {
+bool EncryptionPass::should_encrypt_section(const pe::SectionInfo& section,
+                                             std::string_view mxrt_name) noexcept {
     if (section.data.empty()) return false;
     if (section.virtual_size == 0) return false;
 
     if (section.name == ".reloc" || section.name == ".rsrc" ||
         section.name == ".pdata" || section.name == ".edata" ||
-        section.name == ".mxrt"  || section.name == ".debug" ||
+        section.name == mxrt_name || section.name == ".debug" ||
         section.name == ".CRT"   || section.name == ".tls")
     {
         return false;
@@ -197,7 +198,8 @@ MxStatus EncryptionPass::execute(ProtectionContext& ctx) {
 
     std::vector<size_t> section_indices;
     for (size_t i = 0; i < ctx.pe_image().sections().size(); ++i) {
-        if (should_encrypt_section(ctx.pe_image().sections()[i])) {
+        if (should_encrypt_section(ctx.pe_image().sections()[i],
+                                    ctx.section_names().mxrt)) {
             section_indices.push_back(i);
         }
     }
@@ -283,7 +285,7 @@ MxStatus EncryptionPass::execute(ProtectionContext& ctx) {
     auto mxrt_data = build_mxrt_section(ctx, entries);
 
     pe::SectionInfo mxrt_section;
-    mxrt_section.name = ".mxrt";
+    mxrt_section.name = ctx.section_names().mxrt;
     mxrt_section.data = std::move(mxrt_data);
     mxrt_section.virtual_size = static_cast<uint32_t>(mxrt_section.data.size());
     mxrt_section.characteristics =
@@ -296,7 +298,8 @@ MxStatus EncryptionPass::execute(ProtectionContext& ctx) {
         return std::unexpected(add_result.error());
     }
 
-    ctx.log_fmt("EncryptionPass: секция .mxrt добавлена (индекс {})", *add_result);
+    ctx.log_fmt("EncryptionPass: секция '{}' добавлена (индекс {})",
+        ctx.section_names().mxrt, *add_result);
     ctx.log_fmt("EncryptionPass: завершено. Зашифровано {} секций, OEP=0x{:08X}",
         entries.size(), ctx.pe_image().entry_point_rva());
 

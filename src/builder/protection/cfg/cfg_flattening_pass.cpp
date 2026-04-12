@@ -709,8 +709,9 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
             pe::IMAGE_SCN_MEM_READ;
 
         SectionManager sec_mgr(ctx.pe_image());
+        const std::string& cff_section_name = ctx.section_names().cff;
         auto add_result = sec_mgr.add_section(
-            ".mxprot1",
+            cff_section_name,
             ByteView{section_data.data(), section_data.size()},
             cff_section_characteristics);
 
@@ -725,8 +726,8 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
         const Rva section_rva = new_section.virtual_address;
         const Va image_base = ctx.pe_image().image_base();
 
-        ctx.log_fmt("CfgFlatteningPass: секция .mxprot1 добавлена: RVA=0x{:08X}, "
-                    "размер={} байт", section_rva, section_data.size());
+        ctx.log_fmt("CfgFlatteningPass: секция '{}' добавлена: RVA=0x{:08X}, "
+                    "размер={} байт", cff_section_name, section_rva, section_data.size());
 
         auto& mxprot_section = ctx.pe_image().sections()[section_index];
 

@@ -351,7 +351,8 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
         pe::IMAGE_SCN_MEM_READ;
 
     SectionManager sec_mgr(ctx.pe_image());
-    auto add_result = sec_mgr.add_section(".mxvm",
+    const std::string& vm_section_name = ctx.section_names().vm;
+    auto add_result = sec_mgr.add_section(vm_section_name,
         ByteView{section_data.data(), section_data.size()},
         mxvm_characteristics);
     if (!add_result) {
@@ -361,8 +362,8 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     const uint32_t section_index = *add_result;
     const auto& mxvm_section = ctx.pe_image().sections()[section_index];
     const Rva mxvm_rva = mxvm_section.virtual_address;
-    ctx.log_fmt("VirtualizationPass: секция .mxvm добавлена: RVA=0x{:08X}, "
-                "размер={} байт", mxvm_rva, section_data.size());
+    ctx.log_fmt("VirtualizationPass: секция '{}' добавлена: RVA=0x{:08X}, "
+                "размер={} байт", vm_section_name, mxvm_rva, section_data.size());
 
     // ========================================================================
     // Патчим оригинальные регионы: CALL vm_entry + NOP fill

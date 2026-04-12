@@ -90,12 +90,15 @@ private:
     /**
      * @brief Проверяет, нужно ли шифровать секцию.
      * @param section Информация о секции.
+     * @param mxrt_name Имя runtime-секции для исключения (per-build randomized).
      * @return true если секция подлежит шифрованию.
      *
      * @details Шифруются секции с кодом (.text) и данными (.data, .rdata).
-     *          НЕ шифруются: .reloc, .rsrc, .mxrt, .pdata, .edata.
+     *          НЕ шифруются: .reloc, .rsrc, mxrt-секция, .pdata, .edata.
      */
-    [[nodiscard]] static bool should_encrypt_section(const pe::SectionInfo& section) noexcept;
+    [[nodiscard]] static bool should_encrypt_section(
+        const pe::SectionInfo& section,
+        std::string_view mxrt_name) noexcept;
 
     /**
      * @brief Создаёт IEncryptor по конфигурации (ChaCha20 или AES).

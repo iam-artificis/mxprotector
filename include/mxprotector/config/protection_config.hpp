@@ -49,6 +49,7 @@ struct ProtectionConfig {
     bool strip_debug_info       = true;   ///< Удаление отладочной информации
     bool enable_header_erasure  = true;   ///< Стирание PE-заголовков в рантайме (anti-dump)
     bool prefer_aes             = false;  ///< Предпочитать AES-NI вместо ChaCha20
+    bool debug_section_names    = false;  ///< Use fixed .mxvm/.mxprot1 names instead of randomized
 
     uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
 

@@ -23,6 +23,7 @@
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/core/context.hpp"
+#include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/config/protection_config.hpp"
 #include "mxprotector/pe/pe_parser.hpp"
 #include "mxprotector/pe/pe_image.hpp"
@@ -151,6 +152,59 @@ void print_summary(
     std::cout << "\n";
 }
 
+/**
+ * @brief Pick a section name the target PE plausibly could have contained.
+ *
+ * The pool mixes real PE section names used by common toolchains with slight
+ * variations (`.rdata2`, `.tls1`, `.xdata$x`, ...) so the resulting binary
+ * blends in with MSVC / clang output. Names are never longer than 8 bytes
+ * (PE section name limit) and always begin with a dot.
+ */
+const std::vector<std::string>& stealth_section_pool() {
+    static const std::vector<std::string> kPool = {
+        ".rdata2", ".rdata3", ".xdata2", ".xdata3",
+        ".tls1",   ".tls2",   ".CRT$XC", ".00cfg",
+        ".jcr",    ".gfids",  ".didat",  ".edata1",
+        ".ptab",   ".seh",    ".tbase",  ".bss2",
+        ".xtors",  ".ctors",  ".dtors",  ".orpc",
+    };
+    return kPool;
+}
+
+/**
+ * @brief Generate 4 distinct random section names, or the fixed debug set.
+ *
+ * When `cfg.debug_section_names` is true, returns `.mxvm / .mxprot1 / .mxrt
+ * / .mxpack` for easy debugging. Otherwise draws 4 distinct names from the
+ * stealth pool so the protected binary doesn't advertise which sections
+ * MxProtector added.
+ */
+mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
+                                           mx::Randomizer& rng)
+{
+    if (cfg.debug_section_names) {
+        return mx::SectionNameMap{
+            .vm     = ".mxvm",
+            .cff    = ".mxprot1",
+            .mxrt   = ".mxrt",
+            .packer = ".mxpack",
+        };
+    }
+
+    auto pool = stealth_section_pool();
+    // Fisher-Yates shuffle so we can just take the first 4.
+    for (size_t i = pool.size() - 1; i > 0; --i) {
+        const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
+        std::swap(pool[i], pool[j]);
+    }
+    return mx::SectionNameMap{
+        .vm     = pool[0],
+        .cff    = pool[1],
+        .mxrt   = pool[2],
+        .packer = pool[3],
+    };
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -202,6 +256,16 @@ int main(int argc, char** argv) {
     auto disasm = std::make_shared<mx::analysis::ZydisDisassembler>(pe_image->architecture());
 
     auto ctx = mx::ProtectionContext(std::move(pe_image), config, disasm);
+
+    // Pick per-build section names (random unless --debug-sections).
+    {
+        mx::Randomizer name_rng;
+        auto names = generate_section_names(ctx.config(), name_rng);
+        std::cout << std::format(
+            "[*] Секции: vm='{}' cff='{}' enc='{}' pack='{}'\n",
+            names.vm, names.cff, names.mxrt, names.packer);
+        ctx.set_section_names(std::move(names));
+    }
 
     std::cout << "[*] Сканирование SDK-маркеров...\n";
     auto markers_result = mx::analysis::MarkerScanner::find_markers(ctx.pe_image());

@@ -355,14 +355,16 @@ void disable_relocations(PeImage& image) {
 }
 
 /// Find the primary code section to encrypt. For MSVC-built PEs this is
-/// ".text". If a CFF trampoline section (".mxprot1") was added earlier, it
-/// is also encrypted so CFF code is not left in the clear.
-std::vector<size_t> collect_target_sections(const PeImage& image) {
+/// ".text". If a CFF trampoline section (`ctx.section_names().cff`) or a VM
+/// blob (`ctx.section_names().vm`) was added earlier, they are also encrypted
+/// so neither is left in the clear.
+std::vector<size_t> collect_target_sections(const PeImage& image,
+                                             const SectionNameMap& names) {
     std::vector<size_t> indices;
     for (size_t i = 0; i < image.sections().size(); ++i) {
         const auto& sec = image.sections()[i];
         if (sec.data.empty()) continue;
-        if (sec.name == ".text" || sec.name == ".mxprot1" || sec.name == ".mxvm") {
+        if (sec.name == ".text" || sec.name == names.cff || sec.name == names.vm) {
             indices.push_back(i);
         }
     }
@@ -378,7 +380,8 @@ bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
 MxStatus PackerPass::execute(ProtectionContext& ctx) {
     ctx.log("PackerPass: начало самораспаковывающейся защиты");
 
-    auto target_indices = collect_target_sections(ctx.pe_image());
+    auto target_indices = collect_target_sections(ctx.pe_image(),
+                                                   ctx.section_names());
     if (target_indices.empty()) {
         ctx.log("PackerPass: нет подходящих секций, пропуск");
         return {};
@@ -468,8 +471,9 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         pe::IMAGE_SCN_MEM_READ;
 
     SectionManager sec_mgr(ctx.pe_image());
+    const std::string& packer_section_name = ctx.section_names().packer;
     auto add_res = sec_mgr.add_section(
-        ".mxpack",
+        packer_section_name,
         ByteView{stub_buf.data(), stub_buf.size()},
         pack_characteristics);
     if (!add_res) {
@@ -480,8 +484,8 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     auto& pack_sec = ctx.pe_image().sections()[pack_idx];
     const Rva stub_rva = pack_sec.virtual_address;
 
-    ctx.log_fmt("PackerPass: секция .mxpack добавлена: RVA=0x{:08X}, размер={} байт",
-        stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
+    ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
+        packer_section_name, stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
 
     // 6. Patch the four rel32 placeholders.
     //
