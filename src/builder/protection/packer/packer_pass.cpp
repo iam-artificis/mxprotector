@@ -85,6 +85,8 @@ struct StubPatches {
     uint32_t rel_to_oep_at;        ///< patch offset (rel32 from end-of-jmp to OEP + stolen_size)
     uint32_t text_size_at;         ///< patch offset of the `mov ecx, imm32` immediate
     uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
+    uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
+    uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
 };
 
 /// Minimum number of bytes we want to steal from the OEP. We walk whole
@@ -274,9 +276,30 @@ struct StolenPlan {
                              static_cast<int32_t>(jnz_end);
     u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
 
+    // --- IAT destruction: zero the Import Directory region in memory. ---
+    // After decryption, the loader has already resolved all imports into the
+    // IAT. Zeroing the Import Directory + ILT makes the resolved addresses
+    // un-labelable by dump/reconstruction tools (Scylla, IDA imports tab).
+    //
+    //   push rdi; push rcx; push rax       ; save (reuse already-saved regs)
+    //   lea rdi, [rip + import_dir_rel32]  ; rdi = &ImportDirectory in memory
+    //   xor eax, eax                        ; fill value = 0
+    //   mov ecx, import_dir_size / 4        ; dword count
+    //   rep stosd                           ; zero dwords
+    //   pop rax; pop rcx; pop rdi           ; restore
+    u8(0x57); u8(0x51); u8(0x50);            // push rdi, rcx, rax
+    u8(0x48); u8(0x8D); u8(0x3D);            // lea rdi, [rip + rel32]
+    patches.rel_to_impdir_at = static_cast<uint32_t>(buf.size());
+    u32(0);                                   // placeholder rel32
+    u8(0x31); u8(0xC0);                       // xor eax, eax
+    u8(0xB9);                                  // mov ecx, imm32
+    patches.impdir_size_at = static_cast<uint32_t>(buf.size());
+    u32(0);                                   // placeholder size/4
+    u8(0xF3); u8(0xAB);                       // rep stosd
+    u8(0x58); u8(0x59); u8(0x5F);            // pop rax, rcx, rdi
+
     // Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
-        // Each push op (50..57) translates to the matching pop op (58..5F).
         u8(static_cast<uint8_t>(*it + 0x08));
     }
 
@@ -406,6 +429,13 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     }
     const uint32_t stolen_size = stolen_plan.size;
 
+    // Make .rdata writable so the stub can zero the Import Directory at runtime.
+    for (auto& sec : ctx.pe_image().sections()) {
+        if (sec.name == ".rdata") {
+            sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+        }
+    }
+
     // 3. Generate the per-build random key.
     Randomizer rng;
     ByteBuffer key(kKeySize);
@@ -485,6 +515,37 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         const int32_t rel = static_cast<int32_t>(
             static_cast<int64_t>(oep_rva) - static_cast<int64_t>(jmp_end_rva));
         write_i32(pack_sec.data, patches.rel_to_oep_at, rel);
+    }
+
+    // IAT destruction: patch the lea rdi → Import Directory and size.
+    // Read Import Directory RVA/size from the NT headers.
+    {
+        Rva impdir_rva = 0;
+        uint32_t impdir_size = 0;
+        std::visit([&](const auto& nt) {
+            if (pe::IMAGE_DIRECTORY_ENTRY_IMPORT < nt.OptionalHeader.NumberOfRvaAndSizes) {
+                impdir_rva  = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                impdir_size = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+            }
+        }, ctx.pe_image().nt_headers());
+
+        if (impdir_rva != 0 && impdir_size >= 4) {
+            // lea rdi → Import Directory
+            const Rva lea_end_rva = stub_rva + patches.rel_to_impdir_at + 4;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(impdir_rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(pack_sec.data, patches.rel_to_impdir_at, rel);
+            // mov ecx, size / 4 (dword count for rep stosd)
+            write_i32(pack_sec.data, patches.impdir_size_at,
+                      static_cast<int32_t>(impdir_size / 4));
+
+            ctx.log_fmt("PackerPass: IAT destruction — Import Directory 0x{:08X} ({} байт) "
+                        "будет обнулён при запуске",
+                impdir_rva, impdir_size);
+        } else {
+            // No imports — zero the size so rep stosd is a no-op
+            write_i32(pack_sec.data, patches.impdir_size_at, 0);
+        }
     }
 
     // Fix up CALL rel32 inside the stolen bytes so each CALL still targets
