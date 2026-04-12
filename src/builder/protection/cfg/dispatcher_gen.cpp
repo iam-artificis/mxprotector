@@ -16,11 +16,59 @@
 #include "mxprotector/protection/cfg/dispatcher_gen.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 
+#include <Zydis/Zydis.h>
+
 #include <algorithm>
 #include <format>
 #include <unordered_set>
 
 namespace mx {
+
+namespace {
+
+/**
+ * @brief Проверяет, не клобберит ли блок state_reg. Клобберят:
+ *  - CALL (portable volatile клобберится по ABI);
+ *  - явная запись в state_reg;
+ *  - любая инструкция, у которой dest-операнд = state_reg.
+ */
+bool block_preserves_state_reg(ByteView code, x86::Reg state_reg) {
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+    const ZydisRegister target_largest = ZydisRegisterGetLargestEnclosing(
+        ZYDIS_MACHINE_MODE_LONG_64,
+        (state_reg == x86::Reg::r10) ? ZYDIS_REGISTER_R10 : ZYDIS_REGISTER_R11);
+
+    size_t off = 0;
+    while (off < code.size()) {
+        ZydisDecodedInstruction insn{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, code.data() + off, code.size() - off,
+                &insn, operands))) {
+            ++off;
+            continue;
+        }
+
+        if (insn.meta.category == ZYDIS_CATEGORY_CALL) return false;
+
+        // Any write-visible register operand matching state_reg kills preservation.
+        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
+            const auto& op = operands[i];
+            if (op.type != ZYDIS_OPERAND_TYPE_REGISTER) continue;
+            if (!(op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) continue;
+            const auto enc = ZydisRegisterGetLargestEnclosing(
+                ZYDIS_MACHINE_MODE_LONG_64, op.reg.value);
+            if (enc == target_largest) return false;
+        }
+
+        off += insn.length;
+    }
+    return true;
+}
+
+} // anonymous namespace
 
 DispatcherGenerator::DispatcherGenerator(Architecture arch)
     : arch_(arch)
@@ -231,6 +279,13 @@ MxResult<DispatcherResult> DispatcherGenerator::generate(
 
         em.raw(ByteView{blocks[i].code.data(), blocks[i].code.size()});
 
+        // Determine whether the block body preserves state_var_reg.
+        // If it does, we generate a dependency-rich chain that consumes the
+        // current state from the register; otherwise we fall back to seeding
+        // the chain with a random constant via `mov reg, imm32`.
+        const bool state_preserved = block_preserves_state_reg(
+            ByteView{blocks[i].code.data(), blocks[i].code.size()}, state_var_reg);
+
         // State transition
         if (!blocks[i].successor_states.empty()) {
             if (blocks[i].successor_states.size() == 1) {
@@ -238,7 +293,8 @@ MxResult<DispatcherResult> DispatcherGenerator::generate(
 
                 if (config.enable_mba_transitions) {
                     auto mba_code = mba_gen.generate(
-                        blocks[i].state_id, next_state, state_var_reg, rng);
+                        blocks[i].state_id, next_state, state_var_reg, rng,
+                        state_preserved);
                     em.raw(ByteView{mba_code.data(), mba_code.size()});
                 } else {
                     em.mov(state_var_reg, static_cast<uint64_t>(next_state));
@@ -255,7 +311,8 @@ MxResult<DispatcherResult> DispatcherGenerator::generate(
                 if (config.enable_mba_transitions) {
                     // Fallthrough path MBA transition
                     auto ft_code = mba_gen.generate(
-                        blocks[i].state_id, fallthrough_state, state_var_reg, rng);
+                        blocks[i].state_id, fallthrough_state, state_var_reg, rng,
+                        state_preserved);
 
                     em.jcc(blocks[i].branch_cc, taken_label);
                     em.raw(ByteView{ft_code.data(), ft_code.size()});
@@ -263,7 +320,8 @@ MxResult<DispatcherResult> DispatcherGenerator::generate(
 
                     em.bind_label(taken_label);
                     auto tk_code = mba_gen.generate(
-                        blocks[i].state_id, taken_state, state_var_reg, rng);
+                        blocks[i].state_id, taken_state, state_var_reg, rng,
+                        state_preserved);
                     em.raw(ByteView{tk_code.data(), tk_code.size()});
 
                     em.bind_label(merge_label);

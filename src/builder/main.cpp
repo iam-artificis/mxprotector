@@ -34,6 +34,7 @@
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/protection/encryption/encryption_pass.hpp"
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
+#include "mxprotector/protection/vm/virtualization_pass.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -230,6 +231,7 @@ int main(int argc, char** argv) {
     mx::PassManager pass_manager;
     pass_manager.register_pass(std::make_unique<mx::MutationPass>());
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
+    pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());
     pass_manager.register_pass(std::make_unique<mx::EncryptionPass>());
 

@@ -64,6 +64,11 @@ set(BUILDER_SOURCES
     protection/encryption/chacha20_encryptor.cpp
     protection/encryption/aes_encryptor.cpp
     protection/encryption/encryption_pass.cpp
+
+    # Фаза 4: Виртуализация (VM engine)
+    protection/vm/vm_lifter.cpp
+    protection/vm/vm_runtime_gen.cpp
+    protection/vm/virtualization_pass.cpp
 )
 
 # ==============================================================================

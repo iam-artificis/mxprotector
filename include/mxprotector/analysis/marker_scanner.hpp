@@ -40,11 +40,15 @@ class MarkerScanner {
 public:
     MarkerScanner() = delete;
 
-    /// @brief Магическое число SDK-маркера ("MX_PROT\0" в little-endian).
-    static constexpr uint64_t marker_magic = 0x4D585F50524F5400ULL;
+    /// @brief 7-байтовый префикс магии ("MX_PROT" в little-endian).
+    /// @details Полный 8-байтовый маркер: младшие 7 байт = префикс,
+    ///          старший байт = MarkerType. Каждый тип — уникальный imm64,
+    ///          что блокирует shared-load в MSVC /O2.
+    static constexpr uint64_t marker_prefix_mask = 0x00FFFFFFFFFFFFFFULL;
+    static constexpr uint64_t marker_prefix      = 0x00544F52505F584DULL;
 
-    /// @brief Полный размер одного маркера (magic + type).
-    static constexpr size_t marker_size = sizeof(uint64_t) + sizeof(uint8_t);
+    /// @brief Полный размер одного маркера (8 байт — magic+type в одном qword).
+    static constexpr size_t marker_size = sizeof(uint64_t);
 
     /**
      * @brief Сканирует PE-образ на наличие SDK-маркеров.
@@ -61,9 +65,10 @@ private:
      * @brief Описание найденного сырого маркера (до валидации парности).
      */
     struct RawMarker {
-        MarkerType type;         ///< Тип маркера
-        Rva        rva;          ///< RVA маркера в PE
-        uint32_t   section_index;///< Индекс секции
+        MarkerType type;          ///< Тип маркера
+        Rva        rva;           ///< RVA первого байта marker-конструкции (инструкции)
+        uint32_t   total_size;    ///< Полная длина marker-конструкции в байтах
+        uint32_t   section_index; ///< Индекс секции
     };
 
     /**

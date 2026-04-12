@@ -25,6 +25,9 @@ enable_testing()
 
 add_subdirectory(unit)
 
+add_executable(mx_test_target testapp/test_target.cpp)
+target_include_directories(mx_test_target PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/sdk/include)
+
 # Интеграционные тесты (требуют MSVC + MASM для gate.asm)
 option(MXPROTECTOR_BUILD_INTEGRATION_TESTS "Собирать live-тесты syscall engine" OFF)
 if(MXPROTECTOR_BUILD_INTEGRATION_TESTS)

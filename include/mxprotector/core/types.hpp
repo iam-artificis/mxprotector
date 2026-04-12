@@ -141,10 +141,12 @@ struct AddressRange {
  * @brief Описание маркированного региона, найденного SDK-сканером.
  */
 struct MarkedRegion {
-    MarkerType type;         ///< Тип маркера (VM/Mutate/Obfuscate)
-    Rva        start_rva;    ///< RVA начала региона (после маркера begin)
-    Rva        end_rva;      ///< RVA конца региона (до маркера end)
-    uint32_t   section_index;///< Индекс секции, содержащей регион
+    MarkerType type;              ///< Тип маркера (VM/Mutate/Obfuscate)
+    Rva        start_rva;         ///< RVA начала тела региона (сразу после begin-маркера)
+    Rva        end_rva;            ///< RVA конца тела региона (начало end-маркера)
+    uint32_t   section_index;     ///< Индекс секции, содержащей регион
+    uint32_t   begin_marker_size; ///< Размер begin-маркерной конструкции (в байтах)
+    uint32_t   end_marker_size;   ///< Размер end-маркерной конструкции (в байтах)
 };
 
 } // namespace mx

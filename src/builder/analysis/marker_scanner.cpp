@@ -16,6 +16,8 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 
+#include <Zydis/Zydis.h>
+
 #include <algorithm>
 #include <cstring>
 #include <format>
@@ -63,32 +65,82 @@ std::vector<MarkerScanner::RawMarker> MarkerScanner::scan_section(
 {
     std::vector<RawMarker> result;
 
-    if (section_data.size() < marker_size) {
+    if (section_data.size() < marker_size + 2) {
         return result;
     }
 
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
     const size_t scan_limit = section_data.size() - marker_size + 1;
 
-    for (size_t offset = 0; offset < scan_limit; ++offset) {
-        uint64_t candidate_magic = 0;
-        std::memcpy(&candidate_magic, section_data.data() + offset, sizeof(uint64_t));
+    // Маркер — это `mov rax, imm64` (10 байт), где imm64 содержит полный
+    // 8-байтовый тэг маркера (младшие 7 байт = префикс "MX_PROT", старший
+    // байт = MarkerType). Префикс инструкции = 48 B8, т.е. imm64-байты
+    // расположены по смещению +2 от начала инструкции.
+    //
+    // За `mov rax, imm64` следует пара volatile-store инструкций, которые
+    // MSVC эмитит из-за `volatile uint64_t magic = ...;`. Их длину вычисляем
+    // через Zydis — они входят в total_size маркера.
+    for (size_t offset = 2; offset < scan_limit; ++offset) {
+        uint64_t candidate = 0;
+        std::memcpy(&candidate, section_data.data() + offset, sizeof(uint64_t));
 
-        if (candidate_magic != marker_magic) continue;
+        if ((candidate & marker_prefix_mask) != marker_prefix) continue;
+        // Instruction must be `mov r64, imm64`: REX.W (48 | 49) + (B8..BF)
+        const uint8_t rex = section_data[offset - 2];
+        const uint8_t op  = section_data[offset - 1];
+        if ((rex != 0x48 && rex != 0x49) || op < 0xB8 || op > 0xBF) continue;
 
-        const uint8_t type_byte = section_data[offset + sizeof(uint64_t)];
-
+        const auto type_byte = static_cast<uint8_t>(candidate >> 56);
         if (type_byte > static_cast<uint8_t>(MarkerType::obfuscate_end)) continue;
 
+        const size_t insn_start = offset - 2;
+        uint32_t total = 10; // mov rax, imm64
+
+        // Декодируем последующие инструкции: это volatile-store(ы), сгенерированные
+        // компилятором. Включаем их в total_size, чтобы VM/мутация могли патчить
+        // весь marker-блок разом. Ограничиваем 24 байтами (до 3 инструкций).
+        size_t trail = insn_start + total;
+        const size_t trail_limit = std::min(section_data.size(), insn_start + 10 + 24);
+        while (trail < trail_limit) {
+            ZydisDecodedInstruction insn{};
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                    &decoder,
+                    section_data.data() + trail,
+                    trail_limit - trail,
+                    &insn, operands))) {
+                break;
+            }
+
+            // Only absorb `mov [rsp|rbp+disp], ...` — these are the volatile
+            // stores that materialize the marker constant. Anything else ends
+            // the marker-absorb phase.
+            if (insn.mnemonic != ZYDIS_MNEMONIC_MOV) break;
+            if (insn.operand_count_visible < 1) break;
+            const auto& dest = operands[0];
+            if (dest.type != ZYDIS_OPERAND_TYPE_MEMORY) break;
+            const auto base = dest.mem.base;
+            if (base != ZYDIS_REGISTER_RSP && base != ZYDIS_REGISTER_RBP) break;
+
+            total += insn.length;
+            trail += insn.length;
+            // Only absorb up to 2 trailing store instructions.
+            if (total >= 10 + 16) break;
+        }
+
         const auto marker_type = static_cast<MarkerType>(type_byte);
-        const Rva marker_rva = section_rva + static_cast<Rva>(offset);
+        const Rva marker_rva = section_rva + static_cast<Rva>(insn_start);
 
         result.push_back(RawMarker{
             .type = marker_type,
             .rva = marker_rva,
+            .total_size = total,
             .section_index = section_index
         });
 
-        offset += marker_size - 1;
+        offset = insn_start + total - 1; // -1 because for-loop will ++offset
     }
 
     return result;
@@ -117,7 +169,7 @@ MxResult<std::vector<MarkedRegion>> MarkerScanner::validate_and_pair(
 
             for (auto it = pending_begins.rbegin(); it != pending_begins.rend(); ++it) {
                 if (matching_end_type(it->marker.type) == raw.type) {
-                    const Rva region_start = it->marker.rva + static_cast<Rva>(marker_size);
+                    const Rva region_start = it->marker.rva + it->marker.total_size;
                     const Rva region_end   = raw.rva;
 
                     if (region_end <= region_start) {
@@ -136,7 +188,9 @@ MxResult<std::vector<MarkedRegion>> MarkerScanner::validate_and_pair(
                         .type = it->marker.type,
                         .start_rva = region_start,
                         .end_rva = region_end,
-                        .section_index = it->marker.section_index
+                        .section_index = it->marker.section_index,
+                        .begin_marker_size = it->marker.total_size,
+                        .end_marker_size = raw.total_size,
                     });
 
                     pending_begins.erase(std::next(it).base());

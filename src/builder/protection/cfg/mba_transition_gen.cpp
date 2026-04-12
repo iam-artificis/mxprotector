@@ -127,57 +127,70 @@ ByteBuffer MbaTransitionGenerator::generate(
     uint32_t current_state,
     uint32_t next_state,
     x86::Reg state_reg,
-    Randomizer& rng)
+    Randomizer& rng,
+    bool state_preserved)
 {
     current_state = sanitize_state_id(current_state);
     next_state = sanitize_state_id(next_state);
 
-    const uint32_t chain_len = rng.next_range(5, 10);
+    // Forward synthesis: state_reg already holds current_state at entry
+    // (if state_preserved == true). Generate chain_len-1 random ops accumulating
+    // a running value; the final XOR closes the gap so the total chain transforms
+    // current_state → next_state without re-loading the register via MOV.
+    //
+    // Property: when state_preserved is true, next_state is a deterministic
+    // function of BOTH current_state AND the (build-time-fixed) chain. A decoder
+    // must simulate the full arithmetic per block instead of just reading
+    // `mov reg, NEXT_STATE`.
+    //
+    // When state_preserved is false (block clobbers state_reg, e.g. via CALL),
+    // we fall back to loading `required_input` first, then applying the chain.
+    const uint32_t chain_len = rng.next_range(6, 12);
 
     std::vector<ChainOp> chain;
     chain.reserve(chain_len);
 
-    // Backward synthesis: start from target, apply inverse operations
-    uint32_t value = next_state;
+    const uint32_t start_value = state_preserved ? current_state : rng.next_u32();
+    uint32_t value = start_value;
 
-    for (uint32_t i = 0; i < chain_len; ++i) {
+    for (uint32_t i = 0; i + 1 < chain_len; ++i) {
         const auto op_idx = rng.next_range(0, 5);
         ChainOp op;
 
         switch (op_idx) {
-            case 0: { // Forward: ADD K → Inverse: SUB K
-                uint32_t K = rng.next_u32() | 1; // non-zero
+            case 0: {
+                uint32_t K = rng.next_u32() | 1;
                 op = {OpType::add_imm, K};
-                value -= K; // inverse of ADD
+                value += K;
                 break;
             }
-            case 1: { // Forward: SUB K → Inverse: ADD K
+            case 1: {
                 uint32_t K = rng.next_u32() | 1;
                 op = {OpType::sub_imm, K};
-                value += K; // inverse of SUB
+                value -= K;
                 break;
             }
-            case 2: { // Forward: XOR K → Inverse: XOR K
+            case 2: {
                 uint32_t K = rng.next_u32();
                 op = {OpType::xor_imm, K};
                 value ^= K;
                 break;
             }
-            case 3: { // Forward: NOT → Inverse: NOT
+            case 3: {
                 op = {OpType::not_op, 0};
                 value = ~value;
                 break;
             }
-            case 4: { // Forward: ROL K → Inverse: ROR K
+            case 4: {
                 uint32_t K = rng.next_range(1, 31);
                 op = {OpType::rol_imm, K};
-                value = rotr32(value, K); // inverse of ROL
+                value = rotl32(value, K);
                 break;
             }
-            case 5: { // Forward: ROR K → Inverse: ROL K
+            case 5: {
                 uint32_t K = rng.next_range(1, 31);
                 op = {OpType::ror_imm, K};
-                value = rotl32(value, K); // inverse of ROR
+                value = rotr32(value, K);
                 break;
             }
             default:
@@ -187,31 +200,31 @@ ByteBuffer MbaTransitionGenerator::generate(
         chain.push_back(op);
     }
 
-    // `value` is the required_input: applying the forward chain to it produces next_state.
-    // R10 may have been clobbered by the block's code (CALL destroys volatile regs),
-    // so we load required_input directly via MOV r32, imm32 (zero-extended to 64-bit).
-    const uint32_t required_input = value;
+    // Final XOR: closes the gap so `value ^ correction == next_state`.
+    const uint32_t correction = value ^ next_state;
+    chain.push_back(ChainOp{OpType::xor_imm, correction});
 
     ByteBuffer result;
     result.reserve(chain_len * 7 + 7);
 
-    // Emit MOV r32, imm32 to load required_input (REX.B + B8+rd + imm32)
-    {
+    if (!state_preserved) {
+        // Fallback: load start_value (random seed) into state_reg via
+        // MOV r32, imm32 (REX.B + B8+rd + imm32, zero-extends to 64-bit).
         const uint8_t reg_num = static_cast<uint8_t>(state_reg);
         if (reg_num >= 8) {
             result.push_back(0x41); // REX.B
         }
         result.push_back(static_cast<uint8_t>(0xB8 + (reg_num & 0x07)));
-        result.push_back(static_cast<uint8_t>(required_input & 0xFF));
-        result.push_back(static_cast<uint8_t>((required_input >> 8) & 0xFF));
-        result.push_back(static_cast<uint8_t>((required_input >> 16) & 0xFF));
-        result.push_back(static_cast<uint8_t>((required_input >> 24) & 0xFF));
+        result.push_back(static_cast<uint8_t>(start_value & 0xFF));
+        result.push_back(static_cast<uint8_t>((start_value >> 8) & 0xFF));
+        result.push_back(static_cast<uint8_t>((start_value >> 16) & 0xFF));
+        result.push_back(static_cast<uint8_t>((start_value >> 24) & 0xFF));
     }
 
-    // Emit forward chain in REVERSE order (backward synthesis built ops
-    // from target backward, so forward application is reversed)
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        emit_op_32bit(result, it->type, it->constant, state_reg);
+    // Emit the chain directly onto state_reg. When state_preserved,
+    // state_reg starts at current_state; after the chain it equals next_state.
+    for (const auto& op : chain) {
+        emit_op_32bit(result, op.type, op.constant, state_reg);
     }
 
     return result;

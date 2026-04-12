@@ -51,13 +51,20 @@ public:
      * @param next_state Целевой state ID.
      * @param state_reg Регистр state-переменной.
      * @param rng Генератор случайных чисел.
+     * @param state_preserved Если true, state_reg гарантированно содержит
+     *        current_state на входе в цепочку (блок не клобберит его) —
+     *        цепочка применяется непосредственно к state_reg, создавая
+     *        жёсткую зависимость следующего состояния от предыдущего.
+     *        Если false, цепочка сначала загружает required_input через
+     *        `mov reg, imm32` (fallback для блоков с CALL'ами).
      * @return Буфер машинного кода с цепочкой операций.
      */
     [[nodiscard]] ByteBuffer generate(
         uint32_t current_state,
         uint32_t next_state,
         x86::Reg state_reg,
-        Randomizer& rng);
+        Randomizer& rng,
+        bool state_preserved = true);
 
     /**
      * @brief Ограничивает state ID до 31 бита (совместимость с sign-extension CMP).
