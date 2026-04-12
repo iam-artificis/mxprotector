@@ -62,6 +62,13 @@ public:
      */
     [[nodiscard]] ByteBuffer generate_single_pattern(Randomizer& rng) const;
 
+    /**
+     * @brief Генерирует один junk-паттерн, гарантированно безопасный для
+     *        выполнения как native VM handler (не модифицирует регистры,
+     *        флаги или стек в net-эффекте).
+     */
+    [[nodiscard]] ByteBuffer generate_vm_safe_pattern(Randomizer& rng) const;
+
     /// @brief Возвращает целевую архитектуру.
     [[nodiscard]] Architecture architecture() const noexcept { return arch_; }
 
@@ -88,6 +95,18 @@ private:
 
     /// @brief Генерирует BSWAP reg; BSWAP reg — double byte-swap identity (4 байта, dead code only).
     [[nodiscard]] ByteBuffer gen_double_bswap(Randomizer& rng) const;
+
+    /// @brief LEA reg, [reg+0] — looks like address computation (3–4 bytes).
+    [[nodiscard]] ByteBuffer gen_lea_identity(Randomizer& rng) const;
+
+    /// @brief NEG reg; NEG reg — identity (4–6 bytes).
+    [[nodiscard]] ByteBuffer gen_double_neg(Randomizer& rng) const;
+
+    /// @brief ROL reg, N; ROR reg, N — rotate/unrotate (6 bytes).
+    [[nodiscard]] ByteBuffer gen_rotate_pair(Randomizer& rng) const;
+
+    /// @brief CMP reg, reg — always-equal comparison (2–3 bytes, looks like branch setup).
+    [[nodiscard]] ByteBuffer gen_fake_cmp(Randomizer& rng) const;
 };
 
 } // namespace mx

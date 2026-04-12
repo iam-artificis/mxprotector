@@ -33,6 +33,7 @@
 #include "mxprotector/protection/vm/virtualization_pass.hpp"
 #include "mxprotector/protection/vm/vm_lifter.hpp"
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
+#include "mxprotector/protection/mutation/junk_generator.hpp"
 
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
@@ -170,11 +171,54 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
             continue;
         }
 
-        const auto& [vm_insns, report] = *lift_result;
+        auto [vm_insns, report] = *lift_result;
         ctx.log_fmt("  VM регион [0x{:08X}..0x{:08X}] {} байт: "
                     "generic={}, native={}, total={}",
             body_start, body_end, body_size,
             report.generic_ops, report.native_ops, report.total_insns);
+
+        // Inject junk native handlers between real instructions. Each junk
+        // instruction is a VmOp::native containing semantically dead x64
+        // bytes (push/pop, self-canceling arithmetic, etc.). This pollutes
+        // the bytecode and handler chain with noise that a reverser must
+        // analyze instruction-by-instruction to distinguish real from junk.
+        {
+            JunkGenerator junk_gen(ctx.pe_image().architecture());
+            std::vector<vm::VmInstruction> augmented;
+            augmented.reserve(vm_insns.size() * 2);
+
+            // old_index → new_index mapping (for branch target fixup)
+            std::vector<uint32_t> remap(vm_insns.size() + 1);
+
+            for (size_t oi = 0; oi < vm_insns.size(); ++oi) {
+                remap[oi] = static_cast<uint32_t>(augmented.size());
+                // ~30% chance to insert a junk instruction BEFORE each real one
+                if (rng.next_bool(0.3)) {
+                    // Only use patterns that are completely state-safe
+                    // when executed as native handlers (no flag/reg corruption):
+                    // - push/pop same reg (stack net-zero)
+                    // - xchg pair (swap+unswap, no flags)
+                    // - double bswap (identity, no flags)
+                    // - multi-byte NOP (literal no-op)
+                    vm::VmInstruction junk;
+                    junk.op = vm::VmOp::native;
+                    junk.native_bytes = junk_gen.generate_vm_safe_pattern(rng);
+                    augmented.push_back(std::move(junk));
+                }
+                augmented.push_back(std::move(vm_insns[oi]));
+            }
+            // Sentinel: remap[vm_insns.size()] = exit position (for branches to exit)
+            remap[vm_insns.size()] = static_cast<uint32_t>(augmented.size());
+
+            // Fix up VJMP/VJCC branch targets
+            for (auto& vi : augmented) {
+                if (vi.op == vm::VmOp::vjmp || vi.op == vm::VmOp::vjcc) {
+                    vi.branch_target_insn = remap[vi.branch_target_insn];
+                }
+            }
+
+            vm_insns = std::move(augmented);
+        }
 
         auto runtime_result = gen.generate(vm_insns, rng);
         if (!runtime_result) {

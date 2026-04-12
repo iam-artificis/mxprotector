@@ -53,8 +53,18 @@ ByteBuffer JunkGenerator::generate(size_t desired_size, Randomizer& rng) const {
 // generate_single_pattern — один случайный junk-паттерн
 // ============================================================================
 
+ByteBuffer JunkGenerator::generate_vm_safe_pattern(Randomizer& rng) const {
+    // Inside a native VM handler, rsp is at the caller's frame. ANY push/pop
+    // would corrupt the VM return address at [rsp-8]. ANY 32-bit ALU op
+    // (xchg r32, bswap r32, mov r32) zero-extends and destroys upper bits.
+    // The ONLY truly safe instructions are multi-byte NOPs with varying
+    // encodings to look diverse in IDA's disassembly.
+    auto nop = x86::make_nop(static_cast<uint8_t>(rng.next_range(2, 9)));
+    return ByteBuffer(nop.begin(), nop.end());
+}
+
 ByteBuffer JunkGenerator::generate_single_pattern(Randomizer& rng) const {
-    const uint32_t choice = rng.next_range(0, 6);
+    const uint32_t choice = rng.next_range(0, 10);
 
     switch (choice) {
         case 0:  return gen_push_pop(rng);
@@ -63,7 +73,11 @@ ByteBuffer JunkGenerator::generate_single_pattern(Randomizer& rng) const {
         case 3:  return gen_dead_mov(rng);
         case 4:  return gen_xchg_pair(rng);
         case 5:  return gen_double_not(rng);
-        default: return gen_double_bswap(rng);
+        case 6:  return gen_double_bswap(rng);
+        case 7:  return gen_lea_identity(rng);
+        case 8:  return gen_double_neg(rng);
+        case 9:  return gen_rotate_pair(rng);
+        default: return gen_fake_cmp(rng);
     }
 }
 
@@ -225,6 +239,82 @@ ByteBuffer JunkGenerator::gen_double_bswap(Randomizer& rng) const {
     result.push_back(static_cast<uint8_t>(0xC8 + reg));
     result.push_back(0x0F);
     result.push_back(static_cast<uint8_t>(0xC8 + reg));
+    return result;
+}
+
+// ============================================================================
+// gen_lea_identity — LEA reg, [reg + 0] (looks like address computation, 3–7 bytes)
+// ============================================================================
+
+ByteBuffer JunkGenerator::gen_lea_identity(Randomizer& rng) const {
+    const uint8_t reg = static_cast<uint8_t>(rng.next_range(0, 5));
+    if (reg == 4) return gen_push_pop(rng);
+
+    ByteBuffer result;
+    // LEA reg, [reg + 0]: opcode 8D, ModRM mod=01 (disp8=0), reg=reg, rm=reg
+    if (arch_ == Architecture::x64) result.push_back(0x48); // REX.W
+    result.push_back(0x8D);
+    result.push_back(x86::make_modrm(1, reg, reg));
+    if (reg == 4) result.push_back(0x24); // SIB for rsp base (never reached due to guard)
+    result.push_back(0x00); // disp8 = 0
+    return result;
+}
+
+// ============================================================================
+// gen_double_neg — NEG reg; NEG reg (identity, 4–6 bytes)
+// ============================================================================
+
+ByteBuffer JunkGenerator::gen_double_neg(Randomizer& rng) const {
+    const uint8_t reg = static_cast<uint8_t>(rng.next_range(0, 5));
+    if (reg == 4) return gen_push_pop(rng);
+
+    ByteBuffer result;
+    if (arch_ == Architecture::x64 && rng.next_bool(0.5)) {
+        result.push_back(0x48); // REX.W
+        result.push_back(0xF7); result.push_back(x86::make_modrm(3, 3, reg));
+        result.push_back(0x48);
+        result.push_back(0xF7); result.push_back(x86::make_modrm(3, 3, reg));
+    } else {
+        result.push_back(0xF7); result.push_back(x86::make_modrm(3, 3, reg));
+        result.push_back(0xF7); result.push_back(x86::make_modrm(3, 3, reg));
+    }
+    return result;
+}
+
+// ============================================================================
+// gen_rotate_pair — ROL reg, N; ROR reg, N (identity, 6–8 bytes)
+// ============================================================================
+
+ByteBuffer JunkGenerator::gen_rotate_pair(Randomizer& rng) const {
+    const uint8_t reg = static_cast<uint8_t>(rng.next_range(0, 5));
+    if (reg == 4) return gen_push_pop(rng);
+    const uint8_t count = static_cast<uint8_t>(rng.next_range(1, 31));
+
+    ByteBuffer result;
+    // ROL r32, imm8: C1 /0 ib
+    result.push_back(0xC1); result.push_back(x86::make_modrm(3, 0, reg));
+    result.push_back(count);
+    // ROR r32, imm8: C1 /1 ib
+    result.push_back(0xC1); result.push_back(x86::make_modrm(3, 1, reg));
+    result.push_back(count);
+    return result;
+}
+
+// ============================================================================
+// gen_fake_cmp — CMP reg, reg (always equal, 2–3 bytes, looks like branch setup)
+// ============================================================================
+
+ByteBuffer JunkGenerator::gen_fake_cmp(Randomizer& rng) const {
+    const uint8_t reg = static_cast<uint8_t>(rng.next_range(0, 5));
+    if (reg == 4) return gen_push_pop(rng);
+
+    ByteBuffer result;
+    if (arch_ == Architecture::x64 && rng.next_bool(0.5)) {
+        result.push_back(0x48); // REX.W
+    }
+    // CMP reg, reg → 3B ModRM(3, reg, reg)
+    result.push_back(0x3B);
+    result.push_back(x86::make_modrm(3, reg, reg));
     return result;
 }
 
