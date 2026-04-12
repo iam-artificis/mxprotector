@@ -258,21 +258,110 @@ struct StolenPlan {
     StubPatches patches{};
     patches.sections.reserve(section_count);
 
-    // (2) Anti-debug: read PEB.BeingDebugged into edx.
-    //   mov rax, gs:[0x60]         65 48 8B 04 25 60 00 00 00
-    //   movzx eax, byte [rax+2]    0F B6 40 02
-    //   mov edx, eax               89 C2
-    u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
-    u8(0x60); u8(0x00); u8(0x00); u8(0x00);
-    u8(0x0F); u8(0xB6); u8(0x40); u8(0x02);
-    u8(0x89); u8(0xC2);
+    // (2) Anti-debug — polymorphic. Each variant reads a different Windows
+    //     "debugger present" indicator and normalizes the result to `edx`
+    //     ∈ {0, 1}. The downstream decrypt loop uses `edx` as the key-stream
+    //     start index, so a non-zero value silently garbles the entire
+    //     decrypted output. No explicit jump to patch: the check is baked
+    //     into the cipher.
+    //
+    // All variants leave edx ∈ {0, 1} and clobber rax. Callers that need
+    // a preserved rax must restore it after the stub.
+    //
+    // Variant 0: PEB.BeingDebugged (byte at PEB+0x02) — classic.
+    //    mov rax, gs:[0x60]         ; PEB
+    //    movzx eax, byte [rax+2]    ; 0 or 1
+    //    mov edx, eax
+    //
+    // Variant 1: PEB.NtGlobalFlag (dword at PEB+0xBC). Under a debugger the
+    //    loader sets FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK
+    //    | FLG_HEAP_VALIDATE_PARAMETERS (mask 0x70). We reduce to {0, 1}
+    //    via `(val & 0x70) ? 1 : 0`.
+    //    mov rax, gs:[0x60]              ; PEB
+    //    mov eax, [rax + 0xBC]           ; NtGlobalFlag
+    //    and eax, 0x70                   ; mask heap flags
+    //    xor edx, edx
+    //    test eax, eax
+    //    setnz dl                         ; edx = (masked != 0)
+    //
+    // Variant 2: KUSER_SHARED_DATA.KdDebuggerEnabled at 0x7FFE02D4.
+    //    User-mode readable page mapped at fixed VA 0x7FFE0000. Byte at
+    //    +0x2D4 has bit 0x01 set when a kernel debugger is present AND
+    //    attached. bit 0x02 set when user-mode code runs under a debugger
+    //    in many Windows versions, but less reliable — we use bit 0x01
+    //    OR bit 0x02 for broader coverage.
+    //    mov rax, 0x7FFE02D4
+    //    movzx eax, byte [rax]
+    //    and eax, 0x03
+    //    xor edx, edx
+    //    test eax, eax
+    //    setnz dl
+    const uint32_t adv = rng.next_range(0, 2);
+    switch (adv) {
+        case 0: {
+            // PEB.BeingDebugged
+            u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
+            u8(0x60); u8(0x00); u8(0x00); u8(0x00);     // mov rax, gs:[0x60]
+            u8(0x0F); u8(0xB6); u8(0x40); u8(0x02);     // movzx eax, byte [rax+2]
+            u8(0x89); u8(0xC2);                          // mov edx, eax
+            break;
+        }
+        case 1: {
+            // PEB.NtGlobalFlag
+            u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
+            u8(0x60); u8(0x00); u8(0x00); u8(0x00);     // mov rax, gs:[0x60]
+            u8(0x8B); u8(0x80); u8(0xBC); u8(0x00); u8(0x00); u8(0x00);
+                                                          // mov eax, [rax + 0xBC]
+            u8(0x83); u8(0xE0); u8(0x70);                // and eax, 0x70
+            u8(0x31); u8(0xD2);                          // xor edx, edx
+            u8(0x85); u8(0xC0);                          // test eax, eax
+            u8(0x0F); u8(0x95); u8(0xC2);                // setnz dl
+            break;
+        }
+        default: {
+            // KUSER_SHARED_DATA.KdDebuggerEnabled at 0x7FFE02D4.
+            // `mov rax, imm64` is 10 bytes; we need the full 64-bit addr.
+            u8(0x48); u8(0xB8);                          // mov rax, imm64
+            u8(0xD4); u8(0x02); u8(0xFE); u8(0x7F);
+            u8(0x00); u8(0x00); u8(0x00); u8(0x00);      // 0x7FFE02D4
+            u8(0x0F); u8(0xB6); u8(0x00);                // movzx eax, byte [rax]
+            u8(0x83); u8(0xE0); u8(0x03);                // and eax, 0x03
+            u8(0x31); u8(0xD2);                          // xor edx, edx
+            u8(0x85); u8(0xC0);                          // test eax, eax
+            u8(0x0F); u8(0x95); u8(0xC2);                // setnz dl
+            break;
+        }
+    }
 
     // (3) lea rsi, [rip + key_rel32]   — load key pointer, shared by all loops.
     u8(0x48); u8(0x8D); u8(0x35);
     patches.rel_to_key_at = static_cast<uint32_t>(buf.size());
     u32(0);
 
-    // (4) Per-section decrypt loop. dl (key index) is carried across iterations.
+    // (4) Per-section decrypt loop. dl (key index) is carried across
+    //     iterations. Two equivalent loop shapes are picked per-build:
+    //
+    //     V0 "load-xor-store":
+    //         mov al, [rdi]            8A 07
+    //         xor al, [rsi + rdx*1]    32 04 16
+    //         mov [rdi], al            88 07
+    //         inc rdi                  48 FF C7
+    //         inc dl                   FE C2
+    //         dec ecx                  FF C9
+    //         jnz .loop                75 rel8
+    //
+    //     V1 "memory-xor":
+    //         mov al, [rsi + rdx*1]    8A 04 16
+    //         xor [rdi], al            30 07
+    //         inc rdi                  48 FF C7
+    //         inc dl                   FE C2
+    //         dec ecx                  FF C9
+    //         jnz .loop                75 rel8
+    //
+    //     The same variant is used for every section in a single build so
+    //     the stream cipher stays consistent; sections are laid out back
+    //     to back with the dl index carrying through.
+    const uint32_t loop_variant = rng.next_range(0, 1);
     for (uint32_t s = 0; s < section_count; ++s) {
         DecryptSection ds{};
 
@@ -290,17 +379,24 @@ struct StolenPlan {
 
         const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
 
-        //   mov al, [rdi]           8A 07
-        u8(0x8A); u8(0x07);
-        //   xor al, [rsi + rdx*1]   32 04 16
-        u8(0x32); u8(0x04); u8(0x16);
-        //   mov [rdi], al           88 07
-        u8(0x88); u8(0x07);
+        if (loop_variant == 0) {
+            //   mov al, [rdi]           8A 07
+            u8(0x8A); u8(0x07);
+            //   xor al, [rsi + rdx*1]   32 04 16
+            u8(0x32); u8(0x04); u8(0x16);
+            //   mov [rdi], al           88 07
+            u8(0x88); u8(0x07);
+        } else {
+            //   mov al, [rsi + rdx*1]   8A 04 16
+            u8(0x8A); u8(0x04); u8(0x16);
+            //   xor [rdi], al           30 07
+            u8(0x30); u8(0x07);
+        }
         //   inc rdi                 48 FF C7
         u8(0x48); u8(0xFF); u8(0xC7);
         //   inc dl                  FE C2
         u8(0xFE); u8(0xC2);
-        //   dec ecx                 FF C9   (32-bit form — upper 32 of rcx irrelevant)
+        //   dec ecx                 FF C9   (32-bit form)
         u8(0xFF); u8(0xC9);
         //   jnz .loop (rel8)
         const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;

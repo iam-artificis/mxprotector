@@ -92,34 +92,59 @@
 
 ## Следующие шаги (по приоритету)
 
-### 1. VM-handler polymorphism *(средний)*
-Сейчас handler'ы на разные опкоды имеют устойчивые эпилоги (jmp dispatcher). Нужно:
-- Несколько эквивалентных эпилогов (indirect jmp через scratch, ret-to-dispatcher, push+ret)
-- Per-handler junk prologue (dead MOV/XOR в scratch)
-- Рандомизированные scratch-slot'ы внутри 24-байтового фрейма
-
-### 2. Handler-table key через ImageBase *(средний)*
-Вместо захардкоженного `table_xor_key` вычислять его в рантайме от `ImageBase + per-build salt`. Статически в бинарнике правильного ключа нет, ASLR делает его непредсказуемым.
-
-### 3. Packer polymorphism *(средний)*
+### 1. Packer polymorphism *(следующий — текущий шаг)*
 У packer stub сейчас фиксированная структура (push/anti-debug/key-lea/per-section-loop/IAT-wipe/pop/stolen/jmp). Добавить:
-- Варианты anti-debug: PEB.BeingDebugged, PEB.NtGlobalFlag (bit 0x70), KUSER_SHARED_DATA timing
-- Несколько форм decrypt loop (rep-based, SIMD, simple loop)
-- Рандомизация где происходит IAT wipe (до/после каждого section loop)
+- Варианты anti-debug: PEB.BeingDebugged, PEB.NtGlobalFlag (bit 0x70), KUSER_SHARED_DATA.KdDebuggerEnabled
+- Несколько форм decrypt loop (byte loop, dword loop, xchg-style)
+- Рандомизация: где IAT wipe (до/после decrypt loops), где anti-debug (inline с decrypt vs отдельно)
 
-### 4. Анти-unicorn / анти-эмуляция *(средний)*
+### 2. Entry-stub MBA для table key derivation *(средний)*
+Сейчас entry stub вычисляет handler-table key через фикс форму
+`xor eax, <salt>`. Заменить на MBA-цепочку (add/sub/xor/rol/ror)
+которая композируется в нужное значение:
+```
+add eax, K1
+rol eax, N
+xor eax, K2
+sub eax, K3
+```
+`MbaTransitionGenerator` уже реализует этот алгоритм для CFF state
+transitions — переиспользовать. Статический анализатор вместо `xor
+imm32` видит 5-10 шагов произвольной арифметики над ImageBase.
+
+### 3. Scattered key composition *(средний, после #2)*
+Вместо вычисления всего table key в entry stub, распылить компоненты
+по первым N handlers. Каждый handler применяет один шаг к key slot
+(`[rsp + key_disp]`). Reverser увидит корректный ключ только после
+symbolic execution первых N dispatches — static extraction невозможно.
+
+Формула: эффективный ключ при dispatch i = `composition(entry_seed,
+{step[0], step[1], ..., step[min(i, N)-1]})`. Таблица encrypted в
+build-time с финальной композицией. Первые N dispatches дают
+неправильные targets — для них нужны специальные "burn-in" bytecode
+инструкции, которые выполняют реальную работу, но чей handler id
+совпадает со СТАРТОВЫМ значением key и постепенно доходит до
+финального. Сложно правильно реализовать.
+
+### 4. Handler-table integrity check *(средний)*
+Checksum таблицы, проверяемый в entry stub после расшифровки packer'ом.
+Если таблица модифицирована (hardware breakpoints, memory patches,
+runtime injection), checksum не совпадает → бинарь молча корраптится
+(например через +1 к ключу, аналогично anti-debug).
+
+### 5. Анти-unicorn / анти-эмуляция *(средний)*
 - Проверки на недокументированные CPU-флаги (AC, ID) в VM-контексте
 - Timing checks через RDTSC внутри handler'ов (редко, не на каждом)
 - CPUID-анти-VM проверки в stub
 
-### 5. Native handler expansion *(низкий)*
+### 6. Native handler expansion *(низкий)*
 Добавить покрытие generic лифтинга для:
 - `shl/shr/sar` с рег-операндами
 - `imul` r/m64, r64, imm
 - `cmov*` семейство
 - Расширенные bit-ops (`bt`, `bts`, `btr`)
 
-### 6. Инфраструктура тестирования *(низкий)*
+### 7. Инфраструктура тестирования *(низкий)*
 - Smoke-тест, проверяющий что в выходном бинаре реально присутствуют patterns: XOR handler table, XOR vflags scramble, рандомизированный reg mapping
 - Diff-тест двух билдов одного input'а: должны отличаться handler permutation, vflags_key, vflags_rol, XOR keys, reg order, section names, packer key
 - Fuzz-style стресс сотни input'ов × full pipeline
@@ -246,3 +271,30 @@ container-specific guard в `PackerPass`.
 - Сетевая лицензия / DRM-хуки
 - JIT-compiled stub (runtime-assembled stub code)
 - Hell's Gate / direct syscalls (эксперимент с custom loader'ом откатан — может вернуться как опциональная фича)
+
+## Отклонённые идеи (не возвращаться)
+
+- **Delta-trick для ASLR-совместимого ImageBase key**:
+  `BaseForKey = RuntimeBase - (RuntimeBase - PreferredBase)`. Формула
+  сокращается до `PreferredBase`, который известен статически из PE
+  заголовка, поэтому "обфускация" тривиально реверсится. Фундаментально
+  нельзя сделать ключ зависящим только от ASLR-state: если ключ должен
+  быть ИДЕНТИЧНЫМ у всех запусков бинаря, он должен зависеть только от
+  build-time-known данных. Если ОТ runtime-state — то надо SHIPping
+  шифротекст с per-запуск перекриптовкой, что дорого и не даёт ничего.
+  → Используем ImageBase key только когда packer disables ASLR.
+
+- **Rolling key для handler table decryption**:
+  Смешение потокового шифра с ассоциативной таблицей. Rolling key
+  предполагает линейный порядок доступа (каждый байт декриптуется один
+  раз), а handler table читается в произвольном порядке с multiple
+  hits на один entry. Нельзя согласовать не потеряв либо корректность,
+  либо обфускацию. → Если нужно "не оставлять ключ в памяти" — делать
+  scattered key composition (пункт 3 roadmap'а), а не rolling.
+
+- **Decrypt handler table in-place при первом dispatch**:
+  После первого использования таблица становится plaintext в памяти.
+  Любой дамп после первого VM вызова вскрывает dispatch map. Обфускация
+  только против ПРЕДВАРИТЕЛЬНОГО статического анализа, не против
+  dynamic analysis. Наша цель — обе формы, поэтому in-place decrypt
+  не подходит.
