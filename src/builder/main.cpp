@@ -30,6 +30,7 @@
 #include "mxprotector/pe/pe_builder.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/marker_scanner.hpp"
+#include "mxprotector/target/target_info.hpp"
 #include "mxprotector/protection/pass_manager.hpp"
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
@@ -256,6 +257,24 @@ int main(int argc, char** argv) {
     auto disasm = std::make_shared<mx::analysis::ZydisDisassembler>(pe_image->architecture());
 
     auto ctx = mx::ProtectionContext(std::move(pe_image), config, disasm);
+
+    // Record the target platform. Today the pipeline is PE-only so we know
+    // it's Windows PE; the architecture comes from the parsed image. When
+    // ELF / Mach-O parsers are added, this is the one place that changes.
+    {
+        const auto& img = ctx.pe_image();
+        mx::target::TargetInfo info{
+            .os        = mx::target::Os::windows,
+            .container = mx::target::ContainerFormat::pe,
+            .arch      = img.is_64bit() ? mx::target::Arch::x64
+                                         : mx::target::Arch::x86,
+        };
+        ctx.set_target(info);
+        std::cout << std::format("[*] Target: {}/{}/{}\n",
+            mx::target::os_name(info.os),
+            mx::target::container_name(info.container),
+            mx::target::arch_name(info.arch));
+    }
 
     // Pick per-build section names (random unless --debug-sections).
     {

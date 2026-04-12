@@ -374,7 +374,9 @@ std::vector<size_t> collect_target_sections(const PeImage& image,
 } // anonymous namespace
 
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    return ctx.config().enable_packer;
+    // The self-unpacking stub is assembled in x64 PE form; other targets
+    // need their own packer implementations.
+    return ctx.config().enable_packer && ctx.target().is_windows_pe_x64();
 }
 
 MxStatus PackerPass::execute(ProtectionContext& ctx) {

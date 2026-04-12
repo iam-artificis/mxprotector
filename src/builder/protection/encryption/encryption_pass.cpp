@@ -94,7 +94,9 @@ std::unique_ptr<IEncryptor> EncryptionPass::create_encryptor(
 // ============================================================================
 
 bool EncryptionPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    return ctx.config().enable_encryption;
+    // The decryption stub that consumes the `.mxrt` config is PE-specific
+    // (see src/stub/loader). ELF/Mach-O encryption needs its own runtime.
+    return ctx.config().enable_encryption && ctx.target().is_windows_pe_x64();
 }
 
 // ============================================================================

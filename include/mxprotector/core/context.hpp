@@ -28,6 +28,7 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/analysis/cfg.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
+#include "mxprotector/target/target_info.hpp"
 
 namespace mx {
 
@@ -150,6 +151,19 @@ public:
     void set_cfg(analysis::ControlFlowGraph cfg) { cfg_ = std::move(cfg); }
 
     // ====================================================================
+    // Target platform (OS × container × arch)
+    // ====================================================================
+
+    /// @brief Read-only target descriptor for this build. Set by main()
+    ///        after the binary is parsed.
+    [[nodiscard]] const target::TargetInfo& target() const noexcept {
+        return target_;
+    }
+
+    /// @brief Установить дескриптор target платформы.
+    void set_target(target::TargetInfo info) noexcept { target_ = info; }
+
+    // ====================================================================
     // Имена добавляемых секций (рандомизированные per-build)
     // ====================================================================
 
@@ -200,6 +214,8 @@ private:
     std::vector<MarkedRegion>                        markers_;      ///< Маркированные регионы
     std::shared_ptr<analysis::IDisassembler>         disasm_;       ///< Дизассемблер
     std::optional<analysis::ControlFlowGraph>        cfg_;          ///< CFG (опционально)
+    target::TargetInfo                               target_ =
+        target::TargetInfo::windows_pe_x64();                       ///< Target platform
     SectionNameMap                                   section_names_;///< Имена добавленных секций
     std::vector<std::string>                         log_messages_; ///< Журнал
 };
