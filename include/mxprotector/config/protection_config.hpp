@@ -43,6 +43,7 @@ struct ProtectionConfig {
     bool enable_anti_debug      = true;   ///< Анти-отладка
     bool enable_anti_sandbox    = true;   ///< Анти-песочница / анти-VM
     bool enable_encryption      = true;   ///< Шифрование секций/кода
+    bool enable_packer          = false;  ///< Self-unpacking packer (runs last in pipeline)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)
     bool strip_debug_info       = true;   ///< Удаление отладочной информации

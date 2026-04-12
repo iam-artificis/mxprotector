@@ -69,6 +69,9 @@ set(BUILDER_SOURCES
     protection/vm/vm_lifter.cpp
     protection/vm/vm_runtime_gen.cpp
     protection/vm/virtualization_pass.cpp
+
+    # Фаза 5: Self-unpacking packer
+    protection/packer/packer_pass.cpp
 )
 
 # ==============================================================================

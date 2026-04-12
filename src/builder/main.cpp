@@ -35,6 +35,7 @@
 #include "mxprotector/protection/encryption/encryption_pass.hpp"
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/vm/virtualization_pass.hpp"
+#include "mxprotector/protection/packer/packer_pass.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -234,6 +235,7 @@ int main(int argc, char** argv) {
     pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());
     pass_manager.register_pass(std::make_unique<mx::EncryptionPass>());
+    pass_manager.register_pass(std::make_unique<mx::PackerPass>());
 
     auto pass_result = pass_manager.execute_all(ctx);
     if (!pass_result) {

@@ -104,6 +104,8 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--no-anti-debug")       { config.enable_anti_debug = false; continue; }
         if (arg == "--no-anti-sandbox")     { config.enable_anti_sandbox = false; continue; }
         if (arg == "--no-encryption")       { config.enable_encryption = false; continue; }
+        if (arg == "--packer")              { config.enable_packer = true; continue; }
+        if (arg == "--no-packer")           { config.enable_packer = false; continue; }
         if (arg == "--no-strip-debug")      { config.strip_debug_info = false; continue; }
         if (arg == "--nanomites")           { config.enable_nanomites = true; continue; }
         if (arg == "--code-interleaving")   { config.enable_code_interleaving = true; continue; }
