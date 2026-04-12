@@ -34,12 +34,16 @@
 namespace mx::vm {
 
 struct VmRuntime {
-    ByteBuffer blob;                  ///< Полный runtime: entry + dispatcher + handlers + bytecode
+    ByteBuffer blob;                  ///< Полный runtime: entry + handlers + bytecode
     uint32_t   entry_offset = 0;      ///< Смещение entry point в blob
     uint32_t   bytecode_offset = 0;   ///< Смещение bytecode
     uint32_t   bytecode_size = 0;
     uint32_t   handler_count = 0;
     VmOpcodeMap opcode_map;
+
+    /// If non-zero, the exit handler emits `jmp rel32` instead of `ret`.
+    /// The rel32 at this offset must be patched to the next VM's entry.
+    uint32_t   exit_jmp_patch = 0;
 };
 
 class VmRuntimeGenerator final {
@@ -51,9 +55,15 @@ public:
      * @param rng           Генератор для рандомизации маппинга/ключа.
      * @return VmRuntime c байт-блобом, готовым к размещению в секции.
      */
+    /**
+     * @param emit_exit_as_jmp If true, the exit handler emits `jmp rel32`
+     *        instead of `ret`. Used for Cross-VM: the first sub-VM jumps
+     *        to the second sub-VM's entry instead of returning.
+     */
     [[nodiscard]] MxResult<VmRuntime> generate(
         const std::vector<VmInstruction>& instructions,
-        Randomizer& rng);
+        Randomizer& rng,
+        bool emit_exit_as_jmp = false);
 
 private:
     /**

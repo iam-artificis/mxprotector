@@ -220,6 +220,90 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
             vm_insns = std::move(augmented);
         }
 
+        // Cross-VM: if the instruction count is large enough, split into
+        // two sub-VMs with independent handler tables, keys, and permutations.
+        // The first sub-VM's exit jumps to the second's entry.
+        constexpr size_t kCrossVmMinInsns = 8;
+        const bool do_cross_vm = (vm_insns.size() >= kCrossVmMinInsns);
+
+        if (do_cross_vm) {
+            // Find a split point: midpoint, avoiding branch targets.
+            size_t split = vm_insns.size() / 2;
+            // Ensure we don't split inside a vjcc/vjmp sequence
+            while (split > 1 && (vm_insns[split].op == vm::VmOp::vjmp ||
+                                  vm_insns[split].op == vm::VmOp::vjcc)) {
+                --split;
+            }
+            if (split < 2) split = vm_insns.size() / 2;
+
+            // Check that no branch in the first half targets the second half
+            // and vice versa — if so, fall back to single VM.
+            bool can_split = true;
+            for (size_t j = 0; j < split; ++j) {
+                if ((vm_insns[j].op == vm::VmOp::vjmp || vm_insns[j].op == vm::VmOp::vjcc) &&
+                    vm_insns[j].branch_target_insn >= split) {
+                    can_split = false; break;
+                }
+            }
+            for (size_t j = split; j < vm_insns.size(); ++j) {
+                if ((vm_insns[j].op == vm::VmOp::vjmp || vm_insns[j].op == vm::VmOp::vjcc) &&
+                    vm_insns[j].branch_target_insn < split) {
+                    can_split = false; break;
+                }
+            }
+
+            if (can_split) {
+                // Remap branch targets in the second half: subtract split
+                std::vector<vm::VmInstruction> part1(
+                    vm_insns.begin(), vm_insns.begin() + split);
+                std::vector<vm::VmInstruction> part2(
+                    vm_insns.begin() + split, vm_insns.end());
+                for (auto& vi : part2) {
+                    if (vi.op == vm::VmOp::vjmp || vi.op == vm::VmOp::vjcc) {
+                        vi.branch_target_insn -= static_cast<uint32_t>(split);
+                    }
+                }
+
+                auto rt1 = gen.generate(part1, rng, true);  // exit as JMP
+                auto rt2 = gen.generate(part2, rng, false);  // normal exit
+
+                if (rt1 && rt2) {
+                    // Merge the two blobs: rt1 followed by rt2, patch the JMP
+                    const uint32_t rt1_size = static_cast<uint32_t>(rt1->blob.size());
+                    const uint32_t rt2_entry = rt1_size + rt2->entry_offset;
+
+                    // Patch rt1's exit jmp rel32 to point to rt2's entry
+                    if (rt1->exit_jmp_patch != 0) {
+                        const uint32_t jmp_end = rt1->exit_jmp_patch + 4;
+                        const int32_t rel = static_cast<int32_t>(
+                            static_cast<int64_t>(rt2_entry) -
+                            static_cast<int64_t>(jmp_end));
+                        std::memcpy(rt1->blob.data() + rt1->exit_jmp_patch, &rel, 4);
+                    }
+
+                    ByteBuffer merged;
+                    merged.reserve(rt1->blob.size() + rt2->blob.size());
+                    merged.insert(merged.end(), rt1->blob.begin(), rt1->blob.end());
+                    merged.insert(merged.end(), rt2->blob.begin(), rt2->blob.end());
+
+                    PendingRegion p;
+                    p.begin_marker_rva = begin_marker_rva;
+                    p.body_start_rva = body_start;
+                    p.body_end_rva = body_end;
+                    p.total_patch_size = r->begin_marker_size + body_size + r->end_marker_size;
+                    p.vm_blob = std::move(merged);
+                    p.entry_offset_in_blob = rt1->entry_offset;
+                    pendings.push_back(std::move(p));
+
+                    ctx.log_fmt("  Cross-VM: split at insn {}/{}, blob1={}B blob2={}B",
+                        split, vm_insns.size(), rt1->blob.size(), rt2->blob.size());
+                    continue;
+                }
+                // fall through to single-VM if cross-VM generation failed
+            }
+        }
+
+        // Single VM (no split)
         auto runtime_result = gen.generate(vm_insns, rng);
         if (!runtime_result) {
             ctx.log_fmt("  VM регион: ошибка генерации runtime: {}",

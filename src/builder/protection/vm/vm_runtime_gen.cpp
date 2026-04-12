@@ -767,7 +767,8 @@ constexpr uint8_t variant_count_for(VmOp op) {
 
 MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const std::vector<VmInstruction>& instructions,
-    Randomizer& rng)
+    Randomizer& rng,
+    bool emit_exit_as_jmp)
 {
     if (instructions.empty()) {
         return std::unexpected(MxError(
@@ -1049,6 +1050,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // Emit one body for (op, variant_index). Returns true if a tail dispatch
     // should be appended after the body. The VmOp::exit variant emits its own
     // ret and returns false.
+    uint32_t exit_jmp_offset = 0;  // patched if emit_exit_as_jmp
+
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
             case VmOp::mov_rr:   emit_handler_mov_rr(rt, kRollingKeyDisp, rolling);             return true;
@@ -1125,8 +1128,15 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                 emit_pop_reg(rt, 7);  // rdi
                 for (uint8_t r = 8; r <= 15; ++r) emit_pop_reg(rt, r);
                 emit_popfq(rt);
-                emit_ret(rt);
-                return false;  // no tail dispatch — we return to the caller
+                if (emit_exit_as_jmp) {
+                    // Cross-VM: jmp rel32 to next sub-VM entry (patched later)
+                    rt.u8(0xE9);
+                    exit_jmp_offset = static_cast<uint32_t>(rt.size());
+                    rt.u32(0);  // placeholder rel32
+                } else {
+                    emit_ret(rt);
+                }
+                return false;  // no tail dispatch
             }
             case VmOp::count_:
                 return false;
@@ -1288,11 +1298,12 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     VmRuntime result;
     result.blob = std::move(rt.buf);
-    result.entry_offset   = static_cast<uint32_t>(entry_offset);
+    result.entry_offset    = static_cast<uint32_t>(entry_offset);
     result.bytecode_offset = static_cast<uint32_t>(bytecode_offset);
     result.bytecode_size   = static_cast<uint32_t>(bytecode_plain.size());
     result.handler_count   = total_handlers;
     result.opcode_map      = map;
+    result.exit_jmp_patch  = exit_jmp_offset;
     return result;
 }
 
