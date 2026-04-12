@@ -104,10 +104,10 @@ constexpr uint32_t kVmOpCount = static_cast<uint32_t>(VmOp::count_);
             return 2;
 
         case VmOp::vjmp:
-            return 4 + 1;       // rel32 + key checkpoint
+            return 4;           // rel32 only (static XOR for branched regions)
 
         case VmOp::vjcc:
-            return 1 + 4 + 1;   // cc_byte + rel32 + key checkpoint
+            return 4;           // rel32 only (CC is baked into handler variant)
 
         case VmOp::native:
         case VmOp::exit:

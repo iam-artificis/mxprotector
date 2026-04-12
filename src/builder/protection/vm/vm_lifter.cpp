@@ -308,7 +308,7 @@ VmLifter::lift(ByteView code, Va base_va)
             }
 
             const Va target_va = insn.branch_targets().front();
-            if (target_va < base_va || target_va >= region_end_va) {
+            if (target_va < base_va || target_va > region_end_va) {
                 return std::unexpected(MxError(
                     ProtectionErrorCode::vm_translation_error,
                     std::format(
@@ -316,18 +316,29 @@ VmLifter::lift(ByteView code, Va base_va)
                         insn.to_string(), target_va)));
             }
 
-            auto it = va_to_insn_index.find(target_va);
-            if (it == va_to_insn_index.end()) {
-                return std::unexpected(MxError(
-                    ProtectionErrorCode::vm_translation_error,
-                    std::format(
-                        "VmLifter: target 0x{:016X} не совпадает с границей инструкции",
-                        target_va)));
+            // A branch to region_end_va means "exit the VM region". We resolve
+            // it to the terminal exit instruction which is always the last
+            // element of the output vector (appended as VmOp::exit by the
+            // caller). We use a sentinel value that the caller resolves after
+            // lifting: insns.size() means "the exit instruction".
+            uint32_t target_idx;
+            if (target_va == region_end_va) {
+                target_idx = static_cast<uint32_t>(insns.size()); // sentinel → exit
+            } else {
+                auto it = va_to_insn_index.find(target_va);
+                if (it == va_to_insn_index.end()) {
+                    return std::unexpected(MxError(
+                        ProtectionErrorCode::vm_translation_error,
+                        std::format(
+                            "VmLifter: target 0x{:016X} не совпадает с границей инструкции",
+                            target_va)));
+                }
+                target_idx = it->second;
             }
 
             VmInstruction vi;
             vi.original_va = insn.address();
-            vi.branch_target_insn = it->second;
+            vi.branch_target_insn = target_idx;
 
             if (insn.is_unconditional_jump()) {
                 vi.op = VmOp::vjmp;
