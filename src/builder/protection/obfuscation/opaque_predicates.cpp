@@ -57,35 +57,74 @@ OpaquePredicateCode OpaquePredicateGenerator::generate_always_false(Randomizer& 
 OpaquePredicateCode OpaquePredicateGenerator::gen_quadratic_parity(
     Randomizer& rng, bool always_true) const
 {
-    const uint8_t reg = pick_safe_register(rng);
+    // Math: x * (x + 1) is always even (one of x, x+1 is even), so bit 0
+    // of the 32-bit truncated product is always 0 → ZF after TEST is 1.
+    //
+    // Implementation requires preserving x while computing x+1 in a scratch
+    // register, otherwise we would end up computing (x+1)^2 which is not
+    // always even.
+    //
+    //   push reg                 ; save x  (acc_reg)
+    //   push scratch             ; save scratch
+    //   mov   scratch, reg       ; scratch = x
+    //   add   scratch, 1         ; scratch = x + 1
+    //   imul  reg, scratch       ; reg = x * (x + 1)   ← always even
+    //   test  reg, 1
+    //   pop   scratch
+    //   pop   reg
+    //   jz/jnz 0                 ; rel8 patched by caller
+    //
+    // Two distinct safe registers are needed. pick_safe_register may repeat,
+    // so we re-roll until we get a second, different one.
+    const uint8_t acc_reg = pick_safe_register(rng);
+    uint8_t scratch_reg;
+    do {
+        scratch_reg = pick_safe_register(rng);
+    } while (scratch_reg == acc_reg);
+
     ByteBuffer code;
 
-    code.push_back(static_cast<uint8_t>(0x50 + reg));
+    // push acc_reg, push scratch_reg (64-bit)
+    code.push_back(static_cast<uint8_t>(0x50 + acc_reg));
+    code.push_back(static_cast<uint8_t>(0x50 + scratch_reg));
 
+    // mov scratch, acc (32-bit)    89 /r
+    //   ModRM: mod=3, reg=src (acc_reg), rm=dst (scratch_reg)
     code.push_back(0x89);
-    code.push_back(x86::make_modrm(3, reg, reg));
+    code.push_back(x86::make_modrm(3, acc_reg, scratch_reg));
 
+    // add scratch, 1 (32-bit)    83 /0 ib
     code.push_back(0x83);
-    code.push_back(x86::make_modrm(3, 0, reg));
+    code.push_back(x86::make_modrm(3, 0, scratch_reg));
     code.push_back(0x01);
 
+    // imul acc, scratch (32-bit)    0F AF /r
+    //   ModRM: mod=3, reg=dst (acc_reg), rm=src (scratch_reg)
     code.push_back(0x0F);
     code.push_back(0xAF);
-    code.push_back(x86::make_modrm(3, reg, reg));
+    code.push_back(x86::make_modrm(3, acc_reg, scratch_reg));
 
-    code.push_back(0xA8);
+    // test acc, imm32 (32-bit)    F7 /0 id
+    code.push_back(0xF7);
+    code.push_back(x86::make_modrm(3, 0, acc_reg));
     code.push_back(0x01);
+    code.push_back(0x00);
+    code.push_back(0x00);
+    code.push_back(0x00);
 
-    code.push_back(static_cast<uint8_t>(0x58 + reg));
+    // pop scratch_reg, pop acc_reg (64-bit, reverse order)
+    //   POP does not modify ZF, so the TEST result survives into JCC.
+    code.push_back(static_cast<uint8_t>(0x58 + scratch_reg));
+    code.push_back(static_cast<uint8_t>(0x58 + acc_reg));
 
     const uint8_t jcc_offset = static_cast<uint8_t>(code.size());
 
     if (always_true) {
-        code.push_back(0x74);
+        code.push_back(0x74);  // JZ  — taken because bit 0 of x*(x+1) is 0
     } else {
-        code.push_back(0x75);
+        code.push_back(0x75);  // JNZ — never taken
     }
-    code.push_back(0x00);
+    code.push_back(0x00);  // rel8 placeholder (patched by caller)
 
     OpaquePredicateCode result;
     result.code = std::move(code);

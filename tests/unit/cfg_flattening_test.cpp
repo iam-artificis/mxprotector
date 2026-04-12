@@ -647,89 +647,121 @@ TEST(MbaTransitionGenerator, ProducesNonEmptyCode) {
     EXPECT_GE(code.size(), 10u);
 }
 
-TEST(MbaTransitionGenerator, SimulationCorrectness) {
+namespace {
+
+/// Simulate the MBA chain in software. `initial` is the starting value of
+/// state_reg before the chain runs. Returns the final value.
+///
+/// Decodes the same subset of x86 instructions `MbaTransitionGenerator` emits:
+///   MOV r32, imm32          B8+rd id
+///   ADD r32, imm32          81 /0 id
+///   SUB r32, imm32          81 /5 id
+///   XOR r32, imm32          81 /6 id
+///   NOT r32                 F7 /2
+///   ROL r32, imm8 / 1       C1 /0 / D1 /0
+///   ROR r32, imm8 / 1       C1 /1 / D1 /1
+[[nodiscard]] uint32_t simulate_mba_chain(mx::ByteView code, uint32_t initial) {
+    uint32_t value = initial;
+    size_t offset = 0;
+
+    while (offset < code.size()) {
+        if (code[offset] == 0x41) ++offset;  // REX.B prefix — skip
+        if (offset >= code.size()) break;
+
+        const uint8_t opcode = code[offset++];
+
+        if (opcode >= 0xB8 && opcode <= 0xBF) {
+            // MOV r32, imm32
+            if (offset + 4 > code.size()) break;
+            uint32_t imm = 0;
+            std::memcpy(&imm, code.data() + offset, 4);
+            offset += 4;
+            value = imm;
+        } else if (opcode == 0x81 && offset < code.size()) {
+            const uint8_t modrm = code[offset++];
+            const uint8_t reg_field = (modrm >> 3) & 0x07;
+            if (offset + 4 > code.size()) break;
+            uint32_t imm = 0;
+            std::memcpy(&imm, code.data() + offset, 4);
+            offset += 4;
+            switch (reg_field) {
+                case 0: value += imm; break;
+                case 5: value -= imm; break;
+                case 6: value ^= imm; break;
+                default: break;
+            }
+        } else if (opcode == 0xF7 && offset < code.size()) {
+            const uint8_t modrm = code[offset++];
+            const uint8_t reg_field = (modrm >> 3) & 0x07;
+            if (reg_field == 2) value = ~value;
+        } else if (opcode == 0xC1 && offset + 1 < code.size()) {
+            const uint8_t modrm = code[offset++];
+            const uint8_t reg_field = (modrm >> 3) & 0x07;
+            const uint8_t count = code[offset++] & 31;
+            if (count == 0) continue;
+            if (reg_field == 0) value = (value << count) | (value >> (32 - count));
+            else if (reg_field == 1) value = (value >> count) | (value << (32 - count));
+        } else if (opcode == 0xD1 && offset < code.size()) {
+            const uint8_t modrm = code[offset++];
+            const uint8_t reg_field = (modrm >> 3) & 0x07;
+            if (reg_field == 0) value = (value << 1) | (value >> 31);
+            else if (reg_field == 1) value = (value >> 1) | (value << 31);
+        } else {
+            break;  // unknown instruction — bail
+        }
+    }
+
+    return value;
+}
+
+} // namespace
+
+// When state_preserved == true, the generator assumes state_reg already holds
+// `current` at entry to the chain and omits the initialising MOV. The chain
+// transforms `current → target` directly on the register.
+TEST(MbaTransitionGenerator, SimulationCorrectness_StatePreserved) {
     mx::MbaTransitionGenerator gen(mx::Architecture::x64);
 
     for (uint64_t seed = 0; seed < 50; ++seed) {
         mx::Randomizer rng(seed);
+        const uint32_t current = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+        const uint32_t target  = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
 
-        uint32_t current = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
-        uint32_t target  = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+        auto code = gen.generate(current, target, mx::x86::Reg::r10, rng, /*state_preserved=*/true);
+        ASSERT_FALSE(code.empty()) << "Empty code for seed=" << seed;
 
-        auto code = gen.generate(current, target, mx::x86::Reg::r10, rng);
-        EXPECT_FALSE(code.empty())
-            << "Empty code for seed=" << seed;
-
-        // Simulate the chain: first insn is MOV r32, imm32 (sets value),
-        // then arithmetic/bitwise ops transform it to target
-        uint32_t value = 0xDEADBEEF; // garbage, MOV will overwrite
-        size_t offset = 0;
-
-        while (offset < code.size()) {
-            bool has_rex_b = false;
-            if (code[offset] == 0x41) {
-                has_rex_b = true;
-                ++offset;
-            }
-
-            if (offset >= code.size()) break;
-
-            const uint8_t opcode = code[offset++];
-
-            // MOV r32, imm32: opcode B8+rd (B8-BF)
-            if (opcode >= 0xB8 && opcode <= 0xBF) {
-                if (offset + 4 > code.size()) break;
-                uint32_t imm = 0;
-                std::memcpy(&imm, code.data() + offset, 4);
-                offset += 4;
-                value = imm;
-            } else if (opcode == 0x81 && offset < code.size()) {
-                uint8_t modrm = code[offset++];
-                uint8_t reg_field = (modrm >> 3) & 0x07;
-                if (offset + 4 > code.size()) break;
-
-                uint32_t imm = 0;
-                std::memcpy(&imm, code.data() + offset, 4);
-                offset += 4;
-
-                switch (reg_field) {
-                    case 0: value += imm; break;  // ADD
-                    case 5: value -= imm; break;  // SUB
-                    case 6: value ^= imm; break;  // XOR
-                    default: break;
-                }
-            } else if (opcode == 0xF7 && offset < code.size()) {
-                uint8_t modrm = code[offset++];
-                uint8_t reg_field = (modrm >> 3) & 0x07;
-                if (reg_field == 2) {
-                    value = ~value;  // NOT
-                }
-            } else if (opcode == 0xC1 && offset + 1 < code.size()) {
-                uint8_t modrm = code[offset++];
-                uint8_t reg_field = (modrm >> 3) & 0x07;
-                uint8_t count = code[offset++] & 31;
-                if (reg_field == 0) {
-                    value = (value << count) | (value >> (32 - count));  // ROL
-                } else if (reg_field == 1) {
-                    value = (value >> count) | (value << (32 - count));  // ROR
-                }
-            } else if (opcode == 0xD1 && offset < code.size()) {
-                uint8_t modrm = code[offset++];
-                uint8_t reg_field = (modrm >> 3) & 0x07;
-                if (reg_field == 0) {
-                    value = (value << 1) | (value >> 31);  // ROL 1
-                } else if (reg_field == 1) {
-                    value = (value >> 1) | (value << 31);  // ROR 1
-                }
-            } else {
-                // Unknown instruction — skip
-                break;
-            }
-        }
+        const uint32_t value = simulate_mba_chain(
+            mx::ByteView{code.data(), code.size()}, current);
 
         EXPECT_EQ(value, target)
             << "MBA chain failed for seed=" << seed
-            << " current=0x" << std::hex << current
+            << std::hex << " current=0x" << current
+            << " target=0x" << target
+            << " got=0x" << value;
+    }
+}
+
+// When state_preserved == false, the generator loads a random seed via
+// `MOV r32, imm32` first (because the block may have clobbered state_reg)
+// and then applies the chain. The simulator starts at garbage; the MOV is
+// the very first thing that sets a defined value.
+TEST(MbaTransitionGenerator, SimulationCorrectness_StateNotPreserved) {
+    mx::MbaTransitionGenerator gen(mx::Architecture::x64);
+
+    for (uint64_t seed = 0; seed < 50; ++seed) {
+        mx::Randomizer rng(seed);
+        const uint32_t current = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+        const uint32_t target  = mx::MbaTransitionGenerator::sanitize_state_id(rng.next_u32());
+
+        auto code = gen.generate(current, target, mx::x86::Reg::r10, rng, /*state_preserved=*/false);
+        ASSERT_FALSE(code.empty()) << "Empty code for seed=" << seed;
+
+        const uint32_t value = simulate_mba_chain(
+            mx::ByteView{code.data(), code.size()}, 0xDEADBEEF /*garbage*/);
+
+        EXPECT_EQ(value, target)
+            << "MBA chain failed for seed=" << seed
+            << std::hex << " current=0x" << current
             << " target=0x" << target
             << " got=0x" << value;
     }

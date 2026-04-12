@@ -33,14 +33,28 @@
 
 ---
 
-## Критические баги
+## Критические баги (закрыты)
 
-### CFG Flattening нестабилен
-- **Симптом:** билды с `--cfg-flattening` падают ~30-80% в зависимости от входного бинаря
-- **Статус:** pre-existing, как минимум с `b31c0b1` (verified bisect'ом)
-- **Где копать:** `MbaTransitionGenerator::SimulationCorrectness` — unit-тест падает с несовпадающими значениями. Это математика MBA-цепочек в CFG transitions. Подозреваю баг в генерации inverse-функции или в state encoding
-- **Временный обход:** `--no-cfg-flattening`
-- **Приоритет:** высокий — следующая задача
+### Bug B: CFG Flattening нестабилен — FIXED
+- **Симптом (был):** билды с `--cfg-flattening` падали ~30-80%
+- **Корневая причина:** два бага в `OpaquePredicateGenerator::gen_quadratic_parity`:
+  1. **Hardcoded register**: использовался `test al, 1` (опкод `A8 01`), который всегда
+     тестирует AL, независимо от того какой регистр выбрал `pick_safe_register`. Для
+     5 из 6 safe-регистров тест проверял случайный байт AL, не результат вычисления.
+  2. **Математика была неверна с самого начала**: последовательность
+     `mov reg, reg; add reg, 1; imul reg, reg` вычисляет `(x+1)^2`, не `x * (x+1)`.
+     `(x+1)^2` имеет 50% шанс быть нечётным, поэтому "always-true" предикат был
+     таким на 50%. Баг #1 маскировал баг #2 за счёт случайности содержимого AL.
+- **Фикс:**
+  - `test reg, 1` через 32-bit форму `F7 /0 imm32` — работает для любого safe-регистра
+  - Использовать два разных регистра: скопировать `x` в `scratch`, `inc scratch`,
+    `imul reg, scratch` → настоящее `x * (x+1)`, всегда чётное
+  - Исправлен ложно-положительный тест `SimulationCorrectness`, который ожидал
+    ведущий `MOV` когда генератор его не эмитит (при `state_preserved=true`).
+    Разделил на два теста: `_StatePreserved` и `_StateNotPreserved`
+- **Результат:** 140/140 тестов проходят при `level=standard --no-packer` и
+  140/140 при `level=maximum` (полный пайплайн — Mutation + Obfuscation + VM +
+  CFF + Packer)
 
 ---
 
@@ -73,8 +87,17 @@
 
 ## Следующие шаги (по приоритету)
 
-### 1. Починка CFG Flattening *(высокий)*
-Сначала разобраться с `MbaTransitionGenerator::SimulationCorrectness`, потом прогнать стресс на реальных бинарях.
+### 1. arm64 architecture foundation *(следующий шаг)*
+Заложить минимальный sketch интерфейсов по аналогии с `target/` (архитектура ≠ container):
+- `include/mxprotector/arch/arch_info.hpp` — расширенный `Arch` enum (arm64_v8a,
+  arm64_v8.1a, cortex_m4, cortex_a76 и т.д.) + capability flags (NEON, crypto ext)
+- `include/mxprotector/arch/code_emitter.hpp` — `ICodeEmitter` sketch для
+  архитектуро-специфичной эмиссии (arch-specific, container-agnostic)
+- `include/mxprotector/arch/vm_backend.hpp` — `IVmBackend` для VM runtime gen
+  (параметризует количество регистров, flag encoding, calling convention)
+- ROADMAP обновление с fine-grained фазами: embedded Linux arm64 → Android arm64
+  → (возможно позже) bare-metal Cortex-M
+Реализация самого arm64 backend — отдельная многомесячная веха.
 
 ### 2. VM-handler polymorphism *(средний)*
 Сейчас handler'ы на разные опкоды имеют устойчивые эпилоги (jmp dispatcher). Нужно:
