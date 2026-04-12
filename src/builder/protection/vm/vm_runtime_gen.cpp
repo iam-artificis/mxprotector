@@ -405,100 +405,393 @@ struct TailDispatchPatch {
     size_t instruction_end;   ///< byte just after the rel32
 };
 
-/// vEFLAGS store: pushfq → pop rax → rol eax, rol → xor eax, key → store.
-/// Writes the scrambled rflags into [rsp + kRflagsOffset].
-///
-///   9C                     pushfq
-///   58                     pop rax
-///   C1 C0 rol              rol eax, rol   (if rol != 0)
-///   35 imm32               xor eax, key   (if key != 0)
-///   48 89 84 24 80 00 00 00   mov [rsp+128], rax
-void emit_vflags_store(RawEmitter& e, uint32_t vflags_key, uint32_t vflags_rol,
-                       int32_t rflags_disp)
-{
-    e.u8(0x9C); e.u8(0x58);  // pushfq; pop rax
-    if (vflags_rol != 0) {
-        e.u8(0xC1); e.u8(0xC0); e.u8(static_cast<uint8_t>(vflags_rol & 0x1F));
-    }
-    if (vflags_key != 0) {
-        e.u8(0x35);
-        e.u8(static_cast<uint8_t>(vflags_key & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 8) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 16) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 24) & 0xFF));
-    }
-    // mov [rsp + rflags_disp], rax    48 89 84 24 disp32
-    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24);
-    e.u8(static_cast<uint8_t>(rflags_disp & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 8) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 16) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 24) & 0xFF));
+// ---------------------------------------------------------------------------
+// vEFLAGS polymorphism
+// ---------------------------------------------------------------------------
+//
+// Every store and every descramble site picks a random variant from a small
+// pool of semantically-equivalent byte sequences. This breaks YARA-style
+// signature matching across the binary (each sub-VM has 60+ store sites and
+// 20+ descramble sites — signing them with one regex used to work).
+//
+// rol(key, n) is the "pre-rotated" key: rol(real, n) ^ key == rol(real ^ ror(key,n), n)
+// so `xor-then-rol` uses ror(key, n) while `rol-then-xor` uses key directly.
+
+/// Rotate a 32-bit value right by n (modulo 32).
+[[nodiscard]] inline uint32_t ror32(uint32_t v, uint32_t n) noexcept {
+    n &= 31;
+    return (n == 0) ? v : (v >> n) | (v << (32 - n));
 }
 
-/// vEFLAGS load-to-eax: mov eax, slot → xor eax, key → ror eax, rol.
-/// After this eax holds the descrambled RFLAGS value; caller decides what to
-/// do with it (push+popfq, test bits, ...).
+/// Variant selector for vEFLAGS store (write scrambled rflags to slot).
+enum class VflagsStoreV : uint8_t {
+    RaxRolFirst = 0,  // pushfq; pop rax; rol eax,n; xor eax,key; mov slot,rax
+    RaxXorFirst = 1,  // pushfq; pop rax; xor eax,ror(key,n); rol eax,n; mov slot,rax
+    InPlace     = 2,  // pushfq; rol [rsp],n; xor [rsp],key; pop qword slot
+    kCount      = 3
+};
+
+/// Variant selector for vEFLAGS descramble-then-popfq.
+enum class VflagsPopfqV : uint8_t {
+    RaxXorFirst = 0,  // mov eax,slot; xor eax,key; ror eax,n; push rax; popfq
+    RaxRorFirst = 1,  // mov eax,slot; ror eax,n; xor eax,ror(key,n); push rax; popfq
+    InPlace     = 2,  // push qword slot; xor [rsp],key; ror [rsp],n; popfq
+    kCount      = 3
+};
+
+/// Variant selector for vEFLAGS descramble-into-ecx (VJCC bit testing).
+enum class VflagsToEcxV : uint8_t {
+    XorFirst = 0,     // mov ecx,slot; xor ecx,key; ror ecx,n
+    RorFirst = 1,     // mov ecx,slot; ror ecx,n; xor ecx,ror(key,n)
+    kCount   = 2
+};
+
+[[nodiscard]] inline VflagsStoreV pick_store_variant(Randomizer& rng) {
+    return static_cast<VflagsStoreV>(rng.next_range(0,
+        static_cast<uint32_t>(VflagsStoreV::kCount) - 1));
+}
+[[nodiscard]] inline VflagsPopfqV pick_popfq_variant(Randomizer& rng) {
+    return static_cast<VflagsPopfqV>(rng.next_range(0,
+        static_cast<uint32_t>(VflagsPopfqV::kCount) - 1));
+}
+[[nodiscard]] inline VflagsToEcxV pick_to_ecx_variant(Randomizer& rng) {
+    return static_cast<VflagsToEcxV>(rng.next_range(0,
+        static_cast<uint32_t>(VflagsToEcxV::kCount) - 1));
+}
+
+/// Helper: emit `mov [rsp + disp], rax` (48 89 84 24 disp32).
+inline void emit_mov_rsp_disp_rax(RawEmitter& e, int32_t disp) {
+    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24);
+    e.u32(static_cast<uint32_t>(disp));
+}
+
+/// Helper: emit `mov eax, [rsp + disp]` (8B 84 24 disp32).
+inline void emit_mov_eax_rsp_disp(RawEmitter& e, int32_t disp) {
+    e.u8(0x8B); e.u8(0x84); e.u8(0x24);
+    e.u32(static_cast<uint32_t>(disp));
+}
+
+/// Helper: emit `xor eax, imm32` (35 imm32).
+inline void emit_xor_eax_imm32(RawEmitter& e, uint32_t imm) {
+    e.u8(0x35); e.u32(imm);
+}
+
+/// Helper: emit `rol eax, imm8` (C1 C0 imm8).
+inline void emit_rol_eax_imm8(RawEmitter& e, uint8_t imm) {
+    e.u8(0xC1); e.u8(0xC0); e.u8(imm);
+}
+
+/// Helper: emit `ror eax, imm8` (C1 C8 imm8).
+inline void emit_ror_eax_imm8(RawEmitter& e, uint8_t imm) {
+    e.u8(0xC1); e.u8(0xC8); e.u8(imm);
+}
+
+/// vEFLAGS store (polymorphic). Writes `rol(real_rflags, rol) ^ key` into
+/// [rsp + rflags_disp].
+///
+/// All three variants clobber rax or no registers at all (see `InPlace`).
+/// Caller is responsible for saving/restoring rax if needed (native handler
+/// does this via its scratch slot).
+void emit_vflags_store(RawEmitter& e, VflagsStoreV variant,
+                       uint32_t vflags_key, uint32_t vflags_rol,
+                       int32_t rflags_disp)
+{
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    switch (variant) {
+        case VflagsStoreV::RaxRolFirst: {
+            // 9C        pushfq
+            // 58        pop rax
+            // C1 C0 n   rol eax, n
+            // 35 k32    xor eax, key
+            // 48 89 ..  mov [rsp+disp], rax
+            e.u8(0x9C); e.u8(0x58);
+            if (n != 0) emit_rol_eax_imm8(e, n);
+            if (vflags_key != 0) emit_xor_eax_imm32(e, vflags_key);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsStoreV::RaxXorFirst: {
+            // 9C        pushfq
+            // 58        pop rax
+            // 35 k'32   xor eax, ror(key, n)
+            // C1 C0 n   rol eax, n
+            // 48 89 ..  mov [rsp+disp], rax
+            const uint32_t k_pre = ror32(vflags_key, n);
+            e.u8(0x9C); e.u8(0x58);
+            if (vflags_key != 0) emit_xor_eax_imm32(e, k_pre);
+            if (n != 0) emit_rol_eax_imm8(e, n);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsStoreV::InPlace: {
+            // 9C                pushfq
+            // C1 04 24 n        rol dword [rsp], n
+            // 81 34 24 k32      xor dword [rsp], key
+            // 8F 84 24 disp32   pop qword [rsp+disp]
+            //
+            // pop with [rsp+disp] computes the destination address AFTER the
+            // rsp increment (Intel SDM), so disp relative to the AFTER-pop rsp
+            // is the same as the original rflags_disp.
+            e.u8(0x9C);
+            if (n != 0) { e.u8(0xC1); e.u8(0x04); e.u8(0x24); e.u8(n); }
+            if (vflags_key != 0) {
+                e.u8(0x81); e.u8(0x34); e.u8(0x24); e.u32(vflags_key);
+            }
+            e.u8(0x8F); e.u8(0x84); e.u8(0x24);
+            e.u32(static_cast<uint32_t>(rflags_disp));
+            return;
+        }
+        case VflagsStoreV::kCount: break;
+    }
+}
+
+/// vEFLAGS descramble-and-popfq (polymorphic). Reads the scrambled slot,
+/// descrambles, and loads the real RFLAGS into CPU. Clobbers rax (except
+/// for the `InPlace` variant which uses no scratch register).
+void emit_vflags_popfq(RawEmitter& e, VflagsPopfqV variant,
+                       uint32_t vflags_key, uint32_t vflags_rol,
+                       int32_t rflags_disp)
+{
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    switch (variant) {
+        case VflagsPopfqV::RaxXorFirst: {
+            // 8B 84 ..  mov eax, [rsp+disp]
+            // 35 k32    xor eax, key
+            // C1 C8 n   ror eax, n
+            // 50        push rax
+            // 9D        popfq
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (vflags_key != 0) emit_xor_eax_imm32(e, vflags_key);
+            if (n != 0) emit_ror_eax_imm8(e, n);
+            e.u8(0x50); e.u8(0x9D);
+            return;
+        }
+        case VflagsPopfqV::RaxRorFirst: {
+            // 8B 84 ..  mov eax, [rsp+disp]
+            // C1 C8 n   ror eax, n
+            // 35 k'32   xor eax, ror(key, n)
+            // 50        push rax
+            // 9D        popfq
+            const uint32_t k_post = ror32(vflags_key, n);
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (n != 0) emit_ror_eax_imm8(e, n);
+            if (vflags_key != 0) emit_xor_eax_imm32(e, k_post);
+            e.u8(0x50); e.u8(0x9D);
+            return;
+        }
+        case VflagsPopfqV::InPlace: {
+            // FF B4 24 disp32   push qword [rsp+disp]
+            // 81 34 24 k32      xor dword [rsp], key
+            // C1 0C 24 n        ror dword [rsp], n
+            // 9D                popfq
+            //
+            // `push qword [rsp+disp]` uses the rsp value BEFORE the push
+            // decrement for the source address. disp remains the original
+            // rflags_disp.
+            e.u8(0xFF); e.u8(0xB4); e.u8(0x24);
+            e.u32(static_cast<uint32_t>(rflags_disp));
+            if (vflags_key != 0) {
+                e.u8(0x81); e.u8(0x34); e.u8(0x24); e.u32(vflags_key);
+            }
+            if (n != 0) { e.u8(0xC1); e.u8(0x0C); e.u8(0x24); e.u8(n); }
+            e.u8(0x9D);
+            return;
+        }
+        case VflagsPopfqV::kCount: break;
+    }
+}
+
+/// vEFLAGS load-to-eax (non-polymorphic). Reads and descrambles into eax.
+/// Only used by code paths that need the descrambled value in a register but
+/// not to popfq. Currently unused — left in for future call sites.
 void emit_vflags_load_to_eax(RawEmitter& e, uint32_t vflags_key,
                              uint32_t vflags_rol, int32_t rflags_disp)
 {
-    // mov eax, [rsp + rflags_disp]   8B 84 24 disp32
-    e.u8(0x8B); e.u8(0x84); e.u8(0x24);
-    e.u8(static_cast<uint8_t>(rflags_disp & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 8) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 16) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 24) & 0xFF));
-    if (vflags_key != 0) {
-        e.u8(0x35);
-        e.u8(static_cast<uint8_t>(vflags_key & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 8) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 16) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 24) & 0xFF));
-    }
-    if (vflags_rol != 0) {
-        // ror eax, rol    C1 C8 rol
-        e.u8(0xC1); e.u8(0xC8); e.u8(static_cast<uint8_t>(vflags_rol & 0x1F));
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    emit_mov_eax_rsp_disp(e, rflags_disp);
+    if (vflags_key != 0) emit_xor_eax_imm32(e, vflags_key);
+    if (n != 0) emit_ror_eax_imm8(e, n);
+}
+
+/// Variant selector for in-slot transforms (entry scramble / exit descramble).
+enum class VflagsInSlotV : uint8_t {
+    RegXorFirst = 0,  // mov eax,[slot]; xor/rol-or-ror; mov [slot],rax  (rax scratch)
+    RegRorFirst = 1,  // mov eax,[slot]; ror/rol-or-xor; mov [slot],rax  (rax scratch)
+    MemXorFirst = 2,  // xor dword [slot],k; rol/ror dword [slot],n      (no scratch)
+    MemRorFirst = 3,  // rol/ror dword [slot],n; xor dword [slot],k'     (no scratch)
+    kCount      = 4
+};
+
+[[nodiscard]] inline VflagsInSlotV pick_inslot_variant(Randomizer& rng) {
+    return static_cast<VflagsInSlotV>(rng.next_range(0,
+        static_cast<uint32_t>(VflagsInSlotV::kCount) - 1));
+}
+
+/// In-slot FORWARD transform: [slot] (raw rflags) → [slot] (scrambled).
+/// Used by the entry stub right after pushfq/16 pushes to convert the
+/// freshly-saved rflags into the scrambled form the handlers expect.
+///   forward = rol(real, n) ^ key
+void emit_vflags_inslot_scramble(RawEmitter& e, VflagsInSlotV variant,
+                                  uint32_t vflags_key, uint32_t vflags_rol,
+                                  int32_t rflags_disp)
+{
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    const uint32_t k = vflags_key;
+    const uint32_t k_pre = ror32(k, n);
+
+    auto emit_xor_mem_imm32 = [&](uint32_t val) {
+        // xor dword [rsp + disp], imm32    81 B4 24 disp32 imm32
+        e.u8(0x81); e.u8(0xB4); e.u8(0x24);
+        e.u32(static_cast<uint32_t>(rflags_disp));
+        e.u32(val);
+    };
+    auto emit_rol_mem_imm8 = [&](uint8_t amt) {
+        // rol dword [rsp + disp], imm8    C1 84 24 disp32 imm8
+        e.u8(0xC1); e.u8(0x84); e.u8(0x24);
+        e.u32(static_cast<uint32_t>(rflags_disp));
+        e.u8(amt);
+    };
+
+    switch (variant) {
+        case VflagsInSlotV::RegXorFirst: {
+            // mov eax,[slot]; rol eax,n; xor eax,k; mov [slot],rax
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (n != 0) emit_rol_eax_imm8(e, n);
+            if (k != 0) emit_xor_eax_imm32(e, k);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsInSlotV::RegRorFirst: {
+            // mov eax,[slot]; xor eax,k_pre; rol eax,n; mov [slot],rax
+            // (xor-then-rol ≡ rol-then-xor-with-rol(k_pre,n)=k)
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (k != 0) emit_xor_eax_imm32(e, k_pre);
+            if (n != 0) emit_rol_eax_imm8(e, n);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsInSlotV::MemXorFirst: {
+            // xor dword [slot], k_pre; rol dword [slot], n
+            if (k != 0) emit_xor_mem_imm32(k_pre);
+            if (n != 0) emit_rol_mem_imm8(n);
+            return;
+        }
+        case VflagsInSlotV::MemRorFirst: {
+            // rol dword [slot], n; xor dword [slot], k
+            if (n != 0) emit_rol_mem_imm8(n);
+            if (k != 0) emit_xor_mem_imm32(k);
+            return;
+        }
+        case VflagsInSlotV::kCount: break;
     }
 }
 
-/// vEFLAGS load-to-ecx: same as above but into ecx. Used by VJCC which wants
-/// the unscrambled flags in a separate scratch reg.
-void emit_vflags_load_to_ecx(RawEmitter& e, uint32_t vflags_key,
-                             uint32_t vflags_rol, int32_t rflags_disp)
+/// In-slot REVERSE transform: [slot] (scrambled) → [slot] (raw rflags).
+/// Used by the exit stub just before the final popfq so the popfq loads
+/// real rflags into the CPU without clobbering live regs after.
+///   reverse = ror(slot ^ key, n) = ror(slot, n) ^ ror(key, n)
+void emit_vflags_inslot_descramble(RawEmitter& e, VflagsInSlotV variant,
+                                    uint32_t vflags_key, uint32_t vflags_rol,
+                                    int32_t rflags_disp)
 {
-    // mov ecx, [rsp + rflags_disp]   8B 8C 24 disp32
-    e.u8(0x8B); e.u8(0x8C); e.u8(0x24);
-    e.u8(static_cast<uint8_t>(rflags_disp & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 8) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 16) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 24) & 0xFF));
-    if (vflags_key != 0) {
-        // xor ecx, imm32    81 F1 imm32
-        e.u8(0x81); e.u8(0xF1);
-        e.u8(static_cast<uint8_t>(vflags_key & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 8) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 16) & 0xFF));
-        e.u8(static_cast<uint8_t>((vflags_key >> 24) & 0xFF));
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    const uint32_t k = vflags_key;
+    const uint32_t k_post = ror32(k, n);
+
+    auto emit_xor_mem_imm32 = [&](uint32_t val) {
+        e.u8(0x81); e.u8(0xB4); e.u8(0x24);
+        e.u32(static_cast<uint32_t>(rflags_disp));
+        e.u32(val);
+    };
+    auto emit_ror_mem_imm8 = [&](uint8_t amt) {
+        // ror dword [rsp + disp], imm8    C1 8C 24 disp32 imm8
+        e.u8(0xC1); e.u8(0x8C); e.u8(0x24);
+        e.u32(static_cast<uint32_t>(rflags_disp));
+        e.u8(amt);
+    };
+
+    switch (variant) {
+        case VflagsInSlotV::RegXorFirst: {
+            // mov eax,[slot]; xor eax,k; ror eax,n; mov [slot],rax
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (k != 0) emit_xor_eax_imm32(e, k);
+            if (n != 0) emit_ror_eax_imm8(e, n);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsInSlotV::RegRorFirst: {
+            // mov eax,[slot]; ror eax,n; xor eax,k_post; mov [slot],rax
+            emit_mov_eax_rsp_disp(e, rflags_disp);
+            if (n != 0) emit_ror_eax_imm8(e, n);
+            if (k != 0) emit_xor_eax_imm32(e, k_post);
+            emit_mov_rsp_disp_rax(e, rflags_disp);
+            return;
+        }
+        case VflagsInSlotV::MemXorFirst: {
+            // xor dword [slot], k; ror dword [slot], n
+            if (k != 0) emit_xor_mem_imm32(k);
+            if (n != 0) emit_ror_mem_imm8(n);
+            return;
+        }
+        case VflagsInSlotV::MemRorFirst: {
+            // ror dword [slot], n; xor dword [slot], k_post
+            if (n != 0) emit_ror_mem_imm8(n);
+            if (k != 0) emit_xor_mem_imm32(k_post);
+            return;
+        }
+        case VflagsInSlotV::kCount: break;
     }
-    if (vflags_rol != 0) {
-        // ror ecx, rol     C1 C9 rol
-        e.u8(0xC1); e.u8(0xC9); e.u8(static_cast<uint8_t>(vflags_rol & 0x1F));
+}
+
+/// vEFLAGS descramble-to-ecx (polymorphic). Used by VJCC which needs the
+/// descrambled value in ecx for subsequent bit tests.
+void emit_vflags_to_ecx(RawEmitter& e, VflagsToEcxV variant,
+                        uint32_t vflags_key, uint32_t vflags_rol,
+                        int32_t rflags_disp)
+{
+    const uint8_t n = static_cast<uint8_t>(vflags_rol & 0x1F);
+    // mov ecx, [rsp + rflags_disp]    8B 8C 24 disp32
+    e.u8(0x8B); e.u8(0x8C); e.u8(0x24);
+    e.u32(static_cast<uint32_t>(rflags_disp));
+
+    if (variant == VflagsToEcxV::XorFirst) {
+        if (vflags_key != 0) {
+            // xor ecx, imm32    81 F1 imm32
+            e.u8(0x81); e.u8(0xF1); e.u32(vflags_key);
+        }
+        if (n != 0) {
+            // ror ecx, imm8     C1 C9 imm8
+            e.u8(0xC1); e.u8(0xC9); e.u8(n);
+        }
+    } else {
+        // RorFirst: ror first, then xor with ror(key, n)
+        if (n != 0) { e.u8(0xC1); e.u8(0xC9); e.u8(n); }
+        if (vflags_key != 0) {
+            const uint32_t k_post = ror32(vflags_key, n);
+            e.u8(0x81); e.u8(0xF1); e.u32(k_post);
+        }
     }
 }
 
 /// Emits the tail dispatch stub. Caller must collect the returned patch and
 /// fix it up to point at the handler_table once the table offset is known.
+/// When `save_rflags` is set, a randomly-chosen vEFLAGS store variant is
+/// emitted at the top so each tail dispatch has a different byte shape.
 TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      bool rolling,
                                      bool save_rflags,
                                      std::vector<size_t>& table_key_patches,
-                                     uint32_t vflags_key = 0,
-                                     uint32_t vflags_rol = 0) {
+                                     uint32_t vflags_key,
+                                     uint32_t vflags_rol,
+                                     Randomizer* rng) {
     // Optionally save CPU rflags into the VM context BEFORE clobbering them
     // with the fetch logic (movzx/xor). This is the single collection point
     // for flag preservation — every handler's body has just finished, and the
     // CPU flags still reflect the last ALU/native operation.
     if (save_rflags) {
-        emit_vflags_store(e, vflags_key, vflags_rol, kRflagsOffset);
+        const auto v = (rng != nullptr) ? pick_store_variant(*rng)
+                                         : VflagsStoreV::RaxRolFirst;
+        emit_vflags_store(e, v, vflags_key, vflags_rol, kRflagsOffset);
     }
 
     emit_movzx_r32_byte_mem(e, 0 /*rax*/, 11, 0);
@@ -736,15 +1029,15 @@ void emit_handler_vjmp(RawEmitter& e, int32_t key_disp, bool rolling) {
 ///
 /// Multi-bit conditions (CC 6,7,12-15) are supported via compound tests.
 void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
-                       uint8_t cc, uint32_t vflags_key = 0,
-                       uint32_t vflags_rol = 0) {
+                       uint8_t cc, uint32_t vflags_key,
+                       uint32_t vflags_rol, Randomizer& rng) {
     emit_fetch_dword(e, key_disp, rolling);      // eax = rel32
     // movsxd rax, eax        48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
 
-    // Load and fully descramble saved RFLAGS into ecx (32-bit):
-    //   mov ecx, slot; xor ecx, key; ror ecx, rol
-    emit_vflags_load_to_ecx(e, vflags_key, vflags_rol, kRflagsOffset);
+    // Load and fully descramble saved RFLAGS into ecx (polymorphic).
+    emit_vflags_to_ecx(e, pick_to_ecx_variant(rng),
+                       vflags_key, vflags_rol, kRflagsOffset);
 
     // Determine which RFLAGS bit(s) to test and whether to jump-if-set or
     // jump-if-clear. We emit: `test rcx, MASK; jnz taken` or `jz taken`.
@@ -1147,45 +1440,12 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     rt.u8(initial_key);
 
     // Transform the raw RFLAGS the entry's pushfq just wrote into the scrambled
-    // form: slot = rol(real, vflags_rol) ^ vflags_key. We round-trip through
-    // eax (not in-place, because there is no single instruction for in-place
-    // rol-then-xor and we prefer a single helper to the VM pattern). Since
-    // cross-VM's exit stub fully descrambles before popfq, every entry can
-    // unconditionally re-scramble — no skip-on-handoff special case.
-    //
-    //   pop rax                    ; rax = raw rflags just pushed (rsp += 8)
-    //   rol eax, vflags_rol
-    //   xor eax, vflags_key
-    //   push rax                   ; restore rsp, now slot holds scrambled form
-    //
-    // Note: pop rax overwrites the rax *slot* because pop takes from [rsp+0]
-    // which is slot 0... wait no: rsp points at the rflags slot at this moment
-    // (we just did pushfq, then 16 reg pushes, then rsp points at slot 0).
-    // We can't use pop here. Use load/store via eax scratch instead.
+    // form: slot = rol(real, vflags_rol) ^ vflags_key. Polymorphic — one of
+    // four equivalent byte sequences per build. Since the exit stub fully
+    // descrambles before popfq, every entry re-scrambles unconditionally.
     if (vflags_key != 0 || vflags_rol != 0) {
-        // mov eax, [rsp + kRflagsOffset]
-        rt.u8(0x8B); rt.u8(0x84); rt.u8(0x24);
-        rt.u8(static_cast<uint8_t>(kRflagsOffset & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 8) & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 16) & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 24) & 0xFF));
-        if (vflags_rol != 0) {
-            // rol eax, imm8   C1 C0 imm8
-            rt.u8(0xC1); rt.u8(0xC0); rt.u8(static_cast<uint8_t>(vflags_rol & 0x1F));
-        }
-        if (vflags_key != 0) {
-            rt.u8(0x35);
-            rt.u8(static_cast<uint8_t>(vflags_key & 0xFF));
-            rt.u8(static_cast<uint8_t>((vflags_key >> 8) & 0xFF));
-            rt.u8(static_cast<uint8_t>((vflags_key >> 16) & 0xFF));
-            rt.u8(static_cast<uint8_t>((vflags_key >> 24) & 0xFF));
-        }
-        // mov [rsp + kRflagsOffset], rax
-        rt.u8(0x48); rt.u8(0x89); rt.u8(0x84); rt.u8(0x24);
-        rt.u8(static_cast<uint8_t>(kRflagsOffset & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 8) & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 16) & 0xFF));
-        rt.u8(static_cast<uint8_t>((kRflagsOffset >> 24) & 0xFF));
+        emit_vflags_inslot_scramble(rt, pick_inslot_variant(rng),
+                                     vflags_key, vflags_rol, kRflagsOffset);
     }
 
     // lea r11, [rip + bytecode_rel32]
@@ -1198,9 +1458,10 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     // Inline first dispatch (same shape as handler tails): fetch opcode,
     // decrypt, update key, look up handler via encrypted table, jump.
+    // save_rflags=false here so no vflags store variant is picked (no rng needed).
     const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                 false, table_key_patches,
-                                                vflags_key, vflags_rol);
+                                                vflags_key, vflags_rol, nullptr);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
     // ---- Handler emission ----------------------------------------------------
@@ -1215,7 +1476,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     auto end_handler_tail = [&]() {
         const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                           has_branches, table_key_patches,
-                                          vflags_key, vflags_rol);
+                                          vflags_key, vflags_rol, &rng);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
     };
 
@@ -1272,7 +1533,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             case VmOp::vjcc:
                 emit_handler_vjcc(rt, rolling_key_disp, rolling,
                                   static_cast<uint8_t>(variant),
-                                  vflags_key, vflags_rol);
+                                  vflags_key, vflags_rol, rng);
                 return true;
 
             case VmOp::native:
@@ -1282,23 +1543,14 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                 return false;
 
             case VmOp::exit: {
-                // Before popping, fully descramble the RFLAGS slot in place:
-                //   mov eax, [rsp + 128]
-                //   xor eax, vflags_key
-                //   ror eax, vflags_rol
-                //   mov [rsp + 128], rax        (64-bit store, upper 4 bytes = 0)
-                //
-                // eax is a safe scratch here because all 16 reg slots still
-                // sit on the stack — whichever slot maps to rax will be
-                // popped below and overwrite our scratch value.
+                // Before popping, fully descramble the RFLAGS slot in place
+                // (polymorphic — one of four variants). The scratch reg
+                // variants clobber rax, which is safe here because the
+                // subsequent pops will overwrite it.
                 if (vflags_key != 0 || vflags_rol != 0) {
-                    emit_vflags_load_to_eax(rt, vflags_key, vflags_rol, kRflagsOffset);
-                    // mov [rsp + kRflagsOffset], rax
-                    rt.u8(0x48); rt.u8(0x89); rt.u8(0x84); rt.u8(0x24);
-                    rt.u8(static_cast<uint8_t>(kRflagsOffset & 0xFF));
-                    rt.u8(static_cast<uint8_t>((kRflagsOffset >> 8) & 0xFF));
-                    rt.u8(static_cast<uint8_t>((kRflagsOffset >> 16) & 0xFF));
-                    rt.u8(static_cast<uint8_t>((kRflagsOffset >> 24) & 0xFF));
+                    emit_vflags_inslot_descramble(rt, pick_inslot_variant(rng),
+                                                   vflags_key, vflags_rol,
+                                                   kRflagsOffset);
                 }
 
                 // Exit: pop all 16 slots in slot order (slot 0 at [rsp+0]
@@ -1388,21 +1640,22 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         for (const auto& l : loads) emit_mem_mov(0x8B, l.native_reg, l.offset);
 
         // Restore CPU flags from ctx so flag-dependent native instructions
-        // (CMOV, ADC, SBB, etc.) see the correct state. Pipeline:
-        //   save rax to scratch [rsp+8]
-        //   mov eax, slot; xor eax, key; ror eax, rol    (descramble)
-        //   push rax; popfq
-        //   restore rax from scratch
+        // (CMOV, ADC, SBB, etc.) see the correct state. Polymorphic variant:
+        // reg-based variants clobber rax, so we save it to scratch [rsp+8]
+        // first; the InPlace variant uses no registers at all.
         {
             const int32_t rf_disp = 24 + kRflagsOffset;
-            // Save rax to scratch [rsp+8]
-            rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            // Descramble into eax
-            emit_vflags_load_to_eax(rt, vflags_key, vflags_rol, rf_disp);
-            // push rax; popfq
-            rt.u8(0x50); rt.u8(0x9D);
-            // Restore rax from scratch
-            rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            const auto popfq_v = pick_popfq_variant(rng);
+            const bool uses_rax = (popfq_v != VflagsPopfqV::InPlace);
+            if (uses_rax) {
+                // Save rax to scratch [rsp+8]
+                rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            }
+            emit_vflags_popfq(rt, popfq_v, vflags_key, vflags_rol, rf_disp);
+            if (uses_rax) {
+                // Restore rax from scratch
+                rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            }
         }
 
         // Shift rsp to caller frame via LEA (flag-preserving).
@@ -1419,18 +1672,19 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         rt.u32(static_cast<uint32_t>(-kNativeFrameShift));
 
         // Save CPU flags after native execution into ctx so the NEXT
-        // handler (or VJCC) sees the correct flags. Pipeline:
-        //   save rax to scratch [rsp+8]
-        //   pushfq; pop rax; rol eax, rol; xor eax, key
-        //   mov slot, rax
-        //   restore rax from scratch
+        // handler (or VJCC) sees the correct flags. Polymorphic — reg
+        // variants clobber rax and need the scratch dance, InPlace does not.
         {
             const int32_t rf_disp = 24 + kRflagsOffset;
-            // Save rax to scratch [rsp+8]
-            rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            emit_vflags_store(rt, vflags_key, vflags_rol, rf_disp);
-            // Restore rax
-            rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            const auto store_v = pick_store_variant(rng);
+            const bool uses_rax = (store_v != VflagsStoreV::InPlace);
+            if (uses_rax) {
+                rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            }
+            emit_vflags_store(rt, store_v, vflags_key, vflags_rol, rf_disp);
+            if (uses_rax) {
+                rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
+            }
         }
 
         // Save all native regs back to ctx
@@ -1445,7 +1699,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         {
             const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,
-                                              vflags_key, vflags_rol);
+                                              vflags_key, vflags_rol, nullptr);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
     }
