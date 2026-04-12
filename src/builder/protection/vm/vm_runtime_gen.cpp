@@ -71,6 +71,7 @@
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 #include "mxprotector/analysis/assembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
+#include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1673,36 +1674,60 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // carrying an imm32 — the table key never appears as a literal in the
     // VM blob, and statically extracting it requires simulating the entry.
     //
-    // A per-build random salt is XOR'd in so the stored dword isn't simply
-    // `preferred_image_base & 0xFFFFFFFF`. Both the runtime computation
-    // and the build-time table encryption use the same salt so decryption
-    // is lossless.
+    // The transformation from `ImageBase_low32` to `table_xor_key` is a
+    // random MBA chain (6–12 ops of add/sub/xor/not/rol/ror) generated via
+    // `MbaTransitionGenerator`, not a single `xor eax, salt`. A reverser
+    // staring at the entry stub sees a sequence of arithmetic ops with no
+    // single "this is the key" immediate they can grep for.
     //
     // Precondition: the output binary has ASLR disabled (packer strips
     // relocations + DYNAMIC_BASE). When ASLR is on, runtime ImageBase
     // differs from `opts.preferred_image_base` and the VM silently breaks.
     // The caller in VirtualizationPass only sets this opt when the packer
     // is enabled (which guarantees ASLR is stripped later).
-    const uint32_t imagebase_salt = rng.next_u32();
-    const int32_t  imagebase_key_disp =
+    const int32_t imagebase_key_disp =
         opts.use_imagebase_key ? (rolling_key_disp + 4) : -1;
 
+    // Handler-table encryption key. Two modes decide it here:
+    //   1. Legacy static: a per-build random u32, baked into every tail
+    //      dispatch as `xor eax, imm32`.
+    //   2. ImageBase path: still a per-build random u32 — but the entry
+    //      stub transforms `ImageBase_low32` → this value via a random
+    //      MBA chain, and dispatches load the result from the slot.
+    //
+    // We compute it up-front so the MBA chain below can consume it as its
+    // target value, and the handler_table encryption in Step 4 uses the
+    // same value to seal the entries.
+    const uint32_t table_xor_key = opts.use_imagebase_key
+        ? rng.next_u32()
+        : (rng.next_u32() | 1);  // legacy path wants non-zero
+
     if (opts.use_imagebase_key) {
-        // Save rax to a VM slot temporarily. We use the junk slot's low byte
-        // area [rsp + rolling_key_disp] — wait, that's the rolling-key byte.
-        // Simpler: we don't need to save rax here, because the NEXT thing
-        // that runs after this is the inline entry tail dispatch, which
-        // loads rax fresh from the bytecode. Clobbering rax is free.
-        //
         //   65 48 8B 04 25 60 00 00 00   mov rax, gs:[0x60]    ; PEB
         //   48 8B 40 10                  mov rax, [rax + 0x10] ; ImageBase
-        //   35 <imm32>                   xor eax, salt          ; key = IB ^ salt
+        //   <MBA chain>                  transforms eax from IB_low32
+        //                                to table_xor_key via random ops
         //   89 44 24 <disp8>             mov [rsp + key_disp], eax
+        //
+        // The MOV [rax+0x10] is a 64-bit load — upper 32 of rax hold
+        // ImageBase_high32. The MBA chain emits 32-bit ops (81 /0 etc.)
+        // which zero-extend into rax, so the subsequent 32-bit store of
+        // eax saves only table_xor_key. Upper half of rax is discarded.
         rt.u8(0x65); rt.u8(0x48); rt.u8(0x8B); rt.u8(0x04); rt.u8(0x25);
         rt.u8(0x60); rt.u8(0x00); rt.u8(0x00); rt.u8(0x00);
         rt.u8(0x48); rt.u8(0x8B); rt.u8(0x40); rt.u8(0x10);
-        rt.u8(0x35);
-        rt.u32(imagebase_salt);
+
+        // Generate the IB_low32 → table_xor_key chain. state_preserved=true
+        // because rax already holds the source value (upper 32 of rax are
+        // discarded by the 32-bit ops).
+        const uint32_t ib_low32 =
+            static_cast<uint32_t>(opts.preferred_image_base & 0xFFFFFFFFULL);
+        MbaTransitionGenerator mba_gen(Architecture::x64);
+        auto chain = mba_gen.generate(
+            ib_low32, table_xor_key, x86::Reg::rax, rng,
+            /*state_preserved=*/true);
+        rt.bytes(ByteView{chain.data(), chain.size()});
+
         // mov [rsp + disp8], eax    89 44 24 disp8  (reg=eax=0, SIB=rsp)
         rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
         rt.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
@@ -2002,30 +2027,13 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         patch_rel32(rt.buf, p.rel32_offset, p.instruction_end, handler_table_offset);
     }
 
-    // Handler-table encryption key. Two modes:
-    //   1. Static (legacy): a per-build random u32 baked into every tail
-    //      dispatch site via `xor eax, imm32`. Simple, but every dispatch
-    //      exposes the key as a literal.
-    //   2. Runtime (ImageBase-derived): the key is computed at entry as
-    //      `preferred_image_base_low32 ^ imagebase_salt`. At runtime the
-    //      entry stub reads ImageBase from PEB.ImageBaseAddress, XORs with
-    //      the salt, and stores the result in a VM context slot. Dispatch
-    //      sites then `xor eax, [rsp + disp8]` — no literal key anywhere.
-    //      Requires ASLR to be disabled on the output binary (otherwise
-    //      runtime ImageBase would differ from the preferred base).
-    uint32_t table_xor_key;
-    if (opts.use_imagebase_key) {
-        const uint32_t ib_low32 =
-            static_cast<uint32_t>(opts.preferred_image_base & 0xFFFFFFFFULL);
-        table_xor_key = ib_low32 ^ imagebase_salt;
-        // No imm32 placeholders to patch — tail dispatches already emit
-        // memory-load form. table_key_patches should be empty.
-    } else {
-        table_xor_key = rng.next_u32() | 1;  // non-zero
-        // Patch all imm32 TABLE_KEY placeholders in tail dispatches.
-        for (const auto patch_off : table_key_patches) {
-            std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
-        }
+    // `table_xor_key` was fixed up-front (before the entry stub was emitted)
+    // so the MBA chain could consume it as its target value. Here we only
+    // need to patch the legacy `xor eax, imm32` placeholders in tail
+    // dispatches — the ImageBase path leaves `table_key_patches` empty
+    // because its dispatches use the memory-load form.
+    for (const auto patch_off : table_key_patches) {
+        std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
     }
 
     // handler_table entries: each = (handler_offset - table_offset) ^ table_xor_key

@@ -130,8 +130,15 @@ ByteBuffer MbaTransitionGenerator::generate(
     Randomizer& rng,
     bool state_preserved)
 {
-    current_state = sanitize_state_id(current_state);
-    next_state = sanitize_state_id(next_state);
+    // Note: we used to `sanitize_state_id` both inputs here, which strips the
+    // top bit for signed-CMP compatibility in the CFG dispatcher. That is a
+    // CFG-specific concern; the MBA chain itself works on any 32-bit value.
+    // Callers that need sanitization do it before passing values in
+    // (CfgFlatteningPass already does). Removing the internal sanitize lets
+    // other callers — notably the VM entry stub's ImageBase-derived key
+    // path — use the generator for arbitrary 32-bit (value → value)
+    // transforms without losing the high bit of things like
+    // ImageBase_low32 == 0x80000000 for DLLs at 0x180000000.
 
     // Forward synthesis: state_reg already holds current_state at entry
     // (if state_preserved == true). Generate chain_len-1 random ops accumulating
