@@ -381,8 +381,9 @@ struct TailDispatchPatch {
 /// Emits the tail dispatch stub. Caller must collect the returned patch and
 /// fix it up to point at the handler_table once the table offset is known.
 TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
-                                     bool rolling = true,
-                                     bool save_rflags = false) {
+                                     bool rolling,
+                                     bool save_rflags,
+                                     std::vector<size_t>& table_key_patches) {
     // Optionally save CPU rflags into the VM context BEFORE clobbering them
     // with the fetch logic (movzx/xor). This is the single collection point
     // for flag preservation — every handler's body has just finished, and the
@@ -408,8 +409,16 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     const auto patch_off = emit_lea_rcx_rip_rel32(e);
     const auto patch_end = e.size();
 
-    // movsxd rax, dword [rcx + rax*4]   48 63 04 81
-    e.u8(0x48); e.u8(0x63); e.u8(0x04); e.u8(0x81);
+    // Load encrypted 32-bit table entry (zero-extended, NOT sign-extended):
+    //   mov eax, dword [rcx + rax*4]       8B 04 81
+    e.u8(0x8B); e.u8(0x04); e.u8(0x81);
+    // xor eax, TABLE_KEY  — decrypt table entry (IDA can't resolve this)
+    //   35 imm32
+    e.u8(0x35);
+    table_key_patches.push_back(e.size());
+    e.u32(0);  // placeholder, patched with table_xor_key later
+    // movsxd rax, eax  — sign-extend AFTER decryption    48 63 C0
+    e.u8(0x48); e.u8(0x63); e.u8(0xC0);
     // add rcx, rax                       48 01 C1
     e.u8(0x48); e.u8(0x01); e.u8(0xC1);
     // jmp rcx                            FF E1
@@ -1012,9 +1021,14 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const size_t entry_bc_patch = emit_lea_r11_rip_rel32(rt);
     const size_t entry_bc_patch_end = rt.size();
 
+    // Collection of positions where TABLE_XOR_KEY must be patched into the
+    // `xor eax, KEY` instructions inside each tail dispatch.
+    std::vector<size_t> table_key_patches;
+
     // Inline first dispatch (same shape as handler tails): fetch opcode,
-    // decrypt, update key, look up handler via table, jump.
-    const auto entry_tail = emit_tail_dispatch(rt, kRollingKeyDisp, rolling);
+    // decrypt, update key, look up handler via encrypted table, jump.
+    const auto entry_tail = emit_tail_dispatch(rt, kRollingKeyDisp, rolling,
+                                                false, table_key_patches);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
     // ---- Handler emission ----------------------------------------------------
@@ -1028,7 +1042,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     auto end_handler_tail = [&]() {
         const auto p = emit_tail_dispatch(rt, kRollingKeyDisp, rolling,
-                                          has_branches);
+                                          has_branches, table_key_patches);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
     };
 
@@ -1247,16 +1261,28 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         patch_rel32(rt.buf, p.rel32_offset, p.instruction_end, handler_table_offset);
     }
 
-    // handler_table entries: each = handler_offset - table_offset (int32 LE)
+    // Per-build table encryption key. Each table entry is XOR'd with this so
+    // the table in memory looks like random noise. The `xor eax, KEY` in every
+    // tail dispatch decrypts on the fly. IDA cannot statically resolve the
+    // indirect jump through the encrypted table.
+    const uint32_t table_xor_key = rng.next_u32() | 1; // non-zero
+
+    // Patch all TABLE_KEY placeholders in tail dispatches.
+    for (const auto patch_off : table_key_patches) {
+        std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
+    }
+
+    // handler_table entries: each = (handler_offset - table_offset) ^ table_xor_key
     for (uint32_t h = 0; h < total_handlers; ++h) {
         if (handler_offset_by_id[h] == SIZE_MAX) {
             return std::unexpected(MxError(
                 ProtectionErrorCode::vm_translation_error,
                 std::format("VmRuntimeGenerator: handler id {} not emitted", h)));
         }
-        const auto rel = static_cast<int32_t>(
+        auto rel = static_cast<int32_t>(
             static_cast<int64_t>(handler_offset_by_id[h]) -
             static_cast<int64_t>(handler_table_offset));
+        rel ^= static_cast<int32_t>(table_xor_key); // encrypt
         std::memcpy(rt.buf.data() + handler_table_offset + h * 4, &rel, 4);
     }
 
