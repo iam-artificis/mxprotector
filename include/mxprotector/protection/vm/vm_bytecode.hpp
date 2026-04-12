@@ -52,6 +52,13 @@ enum class VmOp : uint8_t {
     rol_ri,       ///< rol vm[dst], imm8              operands: [dst,count]
     ror_ri,       ///< ror vm[dst], imm8              operands: [dst,count]
 
+    // Virtual control-flow — VM branches within its own bytecode stream.
+    // Operand is a signed 4-byte offset relative to the byte AFTER the operand
+    // (i.e., the next opcode position), plus a 1-byte key-checkpoint that
+    // reseeds the rolling key at the target so branch paths converge correctly.
+    vjmp,         ///< unconditional bytecode jump   operands: [rel32, key_ckpt]
+    vjcc,         ///< conditional bytecode jump     operands: [cc, rel32, key_ckpt]
+
     native,       ///< execute inlined native bytes   no operand bytes (handler is specialized)
     exit,         ///< restore ctx & return           no operand bytes
 
@@ -96,6 +103,12 @@ constexpr uint32_t kVmOpCount = static_cast<uint32_t>(VmOp::count_);
         case VmOp::ror_ri:
             return 2;
 
+        case VmOp::vjmp:
+            return 4 + 1;       // rel32 + key checkpoint
+
+        case VmOp::vjcc:
+            return 1 + 4 + 1;   // cc_byte + rel32 + key checkpoint
+
         case VmOp::native:
         case VmOp::exit:
             return 0;
@@ -118,6 +131,10 @@ struct VmInstruction {
     uint64_t imm64 = 0;           ///< 64-бит immediate
     ByteBuffer native_bytes;      ///< для VmOp::native — сырые байты x64 инструкции
     Va       original_va = 0;     ///< для диагностики
+
+    // Virtual control-flow (vjmp / vjcc)
+    uint8_t  branch_cc = 0;       ///< x86 condition code for vjcc (0x0..0xF)
+    uint32_t branch_target_insn = 0; ///< index into VmInstruction array (resolved by lifter)
 };
 
 /**

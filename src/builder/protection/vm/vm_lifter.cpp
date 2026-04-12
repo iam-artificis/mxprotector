@@ -281,12 +281,79 @@ VmLifter::lift(ByteView code, Va base_va)
             "VmLifter: пустой регион"));
     }
 
-    for (const auto& insn : insns) {
+    // Build a VA → index map for two-pass branch resolution.
+    const Va region_end_va = base_va + code.size();
+    std::unordered_map<Va, uint32_t> va_to_insn_index;
+    for (size_t i = 0; i < insns.size(); ++i) {
+        va_to_insn_index[insns[i].address()] = static_cast<uint32_t>(i);
+    }
+
+    for (size_t ii = 0; ii < insns.size(); ++ii) {
+        const auto& insn = insns[ii];
         ++report.total_insns;
         report.total_bytes += insn.length();
 
-        // Блокирующие конструкции — отказ от лифтинга всего региона
-        if (insn.is_branch() || insn.is_call() || insn.is_return()) {
+        // ----------------------------------------------------------------
+        // Intra-region branches → lift to vjmp / vjcc
+        // ----------------------------------------------------------------
+        if (insn.is_branch() && !insn.is_call() && !insn.is_return()) {
+            // Only accept relative branches whose target is within the
+            // marked region. Absolute or external branches are rejected.
+            if (insn.branch_targets().empty()) {
+                return std::unexpected(MxError(
+                    ProtectionErrorCode::vm_translation_error,
+                    std::format(
+                        "VmLifter: неразрешённая ветка '{}' по VA 0x{:016X}",
+                        insn.to_string(), insn.address())));
+            }
+
+            const Va target_va = insn.branch_targets().front();
+            if (target_va < base_va || target_va >= region_end_va) {
+                return std::unexpected(MxError(
+                    ProtectionErrorCode::vm_translation_error,
+                    std::format(
+                        "VmLifter: ветка '{}' уходит за пределы региона (target 0x{:016X})",
+                        insn.to_string(), target_va)));
+            }
+
+            auto it = va_to_insn_index.find(target_va);
+            if (it == va_to_insn_index.end()) {
+                return std::unexpected(MxError(
+                    ProtectionErrorCode::vm_translation_error,
+                    std::format(
+                        "VmLifter: target 0x{:016X} не совпадает с границей инструкции",
+                        target_va)));
+            }
+
+            VmInstruction vi;
+            vi.original_va = insn.address();
+            vi.branch_target_insn = it->second;
+
+            if (insn.is_unconditional_jump()) {
+                vi.op = VmOp::vjmp;
+            } else {
+                vi.op = VmOp::vjcc;
+                // Extract x86 condition code from the raw bytes.
+                const auto raw = insn.raw_bytes();
+                if (raw.size() >= 2 && raw[0] == 0x0F && (raw[1] & 0xF0) == 0x80) {
+                    vi.branch_cc = raw[1] & 0x0F;
+                } else if (raw.size() >= 1 && (raw[0] & 0xF0) == 0x70) {
+                    vi.branch_cc = raw[0] & 0x0F;
+                } else {
+                    return std::unexpected(MxError(
+                        ProtectionErrorCode::vm_translation_error,
+                        std::format("VmLifter: не удалось извлечь CC из '{}'", insn.to_string())));
+                }
+            }
+
+            out.push_back(std::move(vi));
+            continue;
+        }
+
+        // ----------------------------------------------------------------
+        // Remaining blocking constructions
+        // ----------------------------------------------------------------
+        if (insn.is_call() || insn.is_return()) {
             return std::unexpected(MxError(
                 ProtectionErrorCode::vm_translation_error,
                 std::format(
