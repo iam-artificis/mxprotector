@@ -278,6 +278,25 @@ size_t emit_lea_rcx_rip_rel32(RawEmitter& e) {
     return patch;
 }
 
+/// Emit `lea <reg>, [rip + rel32]` for any reg index 0..15. Returns the
+/// file offset of the rel32 placeholder so the caller can patch it.
+///
+///   Encoding: [REX.W|REX.WR] 8D (00 dst 101) rel32
+///   REX is 48 for r0..r7 and 4C for r8..r15.
+///   ModRM reg field is dst & 7.
+///
+/// Used by the tail dispatch to randomize which GPR holds the handler table.
+size_t emit_lea_reg_rip_rel32(RawEmitter& e, uint8_t reg) {
+    const uint8_t rex = (reg >= 8) ? 0x4C : 0x48;
+    e.u8(rex);
+    e.u8(0x8D);
+    // ModRM: mod=00, reg=dst, rm=101 (RIP-relative marker)
+    e.u8(static_cast<uint8_t>(((reg & 0x07) << 3) | 0x05));
+    const auto patch = e.size();
+    e.u32(0);
+    return patch;
+}
+
 void emit_ud2(RawEmitter& e) { e.u8(0x0F); e.u8(0x0B); }
 void emit_ret(RawEmitter& e) { e.u8(0xC3); }
 void emit_pushfq(RawEmitter& e) { e.u8(0x9C); }
@@ -773,10 +792,157 @@ void emit_vflags_to_ecx(RawEmitter& e, VflagsToEcxV variant,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Handler polymorphism: junk prologue + tail dispatch variants.
+// ---------------------------------------------------------------------------
+//
+// Without polymorphism, every handler has the same byte shape at its start
+// and its end: fixed handler body, then a verbatim tail dispatch using `rcx`
+// as the table base and `jmp rcx` as the indirect branch. That's a strong
+// signature — 60+ handlers per build all begin the same way and all end the
+// same way, and YARA / statistical analysis picks them up trivially.
+//
+// Two independent dimensions of polymorphism:
+//
+//   1. Junk prologue: 0–12 bytes of safe no-ops injected at the start of
+//      every handler. Uses the canonical x86 multi-byte NOP forms so the
+//      bytes don't look random — they disassemble as `nop` with varying
+//      ModRM/SIB encoding so IDA sees them as legitimate filler rather
+//      than obfuscation.
+//
+//   2. Tail dispatch variants. All variants compute the same target
+//      address, but:
+//      - pick a different GPR as the table base (13 options minus r11,
+//        which holds the vpc — any other reg is safe because the next
+//        handler reads context from [rsp+slot*8], not from registers)
+//      - pick a different indirect-jump shape: direct `jmp reg` vs
+//        `push reg + ret`, which look completely different at the byte
+//        level and split downstream return-stack prediction in useful ways
+//
+// Each handler picks variants independently at emission time via rng.
+
+/// Emit a random multi-byte NOP of `size` bytes (1–15). Uses Intel's
+/// canonical multi-byte NOP forms which every decoder recognizes as filler.
+void emit_nop_run(RawEmitter& e, uint8_t size) {
+    const auto nop = x86::make_nop(size);
+    for (uint8_t b : nop) e.u8(b);
+}
+
+/// Emit a random junk prologue of 0–max_bytes bytes at the current position.
+/// max_bytes is clamped to 12 so a handler never pays more than ~12 bytes
+/// of alignment padding.
+void emit_junk_prologue(RawEmitter& e, Randomizer& rng, uint32_t max_bytes = 8) {
+    if (max_bytes == 0) return;
+    // Zero-byte prologue is a valid variant (roughly 1/N of handlers).
+    const uint32_t total = rng.next_range(0, max_bytes);
+    uint32_t remaining = total;
+    while (remaining > 0) {
+        // Single NOPs of length 1..9 — Intel documents up to NOP9 in the
+        // optimization manual. Larger NOPs are synthesized from smaller ones.
+        const uint8_t chunk = static_cast<uint8_t>(
+            (remaining > 9) ? 9 : remaining);
+        emit_nop_run(e, chunk);
+        remaining -= chunk;
+    }
+}
+
+/// Which shape the tail dispatch uses for its indirect branch.
+enum class DispatchShape : uint8_t {
+    JmpReg       = 0,   ///< jmp <table_base>               FF E0 + reg
+    PushRegRet   = 1,   ///< push <table_base>; ret         50+r ; C3
+    kCount       = 2
+};
+
+[[nodiscard]] inline DispatchShape pick_dispatch_shape(Randomizer& rng) {
+    return static_cast<DispatchShape>(rng.next_range(0,
+        static_cast<uint32_t>(DispatchShape::kCount) - 1));
+}
+
+/// Pick a GPR to use as the table base in the tail dispatch.
+///
+/// Valid candidates are every GPR except:
+///   - rax (0) — already holds the decrypted opcode index
+///   - r11 (11) — holds the live vpc, must not be clobbered
+///
+/// All other regs are safe: the next handler reloads its operands from the
+/// VM context slots on the stack, and the saved reg values live in those
+/// slots independently of the current CPU register contents. On exit, every
+/// slot is popped back into its native register, overwriting whatever the
+/// tail dispatch left behind.
+[[nodiscard]] inline uint8_t pick_table_base_reg(Randomizer& rng) {
+    static constexpr uint8_t candidates[] = {
+        1,   // rcx
+        2,   // rdx
+        3,   // rbx
+        6,   // rsi
+        7,   // rdi
+        8,   // r8
+        9,   // r9
+        10,  // r10
+        12,  // r12
+        13,  // r13
+        14,  // r14
+        15,  // r15
+    };
+    const uint32_t idx = rng.next_range(0,
+        static_cast<uint32_t>(std::size(candidates)) - 1);
+    return candidates[idx];
+}
+
+/// Emit `mov eax, dword [base + rax*4]` for any GPR `base` (0..15).
+///
+///   Encoding: [REX.B] 8B mod_reg_rm SIB [disp8]
+///   ModRM: reg=000 (eax), rm=100 (SIB follows).
+///   SIB:   scale=10 (x4), index=000 (rax), base=base_low.
+///
+/// Quirk: when (base & 7) == 5 — i.e. rbp or r13 — using mod=00 makes the
+/// x86-64 decoder treat the SIB base field as "disp32 only, no base". To
+/// actually use that register as a base, the instruction must carry a
+/// displacement, so we force mod=01 with disp8=0. Adds 1 byte but decodes
+/// as `[r13 + rax*4 + 0]`, which is semantically identical to the desired
+/// `[r13 + rax*4]`.
+void emit_mov_eax_from_base_rax4(RawEmitter& e, uint8_t base) {
+    if (base >= 8) e.u8(0x41);          // REX.B for r8..r15
+    e.u8(0x8B);                          // MOV r32, r/m32
+    const uint8_t base_low = base & 0x07;
+    const uint8_t sib = static_cast<uint8_t>(0x80 | base_low); // scale=x4 index=rax
+    if (base_low == 5) {
+        // mod=01, reg=000, rm=100 (SIB) → 0x44   + SIB + disp8=0
+        e.u8(0x44);
+        e.u8(sib);
+        e.u8(0x00);
+    } else {
+        // mod=00, reg=000, rm=100 (SIB) → 0x04   + SIB
+        e.u8(0x04);
+        e.u8(sib);
+    }
+}
+
+/// Emit `add <base>, rax` for any GPR base (0..15).
+///   Encoding: REX.W[|REX.B] 01 C0|C_rb  — ADD r/m64, r64 (reg=rax, rm=base)
+void emit_add_base_rax(RawEmitter& e, uint8_t base) {
+    const uint8_t rex = 0x48 | ((base >= 8) ? 0x01 : 0x00);
+    e.u8(rex);
+    e.u8(0x01);
+    // ModRM: mod=11 reg=000 (rax) rm=base_low
+    e.u8(static_cast<uint8_t>(0xC0 | (base & 0x07)));
+}
+
+/// Emit `jmp <reg>` for any GPR 0..15.    [REX.B] FF E0+reg_low
+void emit_jmp_reg(RawEmitter& e, uint8_t reg) {
+    if (reg >= 8) e.u8(0x41);
+    e.u8(0xFF);
+    e.u8(static_cast<uint8_t>(0xE0 | (reg & 0x07)));
+}
+
 /// Emits the tail dispatch stub. Caller must collect the returned patch and
 /// fix it up to point at the handler_table once the table offset is known.
-/// When `save_rflags` is set, a randomly-chosen vEFLAGS store variant is
-/// emitted at the top so each tail dispatch has a different byte shape.
+///
+/// Polymorphism:
+///   - If `save_rflags` is set, a random vEFLAGS store variant is emitted.
+///   - The table-base register is picked randomly each call (13 options).
+///   - The indirect-branch shape is picked randomly (direct `jmp reg` or
+///     `push reg; ret`).
 TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      bool rolling,
                                      bool save_rflags,
@@ -801,24 +967,48 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     }
     emit_inc_r11(e);
 
-    // lea rcx, [rip + rel32]       — rel32 patched to point at handler_table
-    const auto patch_off = emit_lea_rcx_rip_rel32(e);
+    // Pick polymorphism variants. When rng is null (deprecated callers that
+    // predate polymorphism) fall back to the original rcx+jmp shape.
+    const uint8_t       base_reg = (rng != nullptr) ? pick_table_base_reg(*rng) : 1;
+    const DispatchShape shape    = (rng != nullptr) ? pick_dispatch_shape(*rng)
+                                                     : DispatchShape::JmpReg;
+
+    // lea <base>, [rip + rel32]  — rel32 patched to point at the handler_table
+    const auto patch_off = emit_lea_reg_rip_rel32(e, base_reg);
     const auto patch_end = e.size();
 
-    // Load encrypted 32-bit table entry (zero-extended, NOT sign-extended):
-    //   mov eax, dword [rcx + rax*4]       8B 04 81
-    e.u8(0x8B); e.u8(0x04); e.u8(0x81);
-    // xor eax, TABLE_KEY  — decrypt table entry (IDA can't resolve this)
+    // mov eax, dword [base + rax*4]    — zero-extends the 32-bit table entry
+    emit_mov_eax_from_base_rax4(e, base_reg);
+
+    // xor eax, TABLE_KEY     — decrypt (IDA can't statically resolve)
     //   35 imm32
     e.u8(0x35);
     table_key_patches.push_back(e.size());
     e.u32(0);  // placeholder, patched with table_xor_key later
-    // movsxd rax, eax  — sign-extend AFTER decryption    48 63 C0
+
+    // movsxd rax, eax   — sign-extend AFTER decryption    48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
-    // add rcx, rax                       48 01 C1
-    e.u8(0x48); e.u8(0x01); e.u8(0xC1);
-    // jmp rcx                            FF E1
-    e.u8(0xFF); e.u8(0xE1);
+
+    // add <base>, rax
+    emit_add_base_rax(e, base_reg);
+
+    // Indirect branch — polymorphic shape.
+    switch (shape) {
+        case DispatchShape::JmpReg:
+            emit_jmp_reg(e, base_reg);
+            break;
+        case DispatchShape::PushRegRet:
+            // push <base>; ret
+            //   push rcx/rdx/... is a 1-byte 50+r form (or 2-byte with REX.B
+            //   for r8..r15). ret is C3. Net rsp change is zero: push does
+            //   -8, ret does +8. The target handler starts with rsp back at
+            //   slot-base.
+            emit_push_reg(e, base_reg);
+            e.u8(0xC3);
+            break;
+        case DispatchShape::kCount:
+            break;
+    }
 
     return {patch_off, patch_end};
 }
@@ -1458,10 +1648,11 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     // Inline first dispatch (same shape as handler tails): fetch opcode,
     // decrypt, update key, look up handler via encrypted table, jump.
-    // save_rflags=false here so no vflags store variant is picked (no rng needed).
+    // Polymorphism on: entry is a prime signature target, so it gets a
+    // random table-base reg and dispatch shape just like handler tails.
     const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                 false, table_key_patches,
-                                                vflags_key, vflags_rol, nullptr);
+                                                vflags_key, vflags_rol, &rng);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
     // ---- Handler emission ----------------------------------------------------
@@ -1469,8 +1660,14 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // handler_table at the end.
     std::vector<size_t> handler_offset_by_id(total_handlers, SIZE_MAX);
 
+    // Records the entry offset for a handler and then emits a random junk
+    // prologue of 0–8 bytes. The offset is captured BEFORE the junk so the
+    // handler_table entry points at the start of the junk — execution still
+    // falls through into the real body after the no-ops, and the junk bytes
+    // break signature-matching on the handler prologue.
     auto begin_handler = [&](uint8_t handler_id) {
         handler_offset_by_id[handler_id] = rt.size();
+        emit_junk_prologue(rt, rng, /*max_bytes=*/8);
     };
 
     auto end_handler_tail = [&]() {
@@ -1695,11 +1892,12 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         // lea rsp, [rsp + 24]    48 8D 64 24 18  (flags-preserving)
         rt.u8(0x48); rt.u8(0x8D); rt.u8(0x64); rt.u8(0x24); rt.u8(0x18);
 
-        // save_rflags=false: native handler already saved flags above
+        // save_rflags=false: native handler already saved flags above.
+        // Polymorphism on (same as handler tails).
         {
             const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,
-                                              vflags_key, vflags_rol, nullptr);
+                                              vflags_key, vflags_rol, &rng);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
     }
