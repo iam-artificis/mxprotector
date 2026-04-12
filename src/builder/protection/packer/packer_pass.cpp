@@ -79,11 +79,30 @@ constexpr uint32_t kKeySize = 256;
 /// byte counter, which would require detecting that the shift is present.
 constexpr uint32_t kStubCodeSize = 66;
 
+/// A single section the packer stub decrypts at runtime.
+///
+/// For each target section, the stub receives a (rva, size) pair and runs
+/// a standalone XOR loop over that range. The key pointer (`rsi`) is set
+/// once before the first loop; the key index (`dl`) wraps at 256 and is
+/// simply carried from one section to the next, so each section uses a
+/// unique slice of the key stream — good enough against known-plaintext
+/// since one section won't reveal another's offset without guessing the
+/// dl value at the section boundary.
+struct DecryptSection {
+    Rva      rva;            ///< RVA of the section to decrypt
+    uint32_t size;           ///< Size in bytes
+    uint32_t patch_lea_at;   ///< Stub-relative offset of the rel32 inside `lea rdi, [rip+rel]`
+    uint32_t patch_size_at;  ///< Stub-relative offset of the `mov ecx, imm32` immediate
+};
+
 struct StubPatches {
-    uint32_t rel_to_text_at;       ///< patch offset inside stub (rel32 from end-of-lea to .text)
+    // Per-section patch sites (see DecryptSection above). Populated in
+    // stub-emission order; the caller patches each one to its section RVA
+    // and byte count.
+    std::vector<DecryptSection> sections;
+
     uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded key)
     uint32_t rel_to_oep_at;        ///< patch offset (rel32 from end-of-jmp to OEP + stolen_size)
-    uint32_t text_size_at;         ///< patch offset of the `mov ecx, imm32` immediate
     uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
     uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
     uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
@@ -185,18 +204,41 @@ struct StolenPlan {
 }
 
 /// Build the stub code bytes (without patching rel32s yet) and report where
-/// the placeholders need to be filled in. Per-build polymorphism:
+/// the placeholders need to be filled in. The stub protects N sections:
 ///
-///   - The order of the 5 push (and mirrored pops) is randomised, so no two
-///     builds save registers in the same shape.
-///   - The order of the three setup instructions (lea rdi, lea rsi, mov ecx)
-///     is randomised — they are independent so any order is correct.
+///   1. Save 5 registers (randomised push order).
+///   2. Anti-debug: read PEB.BeingDebugged into dl (key-stream index). In a
+///      non-debugged process this is 0; under a debugger it becomes 1, so
+///      every byte of every decrypt loop is XOR'd with the wrong key byte
+///      and the decrypted program is silently garbage — no explicit branch
+///      that the reverser can NOP out.
+///   3. Load the 256-byte key pointer into rsi (shared across all sections).
+///   4. For each section to protect, emit:
+///        lea rdi, [rip + section_rel32]
+///        mov ecx, section_size
+///       .loop:
+///          mov al, [rdi]
+///          xor al, [rsi + rdx*1]
+///          mov [rdi], al
+///          inc rdi
+///          inc dl            ; key index wraps at 256
+///          dec ecx
+///          jnz .loop
+///      The `dl` counter is carried across sections so each one uses a
+///      different slice of the key stream — one section's recovered key
+///      doesn't trivially reveal another's offset.
+///   5. IAT destruction: zero the Import Directory region so dumped binaries
+///      lose their resolved import table.
+///   6. Restore registers (mirror of the push order).
+///   7. Execute the stolen OEP bytes inline.
+///   8. jmp rel32 → OEP + stolen_size.
 [[nodiscard]] std::pair<ByteBuffer, StubPatches> build_stub_bytes(
     Randomizer& rng,
-    ByteView stolen_bytes)
+    ByteView stolen_bytes,
+    uint32_t section_count)
 {
     ByteBuffer buf;
-    buf.reserve(128 + stolen_bytes.size() + kKeySize);
+    buf.reserve(128 + 32 * section_count + stolen_bytes.size() + kKeySize);
 
     auto u8 = [&](uint8_t v) { buf.push_back(v); };
     auto u32 = [&](uint32_t v) {
@@ -206,88 +248,76 @@ struct StolenPlan {
         buf.push_back(static_cast<uint8_t>(v >> 24));
     };
 
-    // Randomised push/pop register order. The same permutation is used for
-    // pushes (top-down) and pops (reverse) so the stack is balanced.
+    // (1) Randomised push/pop register order. Same permutation used for
+    //     pushes (top-down) and pops (reversed) so the stack is balanced.
     std::array<uint8_t, 5> save_order{0x50 /*rax*/, 0x51 /*rcx*/, 0x52 /*rdx*/,
                                        0x56 /*rsi*/, 0x57 /*rdi*/};
     std::shuffle(save_order.begin(), save_order.end(), rng.engine());
-
     for (uint8_t op : save_order) u8(op);
 
     StubPatches patches{};
+    patches.sections.reserve(section_count);
 
-    // Anti-debug: read PEB.BeingDebugged into rdx. Normally 0, a debugger
-    // sets it to 1 — in that case our initial key-stream index becomes 1
-    // and the whole decrypted stream is off by one byte, silently corrupting
-    // the program. No explicit jump to patch.
-    //
-    //   mov rax, gs:[0x60]         ; 65 48 8B 04 25 60 00 00 00
-    //   movzx eax, byte [rax+2]    ; 0F B6 40 02
-    //   mov edx, eax                ; 89 C2
+    // (2) Anti-debug: read PEB.BeingDebugged into edx.
+    //   mov rax, gs:[0x60]         65 48 8B 04 25 60 00 00 00
+    //   movzx eax, byte [rax+2]    0F B6 40 02
+    //   mov edx, eax               89 C2
     u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
     u8(0x60); u8(0x00); u8(0x00); u8(0x00);
     u8(0x0F); u8(0xB6); u8(0x40); u8(0x02);
     u8(0x89); u8(0xC2);
 
-    // Randomised setup ordering. The three gadgets all write independent
-    // registers (rdi, rsi, rcx) so any permutation is valid.
-    enum Gadget : uint8_t { lea_rdi = 0, lea_rsi = 1, mov_ecx = 2 };
-    std::array<Gadget, 3> gadgets{lea_rdi, lea_rsi, mov_ecx};
-    std::shuffle(gadgets.begin(), gadgets.end(), rng.engine());
+    // (3) lea rsi, [rip + key_rel32]   — load key pointer, shared by all loops.
+    u8(0x48); u8(0x8D); u8(0x35);
+    patches.rel_to_key_at = static_cast<uint32_t>(buf.size());
+    u32(0);
 
-    for (Gadget g : gadgets) {
-        switch (g) {
-            case lea_rdi:
-                u8(0x48); u8(0x8D); u8(0x3D);
-                patches.rel_to_text_at = static_cast<uint32_t>(buf.size());
-                u32(0);
-                break;
-            case lea_rsi:
-                u8(0x48); u8(0x8D); u8(0x35);
-                patches.rel_to_key_at = static_cast<uint32_t>(buf.size());
-                u32(0);
-                break;
-            case mov_ecx:
-                u8(0xB9);
-                patches.text_size_at = static_cast<uint32_t>(buf.size());
-                u32(0);
-                break;
-        }
+    // (4) Per-section decrypt loop. dl (key index) is carried across iterations.
+    for (uint32_t s = 0; s < section_count; ++s) {
+        DecryptSection ds{};
+
+        //   lea rdi, [rip + section_rel32]    48 8D 3D rel32
+        u8(0x48); u8(0x8D); u8(0x3D);
+        ds.patch_lea_at = static_cast<uint32_t>(buf.size());
+        u32(0);
+
+        //   mov ecx, imm32                    B9 imm32
+        u8(0xB9);
+        ds.patch_size_at = static_cast<uint32_t>(buf.size());
+        u32(0);
+
+        patches.sections.push_back(ds);
+
+        const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
+
+        //   mov al, [rdi]           8A 07
+        u8(0x8A); u8(0x07);
+        //   xor al, [rsi + rdx*1]   32 04 16
+        u8(0x32); u8(0x04); u8(0x16);
+        //   mov [rdi], al           88 07
+        u8(0x88); u8(0x07);
+        //   inc rdi                 48 FF C7
+        u8(0x48); u8(0xFF); u8(0xC7);
+        //   inc dl                  FE C2
+        u8(0xFE); u8(0xC2);
+        //   dec ecx                 FF C9   (32-bit form — upper 32 of rcx irrelevant)
+        u8(0xFF); u8(0xC9);
+        //   jnz .loop (rel8)
+        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+        const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
+                                 static_cast<int32_t>(jnz_end);
+        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
     }
 
-    // .loop: (target of jnz at bottom)
-    const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
-
-    //   mov al, [rdi]                       8A 07
-    u8(0x8A); u8(0x07);
-    //   xor al, [rsi + rdx*1]               32 04 16
-    u8(0x32); u8(0x04); u8(0x16);
-    //   mov [rdi], al                       88 07
-    u8(0x88); u8(0x07);
-    //   inc rdi                             48 FF C7
-    u8(0x48); u8(0xFF); u8(0xC7);
-    //   inc dl  — wraps at 256 (exactly the key length)    FE C2
-    u8(0xFE); u8(0xC2);
-    //   dec rcx                             48 FF C9
-    u8(0x48); u8(0xFF); u8(0xC9);
-    //   jnz .loop   (rel8 to loop_body_start)
-    const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-    const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
-                             static_cast<int32_t>(jnz_end);
-    u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-
-    // --- IAT destruction: zero the Import Directory region in memory. ---
+    // (5) IAT destruction: zero the Import Directory region in memory.
     // After decryption, the loader has already resolved all imports into the
     // IAT. Zeroing the Import Directory + ILT makes the resolved addresses
     // un-labelable by dump/reconstruction tools (Scylla, IDA imports tab).
     //
-    //   push rdi; push rcx; push rax       ; save (reuse already-saved regs)
-    //   lea rdi, [rip + import_dir_rel32]  ; rdi = &ImportDirectory in memory
-    //   xor eax, eax                        ; fill value = 0
-    //   mov ecx, import_dir_size / 4        ; dword count
-    //   rep stosd                           ; zero dwords
-    //   pop rax; pop rcx; pop rdi           ; restore
-    u8(0x57); u8(0x51); u8(0x50);            // push rdi, rcx, rax
+    //   lea rdi, [rip + import_dir_rel32]
+    //   xor eax, eax
+    //   mov ecx, import_dir_size / 4
+    //   rep stosd
     u8(0x48); u8(0x8D); u8(0x3D);            // lea rdi, [rip + rel32]
     patches.rel_to_impdir_at = static_cast<uint32_t>(buf.size());
     u32(0);                                   // placeholder rel32
@@ -296,23 +326,18 @@ struct StolenPlan {
     patches.impdir_size_at = static_cast<uint32_t>(buf.size());
     u32(0);                                   // placeholder size/4
     u8(0xF3); u8(0xAB);                       // rep stosd
-    u8(0x58); u8(0x59); u8(0x5F);            // pop rax, rcx, rdi
 
-    // Restore registers in reverse of the saved order (LIFO).
+    // (6) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
         u8(static_cast<uint8_t>(*it + 0x08));
     }
 
-    // Stolen bytes: the first instructions of the original OEP have been
-    // moved here. We execute them inline (rsp is now back to what the OEP
-    // would have seen at entry) before jumping past the gap we punched in
-    // the decrypted .text.
+    // (7) Stolen OEP bytes run inline — rsp is now back to what the OEP
+    //     would have seen at entry. If none were stolen this is empty.
     patches.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
-    if (!stolen_bytes.empty()) {
-        for (auto b : stolen_bytes) u8(b);
-    }
+    for (auto b : stolen_bytes) u8(b);
 
-    // jmp rel32   ; to OEP + stolen_size
+    // (8) jmp rel32 → OEP + stolen_size
     u8(0xE9);
     patches.rel_to_oep_at = static_cast<uint32_t>(buf.size());
     u32(0);
@@ -389,41 +414,38 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         return {};
     }
 
-    // MVP supports a single encrypted section per build (the primary .text).
-    // Additional sections can be wired in later by emitting a section-table
-    // at the head of the stub.
-    const size_t target_idx = target_indices.front();
-    auto& target = ctx.pe_image().sections()[target_idx];
+    // The first target must be the one holding the OEP (only .text qualifies
+    // under current policy). plan_stolen_bytes and the OEP retargeting both
+    // reference it below.
+    const size_t oep_target_idx = target_indices.front();
+    auto& oep_target = ctx.pe_image().sections()[oep_target_idx];
 
-    ctx.log_fmt("PackerPass: шифруется '{}' (RVA=0x{:08X}, {} байт)",
-        target.name, target.virtual_address,
-        static_cast<uint32_t>(target.data.size()));
-
-    // 1. Kill base relocations so the encrypted bytes survive to runtime.
+    // (1) Kill base relocations so the encrypted bytes survive to runtime
+    //     without the Windows loader touching them.
     disable_relocations(ctx.pe_image());
     ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
 
-    // 2. Plan stolen bytes: move the first instructions of OEP into the stub
-    //    (before encryption) so a memory dump of the decrypted .text is
-    //    missing its front. plan_stolen_bytes refuses unsafe sequences; in
-    //    that case we skip stealing and keep the packer semantically
-    //    identical. CALL rel32 sites are carried as relocs and fixed up
-    //    once the stub section gets placed.
+    // (2) Plan stolen bytes: move the first instructions of OEP into the
+    //     stub (before encryption) so a memory dump of the decrypted .text
+    //     is missing its front. plan_stolen_bytes refuses unsafe sequences;
+    //     in that case we skip stealing and keep the packer semantically
+    //     identical. CALL rel32 sites are carried as relocs and fixed up
+    //     once the stub section gets placed.
     const Rva oep_rva_initial = ctx.pe_image().entry_point_rva();
     StolenPlan stolen_plan;
     ByteBuffer stolen_bytes;
-    if (oep_rva_initial >= target.virtual_address &&
-        oep_rva_initial < target.virtual_address + target.virtual_size) {
-        const uint32_t oep_off = oep_rva_initial - target.virtual_address;
+    if (oep_rva_initial >= oep_target.virtual_address &&
+        oep_rva_initial < oep_target.virtual_address + oep_target.virtual_size) {
+        const uint32_t oep_off = oep_rva_initial - oep_target.virtual_address;
         stolen_plan = plan_stolen_bytes(
-            ByteView{target.data.data(), target.data.size()},
+            ByteView{oep_target.data.data(), oep_target.data.size()},
             oep_off, oep_rva_initial);
         if (stolen_plan.size > 0) {
             stolen_bytes.assign(
-                target.data.begin() + oep_off,
-                target.data.begin() + oep_off + stolen_plan.size);
-            std::fill(target.data.begin() + oep_off,
-                      target.data.begin() + oep_off + stolen_plan.size,
+                oep_target.data.begin() + oep_off,
+                oep_target.data.begin() + oep_off + stolen_plan.size);
+            std::fill(oep_target.data.begin() + oep_off,
+                      oep_target.data.begin() + oep_off + stolen_plan.size,
                       static_cast<uint8_t>(0xCC));
             ctx.log_fmt("PackerPass: украдено {} байт OEP (0x{:08X}), {} CALL-fixup",
                 stolen_plan.size, oep_rva_initial,
@@ -441,32 +463,60 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // 3. Generate the per-build random key.
+    // (3) Generate the per-build random 256-byte key.
     Randomizer rng;
     ByteBuffer key(kKeySize);
     for (auto& b : key) b = rng.next_u8();
 
-    // 4. Encrypt the target section in place.
-    const uint32_t text_size = static_cast<uint32_t>(target.data.size());
-    for (uint32_t i = 0; i < text_size; ++i) {
-        target.data[i] ^= key[i % kKeySize];
+    // (4) Encrypt every target section in place. The key index `dl` wraps
+    //     at 256 and is carried across sections — mirrored exactly by the
+    //     stub's decrypt loop. We start at dl=0 (builder isn't debugged);
+    //     at runtime the stub's anti-debug step shifts dl by 1 if PEB
+    //     reports a debugger.
+    struct EncryptedTarget {
+        size_t   image_index;
+        Rva      rva;
+        uint32_t size;
+    };
+    std::vector<EncryptedTarget> encrypted;
+    encrypted.reserve(target_indices.size());
+
+    uint8_t key_index = 0;
+    for (const size_t idx : target_indices) {
+        auto& sec = ctx.pe_image().sections()[idx];
+        const uint32_t sec_size = static_cast<uint32_t>(sec.data.size());
+        if (sec_size == 0) continue;
+
+        for (uint32_t i = 0; i < sec_size; ++i) {
+            sec.data[i] ^= key[key_index];
+            key_index = static_cast<uint8_t>(key_index + 1); // wraps at 256
+        }
+
+        // Allow the stub to decrypt in place.
+        sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+
+        encrypted.push_back({idx, sec.virtual_address, sec_size});
+        ctx.log_fmt("PackerPass: зашифрована '{}' (RVA=0x{:08X}, {} байт)",
+            sec.name, sec.virtual_address, sec_size);
     }
 
-    // Allow the stub to decrypt in place.
-    target.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+    if (encrypted.empty()) {
+        ctx.log("PackerPass: все кандидаты пусты, пропуск");
+        return {};
+    }
 
-    // 5. Build the stub code (now including stolen OEP bytes) + append the
-    //    256-byte key. Size is not fixed because the stub is polymorphic.
+    // (5) Build the stub code (includes stolen OEP bytes) + append the
+    //     256-byte key. Size is not fixed because the stub is polymorphic.
     auto [stub_buf, patches] = build_stub_bytes(
-        rng, ByteView{stolen_bytes.data(), stolen_bytes.size()});
+        rng, ByteView{stolen_bytes.data(), stolen_bytes.size()},
+        static_cast<uint32_t>(encrypted.size()));
     const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), key.begin(), key.end());
 
     // The jmp rel32 lands AFTER the stolen bytes: OEP + stolen_size.
     const Rva oep_rva = oep_rva_initial + stolen_size;
-    const Rva text_rva = target.virtual_address;
 
-    // 5. Add the .mxpack section and figure out its RVA.
+    // (6) Add the .mxpack section and figure out its RVA.
     constexpr uint32_t pack_characteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
@@ -489,21 +539,23 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
         packer_section_name, stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
 
-    // 6. Patch the four rel32 placeholders.
-    //
-    // For each `lea reg, [rip + rel32]` and the final `jmp rel32`, the rel32
-    // is computed from the instruction's END (= patch_offset + 4) to the
-    // target. All offsets below are RVA-relative so we can subtract directly.
+    // (7) Patch all rel32 placeholders. For each `lea reg, [rip + rel32]`
+    //     and each `jmp rel32`, rel32 is computed from the instruction's
+    //     END (= patch_offset + 4) to the target RVA.
 
-    // lea rdi, [rip + rel] → target = .text
-    {
-        const Rva lea_end_rva = stub_rva + patches.rel_to_text_at + 4;
+    // Per-section: lea rdi → section base, mov ecx → section size
+    for (size_t i = 0; i < encrypted.size(); ++i) {
+        const auto& ds  = patches.sections[i];
+        const auto& tgt = encrypted[i];
+
+        const Rva lea_end_rva = stub_rva + ds.patch_lea_at + 4;
         const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(text_rva) - static_cast<int64_t>(lea_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_text_at, rel);
+            static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
+        write_i32(pack_sec.data, ds.patch_lea_at, rel);
+        write_i32(pack_sec.data, ds.patch_size_at, static_cast<int32_t>(tgt.size));
     }
 
-    // lea rsi, [rip + rel] → target = embedded key (inside stub)
+    // lea rsi, [rip + rel] → embedded 256-byte key
     {
         const Rva lea_end_rva = stub_rva + patches.rel_to_key_at + 4;
         const Rva key_rva     = stub_rva + key_offset_in_stub;
@@ -511,9 +563,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
             static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
         write_i32(pack_sec.data, patches.rel_to_key_at, rel);
     }
-
-    // mov ecx, imm32 → text_size
-    write_i32(pack_sec.data, patches.text_size_at, static_cast<int32_t>(text_size));
 
     // jmp rel32 → OEP + stolen_size
     {

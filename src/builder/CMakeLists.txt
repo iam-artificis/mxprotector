@@ -60,17 +60,12 @@ set(BUILDER_SOURCES
     protection/cfg/map_parser.cpp
     protection/cfg/mba_transition_gen.cpp
 
-    # Фаза 3: Шифрование
-    protection/encryption/chacha20_encryptor.cpp
-    protection/encryption/aes_encryptor.cpp
-    protection/encryption/encryption_pass.cpp
-
-    # Фаза 4: Виртуализация (VM engine)
+    # Phase 4: Virtualization (VM engine)
     protection/vm/vm_lifter.cpp
     protection/vm/vm_runtime_gen.cpp
     protection/vm/virtualization_pass.cpp
 
-    # Фаза 5: Self-unpacking packer
+    # Phase 5: Self-unpacking packer (multi-section XOR + anti-debug + IAT wipe)
     protection/packer/packer_pass.cpp
 )
 

@@ -39,30 +39,26 @@ struct ProtectionConfig {
     bool enable_vm              = true;   ///< Виртуализация маркированного кода
     bool enable_mutation        = true;   ///< Мутация инструкций
     bool enable_obfuscation     = true;   ///< Обфускация (opaque predicates, MBA)
-    bool enable_cfg_flattening  = true;   ///< Выравнивание потока управления (CFG flattening)
-    bool enable_anti_debug      = true;   ///< Анти-отладка
+    bool enable_cfg_flattening  = true;   ///< Выравнивание потока управления
+    bool enable_anti_debug      = true;   ///< Анти-отладка (inline в packer stub)
     bool enable_anti_sandbox    = true;   ///< Анти-песочница / анти-VM
-    bool enable_encryption      = true;   ///< Шифрование секций/кода
-    bool enable_packer          = false;  ///< Self-unpacking packer (runs last in pipeline)
+    bool enable_packer          = false;  ///< Self-unpacking packer (multi-section XOR)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)
     bool strip_debug_info       = true;   ///< Удаление отладочной информации
     bool enable_header_erasure  = true;   ///< Стирание PE-заголовков в рантайме (anti-dump)
-    bool prefer_aes             = false;  ///< Предпочитать AES-NI вместо ChaCha20
-    bool debug_section_names    = false;  ///< Use fixed .mxvm/.mxprot1 names instead of randomized
+    bool debug_section_names    = false;  ///< Use fixed .mxvm/.mxprot1/.mxpack names
 
     uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
 
     /**
      * @brief Фабричный метод: создаёт конфигурацию по уровню защиты.
-     * @param level Уровень защиты.
-     * @return ProtectionConfig с предустановленными параметрами.
      *
-     * @details Отображение уровней:
-     *          - minimal:  мутация + шифрование, остальное выключено
-     *          - standard: + обфускация + CFG flattening
-     *          - strong:   + VM + anti-debug + anti-sandbox
-     *          - maximum:  все проходы, VM nesting=2, nanomites, code interleaving
+     * Раскладка уровней:
+     *   - minimal:  только мутация (для быстрой разработки)
+     *   - standard: + обфускация + CFG flattening
+     *   - strong:   + VM + anti-debug + anti-sandbox + packer
+     *   - maximum:  всё вышеперечисленное, VM nesting=2, nanomites, code interleaving
      */
     [[nodiscard]] static ProtectionConfig from_level(ProtectionLevel level) {
         ProtectionConfig cfg;
@@ -76,7 +72,7 @@ struct ProtectionConfig {
                 cfg.enable_cfg_flattening  = false;
                 cfg.enable_anti_debug      = false;
                 cfg.enable_anti_sandbox    = false;
-                cfg.enable_encryption      = true;
+                cfg.enable_packer          = false;
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
@@ -90,7 +86,7 @@ struct ProtectionConfig {
                 cfg.enable_cfg_flattening  = true;
                 cfg.enable_anti_debug      = false;
                 cfg.enable_anti_sandbox    = false;
-                cfg.enable_encryption      = true;
+                cfg.enable_packer          = false;
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
@@ -104,7 +100,7 @@ struct ProtectionConfig {
                 cfg.enable_cfg_flattening  = true;
                 cfg.enable_anti_debug      = true;
                 cfg.enable_anti_sandbox    = true;
-                cfg.enable_encryption      = true;
+                cfg.enable_packer          = true;
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
@@ -118,7 +114,7 @@ struct ProtectionConfig {
                 cfg.enable_cfg_flattening  = true;
                 cfg.enable_anti_debug      = true;
                 cfg.enable_anti_sandbox    = true;
-                cfg.enable_encryption      = true;
+                cfg.enable_packer          = true;
                 cfg.enable_nanomites       = true;
                 cfg.enable_code_interleaving = true;
                 cfg.strip_debug_info       = true;

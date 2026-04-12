@@ -13,9 +13,9 @@
  *          8. Запись выходного файла с именем .mx.ext
  *          9. Вывод итоговой сводки
  *
- * @note Зарегистрированные проходы (Phase 2+3):
- *       MutationPass (100), ObfuscationPass (200), EncryptionPass (600).
- *       Пайплайн: парсинг → маркеры → мутация → обфускация → шифрование → сборка.
+ * @note Пайплайн: MutationPass (100) → ObfuscationPass (200) →
+ *       VirtualizationPass (300) → CfgFlatteningPass (400) →
+ *       PackerPass (800).
  */
 
 #include "cli/cli_handler.hpp"
@@ -34,7 +34,6 @@
 #include "mxprotector/protection/pass_manager.hpp"
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
-#include "mxprotector/protection/encryption/encryption_pass.hpp"
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/vm/virtualization_pass.hpp"
 #include "mxprotector/protection/packer/packer_pass.hpp"
@@ -173,12 +172,11 @@ const std::vector<std::string>& stealth_section_pool() {
 }
 
 /**
- * @brief Generate 4 distinct random section names, or the fixed debug set.
+ * @brief Generate 3 distinct random section names, or the fixed debug set.
  *
- * When `cfg.debug_section_names` is true, returns `.mxvm / .mxprot1 / .mxrt
- * / .mxpack` for easy debugging. Otherwise draws 4 distinct names from the
- * stealth pool so the protected binary doesn't advertise which sections
- * MxProtector added.
+ * When `cfg.debug_section_names` is true, returns `.mxvm / .mxprot1 / .mxpack`
+ * for easy debugging. Otherwise draws 3 distinct names from the stealth pool
+ * so the protected binary doesn't advertise which sections MxProtector added.
  */
 mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
                                            mx::Randomizer& rng)
@@ -187,13 +185,12 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
         return mx::SectionNameMap{
             .vm     = ".mxvm",
             .cff    = ".mxprot1",
-            .mxrt   = ".mxrt",
             .packer = ".mxpack",
         };
     }
 
     auto pool = stealth_section_pool();
-    // Fisher-Yates shuffle so we can just take the first 4.
+    // Fisher-Yates shuffle so we can just take the first 3.
     for (size_t i = pool.size() - 1; i > 0; --i) {
         const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
         std::swap(pool[i], pool[j]);
@@ -201,8 +198,7 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
     return mx::SectionNameMap{
         .vm     = pool[0],
         .cff    = pool[1],
-        .mxrt   = pool[2],
-        .packer = pool[3],
+        .packer = pool[2],
     };
 }
 
@@ -281,8 +277,8 @@ int main(int argc, char** argv) {
         mx::Randomizer name_rng;
         auto names = generate_section_names(ctx.config(), name_rng);
         std::cout << std::format(
-            "[*] Секции: vm='{}' cff='{}' enc='{}' pack='{}'\n",
-            names.vm, names.cff, names.mxrt, names.packer);
+            "[*] Секции: vm='{}' cff='{}' pack='{}'\n",
+            names.vm, names.cff, names.packer);
         ctx.set_section_names(std::move(names));
     }
 
@@ -317,7 +313,6 @@ int main(int argc, char** argv) {
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
     pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());
-    pass_manager.register_pass(std::make_unique<mx::EncryptionPass>());
     pass_manager.register_pass(std::make_unique<mx::PackerPass>());
 
     auto pass_result = pass_manager.execute_all(ctx);

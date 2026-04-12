@@ -38,14 +38,13 @@ namespace mx {
  * Names are generated per-build (randomized or hand-picked via --debug-sections)
  * and stored here so that every pass agrees on what to write and what to look
  * for. Later passes reference these when they need to locate sections added
- * by earlier passes (e.g. PackerPass wants to pack the VM blob and CFF
+ * by earlier passes (e.g. PackerPass needs to encrypt the VM blob and CFF
  * trampolines without hardcoding .mxvm / .mxprot1).
  */
 struct SectionNameMap {
     std::string vm;       ///< Virtualization blob section
-    std::string cff;      ///< CFF trampoline section
-    std::string mxrt;     ///< Encryption decrypt-stub section
-    std::string packer;   ///< Packer stub section
+    std::string cff;      ///< CFG-flattening trampoline section
+    std::string packer;   ///< Self-unpacking stub section
 };
 
 /**

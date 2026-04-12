@@ -97,20 +97,18 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
             continue;
         }
 
-        if (arg == "--no-vm")              { config.enable_vm = false; continue; }
+        if (arg == "--no-vm")               { config.enable_vm = false; continue; }
         if (arg == "--no-mutation")         { config.enable_mutation = false; continue; }
         if (arg == "--no-obfuscation")      { config.enable_obfuscation = false; continue; }
         if (arg == "--no-cfg-flattening")   { config.enable_cfg_flattening = false; continue; }
         if (arg == "--no-anti-debug")       { config.enable_anti_debug = false; continue; }
         if (arg == "--no-anti-sandbox")     { config.enable_anti_sandbox = false; continue; }
-        if (arg == "--no-encryption")       { config.enable_encryption = false; continue; }
         if (arg == "--packer")              { config.enable_packer = true; continue; }
         if (arg == "--no-packer")           { config.enable_packer = false; continue; }
         if (arg == "--no-strip-debug")      { config.strip_debug_info = false; continue; }
         if (arg == "--nanomites")           { config.enable_nanomites = true; continue; }
         if (arg == "--code-interleaving")   { config.enable_code_interleaving = true; continue; }
         if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
-        if (arg == "--prefer-aes")          { config.prefer_aes = true; continue; }
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
 
         if (arg.starts_with("--vm-depth=") && arg.size() > 11) {
@@ -176,9 +174,9 @@ void CliHandler::print_usage() {
         "  -o, --output <путь>         Выходной файл (по умолчанию: file.mx.ext)\n"
         "  -m, --map <путь>            .map файл (MSVC) для точной фильтрации CFF\n"
         "  -l, --level <уровень>       Уровень защиты:\n"
-        "                                minimal  — мутация + шифрование\n"
+        "                                minimal  — только мутация инструкций\n"
         "                                standard — + обфускация + CFG flattening\n"
-        "                                strong   — + VM + анти-анализ\n"
+        "                                strong   — + VM + packer + anti-debug/anti-sandbox\n"
         "                                maximum  — все проходы (по умолчанию: standard)\n"
         "\n"
         "Управление проходами:\n"
@@ -186,15 +184,15 @@ void CliHandler::print_usage() {
         "  --no-mutation               Отключить мутацию инструкций\n"
         "  --no-obfuscation            Отключить обфускацию\n"
         "  --no-cfg-flattening         Отключить CFG flattening\n"
-        "  --no-anti-debug             Отключить анти-отладку\n"
+        "  --no-anti-debug             Отключить анти-отладку в packer stub\n"
         "  --no-anti-sandbox           Отключить анти-песочницу\n"
-        "  --no-encryption             Отключить шифрование\n"
+        "  --packer                    Включить self-unpacking packer\n"
+        "  --no-packer                 Отключить self-unpacking packer\n"
         "  --no-strip-debug            Не удалять отладочную информацию\n"
         "  --nanomites                 Включить наномиты\n"
         "  --code-interleaving         Включить перемешивание кода\n"
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
-        "  --prefer-aes                Предпочитать AES-256-CTR вместо ChaCha20\n"
-        "  --debug-sections            Use fixed section names (.mxvm/.mxprot1)\n"
+        "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
         "\n"
         "Информация:\n"
