@@ -784,7 +784,9 @@ constexpr uint8_t variant_count_for(VmOp op) {
 MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const std::vector<VmInstruction>& instructions,
     Randomizer& rng,
-    bool emit_exit_as_jmp)
+    bool emit_exit_as_jmp,
+    uint32_t shared_vflags_key,
+    bool skip_entry_vflags_scramble)
 {
     if (instructions.empty()) {
         return std::unexpected(MxError(
@@ -794,12 +796,15 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     // ------------------------------------------------------------------------
     // Step 1 — per-build randomization: opcode handler_id permutation, handler
-    // variant assignment, initial rolling key.
+    // variant assignment, initial rolling key, vEFLAGS scramble key.
     // ------------------------------------------------------------------------
     VmOpcodeMap map{};
     do { map.opcode_xor_key = rng.next_u8(); } while (map.opcode_xor_key == 0);
     const uint8_t initial_key = map.opcode_xor_key;
-    const uint32_t vflags_key = 0; // DEBUG fixed
+    // Use shared key if provided (Cross-VM sub-VMs must agree), else generate.
+    const uint32_t vflags_key = (shared_vflags_key != 0)
+        ? shared_vflags_key
+        : (rng.next_u32() & 0x8C5) | 1; // masked to flag bits only
 
     const uint32_t native_count = static_cast<uint32_t>(std::count_if(
         instructions.begin(), instructions.end(),
@@ -1035,8 +1040,10 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     //   mov byte [rsp + 32], initial_key    C6 44 24 20 ib
     rt.u8(0xC6); rt.u8(0x44); rt.u8(0x24); rt.u8(0x20); rt.u8(initial_key);
 
-    // Scramble initial RFLAGS if key is non-zero
-    if (vflags_key != 0) {
+    // Scramble initial RFLAGS if key is non-zero.
+    // For cross-VM second sub-VM: skip — the value is ALREADY scrambled
+    // from the first sub-VM's handlers (popfq loaded scrambled → pushfq stored it).
+    if (vflags_key != 0 && !skip_entry_vflags_scramble) {
         // xor dword [rsp + kRflagsOffset], vflags_key
         rt.u8(0x81); rt.u8(0xB4); rt.u8(0x24);
         rt.u8(0x80); rt.u8(0x00); rt.u8(0x00); rt.u8(0x00);

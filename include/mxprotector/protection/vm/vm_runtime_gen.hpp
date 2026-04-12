@@ -57,13 +57,17 @@ public:
      */
     /**
      * @param emit_exit_as_jmp If true, the exit handler emits `jmp rel32`
-     *        instead of `ret`. Used for Cross-VM: the first sub-VM jumps
-     *        to the second sub-VM's entry instead of returning.
+     *        instead of `ret`. Used for Cross-VM.
+     * @param shared_vflags_key If non-zero, forces this vflags_key instead
+     *        of generating a new one. Cross-VM sub-VMs must share the same
+     *        key so scrambled flags survive the context handoff.
      */
     [[nodiscard]] MxResult<VmRuntime> generate(
         const std::vector<VmInstruction>& instructions,
         Randomizer& rng,
-        bool emit_exit_as_jmp = false);
+        bool emit_exit_as_jmp = false,
+        uint32_t shared_vflags_key = 0,
+        bool skip_entry_vflags_scramble = false);
 
 private:
     /**

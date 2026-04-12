@@ -264,8 +264,11 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
                     }
                 }
 
-                auto rt1 = gen.generate(part1, rng, true);  // exit as JMP
-                auto rt2 = gen.generate(part2, rng, false);  // normal exit
+                // Both sub-VMs must share the same vflags_key so the
+                // scrambled vEFLAGS from VM1 can be read correctly by VM2.
+                const uint32_t shared_vflags = (rng.next_u32() & 0x8C5) | 1; // FIXED
+                auto rt1 = gen.generate(part1, rng, true, shared_vflags, false);
+                auto rt2 = gen.generate(part2, rng, false, shared_vflags, true); // skip entry scramble
 
                 if (rt1 && rt2) {
                     // Merge the two blobs: rt1 followed by rt2, patch the JMP
