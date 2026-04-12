@@ -60,13 +60,21 @@ static uint64_t get_image_base() noexcept {
 }
 
 /**
- * @brief Находит секцию .mxrt в загруженном PE.
+ * @brief Находит runtime-config во всех секциях PE по магическому числу.
  *
  * @param image_base VA базы загрузки.
  * @return Указатель на StubRuntimeConfig или nullptr.
  *
- * @details Итерирует заголовки секций PE, ищет секцию с именем ".mxrt".
- *          Проверяет магическую сигнатуру и версию конфигурации.
+ * @details Раньше секция имела фиксированное имя `.mxrt`, но с введением
+ *          per-build рандомизации имён секций имя непредсказуемо. Вместо
+ *          сравнения имени сканируем все секции и находим ту, у которой
+ *          первые 8 байт совпадают с {MXRT_MAGIC, MXRT_VERSION}. Проверка
+ *          version тоже важна: она отсеивает ложные совпадения внутри
+ *          произвольных блобов (например, зашифрованного `.text`).
+ *
+ *          false-positive риск: коллизия {magic=0x5452584D, version=N} в
+ *          первых 8 байтах другой секции — 1 в 2^64 на секцию, пренебрежимо
+ *          при ≤ десятка секций.
  */
 static const StubRuntimeConfig* find_mxrt_config(uint64_t image_base) noexcept {
     const auto* base = va_to_ptr<uint8_t>(image_base);
@@ -78,16 +86,12 @@ static const StubRuntimeConfig* find_mxrt_config(uint64_t image_base) noexcept {
 
     for (uint16_t i = 0; i < num_sections; ++i) {
         const auto& sec = sections[i];
-
-        if (sec.Name[0] == '.' && sec.Name[1] == 'm' &&
-            sec.Name[2] == 'x' && sec.Name[3] == 'r' &&
-            sec.Name[4] == 't' && sec.Name[5] == '\0')
-        {
-            const auto* config = offset_ptr<StubRuntimeConfig>(base, sec.VirtualAddress);
-
-            if (config->magic == MXRT_MAGIC && config->version == MXRT_VERSION) {
-                return config;
-            }
+        if (sec.VirtualAddress == 0 || sec.Misc.VirtualSize < sizeof(StubRuntimeConfig)) {
+            continue;
+        }
+        const auto* config = offset_ptr<StubRuntimeConfig>(base, sec.VirtualAddress);
+        if (config->magic == MXRT_MAGIC && config->version == MXRT_VERSION) {
+            return config;
         }
     }
 
