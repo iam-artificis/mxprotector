@@ -35,32 +35,34 @@
  *
  * VM stack layout after entry (rsp = caller_rsp - 144):
  *
- *   [rsp +   0] = rolling key byte (lives in the junk push slot)
- *   [rsp +   8] = rax  (vm_reg 0)
- *   [rsp +  16] = rcx  (vm_reg 1)
- *   [rsp +  24] = rdx
- *   [rsp +  32] = rbx
- *   [rsp +  40] = rbp  (rsp/idx 4 is skipped — unused)
- *   [rsp +  48] = rsi
- *   [rsp +  56] = rdi
- *   [rsp +  64] = r8
- *   [rsp +  72] = r9
- *   [rsp +  80] = r10
- *   [rsp +  88] = r11  (the *saved* r11; live vpc is in the physical r11)
- *   [rsp +  96] = r12
- *   [rsp + 104] = r13
- *   [rsp + 112] = r14
- *   [rsp + 120] = r15
+ *   [rsp +   0] = slot 0  \
+ *   [rsp +   8] = slot 1   \
+ *       ...                 > 16 slots total (one is the "junk slot", host
+ *   [rsp + 120] = slot 15  /  of the rolling-key byte; the other 15 hold
+ *                         /   the saved native GPRs in a per-build order).
  *   [rsp + 128] = rflags
  *   [rsp + 136] = CALL return address (back to caller instruction stream)
  *
- * The native-escape handler additionally `sub rsp, 16` to reserve a vpc save
- * slot, then `add rsp, 160` around the raw native bytes so the instruction sees
- * the caller's frame. Context loads/stores during native use [rsp + 16 + offset].
+ * Per-build, `VmRegLayout` randomizes:
+ *   - which slot each native GPR lives in (native_to_slot / slot_to_native)
+ *   - which slot is the junk / rolling-key host (junk_slot)
+ *   - consequently, the rolling-key disp = junk_slot * 8
  *
- * Per-build randomization:
+ * The bytecode operand bytes are remapped at emission time from native-reg
+ * indices (produced by the lifter) to virtual-slot indices, so the handlers
+ * don't need a runtime lookup — they just use `slot * 8` as the offset.
+ *
+ * The native-escape handler additionally `sub rsp, 16` to reserve a vpc save
+ * slot, then `add rsp, 168` around the raw native bytes so the instruction
+ * sees the caller's frame. Context loads/stores during native use
+ * [rsp + 24 + slot*8].
+ *
+ * Per-build randomization summary:
  *   - INITIAL_KEY (non-zero)
  *   - handler_id permutation (VmOp → handler_id)
+ *   - register layout (native → slot permutation + junk-slot selection)
+ *   - vflags_key (xor scramble for saved RFLAGS)
+ *   - table_xor_key (handler-table encryption)
  *   - NO central dispatcher (threaded code — every handler ends with a
  *     `lea rcx, [rip + table]; movsxd rax, [rcx+rax*4]; add rcx, rax; jmp rcx`
  *     so the reverser cannot see a single dispatch point in IDA's CFG)
@@ -84,32 +86,57 @@ namespace {
 // Stack layout constants (must match entry prologue below)
 // ============================================================================
 
-/// VM-reg index → byte offset within the saved context (relative to rsp).
-/// All 16 slots are allocated on stack (slot 4 is the rsp slot and doubles as
-/// the rolling-key scratch — no VM op references it directly). A uniform
-/// `idx * 8` mapping lets handlers compute ctx addresses with a single LEA.
-constexpr std::array<int32_t, 16> kVmRegOffset = {
-    0,    // 0  RAX
-    8,    // 1  RCX
-    16,   // 2  RDX
-    24,   // 3  RBX
-    32,   // 4  RSP — dummy slot, unused by ops, host of rolling key byte
-    40,   // 5  RBP
-    48,   // 6  RSI
-    56,   // 7  RDI
-    64,   // 8  R8
-    72,   // 9  R9
-    80,   // 10 R10
-    88,   // 11 R11  (saved r11; live vpc is in the physical r11)
-    96,   // 12 R12
-    104,  // 13 R13
-    112,  // 14 R14
-    120,  // 15 R15
-};
-
-constexpr int32_t kRollingKeyDisp    = 32;   ///< key byte at [rsp + 32] (slot 4)
+/// VM context layout constants. Virtual slot v lives at `[rsp + v*8]` regardless
+/// of which native reg is stored there — the native-to-slot mapping is randomized
+/// per-build (see VmRegLayout below). Slot-to-native mapping is captured by the
+/// entry stub's push order and by bytecode operand remapping at emission time.
+///
+/// The "junk slot" is one of the 16 slots that does NOT host a real native reg;
+/// it hosts the rolling-key scratch byte. Which slot it is, is chosen at random
+/// per-build.
 constexpr int32_t kRflagsOffset      = 128;  ///< rflags at [rsp + 128]
 constexpr int32_t kContextSize       = 136;  ///< 16*8 (regs) + rflags(8) = 136
+
+/// Per-build random mapping between native GPRs (0..15, minus 4=RSP) and
+/// virtual context slots (0..15, minus the junk slot).
+///
+/// Properties:
+///   - slot_to_native[v] ∈ [0..15], or 0xFF if v is the junk slot
+///   - native_to_slot[n] is the slot holding native reg n; 0xFF if n == 4 (RSP)
+///   - exactly one v has slot_to_native[v] == 0xFF, and that v == junk_slot
+///   - rolling_key_disp = junk_slot * 8
+struct VmRegLayout {
+    std::array<uint8_t, 16> slot_to_native{};
+    std::array<uint8_t, 16> native_to_slot{};
+    uint8_t  junk_slot         = 0;
+    int32_t  rolling_key_disp  = 0;
+};
+
+/// Build a random register layout. RSP (native 4) is never pushed; the slot
+/// that "would" hold it is instead the junk / rolling-key slot.
+[[nodiscard]] inline VmRegLayout make_random_layout(Randomizer& rng) {
+    VmRegLayout L{};
+    // Start with identity permutation of 16 slots...
+    std::array<uint8_t, 16> perm{};
+    std::iota(perm.begin(), perm.end(), static_cast<uint8_t>(0));
+    // ...then Fisher–Yates shuffle.
+    for (size_t i = 15; i > 0; --i) {
+        const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
+        std::swap(perm[i], perm[j]);
+    }
+    // perm[v] == native reg stored at slot v.
+    L.slot_to_native = perm;
+    L.native_to_slot.fill(0xFF);
+    for (uint8_t v = 0; v < 16; ++v) {
+        L.native_to_slot[perm[v]] = v;
+    }
+    // Native 4 = RSP cannot really be pushed; its slot becomes the junk slot.
+    L.junk_slot = L.native_to_slot[4];
+    L.slot_to_native[L.junk_slot] = 0xFF;
+    L.native_to_slot[4] = 0xFF;
+    L.rolling_key_disp = static_cast<int32_t>(L.junk_slot) * 8;
+    return L;
+}
 
 /// Frame shift between the caller's rsp (at CALL time) and vm_rsp inside a
 /// native handler after `sub rsp, 16` (vpc scratch). Used to restore the
@@ -806,6 +833,12 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         ? shared_vflags_key
         : (rng.next_u32() & 0x8C5) | 1; // masked to flag bits only
 
+    // Per-build random register layout: which virtual slot hosts each native
+    // GPR. Cross-VM sub-VMs use independent layouts — register state flows
+    // between them via CPU, not via slots.
+    const VmRegLayout layout = make_random_layout(rng);
+    const int32_t rolling_key_disp = layout.rolling_key_disp;
+
     const uint32_t native_count = static_cast<uint32_t>(std::count_if(
         instructions.begin(), instructions.end(),
         [](const VmInstruction& v) { return v.op == VmOp::native; }));
@@ -887,6 +920,15 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         bytecode_plain.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
         bytecode_plain.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
     };
+    // Translate a native-reg operand (as emitted by the lifter) to its
+    // per-build virtual slot. The lifter refuses to emit RSP operands for
+    // generic ops, so native_to_slot[n] must be valid here.
+    auto remap_reg = [&](uint8_t native_reg) -> uint8_t {
+        const uint8_t slot = layout.native_to_slot[native_reg];
+        // Defensive: if the lifter ever lets RSP through, fall back to junk
+        // slot rather than writing 0xFF into the bytecode.
+        return (slot == 0xFF) ? layout.junk_slot : slot;
+    };
 
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& vi = instructions[i];
@@ -917,8 +959,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             case VmOp::and_rr:
             case VmOp::or_rr:
             case VmOp::imul_rr:
-                bytecode_plain.push_back(vi.dst);
-                bytecode_plain.push_back(vi.src);
+                bytecode_plain.push_back(remap_reg(vi.dst));
+                bytecode_plain.push_back(remap_reg(vi.src));
                 break;
 
             case VmOp::mov_ri32:
@@ -927,12 +969,12 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             case VmOp::xor_ri32:
             case VmOp::and_ri32:
             case VmOp::or_ri32:
-                bytecode_plain.push_back(vi.dst);
+                bytecode_plain.push_back(remap_reg(vi.dst));
                 push32(vi.imm32);
                 break;
 
             case VmOp::mov_ri64:
-                bytecode_plain.push_back(vi.dst);
+                bytecode_plain.push_back(remap_reg(vi.dst));
                 for (int b = 0; b < 8; ++b)
                     bytecode_plain.push_back(
                         static_cast<uint8_t>((vi.imm64 >> (b * 8)) & 0xFF));
@@ -940,7 +982,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
             case VmOp::not_r:
             case VmOp::neg_r:
-                bytecode_plain.push_back(vi.dst);
+                bytecode_plain.push_back(remap_reg(vi.dst));
                 break;
 
             case VmOp::shl_ri:
@@ -948,7 +990,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             case VmOp::sar_ri:
             case VmOp::rol_ri:
             case VmOp::ror_ri:
-                bytecode_plain.push_back(vi.dst);
+                bytecode_plain.push_back(remap_reg(vi.dst));
                 bytecode_plain.push_back(vi.shift_count);
                 break;
 
@@ -1024,21 +1066,25 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const size_t entry_offset = rt.size();
 
     emit_pushfq(rt);
-    // 16 register pushes. Slot 4 (vm_reg[RSP]) is a dummy `push rax` — no
-    // VM op references it, so its contents don't matter; we reuse its first
-    // byte as the rolling-key scratch.
-    constexpr uint8_t push_order[] = {
-        15, 14, 13, 12, 11, 10, 9, 8, 7 /*rdi*/, 6 /*rsi*/, 5 /*rbp*/,
-        0 /*dummy for slot 4 (rsp)*/,
-        3 /*rbx*/, 2 /*rdx*/, 1 /*rcx*/, 0 /*rax*/
-    };
-    for (uint8_t r : push_order) {
-        emit_push_reg(rt, r);
+    // 16 register pushes, permuted per-build. Push at position K lands at
+    // offset (15-K)*8, so to put slot V at [rsp + V*8] we push it at K=15-V.
+    // The junk slot (native RSP's would-be home) is filled with a dummy
+    // `push rax` — its byte becomes the rolling-key scratch.
+    for (int k = 0; k < 16; ++k) {
+        const uint8_t v = static_cast<uint8_t>(15 - k);
+        if (v == layout.junk_slot) {
+            emit_push_reg(rt, 0);  // dummy push rax (value irrelevant)
+        } else {
+            emit_push_reg(rt, layout.slot_to_native[v]);
+        }
     }
 
-    // Seed the rolling key inside slot 4 (rsp dummy):
-    //   mov byte [rsp + 32], initial_key    C6 44 24 20 ib
-    rt.u8(0xC6); rt.u8(0x44); rt.u8(0x24); rt.u8(0x20); rt.u8(initial_key);
+    // Seed the rolling key inside the junk slot. Displacement varies per-build.
+    //   C6 44 24 disp8 ib     (if disp <= 127)
+    //   C6 84 24 disp32 ib    (otherwise — impossible here, disp ≤ 120)
+    rt.u8(0xC6); rt.u8(0x44); rt.u8(0x24);
+    rt.u8(static_cast<uint8_t>(rolling_key_disp));
+    rt.u8(initial_key);
 
     // Scramble initial RFLAGS if key is non-zero.
     // For cross-VM second sub-VM: skip — the value is ALREADY scrambled
@@ -1063,7 +1109,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     // Inline first dispatch (same shape as handler tails): fetch opcode,
     // decrypt, update key, look up handler via encrypted table, jump.
-    const auto entry_tail = emit_tail_dispatch(rt, kRollingKeyDisp, rolling,
+    const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                 false, table_key_patches, vflags_key);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
@@ -1077,7 +1123,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     };
 
     auto end_handler_tail = [&]() {
-        const auto p = emit_tail_dispatch(rt, kRollingKeyDisp, rolling,
+        const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                           has_branches, table_key_patches,
                                               vflags_key);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
@@ -1090,51 +1136,51 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
-            case VmOp::mov_rr:   emit_handler_mov_rr(rt, kRollingKeyDisp, rolling);             return true;
+            case VmOp::mov_rr:   emit_handler_mov_rr(rt, rolling_key_disp, rolling);             return true;
 
             case VmOp::add_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x01);
-                else              emit_handler_add_rr_mba(rt, kRollingKeyDisp, rolling);
+                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x01);
+                else              emit_handler_add_rr_mba(rt, rolling_key_disp, rolling);
                 return true;
 
             case VmOp::sub_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x29);
-                else              emit_handler_sub_rr_neg(rt, kRollingKeyDisp, rolling);
+                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x29);
+                else              emit_handler_sub_rr_neg(rt, rolling_key_disp, rolling);
                 return true;
 
             case VmOp::xor_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x31);
-                else              emit_handler_xor_rr_mba(rt, kRollingKeyDisp, rolling);
+                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x31);
+                else              emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
                 return true;
 
-            case VmOp::and_rr:   emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x21);       return true;
-            case VmOp::or_rr:    emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x09);       return true;
-            case VmOp::imul_rr:  emit_handler_imul_rr(rt, kRollingKeyDisp, rolling);            return true;
+            case VmOp::and_rr:   emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);       return true;
+            case VmOp::or_rr:    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);       return true;
+            case VmOp::imul_rr:  emit_handler_imul_rr(rt, rolling_key_disp, rolling);            return true;
 
-            case VmOp::mov_ri32: emit_handler_mov_ri32(rt, kRollingKeyDisp, rolling);           return true;
-            case VmOp::add_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x01);     return true;
-            case VmOp::sub_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x29);     return true;
-            case VmOp::xor_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x31);     return true;
-            case VmOp::and_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x21);     return true;
-            case VmOp::or_ri32:  emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x09);     return true;
+            case VmOp::mov_ri32: emit_handler_mov_ri32(rt, rolling_key_disp, rolling);           return true;
+            case VmOp::add_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x01);     return true;
+            case VmOp::sub_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x29);     return true;
+            case VmOp::xor_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x31);     return true;
+            case VmOp::and_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x21);     return true;
+            case VmOp::or_ri32:  emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x09);     return true;
 
-            case VmOp::mov_ri64: emit_handler_mov_ri64(rt, kRollingKeyDisp, rolling);           return true;
+            case VmOp::mov_ri64: emit_handler_mov_ri64(rt, rolling_key_disp, rolling);           return true;
 
-            case VmOp::not_r:    emit_handler_unary(rt, kRollingKeyDisp, rolling, 2);           return true;
-            case VmOp::neg_r:    emit_handler_unary(rt, kRollingKeyDisp, rolling, 3);           return true;
+            case VmOp::not_r:    emit_handler_unary(rt, rolling_key_disp, rolling, 2);           return true;
+            case VmOp::neg_r:    emit_handler_unary(rt, rolling_key_disp, rolling, 3);           return true;
 
-            case VmOp::shl_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 4);           return true;
-            case VmOp::shr_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 5);           return true;
-            case VmOp::sar_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 7);           return true;
-            case VmOp::rol_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 0);           return true;
-            case VmOp::ror_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 1);           return true;
+            case VmOp::shl_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 4);           return true;
+            case VmOp::shr_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 5);           return true;
+            case VmOp::sar_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 7);           return true;
+            case VmOp::rol_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 0);           return true;
+            case VmOp::ror_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 1);           return true;
 
             case VmOp::vjmp:
-                emit_handler_vjmp(rt, kRollingKeyDisp, rolling);
+                emit_handler_vjmp(rt, rolling_key_disp, rolling);
                 return true;
 
             case VmOp::vjcc:
-                emit_handler_vjcc(rt, kRollingKeyDisp, rolling,
+                emit_handler_vjcc(rt, rolling_key_disp, rolling,
                                   static_cast<uint8_t>(variant), vflags_key);
                 return true;
 
@@ -1145,24 +1191,17 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                 return false;
 
             case VmOp::exit: {
-                // Exit: pop 4 regs, skip dummy slot 4, pop rest, popfq, ret.
-                // Pops mirror the push order in reverse (first popped = lowest
-                // address = last pushed). The push order was:
-                //   r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rbp,
-                //   dummy(slot4), rbx, rdx, rcx, rax
-                // => last pushed = rax at [rsp+0], then rcx at [rsp+8], rdx,
-                //    rbx, dummy, rbp, rsi, rdi, r8..r15.
-                emit_pop_reg(rt, 0);  // rax
-                emit_pop_reg(rt, 1);  // rcx
-                emit_pop_reg(rt, 2);  // rdx
-                emit_pop_reg(rt, 3);  // rbx
-                // Skip slot 4 (rsp dummy / rolling key):
-                //   add rsp, 8       48 83 C4 08
-                rt.u8(0x48); rt.u8(0x83); rt.u8(0xC4); rt.u8(0x08);
-                emit_pop_reg(rt, 5);  // rbp
-                emit_pop_reg(rt, 6);  // rsi
-                emit_pop_reg(rt, 7);  // rdi
-                for (uint8_t r = 8; r <= 15; ++r) emit_pop_reg(rt, r);
+                // Exit: pop all 16 slots in slot order (slot 0 at [rsp+0]
+                // is popped first, then slot 1, etc.). Each pop either
+                // restores a native reg or advances rsp past the junk slot.
+                for (uint8_t v = 0; v < 16; ++v) {
+                    if (v == layout.junk_slot) {
+                        // add rsp, 8       48 83 C4 08
+                        rt.u8(0x48); rt.u8(0x83); rt.u8(0xC4); rt.u8(0x08);
+                    } else {
+                        emit_pop_reg(rt, layout.slot_to_native[v]);
+                    }
+                }
                 emit_popfq(rt);
                 if (emit_exit_as_jmp) {
                     // Cross-VM: jmp rel32 to next sub-VM entry (patched later)
@@ -1205,17 +1244,19 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         rt.u8(0x4C); rt.u8(0x89); rt.u8(0x1C); rt.u8(0x24);
 
         // Reload native regs from ctx. After `sub rsp, 16` the ctx lives at
-        // [rsp + 16 + kVmRegOffset[reg]]. Slot 4 (rsp dummy / rolling-key)
-        // is skipped — no native reg maps to it.
+        // [rsp + 24 + slot * 8]. Each native reg N (N != 4) lives at its
+        // per-build permuted slot layout.native_to_slot[N]. The junk slot
+        // (rolling-key scratch) has no native reg mapped to it.
         struct RegLoad { uint8_t native_reg; int32_t offset; };
-        const RegLoad loads[] = {
-            {0,  24 + 0},    {1,  24 + 8},   {2,  24 + 16},  {3,  24 + 24},
-            /* slot 4 (rsp dummy) skipped */
-            {5,  24 + 40},   {6,  24 + 48},  {7,  24 + 56},
-            {8,  24 + 64},   {9,  24 + 72},  {10, 24 + 80},
-            {11, 24 + 88},   // r11 (will overwrite vpc — saved above)
-            {12, 24 + 96},   {13, 24 + 104}, {14, 24 + 112}, {15, 24 + 120},
-        };
+        RegLoad loads[15];
+        {
+            size_t k = 0;
+            for (uint8_t n = 0; n < 16; ++n) {
+                if (n == 4) continue;   // skip RSP
+                const uint8_t slot = layout.native_to_slot[n];
+                loads[k++] = {n, 24 + static_cast<int32_t>(slot) * 8};
+            }
+        }
 
         auto emit_mem_mov = [&](uint8_t opcode, uint8_t reg, int32_t disp) {
             // opcode=0x8B (load) or 0x89 (store)
@@ -1307,7 +1348,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
         // save_rflags=false: native handler already saved flags above
         {
-            const auto p = emit_tail_dispatch(rt, kRollingKeyDisp, rolling,
+            const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,
                                               vflags_key);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
