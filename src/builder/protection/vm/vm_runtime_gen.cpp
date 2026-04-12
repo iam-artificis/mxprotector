@@ -943,13 +943,26 @@ void emit_jmp_reg(RawEmitter& e, uint8_t reg) {
 ///   - The table-base register is picked randomly each call (13 options).
 ///   - The indirect-branch shape is picked randomly (direct `jmp reg` or
 ///     `push reg; ret`).
+///
+/// Handler-table key:
+///   When `imagebase_key_disp >= 0`, the decrypt step reads the key from
+///   `[rsp + imagebase_key_disp]` (the upper 4 bytes of the junk slot,
+///   initialized once in the entry stub from PEB.ImageBaseAddress). The
+///   immediate form `xor eax, imm32` is not used, so there is no literal
+///   key anywhere in the VM blob — `table_key_patches` stays empty and
+///   every dispatch site looks like `xor eax, [rsp + disp8]`.
+///
+///   When `imagebase_key_disp < 0`, the legacy path is used: a placeholder
+///   imm32 is emitted and its offset pushed into `table_key_patches` so
+///   the caller can patch in the build-time key.
 TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      bool rolling,
                                      bool save_rflags,
                                      std::vector<size_t>& table_key_patches,
                                      uint32_t vflags_key,
                                      uint32_t vflags_rol,
-                                     Randomizer* rng) {
+                                     Randomizer* rng,
+                                     int32_t imagebase_key_disp = -1) {
     // Optionally save CPU rflags into the VM context BEFORE clobbering them
     // with the fetch logic (movzx/xor). This is the single collection point
     // for flag preservation — every handler's body has just finished, and the
@@ -980,11 +993,24 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     // mov eax, dword [base + rax*4]    — zero-extends the 32-bit table entry
     emit_mov_eax_from_base_rax4(e, base_reg);
 
-    // xor eax, TABLE_KEY     — decrypt (IDA can't statically resolve)
-    //   35 imm32
-    e.u8(0x35);
-    table_key_patches.push_back(e.size());
-    e.u32(0);  // placeholder, patched with table_xor_key later
+    // xor eax, TABLE_KEY — decrypt the table entry.
+    //
+    // Two forms depending on where the key lives:
+    //   imm32 (legacy):  35 imm32                     — 5 bytes
+    //   mem32 (ib-key):  33 44 24 disp8               — 4 bytes (disp8 form,
+    //                     since the junk-slot disp is always ≤ 120)
+    if (imagebase_key_disp >= 0) {
+        // xor eax, [rsp + disp8]    33 44 24 disp8
+        e.u8(0x33);
+        e.u8(0x44);
+        e.u8(0x24);
+        e.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
+    } else {
+        // xor eax, imm32    35 imm32  (placeholder, patched later)
+        e.u8(0x35);
+        table_key_patches.push_back(e.size());
+        e.u32(0);  // placeholder, patched with table_xor_key later
+    }
 
     // movsxd rax, eax   — sign-extend AFTER decryption    48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
@@ -1351,13 +1377,15 @@ constexpr uint8_t variant_count_for(VmOp op) {
 MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const std::vector<VmInstruction>& instructions,
     Randomizer& rng,
-    bool emit_exit_as_jmp)
+    VmGenOptions opts)
 {
     if (instructions.empty()) {
         return std::unexpected(MxError(
             ProtectionErrorCode::vm_translation_error,
             "VmRuntimeGenerator: empty VM instruction list"));
     }
+
+    const bool emit_exit_as_jmp = opts.emit_exit_as_jmp;
 
     // ------------------------------------------------------------------------
     // Step 1 — per-build randomization: opcode handler_id permutation, handler
@@ -1638,12 +1666,56 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                                      vflags_key, vflags_rol, kRflagsOffset);
     }
 
+    // Handler-table key derivation: if `opts.use_imagebase_key` is set,
+    // compute the key at runtime from PEB.ImageBaseAddress and store it in
+    // the upper 4 bytes of the junk slot ([rsp + rolling_key_disp + 4]).
+    // Every tail dispatch then reads `xor eax, [rsp + disp8]` instead of
+    // carrying an imm32 — the table key never appears as a literal in the
+    // VM blob, and statically extracting it requires simulating the entry.
+    //
+    // A per-build random salt is XOR'd in so the stored dword isn't simply
+    // `preferred_image_base & 0xFFFFFFFF`. Both the runtime computation
+    // and the build-time table encryption use the same salt so decryption
+    // is lossless.
+    //
+    // Precondition: the output binary has ASLR disabled (packer strips
+    // relocations + DYNAMIC_BASE). When ASLR is on, runtime ImageBase
+    // differs from `opts.preferred_image_base` and the VM silently breaks.
+    // The caller in VirtualizationPass only sets this opt when the packer
+    // is enabled (which guarantees ASLR is stripped later).
+    const uint32_t imagebase_salt = rng.next_u32();
+    const int32_t  imagebase_key_disp =
+        opts.use_imagebase_key ? (rolling_key_disp + 4) : -1;
+
+    if (opts.use_imagebase_key) {
+        // Save rax to a VM slot temporarily. We use the junk slot's low byte
+        // area [rsp + rolling_key_disp] — wait, that's the rolling-key byte.
+        // Simpler: we don't need to save rax here, because the NEXT thing
+        // that runs after this is the inline entry tail dispatch, which
+        // loads rax fresh from the bytecode. Clobbering rax is free.
+        //
+        //   65 48 8B 04 25 60 00 00 00   mov rax, gs:[0x60]    ; PEB
+        //   48 8B 40 10                  mov rax, [rax + 0x10] ; ImageBase
+        //   35 <imm32>                   xor eax, salt          ; key = IB ^ salt
+        //   89 44 24 <disp8>             mov [rsp + key_disp], eax
+        rt.u8(0x65); rt.u8(0x48); rt.u8(0x8B); rt.u8(0x04); rt.u8(0x25);
+        rt.u8(0x60); rt.u8(0x00); rt.u8(0x00); rt.u8(0x00);
+        rt.u8(0x48); rt.u8(0x8B); rt.u8(0x40); rt.u8(0x10);
+        rt.u8(0x35);
+        rt.u32(imagebase_salt);
+        // mov [rsp + disp8], eax    89 44 24 disp8  (reg=eax=0, SIB=rsp)
+        rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
+        rt.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
+    }
+
     // lea r11, [rip + bytecode_rel32]
     const size_t entry_bc_patch = emit_lea_r11_rip_rel32(rt);
     const size_t entry_bc_patch_end = rt.size();
 
     // Collection of positions where TABLE_XOR_KEY must be patched into the
-    // `xor eax, KEY` instructions inside each tail dispatch.
+    // `xor eax, KEY` instructions inside each tail dispatch. Empty when
+    // `use_imagebase_key` is set, since dispatches then load the key from
+    // the context slot instead of carrying an imm32.
     std::vector<size_t> table_key_patches;
 
     // Inline first dispatch (same shape as handler tails): fetch opcode,
@@ -1652,7 +1724,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // random table-base reg and dispatch shape just like handler tails.
     const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                 false, table_key_patches,
-                                                vflags_key, vflags_rol, &rng);
+                                                vflags_key, vflags_rol, &rng,
+                                                imagebase_key_disp);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
     // ---- Handler emission ----------------------------------------------------
@@ -1673,7 +1746,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     auto end_handler_tail = [&]() {
         const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                           has_branches, table_key_patches,
-                                          vflags_key, vflags_rol, &rng);
+                                          vflags_key, vflags_rol, &rng,
+                                          imagebase_key_disp);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
     };
 
@@ -1897,7 +1971,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         {
             const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,
-                                              vflags_key, vflags_rol, &rng);
+                                              vflags_key, vflags_rol, &rng,
+                                              imagebase_key_disp);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
     }
@@ -1927,15 +2002,30 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         patch_rel32(rt.buf, p.rel32_offset, p.instruction_end, handler_table_offset);
     }
 
-    // Per-build table encryption key. Each table entry is XOR'd with this so
-    // the table in memory looks like random noise. The `xor eax, KEY` in every
-    // tail dispatch decrypts on the fly. IDA cannot statically resolve the
-    // indirect jump through the encrypted table.
-    const uint32_t table_xor_key = rng.next_u32() | 1; // non-zero
-
-    // Patch all TABLE_KEY placeholders in tail dispatches.
-    for (const auto patch_off : table_key_patches) {
-        std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
+    // Handler-table encryption key. Two modes:
+    //   1. Static (legacy): a per-build random u32 baked into every tail
+    //      dispatch site via `xor eax, imm32`. Simple, but every dispatch
+    //      exposes the key as a literal.
+    //   2. Runtime (ImageBase-derived): the key is computed at entry as
+    //      `preferred_image_base_low32 ^ imagebase_salt`. At runtime the
+    //      entry stub reads ImageBase from PEB.ImageBaseAddress, XORs with
+    //      the salt, and stores the result in a VM context slot. Dispatch
+    //      sites then `xor eax, [rsp + disp8]` — no literal key anywhere.
+    //      Requires ASLR to be disabled on the output binary (otherwise
+    //      runtime ImageBase would differ from the preferred base).
+    uint32_t table_xor_key;
+    if (opts.use_imagebase_key) {
+        const uint32_t ib_low32 =
+            static_cast<uint32_t>(opts.preferred_image_base & 0xFFFFFFFFULL);
+        table_xor_key = ib_low32 ^ imagebase_salt;
+        // No imm32 placeholders to patch — tail dispatches already emit
+        // memory-load form. table_key_patches should be empty.
+    } else {
+        table_xor_key = rng.next_u32() | 1;  // non-zero
+        // Patch all imm32 TABLE_KEY placeholders in tail dispatches.
+        for (const auto patch_off : table_key_patches) {
+            std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
+        }
     }
 
     // handler_table entries: each = (handler_offset - table_offset) ^ table_xor_key

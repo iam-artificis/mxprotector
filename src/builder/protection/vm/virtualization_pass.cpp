@@ -125,6 +125,23 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     vm::VmLifter lifter(*ctx.disassembler());
     vm::VmRuntimeGenerator gen;
 
+    // Build-wide VM generator options. `use_imagebase_key` is gated on the
+    // packer being enabled — the packer strips ASLR (IMAGE_FILE_RELOCS_STRIPPED
+    // + DllCharacteristics.DYNAMIC_BASE cleared) so runtime ImageBase matches
+    // the build-time preferred ImageBase. Without the packer, ASLR stays on
+    // and the runtime ImageBase is unpredictable, so we must keep the legacy
+    // imm32 table key.
+    const vm::VmGenOptions default_opts{
+        .emit_exit_as_jmp     = false,
+        .use_imagebase_key    = ctx.config().enable_packer,
+        .preferred_image_base = static_cast<uint64_t>(ctx.pe_image().image_base()),
+    };
+    if (default_opts.use_imagebase_key) {
+        ctx.log_fmt("VirtualizationPass: ImageBase-derived table key enabled "
+                    "(preferred_base=0x{:X})",
+            default_opts.preferred_image_base);
+    }
+
     // Собираем все blobs и отмечаем точки замены
     struct PendingRegion {
         Rva       begin_marker_rva;
@@ -267,8 +284,12 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
                 // Sub-VMs are fully independent: VM1's exit descrambles
                 // its RFLAGS before popfq, VM2's entry re-scrambles after
                 // pushfq. No shared vflags state required.
-                auto rt1 = gen.generate(part1, rng, true);
-                auto rt2 = gen.generate(part2, rng, false);
+                vm::VmGenOptions opts1 = default_opts;
+                opts1.emit_exit_as_jmp = true;
+                vm::VmGenOptions opts2 = default_opts;
+                opts2.emit_exit_as_jmp = false;
+                auto rt1 = gen.generate(part1, rng, opts1);
+                auto rt2 = gen.generate(part2, rng, opts2);
 
                 if (rt1 && rt2) {
                     // Merge the two blobs: rt1 followed by rt2, patch the JMP
@@ -307,7 +328,7 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
         }
 
         // Single VM (no split)
-        auto runtime_result = gen.generate(vm_insns, rng);
+        auto runtime_result = gen.generate(vm_insns, rng, default_opts);
         if (!runtime_result) {
             ctx.log_fmt("  VM регион: ошибка генерации runtime: {}",
                 runtime_result.error().message());

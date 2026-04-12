@@ -46,15 +46,39 @@ struct VmRuntime {
     uint32_t   exit_jmp_patch = 0;
 };
 
+/// Options controlling one call to `VmRuntimeGenerator::generate`.
+///
+/// Grouped into a struct so new switches can be added without changing
+/// every call site. The defaults match the stable x64-PE pipeline.
+struct VmGenOptions {
+    /// Cross-VM: if true, the exit handler emits `jmp rel32` instead of
+    /// `ret`. The caller must patch `exit_jmp_patch` afterwards.
+    bool emit_exit_as_jmp = false;
+
+    /// If true, the tail dispatch resolves the handler-table XOR key
+    /// from the running image's ImageBase (via PEB.ImageBaseAddress)
+    /// instead of baking it as an imm32 into every dispatch site.
+    ///
+    /// Enabled when the caller knows ASLR will be disabled on the
+    /// output binary (the packer strips IMAGE_FILE_RELOCS_STRIPPED +
+    /// DllCharacteristics.DYNAMIC_BASE). Without ASLR disabled, the
+    /// runtime ImageBase differs from `preferred_image_base` and the
+    /// decryption produces wrong results.
+    bool use_imagebase_key = false;
+
+    /// Preferred ImageBase from the input PE (OptionalHeader.ImageBase).
+    /// Only consulted when `use_imagebase_key == true`.
+    uint64_t preferred_image_base = 0;
+};
+
 class VmRuntimeGenerator final {
 public:
     /**
      * @brief Генерирует VM runtime для последовательности VM-инструкций.
      *
-     * @param instructions    Результат лифтинга (без финального exit).
-     * @param rng             Генератор для рандомизации маппинга/ключа.
-     * @param emit_exit_as_jmp If true, the exit handler emits `jmp rel32`
-     *        instead of `ret`. Used for Cross-VM sub-VMs.
+     * @param instructions Результат лифтинга (без финального exit).
+     * @param rng          Генератор для рандомизации маппинга/ключа.
+     * @param opts         Build-level options (cross-VM, imagebase key, ...).
      *
      * Each sub-VM independently picks its own (vflags_key, vflags_rol)
      * pair — no state needs to be shared across sub-VMs because the exit
@@ -66,7 +90,7 @@ public:
     [[nodiscard]] MxResult<VmRuntime> generate(
         const std::vector<VmInstruction>& instructions,
         Randomizer& rng,
-        bool emit_exit_as_jmp = false);
+        VmGenOptions opts = {});
 
 private:
     /**
