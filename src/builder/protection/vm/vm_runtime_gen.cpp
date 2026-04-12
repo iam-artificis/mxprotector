@@ -422,8 +422,8 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
 // Specific handlers (ALU / logic / shift / mov / etc.)
 // ============================================================================
 
-void emit_handler_mov_rr(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_mov_rr(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // mov rax, [rdi]   48 8B 07
@@ -434,8 +434,8 @@ void emit_handler_mov_rr(RawEmitter& e, int32_t key_disp) {
 
 /// Generic r-r ALU using dst-memory addressing and op_mr opcode
 /// (add=01, sub=29, xor=31, and=21, or=09).
-void emit_handler_alu_rr(RawEmitter& e, int32_t key_disp, uint8_t op_mr) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_alu_rr(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t op_mr) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // mov rax, [rdi]
@@ -451,8 +451,8 @@ void emit_handler_alu_rr(RawEmitter& e, int32_t key_disp, uint8_t op_mr) {
 // ---------------------------------------------------------------------------
 
 /// ADD variant: x + y ≡ (x ^ y) + 2 * (x & y)
-void emit_handler_add_rr_mba(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_add_rr_mba(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // rax = y = [rdi]
@@ -474,8 +474,8 @@ void emit_handler_add_rr_mba(RawEmitter& e, int32_t key_disp) {
 }
 
 /// SUB variant: x - y ≡ x + (-y)
-void emit_handler_sub_rr_neg(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_sub_rr_neg(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // rax = y = [rdi]
@@ -487,8 +487,8 @@ void emit_handler_sub_rr_neg(RawEmitter& e, int32_t key_disp) {
 }
 
 /// XOR variant: x ^ y ≡ (x | y) - (x & y)
-void emit_handler_xor_rr_mba(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_xor_rr_mba(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // rax = y = [rdi]
@@ -507,8 +507,8 @@ void emit_handler_xor_rr_mba(RawEmitter& e, int32_t key_disp) {
     e.u8(0x48); e.u8(0x89); e.u8(0x16);
 }
 
-void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
     // mov rax, [rsi]
@@ -519,28 +519,28 @@ void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp) {
     e.u8(0x48); e.u8(0x89); e.u8(0x06);
 }
 
-void emit_handler_mov_ri32(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_1_operand_byte(e, key_disp);
+void emit_handler_mov_ri32(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
-    emit_fetch_dword(e, key_disp);
+    emit_fetch_dword(e, key_disp, rolling);
     // movsxd rax, eax   48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
     // mov [rsi], rax
     e.u8(0x48); e.u8(0x89); e.u8(0x06);
 }
 
-void emit_handler_mov_ri64(RawEmitter& e, int32_t key_disp) {
-    emit_fetch_1_operand_byte(e, key_disp);
+void emit_handler_mov_ri64(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
-    emit_fetch_qword(e, key_disp);
+    emit_fetch_qword(e, key_disp, rolling);
     // mov [rsi], rax
     e.u8(0x48); e.u8(0x89); e.u8(0x06);
 }
 
-void emit_handler_alu_ri32(RawEmitter& e, int32_t key_disp, uint8_t op_mr) {
-    emit_fetch_1_operand_byte(e, key_disp);
+void emit_handler_alu_ri32(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t op_mr) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
-    emit_fetch_dword(e, key_disp);
+    emit_fetch_dword(e, key_disp, rolling);
     // movsxd rax, eax
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
     // OP [rsi], rax
@@ -548,16 +548,16 @@ void emit_handler_alu_ri32(RawEmitter& e, int32_t key_disp, uint8_t op_mr) {
 }
 
 /// not/neg [rsi]  (/2 for not, /3 for neg)
-void emit_handler_unary(RawEmitter& e, int32_t key_disp, uint8_t sub_op) {
-    emit_fetch_1_operand_byte(e, key_disp);
+void emit_handler_unary(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t sub_op) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     // 48 F7 /sub_op,rm=6(rsi)
     e.u8(0x48); e.u8(0xF7);
     e.u8(static_cast<uint8_t>((sub_op << 3) | 0x06));
 }
 
-void emit_handler_shift(RawEmitter& e, int32_t key_disp, uint8_t sub_op) {
-    emit_fetch_2_operand_bytes(e, key_disp);
+void emit_handler_shift(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t sub_op) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     // mov rax, [rsi]
     e.u8(0x48); e.u8(0x8B); e.u8(0x06);
@@ -611,90 +611,122 @@ void emit_handler_vjmp(RawEmitter& e, int32_t key_disp, bool rolling) {
 }
 
 /// VJCC (conditional virtual branch) with condition `cc` baked in at emit time.
-/// Operand layout: [rel32] (cc byte is NOT in bytecode — the handler_id itself
-/// encodes the condition through the variant system). Handler loads saved RFLAGS,
-/// evaluates the condition, and if taken adjusts r11 by rel32.
+/// Operand layout: [rel32]. The handler_id encodes the condition via the
+/// variant system. Instead of pushfq/popfq (fragile), the handler directly
+/// bit-tests the saved RFLAGS qword from the ctx slot.
 ///
-/// @param cc  x86 condition code (0..0xF): 0=O,1=NO,2=B,3=NB,4=E,5=NE,...
+/// Supported conditions (single-bit tests):
+///   CC 0  (O):  OF (bit 11)          CC 1  (NO): !OF
+///   CC 2  (B):  CF (bit 0)           CC 3  (NB): !CF
+///   CC 4  (E):  ZF (bit 6)           CC 5  (NE): !ZF
+///   CC 8  (S):  SF (bit 7)           CC 9  (NS): !SF
+///   CC 10 (P):  PF (bit 2)           CC 11 (NP): !PF
+///
+/// Multi-bit conditions (CC 6,7,12-15) are supported via compound tests.
 void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
                        uint8_t cc) {
     emit_fetch_dword(e, key_disp, rolling);      // eax = rel32
-    // movsxd rax, eax
+    // movsxd rax, eax        48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
 
-    // Load the saved RFLAGS from ctx into the CPU:
-    //   pushfq                             9C
-    //   push qword [rsp + kRflagsOffset + 8]
-    //     (the +8 accounts for our pushfq which shifted rsp down)
-    //     For kRflagsOffset=128: disp = 128+8 = 136 > 127 → disp32
-    //     48 FF 34 24 — push [rsp] wrong.
-    //     push [rsp+disp32]: FF B4 24 disp32
-    //   popfq
-    //   48 83 C4 08 — add rsp, 8 (discard the saved rflags copy)
-    //   (CPU flags now reflect saved RFLAGS; rsp back to pre-pushfq position)
-    //
-    // Wait — simpler: swap current flags with saved:
-    //   pushfq                              save current CPU flags
-    //   mov rcx, [rsp + kRflagsOffset + 8]  load saved rflags (+8 for pushfq)
-    //   push rcx                            push it
-    //   popfq                               restore saved flags to CPU
-    //   (now CPU has user's flags; original CPU flags are at [rsp])
-    //
-    //   <test condition via Jcc>
-    //
-    //   popfq                               restore original CPU flags
-
-    // pushfq          9C
-    e.u8(0x9C);
-    // mov rcx, [rsp + 128 + 8]  = [rsp + 136]
-    // 48 8B 8C 24 88 00 00 00   (mod=10, reg=1(rcx), rm=4(SIB), SIB=0x24, disp32=136)
+    // Load saved RFLAGS from ctx into rcx.
+    // mov rcx, [rsp + kRflagsOffset]        48 8B 8C 24 disp32
     e.u8(0x48); e.u8(0x8B); e.u8(0x8C); e.u8(0x24);
-    const int32_t rflags_disp = kRflagsOffset + 8;
-    e.u8(static_cast<uint8_t>(rflags_disp & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 8) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 16) & 0xFF));
-    e.u8(static_cast<uint8_t>((rflags_disp >> 24) & 0xFF));
-    // push rcx         51
-    e.u8(0x51);
-    // popfq            9D   — CPU flags = saved rflags
-    e.u8(0x9D);
+    e.u8(static_cast<uint8_t>(kRflagsOffset & 0xFF));
+    e.u8(static_cast<uint8_t>((kRflagsOffset >> 8) & 0xFF));
+    e.u8(static_cast<uint8_t>((kRflagsOffset >> 16) & 0xFF));
+    e.u8(static_cast<uint8_t>((kRflagsOffset >> 24) & 0xFF));
 
-    // Jcc_short taken_label — rel8 forward (we emit 2 bytes: 0x70+cc, rel8).
-    // The not-taken path is: popfq + tail_dispatch (below). The taken path is:
-    // popfq + add r11, rax + tail_dispatch.
+    // Determine which RFLAGS bit(s) to test and whether to jump-if-set or
+    // jump-if-clear. We emit: `test rcx, MASK; jnz taken` or `jz taken`.
     //
-    // not-taken (next instruction): popfq
-    //   size of popfq = 1
-    //   + jmp rel8 to skip taken block — 2 bytes
-    //   total not-taken body: 3 bytes
+    // Flag bit positions: CF=0, PF=2, ZF=6, SF=7, OF=11.
+    struct CcInfo { uint32_t mask; bool jump_if_set; };
+    constexpr CcInfo cc_table[16] = {
+        /* 0  O  */ {1u << 11, true },
+        /* 1  NO */ {1u << 11, false},
+        /* 2  B  */ {1u << 0,  true },
+        /* 3  NB */ {1u << 0,  false},
+        /* 4  E  */ {1u << 6,  true },
+        /* 5  NE */ {1u << 6,  false},
+        /* 6  BE */ {(1u<<0)|(1u<<6), true },  // CF || ZF — test both, jnz if either set
+        /* 7  A  */ {(1u<<0)|(1u<<6), false},  // !(CF || ZF)
+        /* 8  S  */ {1u << 7,  true },
+        /* 9  NS */ {1u << 7,  false},
+        /* 10 P  */ {1u << 2,  true },
+        /* 11 NP */ {1u << 2,  false},
+        /* 12 L  */ {0, true },  // SF!=OF — handled specially below
+        /* 13 GE */ {0, false},  // SF==OF
+        /* 14 LE */ {0, true },  // ZF || (SF!=OF) — handled specially
+        /* 15 G  */ {0, false},  // !ZF && (SF==OF)
+    };
+
+    const auto& info = cc_table[cc & 0xF];
+
+    if (cc <= 11 && cc != 6 && cc != 7) {
+        // Simple single-bit test:
+        //   test ecx, mask     F7 C1 mask32   (or test rcx, imm32 with REX.W if mask > 32-bit — not needed here)
+        e.u8(0xF7); e.u8(0xC1);
+        e.u8(static_cast<uint8_t>(info.mask & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 8) & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 16) & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 24) & 0xFF));
+    } else if (cc == 6 || cc == 7) {
+        // BE / A: test CF|ZF bits.
+        e.u8(0xF7); e.u8(0xC1);
+        e.u8(static_cast<uint8_t>(info.mask & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 8) & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 16) & 0xFF));
+        e.u8(static_cast<uint8_t>((info.mask >> 24) & 0xFF));
+    } else {
+        // CC 12-15 (L/GE/LE/G): SF vs OF comparison.
+        // Extract SF (bit 7) and OF (bit 11), compare them.
+        //   mov edx, ecx      89 CA
+        //   shr edx, 4        C1 EA 04   — bring OF (bit 11) down to bit 7
+        //   xor edx, ecx      31 CA      — bit 7 of edx: SF ^ OF
+        //   test edx, 0x80    F7 C2 80 00 00 00  — test SF^OF bit
+        // For LE/G we also need ZF:
+        //   or edx, ecx (for LE) at bit 6 — complex. Simplify: use pushfq/popfq fallback.
+        // For now: pushfq/popfq for CC 12-15 (less common in unsigned-dominated code).
+        e.u8(0x89); e.u8(0xCA);             // mov edx, ecx
+        e.u8(0xC1); e.u8(0xEA); e.u8(0x04); // shr edx, 4  (OF bit 11 → bit 7)
+        e.u8(0x31); e.u8(0xCA);             // xor edx, ecx (bit 7 = SF^OF)
+        if (cc == 14 || cc == 15) {
+            // LE: ZF || (SF!=OF). OR in ZF (bit 6) shifted to bit 7:
+            //   but ZF is at bit 6 in ecx. We can `or edx, ecx` then test bit 6|7.
+            // G: !ZF && (SF==OF). Negate.
+            // Simplified: test bits 6 and 7 of (edx | shifted).
+            // Actually: merge ZF into the test:
+            //   or edx, ecx    09 CA   — bit 6 = ZF from ecx
+            e.u8(0x09); e.u8(0xCA);
+            // test edx, 0xC0 (bits 6+7)
+            e.u8(0xF7); e.u8(0xC2);
+            e.u8(0xC0); e.u8(0x00); e.u8(0x00); e.u8(0x00);
+        } else {
+            // L/GE: just test bit 7 of edx (SF^OF)
+            e.u8(0xF7); e.u8(0xC2);
+            e.u8(0x80); e.u8(0x00); e.u8(0x00); e.u8(0x00);
+        }
+    }
+
+    // jnz/jz taken_label. For `jump_if_set`, use JNZ (0x75). For `jump_if_clear`, use JZ (0x74).
+    // taken path: add r11, rax (3 bytes). not-taken path: jmp +3 (2 bytes).
     //
-    // taken (after jcc): popfq + add r11, rax
-    //   popfq = 1
-    //   add r11, rax = 3
-    //   total: 4 bytes
-    //
-    // Jcc: 0x70+cc, rel8 = offset to taken_label from jcc_end.
-    //   jcc_end = current + 2
-    //   not_taken: popfq(1) + jmp rel8(2) = 3 bytes
-    //   taken_label is at jcc_end + 3
-    //   rel8 = 3 → Jcc lands 3 bytes ahead
+    //   jcc +2          ; skip the jmp short
+    //   jmp short +3    ; skip the add (not taken path)
+    //   add r11, rax    ; taken path
 
-    e.u8(static_cast<uint8_t>(0x70 + cc));
-    e.u8(0x03);  // skip the not-taken path (popfq + jmp 4)
+    const uint8_t jcc_opcode = info.jump_if_set ? 0x75 : 0x74;
+    e.u8(jcc_opcode);
+    e.u8(0x02);         // skip the `jmp short +3` below
 
-    // NOT TAKEN path:
-    // popfq            9D
-    e.u8(0x9D);
-    // jmp short +4     EB 04   — skip the taken-path body (popfq + add r11, rax = 4 bytes)
-    e.u8(0xEB); e.u8(0x04);
+    // NOT TAKEN: skip the add r11
+    e.u8(0xEB); e.u8(0x03);  // jmp short +3
 
-    // TAKEN path:
-    // popfq            9D
-    e.u8(0x9D);
-    // add r11, rax     49 01 C3
+    // TAKEN: add r11, rax    49 01 C3
     e.u8(0x49); e.u8(0x01); e.u8(0xC3);
 
-    // Both paths converge here → tail dispatch follows (emitted by caller).
+    // Both paths converge → tail dispatch follows (emitted by caller).
 }
 
 } // anonymous namespace
@@ -1005,44 +1037,44 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // ret and returns false.
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
-            case VmOp::mov_rr:   emit_handler_mov_rr(rt, kRollingKeyDisp);             return true;
+            case VmOp::mov_rr:   emit_handler_mov_rr(rt, kRollingKeyDisp, rolling);             return true;
 
             case VmOp::add_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, 0x01);
-                else              emit_handler_add_rr_mba(rt, kRollingKeyDisp);
+                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x01);
+                else              emit_handler_add_rr_mba(rt, kRollingKeyDisp, rolling);
                 return true;
 
             case VmOp::sub_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, 0x29);
-                else              emit_handler_sub_rr_neg(rt, kRollingKeyDisp);
+                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x29);
+                else              emit_handler_sub_rr_neg(rt, kRollingKeyDisp, rolling);
                 return true;
 
             case VmOp::xor_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, 0x31);
-                else              emit_handler_xor_rr_mba(rt, kRollingKeyDisp);
+                if (variant == 0) emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x31);
+                else              emit_handler_xor_rr_mba(rt, kRollingKeyDisp, rolling);
                 return true;
 
-            case VmOp::and_rr:   emit_handler_alu_rr(rt, kRollingKeyDisp, 0x21);       return true;
-            case VmOp::or_rr:    emit_handler_alu_rr(rt, kRollingKeyDisp, 0x09);       return true;
-            case VmOp::imul_rr:  emit_handler_imul_rr(rt, kRollingKeyDisp);            return true;
+            case VmOp::and_rr:   emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x21);       return true;
+            case VmOp::or_rr:    emit_handler_alu_rr(rt, kRollingKeyDisp, rolling, 0x09);       return true;
+            case VmOp::imul_rr:  emit_handler_imul_rr(rt, kRollingKeyDisp, rolling);            return true;
 
-            case VmOp::mov_ri32: emit_handler_mov_ri32(rt, kRollingKeyDisp);           return true;
-            case VmOp::add_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, 0x01);     return true;
-            case VmOp::sub_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, 0x29);     return true;
-            case VmOp::xor_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, 0x31);     return true;
-            case VmOp::and_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, 0x21);     return true;
-            case VmOp::or_ri32:  emit_handler_alu_ri32(rt, kRollingKeyDisp, 0x09);     return true;
+            case VmOp::mov_ri32: emit_handler_mov_ri32(rt, kRollingKeyDisp, rolling);           return true;
+            case VmOp::add_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x01);     return true;
+            case VmOp::sub_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x29);     return true;
+            case VmOp::xor_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x31);     return true;
+            case VmOp::and_ri32: emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x21);     return true;
+            case VmOp::or_ri32:  emit_handler_alu_ri32(rt, kRollingKeyDisp, rolling, 0x09);     return true;
 
-            case VmOp::mov_ri64: emit_handler_mov_ri64(rt, kRollingKeyDisp);           return true;
+            case VmOp::mov_ri64: emit_handler_mov_ri64(rt, kRollingKeyDisp, rolling);           return true;
 
-            case VmOp::not_r:    emit_handler_unary(rt, kRollingKeyDisp, 2);           return true;
-            case VmOp::neg_r:    emit_handler_unary(rt, kRollingKeyDisp, 3);           return true;
+            case VmOp::not_r:    emit_handler_unary(rt, kRollingKeyDisp, rolling, 2);           return true;
+            case VmOp::neg_r:    emit_handler_unary(rt, kRollingKeyDisp, rolling, 3);           return true;
 
-            case VmOp::shl_ri:   emit_handler_shift(rt, kRollingKeyDisp, 4);           return true;
-            case VmOp::shr_ri:   emit_handler_shift(rt, kRollingKeyDisp, 5);           return true;
-            case VmOp::sar_ri:   emit_handler_shift(rt, kRollingKeyDisp, 7);           return true;
-            case VmOp::rol_ri:   emit_handler_shift(rt, kRollingKeyDisp, 0);           return true;
-            case VmOp::ror_ri:   emit_handler_shift(rt, kRollingKeyDisp, 1);           return true;
+            case VmOp::shl_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 4);           return true;
+            case VmOp::shr_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 5);           return true;
+            case VmOp::sar_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 7);           return true;
+            case VmOp::rol_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 0);           return true;
+            case VmOp::ror_ri:   emit_handler_shift(rt, kRollingKeyDisp, rolling, 1);           return true;
 
             case VmOp::vjmp:
                 emit_handler_vjmp(rt, kRollingKeyDisp, rolling);
