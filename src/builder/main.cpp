@@ -31,6 +31,9 @@
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/marker_scanner.hpp"
 #include "mxprotector/target/target_info.hpp"
+#include "mxprotector/arch/arch_info.hpp"       // Phase 1 arch foundation (unused yet)
+#include "mxprotector/arch/code_emitter.hpp"    // Phase 1 arch foundation (unused yet)
+#include "mxprotector/arch/vm_backend.hpp"      // Phase 1 arch foundation (unused yet)
 #include "mxprotector/protection/pass_manager.hpp"
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"

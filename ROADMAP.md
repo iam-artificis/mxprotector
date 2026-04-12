@@ -25,11 +25,16 @@
 - CFF трамплины, mutation engine, opaque predicates
 - **Random section names**: 3 секции (vm / cff / packer) берутся из пула plausible MSVC/clang имён (`.rdata2`, `.xtors`, `.xdata2`, `.tls1`, `.CRT$XC`, `.00cfg` ...). `--debug-sections` возвращает `.mxvm/.mxprot1/.mxpack`
 
-### Cross-platform foundation
+### Cross-platform foundation (container axis)
 - **`mx::target::TargetInfo`** (`include/mxprotector/target/target_info.hpp`): OS × container × arch дескриптор с factory helpers для `windows_pe_x64`, `linux_elf_x64`, `linux_elf_arm64`, `macos_macho_x64`, `macos_macho_arm64`
 - **`mx::target::IBinaryImage`** (`include/mxprotector/target/binary_image.hpp`): sketch абстрактного интерфейса для будущих ELF/Mach-O бекендов. Сейчас не имплементирован — только design contract для Phase 2+
 - `ProtectionContext::target()` заполняется в `main.cpp` из парсенного бинаря
 - Контейнер-специфичный `PackerPass` guard'ит `is_applicable()` через `ctx.target().is_windows_pe_x64()`
+
+### Cross-platform foundation (architecture axis)
+- **`mx::arch::ArchInfo`** (`include/mxprotector/arch/arch_info.hpp`): fine-grained дескриптор — `ArchVariant` (armv8-a, armv8.2-a, cortex-m4, ...), `ArchProfile` (A/R/M), `ArchFeatures` (NEON, crypto, LSE, MTE, PAC). Factory helpers для common конфигураций: `x64_baseline()`, `x64_modern()`, `arm64_v8a_application()`, `arm64_v82a_crypto()`, `cortex_m4()`
+- **`mx::arch::ICodeEmitter`** (`include/mxprotector/arch/code_emitter.hpp`): абстрактный emitter с операциями mov/load/store/arith/jmp/jcc/call/ret + labels. Ровно то что passes реально используют — без попытки покрыть весь ISA
+- **`mx::arch::IVmBackend`** (`include/mxprotector/arch/vm_backend.hpp`): VM runtime generator как target-agnostic engine + per-arch backend. x64 backend = текущий `vm_runtime_gen.cpp` после будущего рефакторинга; arm64 backend — новая реализация с 31 GPR контекстом, NZCV flag handling, LDR/EOR/STR stream cipher
 
 ---
 
@@ -87,99 +92,150 @@
 
 ## Следующие шаги (по приоритету)
 
-### 1. arm64 architecture foundation *(следующий шаг)*
-Заложить минимальный sketch интерфейсов по аналогии с `target/` (архитектура ≠ container):
-- `include/mxprotector/arch/arch_info.hpp` — расширенный `Arch` enum (arm64_v8a,
-  arm64_v8.1a, cortex_m4, cortex_a76 и т.д.) + capability flags (NEON, crypto ext)
-- `include/mxprotector/arch/code_emitter.hpp` — `ICodeEmitter` sketch для
-  архитектуро-специфичной эмиссии (arch-specific, container-agnostic)
-- `include/mxprotector/arch/vm_backend.hpp` — `IVmBackend` для VM runtime gen
-  (параметризует количество регистров, flag encoding, calling convention)
-- ROADMAP обновление с fine-grained фазами: embedded Linux arm64 → Android arm64
-  → (возможно позже) bare-metal Cortex-M
-Реализация самого arm64 backend — отдельная многомесячная веха.
-
-### 2. VM-handler polymorphism *(средний)*
+### 1. VM-handler polymorphism *(средний)*
 Сейчас handler'ы на разные опкоды имеют устойчивые эпилоги (jmp dispatcher). Нужно:
 - Несколько эквивалентных эпилогов (indirect jmp через scratch, ret-to-dispatcher, push+ret)
 - Per-handler junk prologue (dead MOV/XOR в scratch)
 - Рандомизированные scratch-slot'ы внутри 24-байтового фрейма
 
-### 3. Handler-table key через ImageBase *(средний)*
+### 2. Handler-table key через ImageBase *(средний)*
 Вместо захардкоженного `table_xor_key` вычислять его в рантайме от `ImageBase + per-build salt`. Статически в бинарнике правильного ключа нет, ASLR делает его непредсказуемым.
 
-### 4. Packer polymorphism *(средний)*
+### 3. Packer polymorphism *(средний)*
 У packer stub сейчас фиксированная структура (push/anti-debug/key-lea/per-section-loop/IAT-wipe/pop/stolen/jmp). Добавить:
 - Варианты anti-debug: PEB.BeingDebugged, PEB.NtGlobalFlag (bit 0x70), KUSER_SHARED_DATA timing
 - Несколько форм decrypt loop (rep-based, SIMD, simple loop)
-- Рандомизация where IAT wipe happens (до/после каждого section loop)
+- Рандомизация где происходит IAT wipe (до/после каждого section loop)
 
-### 5. Анти-unicorn / анти-эмуляция *(средний)*
+### 4. Анти-unicorn / анти-эмуляция *(средний)*
 - Проверки на недокументированные CPU-флаги (AC, ID) в VM-контексте
 - Timing checks через RDTSC внутри handler'ов (редко, не на каждом)
 - CPUID-анти-VM проверки в stub
 
-### 6. Native handler expansion *(низкий)*
+### 5. Native handler expansion *(низкий)*
 Добавить покрытие generic лифтинга для:
 - `shl/shr/sar` с рег-операндами
 - `imul` r/m64, r64, imm
 - `cmov*` семейство
 - Расширенные bit-ops (`bt`, `bts`, `btr`)
 
-### 7. Инфраструктура тестирования *(низкий)*
+### 6. Инфраструктура тестирования *(низкий)*
 - Smoke-тест, проверяющий что в выходном бинаре реально присутствуют patterns: XOR handler table, XOR vflags scramble, рандомизированный reg mapping
 - Diff-тест двух билдов одного input'а: должны отличаться handler permutation, vflags_key, vflags_rol, XOR keys, reg order, section names, packer key
-- Full-stack стресс `--packer --cfg-flattening` после починки CFG
+- Fuzz-style стресс сотни input'ов × full pipeline
 
 ---
 
 ## Cross-platform plan
 
-Целевая поддержка (в порядке приоритета):
-1. **Linux ELF x86_64** — основной secondary target
-2. **Linux ELF arm64** — следующий шаг
-3. **macOS Mach-O x86_64 / arm64** — tertiary
+Эта и следующая секция расписывают миграцию по ДВУМ независимым осям:
 
-Текущий статус: **Phase 1 готов** — интерфейсы объявлены, `TargetInfo` прокинут через `ProtectionContext`, контейнер-специфичные пассы guard'ят `is_applicable()`.
+- **Container** (PE / ELF / Mach-O) — "какой парсер и builder работает с файлом"
+- **Architecture** (x64 / arm64 / cortex-m) — "как выглядит машинный код внутри"
 
-### Фазы миграции
+Эти оси ортогональны. Windows PE x64 и Linux ELF x64 делят одну arch-backend,
+но разные container-backend. Linux ELF arm64 и Android ELF arm64 делят один
+arch-backend, но отличаются target-specific passes. Пайплайн должен уметь
+любую комбинацию: для каждого target выбирается `(container backend, arch backend)`.
 
-**Phase 1 — Foundation (done):**
+### Container axis (PE/ELF/Mach-O)
+
+Целевая поддержка по контейнеру:
+1. **Windows PE** — единственный сейчас, полный pipeline
+2. **Linux ELF** — primary secondary target (embedded Linux, Android, desktop)
+3. **macOS Mach-O** — tertiary (Apple Silicon десктоп/ноутбук)
+
+Статус: **Phase 1 container foundation готов** — `target::TargetInfo`,
+`target::IBinaryImage` sketch, `ProtectionContext::target()`,
+container-specific guard в `PackerPass`.
+
+**Phase 1 (done):**
 - `include/mxprotector/target/target_info.hpp` — `TargetInfo`, `Os`, `ContainerFormat`, `Arch` enums
-- `include/mxprotector/target/binary_image.hpp` — `IBinaryImage`, `IBinaryImageParser`, `IBinaryImageBuilder` sketch-интерфейсы
+- `include/mxprotector/target/binary_image.hpp` — `IBinaryImage`, `IBinaryImageParser`, `IBinaryImageBuilder`
 - `ProtectionContext::target()` + guard в `PackerPass`
 
-**Phase 2 — PE подтягивается под интерфейс:**
-- `PeImage` начинает implement `IBinaryImage`
-- `PeParser` становится `IBinaryImageParser`
-- `PeBuilder` становится `IBinaryImageBuilder`
-- `ProtectionContext::image_` ретайп на `std::unique_ptr<IBinaryImage>` (имея PE как единственную реализацию — миграция прозрачна)
-- Существующие пассы компилируются без изменений
+**Phase 2 — PE tucks under the interface:**
+- `PeImage` начинает `implement IBinaryImage`
+- `PeParser` становится `IBinaryImageParser`, `PeBuilder` — `IBinaryImageBuilder`
+- `ProtectionContext::image_` перетипизируется в `std::unique_ptr<IBinaryImage>`
+- Существующие passes компилируются без изменений
 
 **Phase 3 — ELF parser/builder:**
 - `ElfImage`, `ElfParser`, `ElfBuilder` в `src/builder/elf/`
-- Детект контейнера по magic в main.cpp: `MZ` → PE, `\x7fELF` → ELF
-- `TargetInfo` заполняется из ELF-бекенда
-- VM-пасс работает как есть (он уже container-agnostic на уровне байткодогенерации — только x64 encoding внутри)
+- Детект контейнера по magic в `main.cpp`: `MZ` → PE, `\x7fELF` → ELF
+- `TargetInfo` заполняется из выбранного парсера
 
-**Phase 4 — Target-specific пассы:**
-- Linux-версия `PackerPass`: ELF-совместимый decrypt stub, Linux syscalls вместо PEB
+**Phase 4 — Target-specific passes:**
+- Linux-версия packer: ELF-совместимый decrypt stub, `syscall`-based init
 - Linux анти-отладка: ptrace checks, `/proc/self/status:TracerPid`
-- macOS аналоги: `sysctl(KERN_PROC, KERN_PROC_PID)` checks
+- macOS Mach-O parser + ptrace/sysctl анти-debug
 
-**Phase 5 — Architecture abstraction:**
-- `IArchEncoder` интерфейс (x64 encoder — текущий; arm64 encoder — новый)
-- VM runtime generator параметризуется encoder'ом
-- arm64 backend переиспользует lifter+mutation+obfuscation, заменяет только машкодогенерацию
+### Architecture axis (x64 / arm64 / cortex-m)
+
+Целевая поддержка по архитектуре (в порядке приоритета):
+1. **x86-64** — текущая, полный pipeline
+2. **ARMv8-A (arm64)** — следующий шаг после ELF container backend
+   - **Embedded Linux arm64** (Raspberry Pi, роутеры, IP камеры, IoT шлюзы) — ~80% IoT
+   - **Android arm64** — поверх embedded Linux backend, + SELinux-aware
+   - **macOS arm64** (Apple Silicon) — поверх Mach-O backend
+3. **Cortex-M** (ARMv6-M / v7-M / v7E-M) — experimental, bare-metal и RTOS
+   firmware. Только после того как v8-A работает, и только если есть
+   реальный пользовательский спрос (firmware protection для IoT-девайсов).
+4. **Cortex-R** — не в scope. Специализированный real-time target, рынок
+   узкий. Если понадобится — переиспользует бОльшую часть Cortex-A backend'а.
+
+Статус: **Phase 1 arch foundation готов** — `arch::ArchInfo`, `arch::ICodeEmitter`,
+`arch::IVmBackend` sketch-интерфейсы объявлены, реализации нет.
+
+**Phase 1 arch (done):**
+- `include/mxprotector/arch/arch_info.hpp` — `ArchInfo`, `ArchVariant`, `ArchProfile`, `ArchFeatures` + factory helpers (`x64_baseline`, `arm64_v8a_application`, ...)
+- `include/mxprotector/arch/code_emitter.hpp` — `ICodeEmitter` sketch: mov/load/store/arith/jmp/jcc/call/ret + labels
+- `include/mxprotector/arch/vm_backend.hpp` — `IVmBackend` sketch: VM runtime generation абстрагирована от x64 bytes
+
+**Phase 2 arch — x64 tucks under the interface:**
+- Существующий `vm_runtime_gen.cpp` раскладывается на:
+  - `VmRuntimeEngine` (target-agnostic policy: permutation, key generation, variant selection, cross-VM split, bytecode assembly)
+  - `X64VmBackend : IVmBackend` (x64-specific mechanics: push/pop, pushfq, rflags scramble, handler dispatch via lea+jmp, stream cipher)
+- `X86CodeEmitter : ICodeEmitter` — обёртка над существующим `x86_code_emitter.cpp`
+- Ничего в build output не меняется — та же x64 сборка, тот же байт-паттерн
+
+**Phase 3 arch — arm64 VM backend:**
+- `Arm64CodeEmitter : ICodeEmitter` — A64 instruction encoding, 31 GPRs
+- `Arm64VmBackend : IVmBackend`:
+  - 31-slot VM context вместо 16 (vm_bytecode operand size поднимается до 5 бит)
+  - Flag handling через MRS/MSR NZCV, либо computed-predicate в GPRs
+  - Handler dispatch через ADR + LDR + BR table
+  - Stream cipher через LDR/LDR/EOR/STR (4-byte unit)
+  - Native escape: arm64 инструкции выполняются в своём frame
+- Arm64-specific mutation rules (`mov x0, #0` → `eor x0, x0, x0` и т.д.)
+
+**Phase 4 arch — Linux/Android arm64 target passes:**
+- `LinuxArm64PackerPass`: ELF stub на arm64, ptrace-based anti-debug, Android-совместимость
+- Проверки на Android Runtime hooks (Frida, Xposed)
+
+**Phase 5 arch — experimental Cortex-M (optional):**
+- Thumb-2 only encoding, ограниченный набор инструкций
+- Нет MMU → нет ASLR → handler-table key через ImageBase бесполезен
+- Stub loader с учётом Flash/RAM layout
+- Нет dynamic linker → imports резолвятся статически на этапе сборки firmware
+- Вероятно понадобится custom container format (raw binary + manifest)
 
 ### "Непортируемые" фичи
 
-Часть защит физически привязана к конкретной платформе:
-- **PE header erasure, anti-debug через PEB, IAT destruction**: Windows-only. Остаются в PE-версии `PackerPass`
-- **Linux-специфика** (ptrace, `/proc` self-check): новый `LinuxPackerPass` с `is_applicable(linux_elf)`
-- **x86-специфичные VM фичи** (vEFLAGS, rolling-key cipher через pushfq/popfq): остаются в `x64_vm_runtime_gen.cpp`. arm64 получит собственный `arm64_vm_runtime_gen.cpp` с NZCV-based flag handling
+Часть защит физически привязана к конкретной платформе/архитектуре:
 
-Каждый пасс либо **target-agnostic** (мутация байт через лифтер), либо **target-specific** с явным guard'ом. Пайплайн сам по себе платформа-нейтрален.
+| Фича | Где ограничена | Примечание |
+|---|---|---|
+| PE header erasure, PEB anti-debug, IAT destruction | Windows PE | Остаются в PE-версии `PackerPass` |
+| vEFLAGS через RFLAGS scramble | x86-64 | Arm64 backend использует NZCV-based или computed-predicate подход |
+| Rolling-key stream cipher через pushfq/popfq | x86-64 | Arm64 использует LDP/STP + EOR |
+| ptrace-based anti-debug | Linux/Android | Отдельный `LinuxPackerPass` |
+| `sysctl` KERN_PROC anti-debug | macOS | Отдельный `MacOSPackerPass` |
+| TrustZone-M anti-tamper | Cortex-M33 | Experimental, требует hardware support |
+
+Каждый pass либо **target-agnostic** (напр. мутация байт через лифтер),
+либо **target-specific** с явным `is_applicable()` guard'ом. Pipeline сам
+по себе container- и arch-нейтрален.
 
 ---
 

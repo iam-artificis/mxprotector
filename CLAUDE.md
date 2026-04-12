@@ -67,14 +67,28 @@ stub loader никогда не дописали до интеграции в в
 Если в будущем понадобится anti-EDR режим с прямыми syscall'ами — добавляется как
 **опциональная** фича поверх packer'а, не как параллельная вселенная.
 
-### Cross-platform foundation (Phase 1 ready)
-`include/mxprotector/target/target_info.hpp` определяет `TargetInfo{os, container, arch}`
-с factory helpers. `include/mxprotector/target/binary_image.hpp` — sketch абстрактного
-`IBinaryImage` интерфейса (пока без реализации — PE код ещё не мигрирован).
+### Cross-platform foundation (Phase 1 ready, both axes)
+
+Две независимые оси абстракции:
+
+**Container axis** — `include/mxprotector/target/`:
+- `target_info.hpp` определяет `TargetInfo{os, container, arch}` с factory helpers
+- `binary_image.hpp` — sketch абстрактного `IBinaryImage` интерфейса (пока без
+  реализации — PE код ещё не мигрирован)
+
+**Architecture axis** — `include/mxprotector/arch/`:
+- `arch_info.hpp` определяет `ArchInfo` с `ArchVariant` (armv8-a, cortex-m4, ...),
+  `ArchProfile` (A/R/M) и `ArchFeatures` (NEON, crypto, LSE, MTE, PAC) — fine-grained
+  описание которое arch-backend'ы читают при построении
+- `code_emitter.hpp` — `ICodeEmitter` sketch для arch-specific машкодогенерации
+- `vm_backend.hpp` — `IVmBackend` sketch для VM runtime generation, отделяет
+  target-agnostic policy от x64/arm64-specific mechanics
 
 Container-specific passes (`PackerPass`) guard'ят `is_applicable()` через
-`ctx.target().is_windows_pe_x64()`, чтобы при добавлении ELF бекенда они корректно
-пропускались.
+`ctx.target().is_windows_pe_x64()`. Arch-specific passes будут guard'ить через
+`ctx.target().arch == Arch::x64`. Когда появится arm64 backend, существующие
+x64-only passes корректно пропускаются на arm64 target'ах, а arm64-only passes
+на x64.
 
 ### Рандомизация имён секций
 MxProtector добавляет 3 секции (vm / cff / packer). Имена per-build рандомизируются
@@ -124,8 +138,12 @@ call site через `pick_xxx_variant(rng)`. Добавляя новый varian
 - `ROADMAP.md` — приоритизированный roadmap (авторитетный документ)
 - `include/mxprotector/core/context.hpp` — ProtectionContext, SectionNameMap
 - `include/mxprotector/target/target_info.hpp` — TargetInfo, Os/Container/Arch enums
-- `include/mxprotector/target/binary_image.hpp` — future cross-platform interface (sketch)
+- `include/mxprotector/target/binary_image.hpp` — container abstraction sketch
+- `include/mxprotector/arch/arch_info.hpp` — ArchInfo, ArchVariant, ArchFeatures
+- `include/mxprotector/arch/code_emitter.hpp` — ICodeEmitter sketch
+- `include/mxprotector/arch/vm_backend.hpp` — IVmBackend sketch
 - `include/mxprotector/config/protection_config.hpp` — config + level presets
 - `src/builder/main.cpp` — pipeline assembly, section name generation
-- `src/builder/protection/vm/vm_runtime_gen.cpp` — VM runtime codegen (x64, ~2K lines)
+- `src/builder/protection/vm/vm_runtime_gen.cpp` — VM runtime codegen (x64, ~2K lines, to be split into engine + X64VmBackend)
 - `src/builder/protection/packer/packer_pass.cpp` — multi-section packer + stub emit
+- `src/builder/protection/obfuscation/opaque_predicates.cpp` — always-true/false predicates (fixed, see Bug B in ROADMAP)
