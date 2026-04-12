@@ -51,23 +51,22 @@ public:
     /**
      * @brief Генерирует VM runtime для последовательности VM-инструкций.
      *
-     * @param instructions  Результат лифтинга (без финального exit).
-     * @param rng           Генератор для рандомизации маппинга/ключа.
-     * @return VmRuntime c байт-блобом, готовым к размещению в секции.
-     */
-    /**
+     * @param instructions    Результат лифтинга (без финального exit).
+     * @param rng             Генератор для рандомизации маппинга/ключа.
      * @param emit_exit_as_jmp If true, the exit handler emits `jmp rel32`
-     *        instead of `ret`. Used for Cross-VM.
-     * @param shared_vflags_key If non-zero, forces this vflags_key instead
-     *        of generating a new one. Cross-VM sub-VMs must share the same
-     *        key so scrambled flags survive the context handoff.
+     *        instead of `ret`. Used for Cross-VM sub-VMs.
+     *
+     * Each sub-VM independently picks its own (vflags_key, vflags_rol)
+     * pair — no state needs to be shared across sub-VMs because the exit
+     * stub fully descrambles RFLAGS before popfq and the entry stub
+     * re-scrambles after pushfq.
+     *
+     * @return VmRuntime c байт-блобом, готовым к размещению в секции.
      */
     [[nodiscard]] MxResult<VmRuntime> generate(
         const std::vector<VmInstruction>& instructions,
         Randomizer& rng,
-        bool emit_exit_as_jmp = false,
-        uint32_t shared_vflags_key = 0,
-        bool skip_entry_vflags_scramble = false);
+        bool emit_exit_as_jmp = false);
 
 private:
     /**

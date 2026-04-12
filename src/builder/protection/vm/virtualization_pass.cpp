@@ -264,11 +264,11 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
                     }
                 }
 
-                // Both sub-VMs must share the same vflags_key so the
-                // scrambled vEFLAGS from VM1 can be read correctly by VM2.
-                const uint32_t shared_vflags = (rng.next_u32() & 0x8C5) | 1; // FIXED
-                auto rt1 = gen.generate(part1, rng, true, shared_vflags, false);
-                auto rt2 = gen.generate(part2, rng, false, shared_vflags, true); // skip entry scramble
+                // Sub-VMs are fully independent: VM1's exit descrambles
+                // its RFLAGS before popfq, VM2's entry re-scrambles after
+                // pushfq. No shared vflags state required.
+                auto rt1 = gen.generate(part1, rng, true);
+                auto rt2 = gen.generate(part2, rng, false);
 
                 if (rt1 && rt2) {
                     // Merge the two blobs: rt1 followed by rt2, patch the JMP
