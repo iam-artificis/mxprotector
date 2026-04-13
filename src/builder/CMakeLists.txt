@@ -79,6 +79,7 @@ set(BUILDER_SOURCES
     protection/string/string_scanner.cpp
     protection/string/string_xref_finder.cpp
     protection/string/string_encryptor.cpp
+    protection/string/string_decryptor_codegen.cpp
 
     # Phase 6: Anti-emulation checks — one file per technique
     protection/anti_emulation/check_registry.cpp

@@ -1,0 +1,288 @@
+/**
+ * @file string_decryptor_codegen.cpp
+ * @brief [BUILDER] Machine-code emission for `mx_str_get` and its
+ *        per-xref trampolines.
+ *
+ * Every byte of x64 emitted here was laid out by hand and cross
+ * referenced against the unit tests in
+ * `tests/unit/string_decryptor_codegen_test.cpp`. If you change a
+ * byte, the tests will tell you exactly which invariant broke.
+ *
+ * The code is annotated line-by-line with the disassembly so a
+ * reader can follow along without consulting an x64 reference:
+ *
+ *   mx_str_get:   input:  ecx = string_id
+ *                 output: rax = decrypted plaintext pointer
+ *
+ *     lea    r10, [rip + desc_table_disp32]   ; r10 = desc_base
+ *     lea    r10, [r10 + rcx*8]               ; r10 = desc_entry
+ *     mov    eax, [r10]                       ; eax = data_offset
+ *     movzx  ecx, word [r10 + 4]              ; ecx = length
+ *     movzx  edx, byte [r10 + 6]              ; edx = key
+ *     lea    r11, [rip + data_base_disp32]    ; r11 = data_base
+ *     add    rax, r11                         ; rax = plaintext_ptr
+ *     test   byte [r10 + 7], 1                ; already decrypted?
+ *     jnz    .done
+ *     mov    r8, rax                          ; r8 = cursor
+ *     test   rcx, rcx
+ *     jz     .mark_decrypted                  ; len == 0 guard
+ *   .loop:
+ *     xor    byte [r8], dl
+ *     inc    r8
+ *     dec    rcx
+ *     jnz    .loop
+ *   .mark_decrypted:
+ *     or     byte [r10 + 7], 1                ; sticky flag
+ *   .done:
+ *     ret
+ *
+ * The trampoline prologue saves all seven Windows x64 volatile GPRs
+ * plus RFLAGS. The only registers whose final state differs from
+ * entry are (a) the designated target register, which ends up
+ * holding the decrypted pointer, and (b) nothing else — every other
+ * volatile reg and RFLAGS are restored verbatim. That lets the
+ * rewriter drop the trampoline in place of a `lea target, [rip+x]`
+ * without disturbing anything the LEA would not have disturbed.
+ */
+
+#include "mxprotector/protection/string/string_decryptor_codegen.hpp"
+
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+
+namespace mx::string_protect {
+
+// ---------------------------------------------------------------------------
+// Descriptor packing
+// ---------------------------------------------------------------------------
+
+std::array<uint8_t, kDescriptorSize>
+pack_descriptor(const StringDescriptor& d) noexcept
+{
+    std::array<uint8_t, kDescriptorSize> out{};
+    // Little-endian — mirrors the x64 loads inside mx_str_get.
+    out[0] = static_cast<uint8_t>(d.data_offset & 0xFF);
+    out[1] = static_cast<uint8_t>((d.data_offset >> 8)  & 0xFF);
+    out[2] = static_cast<uint8_t>((d.data_offset >> 16) & 0xFF);
+    out[3] = static_cast<uint8_t>((d.data_offset >> 24) & 0xFF);
+    out[4] = static_cast<uint8_t>(d.length & 0xFF);
+    out[5] = static_cast<uint8_t>((d.length >> 8) & 0xFF);
+    out[6] = d.key;
+    out[7] = d.flags;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mx_str_get decryptor
+// ---------------------------------------------------------------------------
+
+EmittedDecryptor emit_mx_str_get()
+{
+    EmittedDecryptor out;
+    out.code.reserve(kMxStrGetSize);
+    auto& c = out.code;
+
+    // lea r10, [rip + desc_table_disp32]           (7 bytes)
+    // REX.W|R (0x4C) + 0x8D + ModRM(00 010 101 = 0x15) + disp32=0
+    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x15);
+    out.desc_table_disp32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // lea r10, [r10 + rcx*8]                       (4 bytes)
+    // REX.W|R|B (0x4D) + 0x8D + ModRM(00 010 100 = 0x14) + SIB(11 001 010 = 0xCA)
+    c.push_back(0x4D); c.push_back(0x8D); c.push_back(0x14); c.push_back(0xCA);
+
+    // mov eax, dword [r10]                         (3 bytes)
+    // REX.B (0x41) + 0x8B + ModRM(00 000 010 = 0x02)
+    c.push_back(0x41); c.push_back(0x8B); c.push_back(0x02);
+
+    // movzx ecx, word [r10 + 4]                    (5 bytes)
+    // REX.B + 0x0F B7 + ModRM(01 001 010 = 0x4A) + disp8=4
+    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB7);
+    c.push_back(0x4A); c.push_back(0x04);
+
+    // movzx edx, byte [r10 + 6]                    (5 bytes)
+    // REX.B + 0x0F B6 + ModRM(01 010 010 = 0x52) + disp8=6
+    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB6);
+    c.push_back(0x52); c.push_back(0x06);
+
+    // lea r11, [rip + data_base_disp32]            (7 bytes)
+    // REX.W|R + 0x8D + ModRM(00 011 101 = 0x1D) + disp32=0
+    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x1D);
+    out.data_base_disp32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // add rax, r11                                 (3 bytes)
+    // REX.W|R (0x4C) + 0x01 + ModRM(11 011 000 = 0xD8)
+    c.push_back(0x4C); c.push_back(0x01); c.push_back(0xD8);
+
+    // test byte [r10 + 7], 1                       (5 bytes)
+    // REX.B + 0xF6 + ModRM(01 000 010 = 0x42) + disp8=7 + imm8=1
+    c.push_back(0x41); c.push_back(0xF6); c.push_back(0x42);
+    c.push_back(0x07); c.push_back(0x01);
+
+    // jnz rel8 → .done  (+24)                      (2 bytes)
+    // 0x75 0x18
+    c.push_back(0x75); c.push_back(0x18);
+
+    // mov r8, rax                                  (3 bytes)
+    // REX.W|B (0x49) + 0x89 + ModRM(11 000 000 = 0xC0)
+    c.push_back(0x49); c.push_back(0x89); c.push_back(0xC0);
+
+    // test rcx, rcx                                (3 bytes)
+    // REX.W (0x48) + 0x85 + ModRM(11 001 001 = 0xC9)
+    c.push_back(0x48); c.push_back(0x85); c.push_back(0xC9);
+
+    // jz  rel8 → .mark_decrypted  (+11)            (2 bytes)
+    // 0x74 0x0B
+    c.push_back(0x74); c.push_back(0x0B);
+
+    // .loop:
+    // xor byte [r8], dl                            (3 bytes)
+    // REX.B + 0x30 + ModRM(00 010 000 = 0x10)
+    c.push_back(0x41); c.push_back(0x30); c.push_back(0x10);
+
+    // inc r8                                       (3 bytes)
+    // REX.W|B (0x49) + 0xFF + ModRM(11 000 000 = 0xC0)
+    c.push_back(0x49); c.push_back(0xFF); c.push_back(0xC0);
+
+    // dec rcx                                      (3 bytes)
+    // REX.W (0x48) + 0xFF + ModRM(11 001 001 = 0xC9)
+    c.push_back(0x48); c.push_back(0xFF); c.push_back(0xC9);
+
+    // jnz rel8 → .loop  (-11)                      (2 bytes)
+    // 0x75 0xF5
+    c.push_back(0x75); c.push_back(0xF5);
+
+    // .mark_decrypted:
+    // or byte [r10 + 7], 1                         (5 bytes)
+    // REX.B + 0x80 + ModRM(01 001 010 = 0x4A) + disp8=7 + imm8=1
+    c.push_back(0x41); c.push_back(0x80); c.push_back(0x4A);
+    c.push_back(0x07); c.push_back(0x01);
+
+    // .done:
+    // ret                                          (1 byte)
+    c.push_back(0xC3);
+
+    assert(c.size() == kMxStrGetSize);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Per-xref trampolines
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Stack slot (offset from rsp) of the saved copy of a volatile GPR
+/// inside the trampoline, measured at the point where the `mov
+/// [rsp+slot], rax` patch fires. Push order is:
+///   push rax   (first after pushfq, deepest in stack)
+///   push rcx
+///   push rdx
+///   push r8
+///   push r9
+///   push r10
+///   push r11   (last, top of stack)
+/// After all seven pushes, the top of stack holds r11 (slot 0), and
+/// rax is eight slots below that at slot 48.
+constexpr uint8_t volatile_stack_slot(GprIndex gpr) noexcept {
+    switch (gpr) {
+        case kGprRax: return 48;
+        case kGprRcx: return 40;
+        case kGprRdx: return 32;
+        case kGprR8:  return 24;
+        case kGprR9:  return 16;
+        case kGprR10: return 8;
+        case kGprR11: return 0;
+        default:      return 0;  // unreachable — caller checks is_volatile
+    }
+}
+
+/// `mov qword [rsp + slot], rax` — 5 bytes.
+/// REX.W (0x48) + 0x89 + ModRM(01 000 100 = 0x44, SIB follows) +
+/// SIB(00 100 100 = 0x24, base=rsp no index) + disp8 = slot.
+void emit_mov_stack_slot_rax(std::vector<uint8_t>& c, uint8_t slot) {
+    c.push_back(0x48);
+    c.push_back(0x89);
+    c.push_back(0x44);
+    c.push_back(0x24);
+    c.push_back(slot);
+}
+
+/// `mov target, rax` — 3 bytes — for a non-volatile GPR target.
+/// Low regs (rbx/rbp/rsi/rdi) get REX 0x48; extended regs
+/// (r12..r15) get REX 0x49 (REX.B set). ModRM is always
+/// 11 000 <target_low3>, where reg field = rax = 0.
+void emit_mov_reg_rax(std::vector<uint8_t>& c, GprIndex target) {
+    const bool     ext   = target >= 8;
+    const uint8_t  rex   = ext ? 0x49 : 0x48;
+    const uint8_t  rm    = static_cast<uint8_t>(target & 0x7);
+    const uint8_t  modrm = static_cast<uint8_t>(0xC0 | rm);
+    c.push_back(rex);
+    c.push_back(0x89);
+    c.push_back(modrm);
+}
+
+} // namespace
+
+EmittedTrampoline emit_trampoline(const TrampolineRequest& req)
+{
+    assert(req.target_reg != kGprRsp && "rsp is not a valid LEA target");
+    assert(req.target_reg < 16       && "target must be a valid x64 GPR");
+
+    EmittedTrampoline out;
+    out.code.reserve(kTrampolineSizeVolatile);
+    auto& c = out.code;
+
+    // ---- Prologue: pushfq + 7 volatile pushes (12 bytes total) ----
+    c.push_back(0x9C);                          // pushfq
+    c.push_back(0x50);                          // push rax
+    c.push_back(0x51);                          // push rcx
+    c.push_back(0x52);                          // push rdx
+    c.push_back(0x41); c.push_back(0x50);       // push r8
+    c.push_back(0x41); c.push_back(0x51);       // push r9
+    c.push_back(0x41); c.push_back(0x52);       // push r10
+    c.push_back(0x41); c.push_back(0x53);       // push r11
+
+    // ---- mov ecx, imm32 (string_id) (5 bytes) ----
+    c.push_back(0xB9);
+    const uint32_t id = req.string_id;
+    c.push_back(static_cast<uint8_t>(id         & 0xFF));
+    c.push_back(static_cast<uint8_t>((id >> 8)  & 0xFF));
+    c.push_back(static_cast<uint8_t>((id >> 16) & 0xFF));
+    c.push_back(static_cast<uint8_t>((id >> 24) & 0xFF));
+
+    // ---- call rel32 (mx_str_get) (5 bytes) ----
+    c.push_back(0xE8);
+    out.call_rel32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // ---- Deliver result to target ----
+    if (is_volatile_gpr(req.target_reg)) {
+        // Patch the saved slot on the stack so the matching pop
+        // below restores `target = rax (pointer)`.
+        emit_mov_stack_slot_rax(c, volatile_stack_slot(req.target_reg));
+    } else {
+        // Direct write. The LEA we replaced was going to clobber
+        // target, so there's nothing to preserve.
+        emit_mov_reg_rax(c, req.target_reg);
+    }
+
+    // ---- Epilogue: 7 pops (reverse order) + popfq + ret ----
+    c.push_back(0x41); c.push_back(0x5B);       // pop r11
+    c.push_back(0x41); c.push_back(0x5A);       // pop r10
+    c.push_back(0x41); c.push_back(0x59);       // pop r9
+    c.push_back(0x41); c.push_back(0x58);       // pop r8
+    c.push_back(0x5A);                          // pop rdx
+    c.push_back(0x59);                          // pop rcx
+    c.push_back(0x58);                          // pop rax
+    c.push_back(0x9D);                          // popfq
+    c.push_back(0xC3);                          // ret
+
+    assert(c.size() == trampoline_size_for(req.target_reg));
+    return out;
+}
+
+} // namespace mx::string_protect
