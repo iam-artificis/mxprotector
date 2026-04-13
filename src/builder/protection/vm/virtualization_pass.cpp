@@ -205,6 +205,22 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
         // bytes (push/pop, self-canceling arithmetic, etc.). This pollutes
         // the bytecode and handler chain with noise that a reverser must
         // analyze instruction-by-instruction to distinguish real from junk.
+        //
+        // NOTE: an earlier experiment at injecting "dead opcodes" that
+        // reused real VM op handlers (mov_rr self-copy, shl_ri 0, etc.)
+        // for shape parity with live ALU ops failed because every
+        // handler's operand fetch is itself an ALU chain (xor + inc +
+        // movzx) that clobbers rflags, and the tail dispatch saves
+        // whatever host rflags is at the end of the body into vflags.
+        // Flag-preserving bodies ("mov", "shl by zero") leave the
+        // fetch's garbage flags in place instead of the prior real
+        // instruction's flags, and a subsequent vjcc reads the wrong
+        // guest flags. The stochastic vjcc miss-branches broke ~3% of
+        // stress builds even after moving to shl-by-0 style
+        // identities. Fixing it requires dedicated dead-op handlers
+        // that stash + restore vflags around the body — deferred to
+        // a future commit. Native-bytes junk is the only junk form
+        // today.
         {
             JunkGenerator junk_gen(ctx.pe_image().architecture());
             std::vector<vm::VmInstruction> augmented;

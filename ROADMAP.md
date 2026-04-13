@@ -37,9 +37,11 @@ below for the full spec.
     strengthening".
 5. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
     (load, store, key derivation). § "Gap vs коммерческие" → G2.
-6. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
-    opcodes, opaque bytecode branches, handler id polymorphism, rolling
-    key per handler. § "Gap vs коммерческие" → G4.
+6. 📋 **VM strengthening — G4 bytecode semantic obfuscation (remainder).**
+    Handler id polymorphism already shipped (8 canonical ops × 2
+    variants each). Still open: dead opcodes via dedicated
+    flag-preserving handlers, opaque bytecode branches, rolling key
+    per handler. § "Gap vs коммерческие" → G4.
 7. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
@@ -68,21 +70,34 @@ handler table. То, что reverser ожидает увидеть как "handl
 `call inner_vm_entry; ret`. Overhead: +30-50% bytecode size на защищённый регион,
 но реверс times умножается на коэффициент inner-VM сложности.
 
-### 📋 G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
-Сейчас bytecode линейный: handler_id, operand, handler_id, operand... Reverser
-после extraction таблицы handler'ов читает логику как plain asm. VMProtect
-разбрасывает по bytecode:
-- **Dead opcodes**: handler'ы, которые читают operand, делают вычисление и
-  отбрасывают результат. Выглядят неотличимо от реальных
-- **Opaque branches inside bytecode**: `VJCC` с всегда-ложным условием, уводящая
-  на мертвую ветку handlers (которая сама корректно завершается)
-- **Handler id polymorphism**: один и тот же guest opcode emit'ится через 3-5
-  разных handler'ов-синонимов (`add rax, rbx` → `ADD_A` / `ADD_B_via_NEG_SUB` /
-  `ADD_C_via_LEA`). Каждый — валидная реализация, выбор per-instruction
-  рандомизирован. Расширяет существующий G1 specialization механизм
-- **Bytecode encryption с rolling key per-handler**: каждый handler XOR'ит
-  следующий opcode byte ключом зависящим от своего handler_id. Static decode
-  невозможен — только трассировкой
+### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
+
+- **Handler id polymorphism** ✅ — shipped. 8 canonical ops
+  (`mov_rr`, `add_rr`, `sub_rr`, `xor_rr`, `and_rr`, `or_rr`,
+  `not_r`, `neg_r`) each have 2 alternative handler bodies. The
+  encoder picks one at random per bytecode instruction via the
+  existing `variant_handler_ids` path. Each handler table now holds
+  2 bodies per targeted op; static opcode-table recovery has to
+  distinguish shapes across the full variant set.
+
+- 📋 **Dead opcodes** — deferred. The "reuse an existing ALU op
+  with an identity imm" approach fails because every handler's
+  operand fetch trashes host rflags and the tail dispatch saves
+  them to vflags, so a flag-preserving body like `shl 0` still
+  leaks garbage flags into vflags and a subsequent `vjcc` reads
+  the wrong guest ZF/SF. Stochastic ~3% vjcc miss-branch under
+  stress. Proper fix: custom dead-op handlers that stash vflags on
+  entry and restore before tail dispatch — those are ~20 bytes
+  each, don't reuse the generic emitter, and need new
+  `variant_count_for` entries.
+
+- 📋 **Opaque branches inside bytecode**: `VJCC` с всегда-ложным
+  условием, уводящая на мертвую ветку handlers (которая сама
+  корректно завершается).
+
+- 📋 **Bytecode encryption с rolling key per-handler**: каждый
+  handler XOR'ит следующий opcode byte ключом зависящим от своего
+  handler_id. Static decode невозможен — только трассировкой.
 
 ### 📋 G5. VM handler call graph obfuscation *(средний, средняя сложность)*
 Сейчас dispatcher — один `jmp [table + handler_id*8]`. Добавить:
