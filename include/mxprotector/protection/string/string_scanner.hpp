@@ -115,17 +115,24 @@ public:
      *        inside an MxProtector candidate string?
      *
      * Printable ASCII is `0x20..0x7E`. We additionally accept `\t`
-     * (0x09) because real log / error strings sometimes contain tabs
-     * for column alignment. `\n` and `\r` are deliberately excluded:
-     * multiline strings are rare in release builds and their
-     * presence usually indicates the run is actually binary data
-     * that happens to contain a couple of ASCII bytes.
+     * (0x09), `\n` (0x0A), and `\r` (0x0D) — format strings like
+     * `"[tag] message\n"` or `"\tcolumn1\tcolumn2\n"` are routine in
+     * release builds and would otherwise get chopped at the newline,
+     * leaving the "NUL-terminator" check to reject them entirely
+     * because what follows the printable run is `\n`, not `\0`.
+     *
+     * The earlier policy excluded `\n`/`\r` on the theory that
+     * multiline strings usually indicate binary data. In practice
+     * that heuristic missed the most common printf-style logging
+     * strings in every C/C++ program, which is much worse than the
+     * occasional false positive from binary data.
      *
      * This is exposed so tests can probe the classifier directly
      * without constructing a full scanner.
      */
     [[nodiscard]] static constexpr bool is_string_byte(uint8_t c) noexcept {
-        return (c >= 0x20 && c <= 0x7E) || c == 0x09;
+        return (c >= 0x20 && c <= 0x7E) ||
+               c == 0x09 || c == 0x0A || c == 0x0D;
     }
 
 private:

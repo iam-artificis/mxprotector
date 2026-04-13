@@ -439,6 +439,18 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     // Data offsets are measured from the start of the data pool (not
     // the section), matching what `mx_str_get` computes:
     //     rax = desc.data_offset + data_base
+    //
+    // NUL-terminator layout: for every protected string we reserve
+    // `enc.length + 1` bytes in the data pool. The extra byte is set
+    // to `enc.key` at build time; when the runtime decryptor XORs it
+    // with `enc.key`, it becomes `0` — a proper NUL terminator. The
+    // descriptor's `length` field is bumped to `enc.length + 1` so
+    // the runtime decrypt loop processes the terminator too.
+    //
+    // Callers treat the returned pointer as a classic C string
+    // (strlen, printf %s, etc.); without the terminator they'd read
+    // past the end of the plaintext into the next ciphertext byte
+    // and produce garbled output up to the next lucky zero byte.
     const size_t desc_table_offset = section_buf.size();
     size_t       data_pool_cursor  = 0;
 
@@ -447,23 +459,25 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     for (const auto& enc : encrypted) {
         StringDescriptor d{};
         d.data_offset = static_cast<uint32_t>(data_pool_cursor);
-        d.length      = static_cast<uint16_t>(enc.length);
+        d.length      = static_cast<uint16_t>(enc.length + 1);
         d.key         = enc.key;
         d.flags       = 0;
         descriptors.push_back(d);
-        data_pool_cursor += enc.length;
+        data_pool_cursor += enc.length + 1;
     }
     for (const auto& d : descriptors) {
         const auto packed = string_protect::pack_descriptor(d);
         section_buf.insert(section_buf.end(), packed.begin(), packed.end());
     }
 
-    // Data pool — append ciphertexts back-to-back.
+    // Data pool — append ciphertexts back-to-back, each followed by
+    // one byte whose decrypted value is `0` (= the per-string key).
     const size_t data_pool_offset = section_buf.size();
     for (const auto& enc : encrypted) {
         section_buf.insert(section_buf.end(),
                            enc.ciphertext.begin(),
                            enc.ciphertext.end());
+        section_buf.push_back(enc.key);  // key ^ 0 = plain NUL after decrypt
     }
 
     // S3 scratch ring. Only appended in ephemeral mode; sticks at

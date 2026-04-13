@@ -1,30 +1,54 @@
 /**
  * @file string_xref_finder.cpp
- * @brief [BUILDER] Zydis-based scanner for LEA rip-relative string refs.
+ * @brief [BUILDER] Byte-pattern scanner for LEA rip-relative string refs.
  *
- * Implementation walks the code buffer linearly. At each offset we
- * attempt a full decode; on success we advance by the decoded
- * instruction length, on failure we advance by 1 byte (this keeps
- * the scan robust against data interleaved with code, common in
- * x64 binaries that mix jump tables and switch tables into the
- * text section).
+ * The earlier implementation walked the code buffer with Zydis in a
+ * linear-decode loop. That works fine in a clean `.text` section but
+ * desynchronises the moment it hits a CFF trampoline section (where
+ * real instructions are interleaved with dispatcher tables, MBA
+ * transitions, and state-machine prologues that don't decode as a
+ * single stream). A single decoded "instruction" whose length
+ * straddles a real LEA silently skips past it.
  *
- * Matching criteria for a LEA site:
+ * Since we only care about one specific instruction form —
+ * `LEA r64, [rip + disp32]`, which has a fixed 7-byte encoding —
+ * we can match it directly at every byte offset instead of trying
+ * to decode the surrounding context. This is both faster and
+ * immune to decoder desync.
  *
- *   1. Mnemonic is `LEA`.
- *   2. Exactly one memory operand whose base is `RIP`.
- *   3. The resolved absolute target (via `ZydisCalcAbsoluteAddress`
- *      using a synthetic "runtime address" built from `code_rva` +
- *      offset) equals some candidate's `rva_start` exactly.
+ * Encoding of `lea r64, [rip + disp32]`:
+ *
+ *   [REX]   0100 W R X B      W=1 always; R selects low/ext reg;
+ *                             X and B are unused for rip-rel and
+ *                             the emitters we care about leave
+ *                             them zero (0x48 for rax..rdi,
+ *                             0x4C for r8..r15)
+ *   [op]    0x8D              LEA
+ *   [ModRM] 00 <reg3> 101     mod=00, rm=101 → rip+disp32;
+ *                             reg field holds the low 3 bits of
+ *                             the destination register
+ *   [disp32] little-endian signed 32-bit displacement
+ *
+ * Matching criteria:
+ *   1. byte[0] ∈ {0x48, 0x4C}
+ *   2. byte[1] == 0x8D
+ *   3. byte[2] & 0xC7 == 0x05  (mod=00, rm=101)
+ *   4. resolved target RVA (= lea_rva + 7 + disp32) equals some
+ *      candidate's `rva_start` exactly.
  *
  * Intra-string references (target RVA inside a string but not at
- * its start) are deliberately excluded — see header comment. They
- * would need a runtime decryptor that accepts (string_id, offset)
- * instead of (string_id), which is out of scope for MVP.
+ * its start) are deliberately excluded — see header comment.
  *
- * Matching uses `std::lower_bound` against the candidates list to
- * keep lookup logarithmic. The candidates list is sorted by
- * `rva_start` per the scanner's natural output order.
+ * False-positive analysis: the LEA byte pattern has probability
+ * ~9.4e-7 per random offset, and among those only the ones that
+ * happen to point exactly at one of a few hundred candidate RVAs
+ * matter. Expected false positives in a 100KB section: ~4.4e-9.
+ * In practice, the pattern is rare enough that confusing a data
+ * table for an LEA site requires deliberate construction.
+ *
+ * rsp (encoding 4) as LEA destination is silently rejected —
+ * `lea rsp, [rip+d]` is legal but our trampoline emitter refuses
+ * it, and this way we don't pollute the caller with a filter.
  */
 
 #include "mxprotector/protection/string/string_xref_finder.hpp"
@@ -32,6 +56,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include <Zydis/Zydis.h>
 
@@ -61,94 +86,68 @@ StringXrefFinder::find(ByteView                       code,
                        const std::vector<FoundString>& candidates) const
 {
     std::vector<StringXref> result;
-    if (code.empty() || candidates.empty()) return result;
+    if (code.size() < 7 || candidates.empty()) return result;
 
-    // Sanity check the precondition: the candidates list must be
-    // sorted by rva_start. We don't own the fixup — callers that
-    // violate this get undefined results from `lower_bound` below
-    // — so this is a cheap debug assert, not a correctness gate.
-    // (Scanner already produces sorted output.)
+    // Scan every byte offset. The LEA form we care about is a fixed
+    // 7 bytes, so offsets past `code.size() - 7` can't hold one.
+    const size_t end = code.size() - 7 + 1;
+    for (size_t off = 0; off < end; ++off) {
+        const uint8_t rex = code[off];
+        // REX.W = 1 always (64-bit operand). REX.R chooses low vs.
+        // extended dest register. REX.X / REX.B are ignored for
+        // rip-relative addressing — we accept only the canonical
+        // 0x48 / 0x4C values that the MSVC and clang codegens
+        // actually emit. Other values (0x49, 0x4D, etc.) are
+        // vanishingly rare for this instruction form.
+        if (rex != 0x48 && rex != 0x4C) continue;
+        if (code[off + 1] != 0x8D)      continue;
 
-    ZydisDecoder decoder{};
-    ZydisDecoderInit(&decoder,
-                     ZYDIS_MACHINE_MODE_LONG_64,
-                     ZYDIS_STACK_WIDTH_64);
+        const uint8_t modrm = code[off + 2];
+        // mod=00 (top 2 bits = 00), rm=101 (low 3 bits = 101).
+        // Mask out the middle `reg` field and compare.
+        if ((modrm & 0xC7) != 0x05) continue;
 
-    size_t offset = 0;
-    while (offset < code.size()) {
-        ZydisDecodedInstruction insn{};
-        ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        // Decode the destination register. REX.R extends the `reg`
+        // field from 3 bits to 4 bits. Reject rsp (encoding 4) as
+        // a destination.
+        const uint8_t rex_r     = (rex >> 2) & 1;
+        const uint8_t reg_low3  = (modrm >> 3) & 7;
+        const uint8_t gpr       = static_cast<uint8_t>((rex_r << 3) | reg_low3);
+        if (gpr == 4 /* rsp */) continue;
 
-        const uint8_t* insn_ptr = code.data() + offset;
-        const size_t   remaining = code.size() - offset;
+        // Read the signed 32-bit displacement.
+        int32_t disp32 = 0;
+        std::memcpy(&disp32, code.data() + off + 3, 4);
 
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-                &decoder, insn_ptr, remaining, &insn, operands)))
-        {
-            // Invalid or truncated instruction — advance one byte
-            // and keep scanning. The LEA we care about is 7 bytes
-            // long, so even at the tail of the buffer we may still
-            // find one on the next offset.
-            ++offset;
-            continue;
-        }
+        // Resolve the target RVA. rip-relative addressing uses the
+        // RVA of the NEXT instruction as the base, which for a
+        // 7-byte LEA is `lea_rva + 7`.
+        const Rva lea_rva    = code_rva + static_cast<Rva>(off);
+        const int64_t rip_after = static_cast<int64_t>(lea_rva) + 7;
+        const int64_t target64  = rip_after + static_cast<int64_t>(disp32);
+        if (target64 < 0 || target64 > 0xFFFFFFFFLL) continue;
+        const Rva target_rva = static_cast<Rva>(target64);
 
-        // Only LEA with a rip-relative memory source qualifies.
-        if (insn.mnemonic != ZYDIS_MNEMONIC_LEA) {
-            offset += insn.length;
-            continue;
-        }
-
-        // LEA has a destination register operand and a memory
-        // operand source. Find them.
-        const ZydisDecodedOperand* dest_reg_op = nullptr;
-        const ZydisDecodedOperand* src_mem_op  = nullptr;
-        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
-            const auto& op = operands[i];
-            if (op.visibility != ZYDIS_OPERAND_VISIBILITY_EXPLICIT) continue;
-            if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && dest_reg_op == nullptr) {
-                dest_reg_op = &op;
-            } else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && src_mem_op == nullptr) {
-                src_mem_op = &op;
-            }
-        }
-
-        if (dest_reg_op == nullptr || src_mem_op == nullptr ||
-            src_mem_op->mem.base != ZYDIS_REGISTER_RIP)
-        {
-            offset += insn.length;
-            continue;
-        }
-
-        // Resolve the absolute target by feeding Zydis a synthetic
-        // "runtime address" equal to the instruction's RVA. Because
-        // rip-relative addressing uses `rip + disp32` where `rip`
-        // is the address of the NEXT instruction, Zydis does the
-        // `+ insn.length` internally when we hand it the base.
-        ZyanU64 abs_target = 0;
-        const ZyanU64 rip_base = static_cast<ZyanU64>(code_rva) +
-                                 static_cast<ZyanU64>(offset);
-        if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(
-                &insn, src_mem_op, rip_base, &abs_target)))
-        {
-            offset += insn.length;
-            continue;
-        }
-
-        const auto target_rva = static_cast<Rva>(abs_target);
+        // Must hit the exact start of one of the candidates.
         const size_t idx = find_exact_match(candidates, target_rva);
-        if (idx < candidates.size()) {
-            StringXref x{};
-            x.xref_rva     = code_rva + static_cast<Rva>(offset);
-            x.insn_length  = insn.length;
-            x.disp_offset  = insn.raw.disp.offset;
-            x.dest_reg     = static_cast<uint32_t>(dest_reg_op->reg.value);
-            x.target_rva   = target_rva;
-            x.string_index = idx;
-            result.push_back(x);
-        }
+        if (idx >= candidates.size()) continue;
 
-        offset += insn.length;
+        // Translate the 0..15 AMD64 GPR index into the Zydis enum
+        // value the downstream pass expects. The AMD64 ordering
+        // (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10,
+        //  r11, r12, r13, r14, r15) matches Zydis's `RAX+k` layout
+        // one-for-one, so a simple add is correct.
+        const uint32_t zydis_reg =
+            static_cast<uint32_t>(ZYDIS_REGISTER_RAX) + gpr;
+
+        StringXref x{};
+        x.xref_rva     = lea_rva;
+        x.insn_length  = 7;
+        x.disp_offset  = 3;
+        x.dest_reg     = zydis_reg;
+        x.target_rva   = target_rva;
+        x.string_index = idx;
+        result.push_back(x);
     }
 
     return result;

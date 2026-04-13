@@ -81,14 +81,20 @@ TEST(StringScannerClassifier, AcceptsPrintableAscii) {
     }
 }
 
-TEST(StringScannerClassifier, AcceptsTab) {
-    EXPECT_TRUE(StringScanner::is_string_byte(0x09));
+TEST(StringScannerClassifier, AcceptsCommonWhitespace) {
+    // Tab / newline / carriage-return are accepted so printf-style
+    // format strings like "[tag] msg\n" or "\tcolumn1\tcolumn2\r\n"
+    // don't get chopped at the first whitespace and rejected by the
+    // NUL-terminator check.
+    EXPECT_TRUE(StringScanner::is_string_byte(0x09));  // \t
+    EXPECT_TRUE(StringScanner::is_string_byte(0x0A));  // \n
+    EXPECT_TRUE(StringScanner::is_string_byte(0x0D));  // \r
 }
 
-TEST(StringScannerClassifier, RejectsNulAndControlBytes) {
+TEST(StringScannerClassifier, RejectsNulAndOtherControlBytes) {
     EXPECT_FALSE(StringScanner::is_string_byte(0x00));
-    EXPECT_FALSE(StringScanner::is_string_byte(0x0A));  // \n
-    EXPECT_FALSE(StringScanner::is_string_byte(0x0D));  // \r
+    EXPECT_FALSE(StringScanner::is_string_byte(0x01));
+    EXPECT_FALSE(StringScanner::is_string_byte(0x08));
     EXPECT_FALSE(StringScanner::is_string_byte(0x1F));
     EXPECT_FALSE(StringScanner::is_string_byte(0x7F));
     EXPECT_FALSE(StringScanner::is_string_byte(0xFF));
