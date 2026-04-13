@@ -1,6 +1,12 @@
 /**
  * @file check_registry.cpp
  * @brief Wires anti-tamper check factories into the registry.
+ *
+ * Unlike the anti-emulation registry, anti-tamper checks do not need
+ * any build-time host probing here. Every check that requires an
+ * NTDLL SSN gets it at protected-binary runtime via the
+ * Hell's Gate resolver (see `hells_gate_resolver.cpp`), so the
+ * registry just instantiates every built-in check unconditionally.
  */
 
 #include "mxprotector/protection/anti_tamper/check_registry.hpp"
@@ -8,25 +14,15 @@
 #include <algorithm>
 #include <numeric>
 
-#include "mxprotector/protection/anti_tamper/syscall_resolver.hpp"
-
 namespace mx::anti_tamper {
 
 // ----------------------------------------------------------------------------
 // Factory forward declarations — defined in the per-check .cpp files.
-// SSN-dependent factories take the resolved SSN as a parameter; if the
-// resolver returned 0 the registry constructor skips the factory call.
 // ----------------------------------------------------------------------------
-std::unique_ptr<ICheck> make_hw_breakpoint_sweep_check(uint32_t nt_get_context_thread_ssn);
+std::unique_ptr<ICheck> make_hw_breakpoint_sweep_check();
 
 CheckRegistry::CheckRegistry() {
-    SyscallResolver resolver;
-
-    // HW breakpoint sweep — needs NtGetContextThread.
-    const uint32_t nt_get_ctx_ssn = resolver.resolve("NtGetContextThread");
-    if (nt_get_ctx_ssn != 0) {
-        checks_.push_back(make_hw_breakpoint_sweep_check(nt_get_ctx_ssn));
-    }
+    checks_.push_back(make_hw_breakpoint_sweep_check());
 }
 
 std::vector<const ICheck*>

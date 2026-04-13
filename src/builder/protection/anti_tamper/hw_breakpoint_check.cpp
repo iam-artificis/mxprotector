@@ -16,11 +16,22 @@
  * DR0..DR3, returning zeros to hide the attacker's own breakpoints.
  *
  * **This check bypasses user-mode hooks completely** by issuing the
- * `syscall` instruction directly with the build-time-resolved SSN of
- * `NtGetContextThread`. The kernel sees the real DR values and the
- * hook never gets a chance to intercept.
+ * `syscall` instruction directly, with the SSN for
+ * `NtGetContextThread` loaded from `r13d` — which the runtime
+ * Hell's Gate resolver (see `hells_gate_resolver.cpp`) populates
+ * once per region, immediately before the anti-tamper loop. The
+ * kernel sees the real DR values and the hook never gets a chance
+ * to intercept.
  *
- * Emitted byte sequence (~92 bytes):
+ * If the Hell's Gate resolver failed for any reason (ntdll moved,
+ * export missing, prologue hooked), it leaves `r13d = 0`. The
+ * subsequent `syscall` with eax=0 ends up calling `NtAcceptConnectPort`
+ * or similar — the call either fails immediately (wrong parameters)
+ * or succeeds but doesn't touch our CONTEXT struct. In both cases
+ * CONTEXT stays zeroed (we clear it before the syscall), the DR OR
+ * reads zero, and the final XOR is a no-op. Graceful degradation.
+ *
+ * Emitted byte sequence (~90 bytes):
  *
  *     49 89 E4                       mov   r12, rsp                ; save rsp (r12 — see note)
  *     48 81 EC E0 04 00 00           sub   rsp, 0x4E0              ; allocate CONTEXT + 16
@@ -36,7 +47,7 @@
  *     48 C7 C1 FE FF FF FF           mov   rcx, -2                 ; thread handle (current thread pseudo)
  *     48 89 E2                       mov   rdx, rsp                ; CONTEXT*
  *     49 89 CA                       mov   r10, rcx                ; syscall ABI: r10 ← rcx
- *     B8 ?? ?? ?? ??                 mov   eax, <SSN>              ; build-time resolved SSN
+ *     44 89 E8                       mov   eax, r13d               ; runtime-resolved SSN
  *     0F 05                          syscall
  *
  *     48 8B 44 24 48                 mov   rax, [rsp+0x48]         ; DR0
@@ -52,11 +63,10 @@
  *     25 ?? ?? ?? ??                 and   eax, <mask>             ; 0 or mask
  *     31 44 24 ??                    xor   [rsp + key_disp], eax   ; corrupt key on real DR
  *
- * Real hardware, no debugger: DR0..DR3 are all zero. eax = 0 →
- * `xor [key_disp], 0` is a no-op. Real hardware, debugger has set a
- * breakpoint: at least one DR is non-zero. eax = mask → key slot is
- * corrupted → every subsequent VM dispatch decrypts wrong → first
- * dispatch jumps into garbage.
+ * Real hardware, no debugger: all DRs zero, eax = 0, the XOR is a
+ * no-op, the VM continues normally. Real hardware with even one DR
+ * set: eax = mask, key slot poisoned, every subsequent VM dispatch
+ * decrypts the wrong handler offset and jumps into garbage.
  *
  * ## Why r12 as the rsp save register
  *
@@ -68,35 +78,12 @@
  *   * it is preserved across syscall (unlike r11);
  *   * it is not used by any other anti-emulation check that may
  *     run before us (rdtsc / cpuid use only rax/rbx/rcx/rdx);
+ *   * it is not used by the Hell's Gate resolver that runs
+ *     immediately before us (resolver uses rbx, rdi, r8, r9, r10,
+ *     r11, r13, r14, r15 — specifically avoids r12 for this
+ *     reason);
  *   * its original value is already saved in its VM-context slot,
- *     so clobbering it here is harmless;
- *   * the first VM dispatch reloads any base register it picks via
- *     `lea base, [rip + table]`, so even if the dispatch picks
- *     r12 as the table base, our scratch use is safely overwritten.
- *
- * ## Stack alignment
- *
- * The Windows x64 ABI requires the `CONTEXT` struct to be 16-byte
- * aligned. The entry stub's rsp may be 8- or 16-aligned depending
- * on the G7 padding draw, so we explicitly align with `and rsp, -16`
- * after subtracting an extra 16 bytes of headroom.
- *
- * ## Failure mode
- *
- * If the syscall fails (wrong SSN, kernel reject, EDR blocking the
- * sysenter), the CONTEXT remains zeroed (we cleared it before the
- * call), DR0..DR3 read as zeros, eax = 0, the XOR is a no-op. The
- * check silently degrades — the protected binary keeps working,
- * just without the DR sweep.
- *
- * ## Limitation: build-time SSN
- *
- * The SSN is hardcoded at build time from the builder host's
- * NTDLL. If the protected binary runs on a Windows build with
- * different syscall numbering, the `syscall` will hit the wrong
- * service. A future runtime Hell's Gate resolver in the entry stub
- * itself will fix this; until then, the check assumes builder and
- * target share the same Windows version.
+ *     so clobbering it here is harmless.
  */
 
 #include "mxprotector/protection/anti_tamper/check.hpp"
@@ -107,9 +94,7 @@ namespace mx::anti_tamper {
 
 class HwBreakpointSweepCheck final : public ICheck {
 public:
-    explicit HwBreakpointSweepCheck(uint32_t nt_get_context_thread_ssn) noexcept
-        : ssn_(nt_get_context_thread_ssn)
-    {}
+    HwBreakpointSweepCheck() = default;
 
     void emit(RawEmitter& e,
               int32_t key_slot_disp,
@@ -120,13 +105,7 @@ public:
         const uint32_t corruption = rng.next_u32() | 1;
 
         // mov r12, rsp                           49 89 E4
-        // CRITICAL: NOT r11. The Windows x64 `syscall` instruction
-        // clobbers BOTH rcx (gets RIP) AND r11 (gets RFLAGS), so r11
-        // does NOT survive across the syscall. r12 is preserved.
-        // We can clobber r12 freely here because (a) its original
-        // value is in its VM-context slot, and (b) the first VM
-        // dispatch reloads any base register it picks via
-        // `lea base, [rip + table]`.
+        // (Preserved across syscall; see header comment for why.)
         e.u8(0x49); e.u8(0x89); e.u8(0xE4);
 
         // sub rsp, 0x4E0                         48 81 EC E0 04 00 00
@@ -165,8 +144,11 @@ public:
         //  because the `syscall` instruction itself clobbers rcx.)
         e.u8(0x49); e.u8(0x89); e.u8(0xCA);
 
-        // mov eax, <SSN>                         B8 imm32
-        e.u8(0xB8); e.u32(ssn_);
+        // mov eax, r13d                          44 89 E8
+        // r13 holds the SSN placed there by the Hell's Gate resolver
+        // that ran immediately before the anti-tamper loop. On
+        // resolver failure r13 is 0 and the syscall silently degrades.
+        e.u8(0x44); e.u8(0x89); e.u8(0xE8);
 
         // syscall                                0F 05
         e.u8(0x0F); e.u8(0x05);
@@ -206,13 +188,10 @@ public:
     [[nodiscard]] const char* name() const noexcept override {
         return "hw_breakpoint_sweep";
     }
-
-private:
-    const uint32_t ssn_;
 };
 
-std::unique_ptr<ICheck> make_hw_breakpoint_sweep_check(uint32_t nt_get_context_thread_ssn) {
-    return std::make_unique<HwBreakpointSweepCheck>(nt_get_context_thread_ssn);
+std::unique_ptr<ICheck> make_hw_breakpoint_sweep_check() {
+    return std::make_unique<HwBreakpointSweepCheck>();
 }
 
 } // namespace mx::anti_tamper

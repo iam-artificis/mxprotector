@@ -3,23 +3,24 @@
  * @brief [TESTS] Unit tests for the G3 anti-tamper infrastructure.
  *
  * Covers:
- *   - SyscallResolver returns a non-zero SSN for NtGetContextThread on
- *     a Windows builder host. (Sanity test that the resolver actually
- *     finds the function and validates the prologue bytes.)
- *   - SyscallResolver returns 0 for an unknown / non-existent function.
- *   - SyscallResolver returns 0 for nullptr.
- *   - CheckRegistry contains the expected hw_breakpoint_sweep check
- *     when running on Windows. (Skipped on non-Windows builders.)
- *   - HwBreakpointSweepCheck emits a non-empty byte sequence whose
- *     tail matches the `xor [rsp+disp8], eax` final write into the
- *     key slot.
- *   - Two emissions with different RNG seeds produce different bytes
- *     (proving the corruption mask is randomised per build).
- *   - Two emissions with the same seed are byte-identical.
+ *   - `djb2_ascii_hash` is constexpr and gives known values for
+ *     both the empty string and a few fixed strings.
+ *   - `emit_hells_gate_resolver` produces a non-empty byte sequence
+ *     whose prefix is the `mov rax, gs:[0x60]` PEB read, and whose
+ *     body embeds the target hash as an imm32 somewhere.
+ *   - `CheckRegistry` contains the expected `hw_breakpoint_sweep`
+ *     entry and supports deterministic picking.
+ *   - `HwBreakpointSweepCheck` emits the documented ~90-byte body,
+ *     contains a `syscall` (0F 05) somewhere inside, reads its SSN
+ *     from `r13d` (`44 89 E8` pattern), and ends with
+ *     `xor [rsp + disp8], eax`.
+ *   - Same RNG seed → byte-identical emission; different seeds →
+ *     differing emission (mask randomisation).
  */
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -27,69 +28,133 @@
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/anti_tamper/check.hpp"
 #include "mxprotector/protection/anti_tamper/check_registry.hpp"
-#include "mxprotector/protection/anti_tamper/syscall_resolver.hpp"
+#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 namespace {
 
 using mx::Randomizer;
 using mx::RawEmitter;
 using mx::anti_tamper::CheckRegistry;
+using mx::anti_tamper::djb2_ascii_hash;
+using mx::anti_tamper::emit_hells_gate_resolver;
 using mx::anti_tamper::ICheck;
-using mx::anti_tamper::SyscallResolver;
 
 // ---------------------------------------------------------------------------
-// SyscallResolver
+// DJB2 hash — constexpr correctness
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32)
-TEST(AntiTamperSyscallResolver, ResolvesNtGetContextThread) {
-    SyscallResolver r;
-    const uint32_t ssn = r.resolve("NtGetContextThread");
-    EXPECT_NE(ssn, 0u)
-        << "SyscallResolver could not extract SSN for NtGetContextThread — "
-           "either the builder host has a hooked NTDLL or the prologue "
-           "format has changed";
-    // SSNs are small positive integers, well under 0x10000.
-    EXPECT_LT(ssn, 0x1000u)
-        << "SSN looks suspiciously large: 0x" << std::hex << ssn;
+TEST(AntiTamperDjb2, EmptyStringHashIsInitValue) {
+    constexpr uint32_t h = djb2_ascii_hash("");
+    static_assert(h == 5381u, "DJB2 init must be 5381");
+    EXPECT_EQ(h, 5381u);
 }
 
-TEST(AntiTamperSyscallResolver, ResolvesNtCloseToDifferentSsn) {
-    // Sanity: the manual PEB walk must work for more than one name.
-    // If the walk is broken it may still return 0 for everything, OR
-    // it may accidentally return the same SSN from a wrong spot. Two
-    // different functions must resolve to two different SSNs.
-    SyscallResolver r;
-    const uint32_t ctx_ssn   = r.resolve("NtGetContextThread");
-    const uint32_t close_ssn = r.resolve("NtClose");
-    EXPECT_NE(ctx_ssn,   0u) << "NtGetContextThread should resolve";
-    EXPECT_NE(close_ssn, 0u) << "NtClose should resolve";
-    EXPECT_NE(ctx_ssn, close_ssn)
-        << "two distinct ntdll exports must have distinct SSNs — "
-           "the PEB walk or export-table parse is broken";
-    EXPECT_LT(close_ssn, 0x1000u);
-}
-#endif
-
-TEST(AntiTamperSyscallResolver, ReturnsZeroForUnknownFunction) {
-    SyscallResolver r;
-    EXPECT_EQ(r.resolve("ThisFunctionDoesNotExistInNtdll12345"), 0u);
+TEST(AntiTamperDjb2, SingleCharHashFormula) {
+    // h = 5381 * 33 + 'A' = 177573 + 65 = 177638
+    constexpr uint32_t h = djb2_ascii_hash("A");
+    static_assert(h == 177638u);
+    EXPECT_EQ(h, 177638u);
 }
 
-TEST(AntiTamperSyscallResolver, ReturnsZeroForNullName) {
-    SyscallResolver r;
-    EXPECT_EQ(r.resolve(nullptr), 0u);
+TEST(AntiTamperDjb2, DistinctStringsProduceDistinctHashes) {
+    // Compile-time check that the hash actually discriminates.
+    constexpr uint32_t h1 = djb2_ascii_hash("NtGetContextThread");
+    constexpr uint32_t h2 = djb2_ascii_hash("NtClose");
+    constexpr uint32_t h3 = djb2_ascii_hash("NtQueryInformationThread");
+    static_assert(h1 != h2);
+    static_assert(h1 != h3);
+    static_assert(h2 != h3);
+    EXPECT_NE(h1, h2);
+    EXPECT_NE(h1, h3);
+    EXPECT_NE(h2, h3);
+}
+
+TEST(AntiTamperDjb2, StableAcrossCallsWithSameInput) {
+    EXPECT_EQ(djb2_ascii_hash("NtGetContextThread"),
+              djb2_ascii_hash("NtGetContextThread"));
+}
+
+// ---------------------------------------------------------------------------
+// Hell's Gate resolver — byte pattern invariants
+// ---------------------------------------------------------------------------
+
+TEST(AntiTamperHellsGate, EmitsNonEmptyBody) {
+    RawEmitter e;
+    emit_hells_gate_resolver(e, 0xDEADBEEFu);
+    EXPECT_GT(e.size(), 100u)
+        << "Hell's Gate resolver is expected to be ~150 bytes";
+    EXPECT_LT(e.size(), 300u)
+        << "...but not a kilobyte";
+}
+
+TEST(AntiTamperHellsGate, StartsWithPebReadPrefix) {
+    // `mov rax, gs:[0x60]` must be the very first instruction.
+    //   65 48 8B 04 25 60 00 00 00
+    RawEmitter e;
+    emit_hells_gate_resolver(e, 0xDEADBEEFu);
+    ASSERT_GE(e.size(), 9u);
+    EXPECT_EQ(e.buf[0], 0x65);
+    EXPECT_EQ(e.buf[1], 0x48);
+    EXPECT_EQ(e.buf[2], 0x8B);
+    EXPECT_EQ(e.buf[3], 0x04);
+    EXPECT_EQ(e.buf[4], 0x25);
+    EXPECT_EQ(e.buf[5], 0x60);
+    EXPECT_EQ(e.buf[6], 0x00);
+    EXPECT_EQ(e.buf[7], 0x00);
+    EXPECT_EQ(e.buf[8], 0x00);
+}
+
+TEST(AntiTamperHellsGate, EmbedsTargetHashAsImm32) {
+    // Two distinct target hashes must produce bodies that differ
+    // in at least one byte (proving the hash is actually threaded
+    // through as an immediate, not dropped on the floor).
+    RawEmitter e1, e2;
+    emit_hells_gate_resolver(e1, 0xAAAAAAAAu);
+    emit_hells_gate_resolver(e2, 0x55555555u);
+    ASSERT_EQ(e1.size(), e2.size())
+        << "resolver size should not depend on hash value";
+    EXPECT_NE(e1.buf, e2.buf);
+}
+
+TEST(AntiTamperHellsGate, TargetHashBytesAppearInBody) {
+    // The target hash is emitted as a little-endian imm32 after the
+    // `cmp eax, imm32` (opcode 0x3D). Scan the body for the exact
+    // 4-byte pattern.
+    constexpr uint32_t kHash = 0xCAFEBABEu;
+    RawEmitter e;
+    emit_hells_gate_resolver(e, kHash);
+
+    const uint8_t b0 = static_cast<uint8_t>(kHash & 0xFFu);
+    const uint8_t b1 = static_cast<uint8_t>((kHash >> 8) & 0xFFu);
+    const uint8_t b2 = static_cast<uint8_t>((kHash >> 16) & 0xFFu);
+    const uint8_t b3 = static_cast<uint8_t>((kHash >> 24) & 0xFFu);
+
+    bool found = false;
+    for (size_t i = 0; i + 3 < e.size(); ++i) {
+        if (e.buf[i]   == b0 && e.buf[i+1] == b1
+         && e.buf[i+2] == b2 && e.buf[i+3] == b3)
+        {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "target hash should appear as a 4-byte imm32";
+}
+
+TEST(AntiTamperHellsGate, DeterministicForSameHash) {
+    RawEmitter a, b;
+    emit_hells_gate_resolver(a, 0x12345678u);
+    emit_hells_gate_resolver(b, 0x12345678u);
+    EXPECT_EQ(a.buf, b.buf);
 }
 
 // ---------------------------------------------------------------------------
 // CheckRegistry
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32)
 TEST(AntiTamperRegistry, ContainsHwBreakpointSweep) {
     CheckRegistry reg;
-    ASSERT_GE(reg.size(), 1u)
-        << "Registry should contain at least the HW breakpoint sweep check";
+    ASSERT_GE(reg.size(), 1u);
     bool found = false;
     for (size_t i = 0; i < reg.size(); ++i) {
         if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
@@ -112,25 +177,23 @@ TEST(AntiTamperRegistry, PickRandomZeroIsEmpty) {
     Randomizer rng(1);
     EXPECT_TRUE(reg.pick_random(0, rng).empty());
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // HwBreakpointSweepCheck — byte-level invariants
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32)
+namespace {
+const ICheck* find_check(const CheckRegistry& reg, const char* name) {
+    for (size_t i = 0; i < reg.size(); ++i) {
+        if (std::string_view{reg.at(i).name()} == name) return &reg.at(i);
+    }
+    return nullptr;
+}
+}  // namespace
+
 TEST(AntiTamperHwBreakpoint, EmitsNonEmptyAndEndsWithXorRspDisp8) {
     CheckRegistry reg;
-    ASSERT_GE(reg.size(), 1u);
-
-    // Find hw_breakpoint_sweep by name (don't depend on registration order).
-    const ICheck* check = nullptr;
-    for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
-            check = &reg.at(i);
-            break;
-        }
-    }
+    const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
     ASSERT_NE(check, nullptr);
 
     Randomizer rng(0xABCDEF);
@@ -138,37 +201,26 @@ TEST(AntiTamperHwBreakpoint, EmitsNonEmptyAndEndsWithXorRspDisp8) {
     constexpr int8_t kProbeDisp = 0x18;
     check->emit(e, kProbeDisp, rng);
 
-    ASSERT_GT(e.size(), 50u)
-        << "HW breakpoint sweep should be ~90 bytes, got " << e.size();
+    ASSERT_GT(e.size(), 50u) << "check should be ~90 bytes";
 
     // Tail must be `xor [rsp + disp8], eax`:
     //   31 44 24 disp8
     const size_t n = e.size();
-    EXPECT_EQ(e.buf[n - 4], 0x31);  // XOR r/m32, r32
-    // ModRM: mod=01, reg=000(eax), rm=100(SIB) → 0x44
+    EXPECT_EQ(e.buf[n - 4], 0x31);
     EXPECT_EQ(e.buf[n - 3], 0x44);
-    // SIB: scale=00, index=100(none), base=100(rsp) → 0x24
     EXPECT_EQ(e.buf[n - 2], 0x24);
-    // disp8 (signed)
     EXPECT_EQ(static_cast<int8_t>(e.buf[n - 1]), kProbeDisp);
 }
 
 TEST(AntiTamperHwBreakpoint, ContainsSyscallInstruction) {
     CheckRegistry reg;
-    const ICheck* check = nullptr;
-    for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
-            check = &reg.at(i);
-            break;
-        }
-    }
+    const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
     ASSERT_NE(check, nullptr);
 
     Randomizer rng(42);
     RawEmitter e;
     check->emit(e, 0x10, rng);
 
-    // The emitted body must contain `0F 05` (syscall) somewhere.
     bool has_syscall = false;
     for (size_t i = 0; i + 1 < e.size(); ++i) {
         if (e.buf[i] == 0x0F && e.buf[i + 1] == 0x05) {
@@ -179,15 +231,31 @@ TEST(AntiTamperHwBreakpoint, ContainsSyscallInstruction) {
     EXPECT_TRUE(has_syscall) << "no `0F 05` syscall byte pair in emitted body";
 }
 
-TEST(AntiTamperHwBreakpoint, DeterministicForSameSeed) {
+TEST(AntiTamperHwBreakpoint, LoadsSsnFromR13) {
+    // The check should use `mov eax, r13d` (44 89 E8) to load the
+    // SSN at runtime, NOT `mov eax, imm32` (B8 imm32).
     CheckRegistry reg;
-    const ICheck* check = nullptr;
-    for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
-            check = &reg.at(i);
+    const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(1);
+    RawEmitter e;
+    check->emit(e, 0x10, rng);
+
+    bool has_mov_from_r13 = false;
+    for (size_t i = 0; i + 2 < e.size(); ++i) {
+        if (e.buf[i] == 0x44 && e.buf[i+1] == 0x89 && e.buf[i+2] == 0xE8) {
+            has_mov_from_r13 = true;
             break;
         }
     }
+    EXPECT_TRUE(has_mov_from_r13)
+        << "HW BP check must read SSN from r13d, not from an imm32";
+}
+
+TEST(AntiTamperHwBreakpoint, DeterministicForSameSeed) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
     ASSERT_NE(check, nullptr);
 
     Randomizer rng_a(0xDEAD);
@@ -199,15 +267,8 @@ TEST(AntiTamperHwBreakpoint, DeterministicForSameSeed) {
 }
 
 TEST(AntiTamperHwBreakpoint, DiffersAcrossSeeds) {
-    // Different seeds → different corruption mask → different bytes.
     CheckRegistry reg;
-    const ICheck* check = nullptr;
-    for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
-            check = &reg.at(i);
-            break;
-        }
-    }
+    const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
     ASSERT_NE(check, nullptr);
 
     Randomizer rng_a(1);
@@ -217,6 +278,5 @@ TEST(AntiTamperHwBreakpoint, DiffersAcrossSeeds) {
     check->emit(eb, 0x10, rng_b);
     EXPECT_NE(ea.buf, eb.buf);
 }
-#endif
 
 } // namespace

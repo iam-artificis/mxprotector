@@ -39,7 +39,7 @@ set(ANTI_EMU_SOURCES
 
 # Anti-tamper sources needed for anti_tamper_test
 set(ANTI_TAMPER_SOURCES
-    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/syscall_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hells_gate_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/check_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hw_breakpoint_check.cpp
 )

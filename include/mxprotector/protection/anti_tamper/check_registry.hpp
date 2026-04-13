@@ -7,13 +7,24 @@
  * checks. The X64 backend instantiates one of each registry and
  * picks from both during entry-stub emission.
  *
+ * Anti-tamper checks that need an NTDLL SSN do not look it up at
+ * builder time. Instead, the X64 backend emits a runtime Hell's
+ * Gate resolver (`hells_gate_resolver.cpp`) once per region, and
+ * the check reads the resolved SSN from `r13d` inside the
+ * protected binary's own process. This keeps the SSN correct on
+ * any Windows version the protected binary runs on, independent
+ * of what the builder host happens to be.
+ *
  * Adding a new technique:
  *   1. Write the check class in
  *      `src/builder/protection/anti_tamper/<name>_check.cpp`.
- *   2. Add a factory `make_<name>_check(SyscallResolver&)` if the
- *      check needs a resolved SSN, or `make_<name>_check()` if not.
+ *   2. Add a factory `make_<name>_check()` with no parameters.
  *   3. Register it in `check_registry.cpp`.
  *   4. Append the source file to `src/builder/CMakeLists.txt`.
+ *
+ * If the check needs a DIFFERENT SSN than NtGetContextThread,
+ * extend the resolver to carry a second target and place it in
+ * another register (e.g. r14). The check reads from there.
  */
 
 #pragma once
@@ -29,11 +40,11 @@ namespace mx::anti_tamper {
 
 class CheckRegistry final {
 public:
-    /// Constructs the registry. Internally instantiates a
-    /// `SyscallResolver` to resolve any SSNs required by the
-    /// built-in checks. Checks whose SSN failed to resolve are
-    /// silently dropped — the registry holds only checks that are
-    /// known to be functional on the current builder host.
+    /// Constructs the registry and instantiates every built-in
+    /// anti-tamper check. No builder-side SSN resolution — any
+    /// syscall-based check receives its SSN via the runtime
+    /// Hell's Gate resolver that the X64 backend emits into the
+    /// entry stub alongside the check itself.
     CheckRegistry();
 
     CheckRegistry(const CheckRegistry&)            = delete;

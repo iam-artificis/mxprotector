@@ -23,6 +23,7 @@
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/anti_emulation/check_registry.hpp"
 #include "mxprotector/protection/anti_tamper/check_registry.hpp"
+#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
@@ -606,12 +607,29 @@ MxResult<VmRuntime> X64VmBackend::generate(
         // hooks, so we cap at one check per build to keep the entry
         // stub compact. Anti-tamper checks XOR into the same key slot
         // the anti-emulation pass writes — every probe stacks.
+        //
+        // G3.2: before the check runs, emit a Hell's Gate SSN resolver
+        // that walks the PEB, finds ntdll, parses its export table,
+        // and places the NtGetContextThread SSN in r13d. The check
+        // reads from r13d instead of a baked-in imm32, so the
+        // protected binary works on any Windows version regardless
+        // of what the builder host happens to be.
         {
             static const anti_tamper::CheckRegistry tamper_registry;
             if (tamper_registry.size() > 0) {
                 const auto picks = tamper_registry.pick_random(1, rng);
-                for (const auto* check : picks) {
-                    check->emit(rt, imagebase_key_disp, rng);
+                if (!picks.empty()) {
+                    // Resolve NtGetContextThread at runtime. The hash
+                    // is computed at build time so the literal ASCII
+                    // name never appears in the VM blob.
+                    constexpr uint32_t kNtGetContextThreadHash =
+                        anti_tamper::djb2_ascii_hash("NtGetContextThread");
+                    anti_tamper::emit_hells_gate_resolver(
+                        rt, kNtGetContextThreadHash);
+
+                    for (const auto* check : picks) {
+                        check->emit(rt, imagebase_key_disp, rng);
+                    }
                 }
             }
         }
