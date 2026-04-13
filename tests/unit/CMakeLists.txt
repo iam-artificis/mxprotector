@@ -42,6 +42,8 @@ set(ANTI_TAMPER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hells_gate_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/check_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hw_breakpoint_check.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/import_hook_check.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/self_crc_check.cpp
 )
 
 # ==============================================================================

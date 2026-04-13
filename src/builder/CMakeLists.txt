@@ -85,6 +85,8 @@ set(BUILDER_SOURCES
     protection/anti_tamper/hells_gate_resolver.cpp
     protection/anti_tamper/check_registry.cpp
     protection/anti_tamper/hw_breakpoint_check.cpp
+    protection/anti_tamper/import_hook_check.cpp
+    protection/anti_tamper/self_crc_check.cpp
 )
 
 # ==============================================================================

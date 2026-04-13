@@ -45,12 +45,73 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 
 namespace mx::anti_tamper {
+
+/**
+ * @brief A deferred-finalise record produced by the Self-CRC check.
+ *
+ * Self-CRC cannot bake its expected CRC value at emit time, because
+ * the byte range it covers (the entry-stub prefix) includes
+ * placeholder bytes that the X64 backend back-patches LATER — most
+ * notably the `integrity_table_lea_patch` rel32 inside the
+ * handler-table integrity check, which sits in the middle of the
+ * CRC range and is still zero at Self-CRC emit time.
+ *
+ * Instead, Self-CRC emits a placeholder `cmp eax, 0x00000000` at
+ * the check's `expected CRC` position and records the patch
+ * information here. After every other post-hoc patch has been
+ * applied (`table_patches`, `table_key_patches`, handler-table
+ * encryption, integrity-check expected sum), the X64 backend
+ * calls `finalize_self_crc_patches` to compute the CRC over the
+ * final byte contents of the range and write it into the
+ * placeholder.
+ */
+struct SelfCrcPatchRecord {
+    size_t placeholder_offset = 0;  ///< Where to write the final u32 CRC.
+    size_t range_start        = 0;  ///< First byte of the range to CRC.
+    size_t length             = 0;  ///< Number of bytes in the range.
+};
+
+/**
+ * @brief Build-time context handed to every anti-tamper check.
+ *
+ * Some checks need to reference the entry-stub bytes that were
+ * already emitted before them — for example, a self-CRC check has
+ * to compute a CRC over the preceding entry-stub instruction bytes
+ * both at build time (to bake the expected CRC) and at runtime (to
+ * verify it). Accessing those bytes requires information the check
+ * doesn't own itself:
+ *
+ *   1. `entry_offset` — the absolute offset of the entry stub's
+ *      first byte inside the `RawEmitter` buffer. The check
+ *      subtracts this from its current position to compute the
+ *      length of the CRC range, and uses it to compute a
+ *      rip-relative rel32 that points at the entry stub start at
+ *      runtime.
+ *
+ *   2. `self_crc_patches` — optional pointer to a vector into
+ *      which the Self-CRC check pushes a `SelfCrcPatchRecord` so
+ *      the X64 backend can compute the real CRC over the final
+ *      (post-patch) buffer state. If nullptr, the check falls
+ *      back to an emit-time CRC, which only catches tampering in
+ *      build modes without post-hoc patches (rare — kept as a
+ *      sentinel for unit tests that construct a check in
+ *      isolation).
+ *
+ * Checks that don't need any of this (HW breakpoint sweep, import
+ * hook detection) simply ignore the context.
+ */
+struct CheckContext {
+    size_t entry_offset = 0;
+    std::vector<SelfCrcPatchRecord>* self_crc_patches = nullptr;
+};
 
 class ICheck {
 public:
@@ -70,10 +131,14 @@ public:
      * @param rng            Per-build randomiser. Checks use it to
      *                       pick random corruption masks and any
      *                       internal polymorphism choices.
+     * @param ctx            Build-time context — see `CheckContext`.
+     *                       Checks that don't need it ignore the
+     *                       parameter.
      */
     virtual void emit(RawEmitter& e,
                       int32_t key_slot_disp,
-                      Randomizer& rng) const = 0;
+                      Randomizer& rng,
+                      const CheckContext& ctx) const = 0;
 
     /// Short human-readable name, for logs and tests.
     [[nodiscard]] virtual const char* name() const noexcept = 0;

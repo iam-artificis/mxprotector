@@ -29,15 +29,21 @@
 #include "mxprotector/protection/anti_tamper/check.hpp"
 #include "mxprotector/protection/anti_tamper/check_registry.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/anti_tamper/self_crc_check.hpp"
 
 namespace {
 
 using mx::Randomizer;
 using mx::RawEmitter;
+using mx::anti_tamper::CheckContext;
 using mx::anti_tamper::CheckRegistry;
 using mx::anti_tamper::djb2_ascii_hash;
 using mx::anti_tamper::emit_hells_gate_resolver;
 using mx::anti_tamper::ICheck;
+
+/// Default context used by tests that don't care about entry_offset.
+/// Self-CRC testing supplies its own with a non-zero offset.
+const CheckContext kEmptyContext{};
 
 // ---------------------------------------------------------------------------
 // DJB2 hash — constexpr correctness
@@ -152,17 +158,22 @@ TEST(AntiTamperHellsGate, DeterministicForSameHash) {
 // CheckRegistry
 // ---------------------------------------------------------------------------
 
-TEST(AntiTamperRegistry, ContainsHwBreakpointSweep) {
+TEST(AntiTamperRegistry, ContainsAllExpectedChecks) {
     CheckRegistry reg;
-    ASSERT_GE(reg.size(), 1u);
-    bool found = false;
+    EXPECT_EQ(reg.size(), 3u);
+
+    bool has_hw_bp = false;
+    bool has_import_hook = false;
+    bool has_self_crc = false;
     for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == "hw_breakpoint_sweep") {
-            found = true;
-            break;
-        }
+        const std::string_view n{reg.at(i).name()};
+        if (n == "hw_breakpoint_sweep")  has_hw_bp = true;
+        if (n == "import_hook_detect")   has_import_hook = true;
+        if (n == "self_crc")             has_self_crc = true;
     }
-    EXPECT_TRUE(found);
+    EXPECT_TRUE(has_hw_bp);
+    EXPECT_TRUE(has_import_hook);
+    EXPECT_TRUE(has_self_crc);
 }
 
 TEST(AntiTamperRegistry, PickRandomReturnsDistinct) {
@@ -199,7 +210,7 @@ TEST(AntiTamperHwBreakpoint, EmitsNonEmptyAndEndsWithXorRspDisp8) {
     Randomizer rng(0xABCDEF);
     RawEmitter e;
     constexpr int8_t kProbeDisp = 0x18;
-    check->emit(e, kProbeDisp, rng);
+    check->emit(e, kProbeDisp, rng, kEmptyContext);
 
     ASSERT_GT(e.size(), 50u) << "check should be ~90 bytes";
 
@@ -219,7 +230,7 @@ TEST(AntiTamperHwBreakpoint, ContainsSyscallInstruction) {
 
     Randomizer rng(42);
     RawEmitter e;
-    check->emit(e, 0x10, rng);
+    check->emit(e, 0x10, rng, kEmptyContext);
 
     bool has_syscall = false;
     for (size_t i = 0; i + 1 < e.size(); ++i) {
@@ -240,7 +251,7 @@ TEST(AntiTamperHwBreakpoint, LoadsSsnFromR13) {
 
     Randomizer rng(1);
     RawEmitter e;
-    check->emit(e, 0x10, rng);
+    check->emit(e, 0x10, rng, kEmptyContext);
 
     bool has_mov_from_r13 = false;
     for (size_t i = 0; i + 2 < e.size(); ++i) {
@@ -261,8 +272,8 @@ TEST(AntiTamperHwBreakpoint, DeterministicForSameSeed) {
     Randomizer rng_a(0xDEAD);
     Randomizer rng_b(0xDEAD);
     RawEmitter ea, eb;
-    check->emit(ea, 0x10, rng_a);
-    check->emit(eb, 0x10, rng_b);
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
     EXPECT_EQ(ea.buf, eb.buf);
 }
 
@@ -274,9 +285,310 @@ TEST(AntiTamperHwBreakpoint, DiffersAcrossSeeds) {
     Randomizer rng_a(1);
     Randomizer rng_b(2);
     RawEmitter ea, eb;
-    check->emit(ea, 0x10, rng_a);
-    check->emit(eb, 0x10, rng_b);
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
     EXPECT_NE(ea.buf, eb.buf);
+}
+
+// ---------------------------------------------------------------------------
+// ImportHookDetectCheck
+// ---------------------------------------------------------------------------
+
+TEST(AntiTamperImportHook, EmitsNonEmptyAndStartsWithPebRead) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "import_hook_detect");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(0xFEED);
+    RawEmitter e;
+    check->emit(e, 0x20, rng, kEmptyContext);
+
+    ASSERT_GT(e.size(), 100u) << "import hook check should be ~150 bytes";
+
+    // Must start with `mov rax, gs:[0x60]` (65 48 8B 04 25 60 00 00 00).
+    ASSERT_GE(e.size(), 9u);
+    EXPECT_EQ(e.buf[0], 0x65);
+    EXPECT_EQ(e.buf[1], 0x48);
+    EXPECT_EQ(e.buf[2], 0x8B);
+    EXPECT_EQ(e.buf[3], 0x04);
+    EXPECT_EQ(e.buf[4], 0x25);
+    EXPECT_EQ(e.buf[5], 0x60);
+}
+
+TEST(AntiTamperImportHook, ContainsPrologueLiteral) {
+    // The check must contain the expected syscall prologue
+    // literal `4C 8B D1 B8` as bytes inside a `cmp dword [rdi], imm32`.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "import_hook_detect");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(1);
+    RawEmitter e;
+    check->emit(e, 0x10, rng, kEmptyContext);
+
+    bool has_prologue_lit = false;
+    for (size_t i = 0; i + 3 < e.size(); ++i) {
+        if (e.buf[i]   == 0x4C && e.buf[i+1] == 0x8B
+         && e.buf[i+2] == 0xD1 && e.buf[i+3] == 0xB8)
+        {
+            has_prologue_lit = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_prologue_lit)
+        << "expected 4C 8B D1 B8 syscall-stub prologue literal in check body";
+}
+
+TEST(AntiTamperImportHook, EndsWithXorRspDisp8) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "import_hook_detect");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(7);
+    RawEmitter e;
+    constexpr int8_t kProbeDisp = 0x30;
+    check->emit(e, kProbeDisp, rng, kEmptyContext);
+
+    const size_t n = e.size();
+    EXPECT_EQ(e.buf[n - 4], 0x31);
+    EXPECT_EQ(e.buf[n - 3], 0x44);
+    EXPECT_EQ(e.buf[n - 2], 0x24);
+    EXPECT_EQ(static_cast<int8_t>(e.buf[n - 1]), kProbeDisp);
+}
+
+TEST(AntiTamperImportHook, DeterministicForSameSeed) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "import_hook_detect");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(0x1234);
+    Randomizer rng_b(0x1234);
+    RawEmitter ea, eb;
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
+    EXPECT_EQ(ea.buf, eb.buf);
+}
+
+TEST(AntiTamperImportHook, DiffersAcrossSeeds) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "import_hook_detect");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(1);
+    Randomizer rng_b(2);
+    RawEmitter ea, eb;
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
+    EXPECT_NE(ea.buf, eb.buf);
+}
+
+// ---------------------------------------------------------------------------
+// SelfCrcCheck
+// ---------------------------------------------------------------------------
+
+/// Helper: pre-fill the emitter with N pseudo-random bytes (simulating
+/// a partially-emitted entry stub), then run the Self-CRC check on top.
+/// Returns the position at which the check started emitting.
+size_t prefill_and_emit_self_crc(RawEmitter& e, const ICheck* check,
+                                  size_t prefix_bytes,
+                                  int32_t key_disp,
+                                  Randomizer& rng)
+{
+    // Fill prefix with a fixed pattern so the expected CRC is stable
+    // across test runs.
+    for (size_t i = 0; i < prefix_bytes; ++i) {
+        e.u8(static_cast<uint8_t>((i * 31u + 7u) & 0xFFu));
+    }
+    const size_t check_start = e.size();
+    const CheckContext ctx{/*entry_offset=*/0};  // whole buffer counts
+    check->emit(e, key_disp, rng, ctx);
+    return check_start;
+}
+
+TEST(AntiTamperSelfCrc, EmitsRoughlyExpectedSize) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(0xBABE);
+    RawEmitter e;
+    const size_t start = prefill_and_emit_self_crc(e, check, 64, 0x10, rng);
+    const size_t check_bytes = e.size() - start;
+    EXPECT_GE(check_bytes, 40u);
+    EXPECT_LE(check_bytes, 80u);
+}
+
+TEST(AntiTamperSelfCrc, ContainsHardwareCrc32Opcode) {
+    // The check uses the SSE4.2 `crc32 eax, byte [rsi]` instruction,
+    // encoded as F2 0F 38 F0 06.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(0xBABE);
+    RawEmitter e;
+    prefill_and_emit_self_crc(e, check, 64, 0x10, rng);
+
+    bool has_crc32 = false;
+    for (size_t i = 0; i + 4 < e.size(); ++i) {
+        if (e.buf[i]   == 0xF2 && e.buf[i+1] == 0x0F
+         && e.buf[i+2] == 0x38 && e.buf[i+3] == 0xF0
+         && e.buf[i+4] == 0x06)
+        {
+            has_crc32 = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_crc32) << "expected F2 0F 38 F0 06 (crc32 eax, [rsi])";
+}
+
+TEST(AntiTamperSelfCrc, ContainsNegativeLeaRel32) {
+    // The check starts with `lea rsi, [rip + rel32]` where rel32 is
+    // negative (points backwards at the entry-stub start). Verify the
+    // instruction is there and its rel32 has the sign bit set.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(1);
+    RawEmitter e;
+    const size_t start = prefill_and_emit_self_crc(e, check, 64, 0x10, rng);
+
+    // The check's first 3 bytes should be 48 8D 35 (lea rsi, [rip+...]),
+    // followed by a 32-bit rel32.
+    ASSERT_GE(e.size() - start, 7u);
+    EXPECT_EQ(e.buf[start + 0], 0x48);
+    EXPECT_EQ(e.buf[start + 1], 0x8D);
+    EXPECT_EQ(e.buf[start + 2], 0x35);
+    // Read rel32 little-endian
+    const uint32_t rel32 =
+         static_cast<uint32_t>(e.buf[start + 3])
+      | (static_cast<uint32_t>(e.buf[start + 4]) << 8)
+      | (static_cast<uint32_t>(e.buf[start + 5]) << 16)
+      | (static_cast<uint32_t>(e.buf[start + 6]) << 24);
+    const int32_t rel32s = static_cast<int32_t>(rel32);
+    EXPECT_LT(rel32s, 0)
+        << "rel32 should point backwards at the entry-stub start";
+}
+
+TEST(AntiTamperSelfCrc, DegradesSafelyOnEmptyRange) {
+    // If entry_offset == current position, the check has nothing to
+    // CRC and must degrade to a safe no-op (eax = 0, xor into slot).
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(1);
+    RawEmitter e;
+    const CheckContext ctx{/*entry_offset=*/0};
+    check->emit(e, 0x10, rng, ctx);
+
+    // Very short body (just xor eax,eax + xor [rsp+disp], eax = 6 bytes).
+    EXPECT_LT(e.size(), 16u);
+    // Final instruction must still be the key-slot XOR.
+    ASSERT_GE(e.size(), 4u);
+    const size_t n = e.size();
+    EXPECT_EQ(e.buf[n - 4], 0x31);
+    EXPECT_EQ(e.buf[n - 3], 0x44);
+    EXPECT_EQ(e.buf[n - 2], 0x24);
+}
+
+TEST(AntiTamperSelfCrc, DeterministicForSameSeedAndPrefix) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(0xDEAD);
+    Randomizer rng_b(0xDEAD);
+    RawEmitter ea, eb;
+    prefill_and_emit_self_crc(ea, check, 64, 0x10, rng_a);
+    prefill_and_emit_self_crc(eb, check, 64, 0x10, rng_b);
+    EXPECT_EQ(ea.buf, eb.buf);
+}
+
+TEST(AntiTamperSelfCrc, DifferentPrefixProducesDifferentExpectedCrc) {
+    // Two checks emitted over two different prefixes must have
+    // different `cmp eax, imm32` operands AFTER finalization —
+    // the expected CRC is deferred until `finalize_self_crc_patches`
+    // runs, so tests must invoke it explicitly (the X64 backend
+    // does so at the end of its patch pass).
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(1);
+    Randomizer rng_b(1);
+
+    // Two different prefixes of the same length.
+    RawEmitter ea, eb;
+    for (size_t i = 0; i < 64; ++i) ea.u8(static_cast<uint8_t>(i));
+    for (size_t i = 0; i < 64; ++i) eb.u8(static_cast<uint8_t>(0xFF - i));
+
+    std::vector<mx::anti_tamper::SelfCrcPatchRecord> patches_a, patches_b;
+    CheckContext ctx_a{};
+    ctx_a.entry_offset     = 0;
+    ctx_a.self_crc_patches = &patches_a;
+    CheckContext ctx_b{};
+    ctx_b.entry_offset     = 0;
+    ctx_b.self_crc_patches = &patches_b;
+    check->emit(ea, 0x10, rng_a, ctx_a);
+    check->emit(eb, 0x10, rng_b, ctx_b);
+
+    // Both checks should have recorded one patch record each.
+    ASSERT_EQ(patches_a.size(), 1u);
+    ASSERT_EQ(patches_b.size(), 1u);
+
+    // Finalise both. This writes the CRC over the prefix bytes
+    // into the placeholder imm32 position inside the check body.
+    mx::anti_tamper::finalize_self_crc_patches(ea, patches_a);
+    mx::anti_tamper::finalize_self_crc_patches(eb, patches_b);
+
+    // Now the check bodies must differ in the 4 bytes at the
+    // placeholder position.
+    ASSERT_EQ(patches_a[0].placeholder_offset, patches_b[0].placeholder_offset);
+    const size_t off = patches_a[0].placeholder_offset;
+    const uint32_t crc_a =
+         static_cast<uint32_t>(ea.buf[off])
+      | (static_cast<uint32_t>(ea.buf[off+1]) << 8)
+      | (static_cast<uint32_t>(ea.buf[off+2]) << 16)
+      | (static_cast<uint32_t>(ea.buf[off+3]) << 24);
+    const uint32_t crc_b =
+         static_cast<uint32_t>(eb.buf[off])
+      | (static_cast<uint32_t>(eb.buf[off+1]) << 8)
+      | (static_cast<uint32_t>(eb.buf[off+2]) << 16)
+      | (static_cast<uint32_t>(eb.buf[off+3]) << 24);
+    EXPECT_NE(crc_a, crc_b)
+        << "different prefixes should produce different finalised CRCs";
+}
+
+TEST(AntiTamperSelfCrc, FinalizePatchesUpdatesImm32) {
+    // Smoke test the finalize function directly: construct a
+    // contrived patch record and verify finalize writes the
+    // expected CRC.
+    RawEmitter e;
+    // Prefix of 10 bytes + 4-byte placeholder.
+    for (size_t i = 0; i < 10; ++i) e.u8(static_cast<uint8_t>(i));
+    const size_t placeholder_off = e.size();
+    e.u32(0xFFFFFFFFu);  // non-zero placeholder so we can see it change
+
+    mx::anti_tamper::SelfCrcPatchRecord rec{};
+    rec.placeholder_offset = placeholder_off;
+    rec.range_start        = 0;
+    rec.length             = 10;
+
+    std::vector<mx::anti_tamper::SelfCrcPatchRecord> patches = {rec};
+    mx::anti_tamper::finalize_self_crc_patches(e, patches);
+
+    // Recompute the expected CRC using the same helper and compare.
+    const uint32_t expected =
+        mx::anti_tamper::crc32c_sw(e.buf.data(), 10);
+    const uint32_t written =
+         static_cast<uint32_t>(e.buf[placeholder_off])
+      | (static_cast<uint32_t>(e.buf[placeholder_off+1]) << 8)
+      | (static_cast<uint32_t>(e.buf[placeholder_off+2]) << 16)
+      | (static_cast<uint32_t>(e.buf[placeholder_off+3]) << 24);
+    EXPECT_EQ(written, expected);
+    EXPECT_NE(written, 0xFFFFFFFFu);
 }
 
 } // namespace

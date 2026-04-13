@@ -24,6 +24,7 @@
 #include "mxprotector/protection/anti_emulation/check_registry.hpp"
 #include "mxprotector/protection/anti_tamper/check_registry.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/anti_tamper/self_crc_check.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
@@ -473,6 +474,12 @@ MxResult<VmRuntime> X64VmBackend::generate(
     };
     std::vector<TablePatch> table_patches;
 
+    // Self-CRC patch records. Populated by the Self-CRC anti-tamper
+    // check (if picked) at emit time; finalised in Step 4 AFTER every
+    // other post-hoc patch has been applied to the entry stub, so
+    // that the computed CRC matches what the runtime loop reads.
+    std::vector<anti_tamper::SelfCrcPatchRecord> self_crc_patches;
+
     // ---- Entry stub --------------------------------------------------------
     const size_t entry_offset = rt.size();
 
@@ -621,14 +628,29 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 if (!picks.empty()) {
                     // Resolve NtGetContextThread at runtime. The hash
                     // is computed at build time so the literal ASCII
-                    // name never appears in the VM blob.
+                    // name never appears in the VM blob. The resolver
+                    // leaves the SSN in r13d; checks that don't need
+                    // a syscall (import hook, self-crc) simply ignore
+                    // it, at a small cost of ~155 wasted bytes in the
+                    // entry stub for those picks. That's acceptable —
+                    // picking a single check at random means we never
+                    // pay the cost twice in one build.
                     constexpr uint32_t kNtGetContextThreadHash =
                         anti_tamper::djb2_ascii_hash("NtGetContextThread");
                     anti_tamper::emit_hells_gate_resolver(
                         rt, kNtGetContextThreadHash);
 
+                    // Build the per-region context. Self-CRC reads
+                    // `entry_offset` from here to compute the rip-
+                    // relative rel32 back to the entry stub start,
+                    // and pushes into `self_crc_patches` so the
+                    // backend can finalise its expected-CRC imm32
+                    // after every other post-hoc patch has landed.
+                    anti_tamper::CheckContext ctx{};
+                    ctx.entry_offset     = entry_offset;
+                    ctx.self_crc_patches = &self_crc_patches;
                     for (const auto* check : picks) {
-                        check->emit(rt, imagebase_key_disp, rng);
+                        check->emit(rt, imagebase_key_disp, rng, ctx);
                     }
                 }
             }
@@ -959,6 +981,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
         std::memcpy(rt.buf.data() + integrity_expected_patch,
                     &table_xor_sum, 4);
     }
+
+    // Self-CRC finalisation. Must run AFTER every other patch has
+    // modified the entry-stub bytes, because the Self-CRC check's
+    // CRC range includes bytes that only become stable here (the
+    // integrity-check rel32, the integrity expected-sum imm32, and
+    // the tail-dispatch rel32s). Computing the expected CRC over
+    // the finalised buffer guarantees the runtime loop — which
+    // reads the same finalised bytes — gets an identical value.
+    anti_tamper::finalize_self_crc_patches(rt, self_crc_patches);
 
     VmRuntime result;
     result.blob = std::move(rt.buf);

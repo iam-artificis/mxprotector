@@ -98,7 +98,8 @@ public:
 
     void emit(RawEmitter& e,
               int32_t key_slot_disp,
-              Randomizer& rng) const override
+              Randomizer& rng,
+              const CheckContext& /*ctx*/) const override
     {
         // Random non-zero corruption mask so two builds differ even
         // when they pick the same check.
