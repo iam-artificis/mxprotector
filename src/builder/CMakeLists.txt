@@ -80,6 +80,11 @@ set(BUILDER_SOURCES
     protection/anti_emulation/rdtsc_timing_check.cpp
     protection/anti_emulation/cpuid_hypervisor_check.cpp
     protection/anti_emulation/eflags_reserved_bit_check.cpp
+
+    # Phase 6: Anti-tamper checks — direct syscall + DR sweep
+    protection/anti_tamper/syscall_resolver.cpp
+    protection/anti_tamper/check_registry.cpp
+    protection/anti_tamper/hw_breakpoint_check.cpp
 )
 
 # ==============================================================================

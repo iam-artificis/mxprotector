@@ -18,6 +18,7 @@ set(TEST_SOURCES
     anti_emulation_check_test.cpp
     mx_string_test.cpp
     x64_specialized_handlers_test.cpp
+    anti_tamper_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests
@@ -34,6 +35,13 @@ set(ANTI_EMU_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/rdtsc_timing_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/cpuid_hypervisor_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/eflags_reserved_bit_check.cpp
+)
+
+# Anti-tamper sources needed for anti_tamper_test
+set(ANTI_TAMPER_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/syscall_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/check_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hw_breakpoint_check.cpp
 )
 
 # ==============================================================================
@@ -66,7 +74,7 @@ set(CFF_SOURCES
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES} ${ANTI_EMU_SOURCES})
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES} ${ANTI_EMU_SOURCES} ${ANTI_TAMPER_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

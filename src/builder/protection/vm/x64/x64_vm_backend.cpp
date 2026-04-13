@@ -22,6 +22,7 @@
 #include "mxprotector/analysis/x86_encoding.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/anti_emulation/check_registry.hpp"
+#include "mxprotector/protection/anti_tamper/check_registry.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
@@ -590,6 +591,25 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 const size_t upper = std::min<size_t>(registry.size(), 2);
                 const size_t count = rng.next_range(1, static_cast<uint32_t>(upper));
                 const auto picks = registry.pick_random(count, rng);
+                for (const auto* check : picks) {
+                    check->emit(rt, imagebase_key_disp, rng);
+                }
+            }
+        }
+
+        // G3 — Anti-tamper checks.
+        //
+        // These probe the running process for live debuggers, hardware
+        // breakpoints, and EDR hooks. Each emitted check is dramatically
+        // bigger than an anti-emulation check (~90 bytes vs ~30) because
+        // it scaffolds a direct `syscall` to NTDLL bypassing user-mode
+        // hooks, so we cap at one check per build to keep the entry
+        // stub compact. Anti-tamper checks XOR into the same key slot
+        // the anti-emulation pass writes — every probe stacks.
+        {
+            static const anti_tamper::CheckRegistry tamper_registry;
+            if (tamper_registry.size() > 0) {
+                const auto picks = tamper_registry.pick_random(1, rng);
                 for (const auto* check : picks) {
                     check->emit(rt, imagebase_key_disp, rng);
                 }
