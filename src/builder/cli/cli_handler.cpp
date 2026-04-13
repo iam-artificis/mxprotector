@@ -111,6 +111,25 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
 
+        if (arg.starts_with("--strings=") && arg.size() > 10) {
+            const auto mode_str = arg.substr(10);
+            if (mode_str == "off" || mode_str == "disabled") {
+                config.string_protection = StringProtectionMode::disabled;
+                continue;
+            }
+            if (mode_str == "stub" || mode_str == "plain") {
+                config.string_protection = StringProtectionMode::stub;
+                continue;
+            }
+            if (mode_str == "vm" || mode_str == "virtualized") {
+                config.string_protection = StringProtectionMode::virtualized;
+                continue;
+            }
+            return std::unexpected(error::config(
+                std::format("--strings: ожидается off|stub|vm, получено '{}'",
+                            mode_str)));
+        }
+
         if (arg.starts_with("--vm-depth=") && arg.size() > 11) {
             const auto depth_str = arg.substr(11);
             uint32_t depth = 0;
@@ -193,6 +212,11 @@ void CliHandler::print_usage() {
         "  --code-interleaving         Включить перемешивание кода\n"
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
+        "  --strings=<режим>           Защита строк в .rdata:\n"
+        "                                off  — оставить plaintext\n"
+        "                                stub — decryptor как обычный x64 asm\n"
+        "                                vm   — decryptor лифтится в VM bytecode\n"
+        "                                (auto-fallback vm→stub при --no-vm)\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
         "\n"
         "Информация:\n"

@@ -23,6 +23,46 @@
 namespace mx {
 
 /**
+ * @brief Режим строковой защиты (S2 pass).
+ *
+ * `disabled` — проход полностью пропускается, строки остаются plaintext в
+ * `.rdata`. Нужен для targets где любой overhead неприемлем (minimal level,
+ * benchmarks, a/b баз).
+ *
+ * `stub` — декриптор эмитится как обычный x64 код в отдельной секции. Каждый
+ * XREF рерайтится на call trampoline → common decryptor. Первый вызов xor-decodes
+ * строку на месте и ставит sticky flag, последующие возвращают кэшированный
+ * pointer. Дёшево в runtime (hot path ~без overhead после первого вызова),
+ * но сам декриптор — plain asm, symbolically executable.
+ *
+ * `virtualized` — тот же декриптор, но проход инжектит его в `ctx.markers()`
+ * как VM region, и `VirtualizationPass` лифтит его в bytecode. Reverser
+ * должен сначала победить VM (handler table, dispatcher, rolling key),
+ * потом разобрать логику декриптора внутри bytecode — две дорогостоящих
+ * фазы вместо одной. Overhead на первом вызове каждой строки равен одному
+ * VM entry (~50×), hot path после кэширования тот же.
+ *
+ * Auto-fallback: если выбран `virtualized` но `enable_vm=false`, проход
+ * откатывается на `stub` с предупреждением. Комбинация не имеет смысла
+ * и скорее всего ошибка конфигурации.
+ */
+enum class StringProtectionMode : uint8_t {
+    disabled    = 0,
+    stub        = 1,
+    virtualized = 2,
+};
+
+[[nodiscard]] constexpr std::string_view
+string_protection_mode_name(StringProtectionMode m) noexcept {
+    switch (m) {
+        case StringProtectionMode::disabled:    return "disabled";
+        case StringProtectionMode::stub:        return "stub";
+        case StringProtectionMode::virtualized: return "virtualized";
+    }
+    return "unknown";
+}
+
+/**
  * @brief Конфигурация защиты PE-файла.
  *
  * @details Агрегат всех параметров, управляющих пайплайном защиты.
@@ -48,6 +88,9 @@ struct ProtectionConfig {
     bool strip_debug_info       = true;   ///< Удаление отладочной информации
     bool enable_header_erasure  = true;   ///< Стирание PE-заголовков в рантайме (anti-dump)
     bool debug_section_names    = false;  ///< Use fixed .mxvm/.mxprot1/.mxpack names
+
+    StringProtectionMode string_protection = StringProtectionMode::disabled;
+                                          ///< `.rdata` string transform (S2/S4, см. enum)
 
     uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
 
@@ -76,6 +119,7 @@ struct ProtectionConfig {
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
+                cfg.string_protection      = StringProtectionMode::disabled;
                 cfg.vm_nesting_depth       = 1;
                 break;
 
@@ -90,6 +134,7 @@ struct ProtectionConfig {
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
+                cfg.string_protection      = StringProtectionMode::stub;
                 cfg.vm_nesting_depth       = 1;
                 break;
 
@@ -104,6 +149,7 @@ struct ProtectionConfig {
                 cfg.enable_nanomites       = false;
                 cfg.enable_code_interleaving = false;
                 cfg.strip_debug_info       = true;
+                cfg.string_protection      = StringProtectionMode::virtualized;
                 cfg.vm_nesting_depth       = 1;
                 break;
 
@@ -118,6 +164,7 @@ struct ProtectionConfig {
                 cfg.enable_nanomites       = true;
                 cfg.enable_code_interleaving = true;
                 cfg.strip_debug_info       = true;
+                cfg.string_protection      = StringProtectionMode::virtualized;
                 cfg.vm_nesting_depth       = 2;
                 break;
         }

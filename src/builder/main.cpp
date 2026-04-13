@@ -225,6 +225,20 @@ int main(int argc, char** argv) {
     }
 
     auto config = std::move(*config_result);
+
+    // Auto-fallback: virtualized string protection requires the VM backend.
+    // If the user disabled VM explicitly (or the level preset has it off)
+    // the virtualized decryptor has nothing to lift into, so we drop to
+    // stub mode and tell the user why.
+    if (config.string_protection == mx::StringProtectionMode::virtualized &&
+        !config.enable_vm)
+    {
+        std::cout <<
+            "[!] --strings=vm требует включённый VM, но VM отключён — "
+            "откат на --strings=stub\n";
+        config.string_protection = mx::StringProtectionMode::stub;
+    }
+
     const auto pipeline_start = std::chrono::high_resolution_clock::now();
 
     std::cout << std::format("[*] Чтение файла: {}\n", config.input_path.string());
