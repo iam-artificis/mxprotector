@@ -15,11 +15,20 @@ set(TEST_SOURCES
     mutation_engine_test.cpp
     cfg_flattening_test.cpp
     vm_stack_layout_test.cpp
+    anti_emulation_check_test.cpp
 )
 
 # VM sources needed for VmStackLayout tests
 set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
+)
+
+# Anti-emulation sources needed for check registry tests
+set(ANTI_EMU_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/check_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/rdtsc_timing_check.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/cpuid_hypervisor_check.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_emulation/eflags_reserved_bit_check.cpp
 )
 
 # ==============================================================================
@@ -52,7 +61,7 @@ set(CFF_SOURCES
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES})
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES} ${ANTI_EMU_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

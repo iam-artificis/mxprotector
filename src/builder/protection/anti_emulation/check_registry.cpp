@@ -31,10 +31,41 @@ namespace mx::anti_emulation {
 std::unique_ptr<ICheck> make_rdtsc_zero_delta_check();
 std::unique_ptr<ICheck> make_rdtsc_huge_delta_check();
 std::unique_ptr<ICheck> make_cpuid_hypervisor_check();
+std::unique_ptr<ICheck> make_eflags_reserved_bit_check();
+
+// ----------------------------------------------------------------------------
+// REJECTED: AC flag fidelity (EFLAGS bit 18 round-trip).
+//
+// The ROADMAP listed it as a candidate, and on paper it's elegant — set
+// AC via popfq, read it back via pushfq, real CPUs preserve, dumb
+// emulators don't. Implementation works.
+//
+// In practice: setting EFLAGS.AC=1 in user mode on Windows x64 ARMS the
+// alignment-check trap. Windows enables CR0.AM (or an equivalent
+// behaviour, exact mechanism is build-specific) — once AC is set, the
+// next unaligned multi-byte access raises #AC. The CRT, vectorised
+// memcpy, exception unwinding, and most third-party libraries do
+// unaligned reads constantly, so the protected binary crashes within
+// microseconds of the check running.
+//
+// We confirmed this empirically: replacing the bit-test logic with a
+// forced `xor eax, eax` (so the corruption mask is always 0) STILL
+// crashed ~25% of stress builds, but removing the `or rax, 0x40000`
+// (so AC is never set) made the same byte sequence 40/40 OK.
+//
+// Conclusion: AC fidelity probing is fundamentally unsafe on Windows
+// targets. Do NOT add it back without first guaranteeing the protected
+// process never executes another unaligned access — which is not
+// achievable for general-purpose Windows binaries. If we ever ship a
+// Linux ELF backend, AC fidelity is fair game there (Linux leaves
+// CR0.AM cleared) — but it must live in a Linux-only registry, never
+// the cross-platform default.
+// ----------------------------------------------------------------------------
 
 CheckRegistry::CheckRegistry() {
     checks_.push_back(make_rdtsc_zero_delta_check());
     checks_.push_back(make_rdtsc_huge_delta_check());
+    checks_.push_back(make_eflags_reserved_bit_check());
     // NOTE: CPUID hypervisor-bit check is intentionally NOT in the default
     // registry. Windows 11 with VBS, Hyper-V, WSL2, Docker, or
     // Credential Guard all runs user mode under a type-1 hypervisor and

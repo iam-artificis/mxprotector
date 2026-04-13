@@ -73,6 +73,7 @@ set(BUILDER_SOURCES
     protection/anti_emulation/check_registry.cpp
     protection/anti_emulation/rdtsc_timing_check.cpp
     protection/anti_emulation/cpuid_hypervisor_check.cpp
+    protection/anti_emulation/eflags_reserved_bit_check.cpp
 )
 
 # ==============================================================================
