@@ -12,7 +12,7 @@
  *
  * void protected_function() {
  *     MX_VM_BEGIN
- *     auto key = MX_STRING("license_key_aes256");
+ *     auto key = MX_STR("license_key_aes256");
  *     int max_attempts = MX_CONST(5);
  *     // ... защищённая логика ...
  *     MX_VM_END

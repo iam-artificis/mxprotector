@@ -16,6 +16,7 @@ set(TEST_SOURCES
     cfg_flattening_test.cpp
     vm_stack_layout_test.cpp
     anti_emulation_check_test.cpp
+    mx_string_test.cpp
 )
 
 # VM sources needed for VmStackLayout tests
@@ -70,6 +71,7 @@ target_include_directories(mxprotector_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/external/zydis/include
     ${CMAKE_SOURCE_DIR}/external/zydis/dependencies/zycore/include
     ${CMAKE_SOURCE_DIR}/src/builder
+    ${CMAKE_SOURCE_DIR}/src/sdk/include
 )
 
 target_link_libraries(mxprotector_tests PRIVATE
