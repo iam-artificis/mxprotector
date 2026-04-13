@@ -281,6 +281,93 @@ void emit_handler_xor_rr_mba(RawEmitter& e, int32_t key_disp, bool rolling) {
     e.u8(0x48); e.u8(0x89); e.u8(0x16);   // [rsi] = rdx
 }
 
+// ---------------------------------------------------------------------------
+// G4 — handler-id polymorphism: alternative emitter variants.
+//
+// Each of these produces the same semantic effect as the canonical
+// handler for the corresponding VmOp but with a different x64 byte
+// sequence. The backend's encoder picks one per bytecode slot at
+// random so two consecutive `and_rr` ops end up at two completely
+// different handler bodies — different opcodes, different
+// register traffic, different body lengths. Static recovery of the
+// guest-opcode table via "one canonical body per VmOp" no longer
+// works.
+// ---------------------------------------------------------------------------
+
+/// mov_rr V1: `push [src]; pop [dst]`. No scratch register, the
+/// stack does the actual data transfer.
+void emit_handler_mov_rr_pushpop(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    emit_vmreg_addr_rdi_from_rdx(e);
+    // push qword [rdi]   FF 37  (PUSH r/m64, /6)
+    e.u8(0xFF); e.u8(0x37);
+    // pop qword [rsi]    8F 06  (POP  r/m64, /0)
+    e.u8(0x8F); e.u8(0x06);
+}
+
+/// and_rr V1: `x & y ≡ ~(~x | ~y)`.
+void emit_handler_and_rr_demorgan(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    emit_vmreg_addr_rdi_from_rdx(e);
+    // rax = x = [rsi]        48 8B 06
+    e.u8(0x48); e.u8(0x8B); e.u8(0x06);
+    // rdx = y = [rdi]        48 8B 17
+    e.u8(0x48); e.u8(0x8B); e.u8(0x17);
+    // not rax                48 F7 D0
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD0);
+    // not rdx                48 F7 D2
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD2);
+    // or rax, rdx            48 09 D0  (or r/m64, r64: reg=rdx src)
+    e.u8(0x48); e.u8(0x09); e.u8(0xD0);
+    // not rax                48 F7 D0
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD0);
+    // mov [rsi], rax         48 89 06
+    e.u8(0x48); e.u8(0x89); e.u8(0x06);
+}
+
+/// or_rr V1: `x | y ≡ ~(~x & ~y)`.
+void emit_handler_or_rr_demorgan(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_2_operand_bytes(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    emit_vmreg_addr_rdi_from_rdx(e);
+    // rax = x = [rsi]        48 8B 06
+    e.u8(0x48); e.u8(0x8B); e.u8(0x06);
+    // rdx = y = [rdi]        48 8B 17
+    e.u8(0x48); e.u8(0x8B); e.u8(0x17);
+    // not rax                48 F7 D0
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD0);
+    // not rdx                48 F7 D2
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD2);
+    // and rax, rdx           48 21 D0  (and r/m64, r64)
+    e.u8(0x48); e.u8(0x21); e.u8(0xD0);
+    // not rax                48 F7 D0
+    e.u8(0x48); e.u8(0xF7); e.u8(0xD0);
+    // mov [rsi], rax         48 89 06
+    e.u8(0x48); e.u8(0x89); e.u8(0x06);
+}
+
+/// not_r V1: `xor qword [slot], -1` (imm32, sign-extended to int64).
+void emit_handler_not_r_xor(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    // xor qword [rsi], -1    48 81 /6 imm32
+    //   REX.W (48) + 81 + ModRM(00 110 110 = 0x36, /6=xor) + disp0 + imm32
+    e.u8(0x48); e.u8(0x81); e.u8(0x36);
+    e.u8(0xFF); e.u8(0xFF); e.u8(0xFF); e.u8(0xFF);
+}
+
+/// neg_r V1: `~x + 1`. Encoded as `not [slot]; inc qword [slot]`.
+void emit_handler_neg_r_notinc(RawEmitter& e, int32_t key_disp, bool rolling) {
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    // not qword [rsi]        48 F7 16  (/2 = not, rm=rsi=6 → ModRM 00 010 110)
+    e.u8(0x48); e.u8(0xF7); e.u8(0x16);
+    // inc qword [rsi]        48 FF 06  (/0 = inc, rm=rsi=6 → ModRM 00 000 110)
+    e.u8(0x48); e.u8(0xFF); e.u8(0x06);
+}
+
 void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp, bool rolling) {
     emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);

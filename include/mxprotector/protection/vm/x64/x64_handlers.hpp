@@ -121,6 +121,43 @@ void emit_handler_sub_rr_neg(RawEmitter& e, int32_t key_disp, bool rolling);
 void emit_handler_xor_rr_mba(RawEmitter& e, int32_t key_disp, bool rolling);
 void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp, bool rolling);
 
+// ---- G4 handler-id polymorphism: alternative variants ----
+//
+// Each of these produces the exact same VM-observable effect as the
+// corresponding `mov_rr` / `and_rr` / `or_rr` / `not_r` / `neg_r`
+// handler, but with a different x64 byte sequence. The backend picks
+// one variant per bytecode instruction at encoding time, so two
+// consecutive `and_rr` ops can be served by two unrelated-looking
+// handler bodies with different opcodes, register use, and lengths.
+// A reverser can no longer recover the guest opcode table by matching
+// one "canonical" body to one VmOp.
+
+/// `mov_rr` V1: `push qword [src]; pop qword [dst]`.
+/// Same net effect as V0's `mov rax, [src]; mov [dst], rax`, but uses
+/// stack-micro-ops and leaves no trace in a scratch register.
+void emit_handler_mov_rr_pushpop(RawEmitter& e, int32_t key_disp, bool rolling);
+
+/// `and_rr` V1: De Morgan's law — `x & y ≡ ~(~x | ~y)`.
+/// Materialises the operands into rax/rdx, negates both, OR's them,
+/// negates the result, and stores. 10 bytes of ALU vs. V0's 3-byte
+/// direct `and`, and touches a completely different set of opcodes.
+void emit_handler_and_rr_demorgan(RawEmitter& e, int32_t key_disp, bool rolling);
+
+/// `or_rr` V1: De Morgan's law — `x | y ≡ ~(~x & ~y)`.
+/// Mirror of the AND variant above.
+void emit_handler_or_rr_demorgan(RawEmitter& e, int32_t key_disp, bool rolling);
+
+/// `not_r` V1: `xor qword [slot], -1`.
+/// Same bitwise result as V0's `not [slot]` but encodes as an XOR
+/// against an imm32 of `0xFFFFFFFF` (sign-extended), producing a
+/// visibly different instruction.
+void emit_handler_not_r_xor(RawEmitter& e, int32_t key_disp, bool rolling);
+
+/// `neg_r` V1: two's-complement identity — `-x ≡ ~x + 1`.
+/// Encoded as `not [slot]; inc qword [slot]`, so the trace looks like
+/// a NOT+INC pair instead of the atomic NEG of V0.
+void emit_handler_neg_r_notinc(RawEmitter& e, int32_t key_disp, bool rolling);
+
 void emit_handler_mov_ri32(RawEmitter& e, int32_t key_disp, bool rolling);
 void emit_handler_mov_ri64(RawEmitter& e, int32_t key_disp, bool rolling);
 void emit_handler_alu_ri32(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t op_mr);

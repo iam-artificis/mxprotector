@@ -38,12 +38,18 @@ namespace {
 /// How many handler variants each canonical VmOp emits. Ops with multiple
 /// variants have two (or more) mathematically equivalent emission forms;
 /// the encoder picks one at random per instruction to defeat simple
-/// opcode-table recovery.
+/// opcode-table recovery (G4 — handler-id polymorphism).
 constexpr uint8_t variant_count_for(VmOp op) {
     switch (op) {
-        case VmOp::add_rr:
-        case VmOp::sub_rr:
-        case VmOp::xor_rr:
+        // Canonical body + MBA / alternative x64 sequence.
+        case VmOp::mov_rr:   // V0 mov/mov        V1 push/pop
+        case VmOp::add_rr:   // V0 add direct     V1 MBA
+        case VmOp::sub_rr:   // V0 sub direct     V1 neg+add
+        case VmOp::xor_rr:   // V0 xor direct     V1 MBA
+        case VmOp::and_rr:   // V0 and direct     V1 De Morgan
+        case VmOp::or_rr:    // V0 or direct      V1 De Morgan
+        case VmOp::not_r:    // V0 not r/m64      V1 xor r/m64, -1
+        case VmOp::neg_r:    // V0 neg r/m64      V1 not + inc
             return 2;
         case VmOp::vjcc:
             return 16;   // one handler per x86 condition code (0..F)
@@ -703,7 +709,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
-            case VmOp::mov_rr:   emit_handler_mov_rr(rt, rolling_key_disp, rolling);             return true;
+            case VmOp::mov_rr:
+                if (variant == 0) emit_handler_mov_rr(rt, rolling_key_disp, rolling);
+                else              emit_handler_mov_rr_pushpop(rt, rolling_key_disp, rolling);
+                return true;
 
             case VmOp::add_rr:
                 if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x01);
@@ -720,8 +729,16 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 else              emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
                 return true;
 
-            case VmOp::and_rr:   emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);       return true;
-            case VmOp::or_rr:    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);       return true;
+            case VmOp::and_rr:
+                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);
+                else              emit_handler_and_rr_demorgan(rt, rolling_key_disp, rolling);
+                return true;
+
+            case VmOp::or_rr:
+                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);
+                else              emit_handler_or_rr_demorgan(rt, rolling_key_disp, rolling);
+                return true;
+
             case VmOp::imul_rr:  emit_handler_imul_rr(rt, rolling_key_disp, rolling);            return true;
 
             case VmOp::mov_ri32: emit_handler_mov_ri32(rt, rolling_key_disp, rolling);           return true;
@@ -733,8 +750,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
             case VmOp::mov_ri64: emit_handler_mov_ri64(rt, rolling_key_disp, rolling);           return true;
 
-            case VmOp::not_r:    emit_handler_unary(rt, rolling_key_disp, rolling, 2);           return true;
-            case VmOp::neg_r:    emit_handler_unary(rt, rolling_key_disp, rolling, 3);           return true;
+            case VmOp::not_r:
+                if (variant == 0) emit_handler_unary(rt, rolling_key_disp, rolling, 2);
+                else              emit_handler_not_r_xor(rt, rolling_key_disp, rolling);
+                return true;
+
+            case VmOp::neg_r:
+                if (variant == 0) emit_handler_unary(rt, rolling_key_disp, rolling, 3);
+                else              emit_handler_neg_r_notinc(rt, rolling_key_disp, rolling);
+                return true;
 
             case VmOp::shl_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 4);           return true;
             case VmOp::shr_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 5);           return true;
