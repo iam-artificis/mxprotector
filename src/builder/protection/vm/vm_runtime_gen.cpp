@@ -71,7 +71,9 @@
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 #include "mxprotector/analysis/assembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
+#include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
+#include "mxprotector/protection/anti_emulation/check_registry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -147,30 +149,9 @@ struct VmRegLayout {
 constexpr int32_t kNativeFrameShift = 168;
 
 // ============================================================================
-// RawEmitter — tiny byte buffer with pos tracking
-// ============================================================================
-
-struct RawEmitter {
-    ByteBuffer buf;
-
-    void u8(uint8_t b) { buf.push_back(b); }
-    void u16(uint16_t v) { u8(static_cast<uint8_t>(v)); u8(static_cast<uint8_t>(v >> 8)); }
-    void u32(uint32_t v) {
-        u8(static_cast<uint8_t>(v));
-        u8(static_cast<uint8_t>(v >> 8));
-        u8(static_cast<uint8_t>(v >> 16));
-        u8(static_cast<uint8_t>(v >> 24));
-    }
-    void u64(uint64_t v) {
-        u32(static_cast<uint32_t>(v));
-        u32(static_cast<uint32_t>(v >> 32));
-    }
-    void bytes(ByteView data) {
-        buf.insert(buf.end(), data.begin(), data.end());
-    }
-    size_t size() const noexcept { return buf.size(); }
-};
-
+// RawEmitter — see include/mxprotector/core/raw_emitter.hpp.
+// We use `mx::RawEmitter` directly (a thin byte-buffer helper shared with
+// other passes that hand-roll machine code).
 // ============================================================================
 // Atomic x64 encoders
 // ============================================================================
@@ -1807,6 +1788,38 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         // mov [rsp + disp8], eax    89 44 24 disp8  (reg=eax=0, SIB=rsp)
         rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
         rt.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
+
+        // ----------------------------------------------------------------
+        // Anti-emulation checks.
+        //
+        // Each check is a short sequence that probes a CPU/OS property
+        // that real hardware always satisfies and common emulators
+        // (Unicorn, QEMU user mode, Triton, Frida) typically don't. The
+        // final instruction of every check is `xor [rsp + key_slot], reg`
+        // where `reg` holds 0 on real hardware and a random non-zero
+        // corruption mask under emulation. On real hardware the XORs are
+        // no-ops; under an emulator they silently scramble the key slot
+        // and every subsequent dispatch decrypts to a garbage address.
+        //
+        // Checks live in `src/builder/protection/anti_emulation/*.cpp` —
+        // one file per technique. The registry picks a random subset per
+        // build so two binaries have different check selections AND
+        // different corruption masks.
+        {
+            static const anti_emulation::CheckRegistry registry;
+            // Pick 1..min(registry.size(), 2) checks per build, so two
+            // builds of the same input produce different check subsets.
+            // (Upper bound of 2 keeps the entry stub compact — each
+            // check is 20-30 bytes, so 2 max ≈ 60 bytes of probe code.)
+            if (registry.size() > 0) {
+                const size_t upper = std::min<size_t>(registry.size(), 2);
+                const size_t count = rng.next_range(1, static_cast<uint32_t>(upper));
+                const auto picks = registry.pick_random(count, rng);
+                for (const auto* check : picks) {
+                    check->emit(rt, imagebase_key_disp, rng);
+                }
+            }
+        }
     }
 
     // lea r11, [rip + bytecode_rel32]

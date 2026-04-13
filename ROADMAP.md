@@ -27,6 +27,7 @@
 - ✅ **Handler-table key через PEB.ImageBase**: ключ вычисляется в рантайме из `PEB.ImageBaseAddress`, dispatches используют `xor eax, [rsp+disp8]` вместо `xor eax, imm32`. Работает только когда packer страйпит ASLR
 - ✅ **Entry-stub MBA**: вычисление `ImageBase_low32 → table_xor_key` через случайную цепочку 6–12 arithmetic ops (переиспользует `MbaTransitionGenerator`), вместо одиночного `xor eax, salt`
 - ✅ **Handler-table integrity check**: entry stub XOR-суммирует все encrypted table entries и сравнивает с build-time expected value. При tampering (debugger memory patch) XOR-сумма отличается → silently corrupts key → все dispatches ломаются. Без branch'а — не NOP-нуть
+- ✅ **Anti-emulation checks** (`include/mxprotector/protection/anti_emulation/`, отдельный файл per-техника): 2 RDTSC-based probe (zero-delta для Unicorn/DBI, huge-delta для QEMU/Triton). Registry архитектура — per-build random 1..2 checks. Каждый XOR'ит 0 (real HW) или random non-zero mask (emulated) в key slot. CPUID hypervisor check реализован но не в default registry из-за false-positives на Windows 11 + VBS/Hyper-V/WSL2
 
 ### PE pipeline
 - ✅ **Self-unpacking packer (multi-section)**: `.text`, VM blob, CFF трамплины шифруются одним 256-байтным ключом, stub расшифровывает по per-section циклу. Ключевой индекс `dl` переносится между секциями
@@ -105,11 +106,14 @@
 
 ## Следующие шаги (по приоритету)
 
-### 📋 1. Анти-unicorn / анти-эмуляция *(средний)*
-Сделать VM resistant к emulator analysis (Unicorn, Triton, angr):
-- Проверки на недокументированные CPU-флаги (AC, ID) в VM-контексте
-- Timing checks через RDTSC внутри handler'ов (редко, не на каждом — ~5% handlers)
-- CPUID-анти-VM проверки в stub (brand string, hypervisor bit)
+### 📋 1. Расширение anti-emulation check pool *(низкий-средний)*
+Дополнительные probe'ы в `protection/anti_emulation/`:
+- **AC flag fidelity**: set/clear bit 18 через pushfq/popfq в user mode — некоторые эмуляторы неправильно обрабатывают reserved flags
+- **FPU quirks**: x87 precision-control behaviors (rounding edge cases) редко идентичны между реальным CPU и эмулятором
+- **Undocumented opcodes**: emit `D6` (SALC) или `F1` (ICEBP) — legitimate but obscure, некоторые emulators crash'атся или ловят exception
+- **Scheduler timing**: timing delta across `pause` instruction (hint to CPU, no-op in most emulators)
+- **CPUID brand-string tail**: читать leaf 0x80000002..04, проверять на характерные подстроки "QEMU", "Hyper"
+- **CLI flag `--aggressive-anti-vm`**: opt-in включение CPUID hypervisor check (disabled в default из-за false-positives на Windows 11 VBS)
 
 ### 📋 2. Scattered key composition *(средний, высокая сложность)*
 Вместо вычисления всего table key в entry stub, распылить компоненты
