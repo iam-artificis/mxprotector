@@ -16,30 +16,11 @@ Legend:
 
 В этом порядке:
 
-### 📋 Packer: revoke WRITE после decryption
-Packer сейчас ставит `IMAGE_SCN_MEM_WRITE` на `.text` / VM blob / CFG trampoline
-sections чтобы decrypt loop мог писать in-place. После расшифровки флаг не
-снимается → при runtime эти секции остаются `PAGE_EXECUTE_READWRITE`. Два
-побочных эффекта:
-
-1. Блокирует правильную реализацию `page_protection_sweep` anti-tamper check —
-   мы вынуждены probe'ить kernel32 или другую неконтролируемую область вместо
-   собственной VM blob секции.
-2. Облегчает в-memory patching: атакеру не нужен `VirtualProtect` чтобы
-   модифицировать код.
-
-**Fix:** в packer stub после decrypt loop'а эмитить direct syscall
-`NtProtectVirtualMemory(section_base, section_size, PAGE_EXECUTE_READ)` для
-каждой расшифрованной секции. Использует уже существующий Hell's Gate
-механизм (runtime PEB walk → SSN). После этого:
-- Все защищаемые секции возвращаются к нормальному R+X состоянию
-- `VirtualProtect` от атакера становится наблюдаемым (меняет Protect)
-- `page_protection_sweep` probes собственную `.mxvm` секцию и работает
-  корректно
-
-### 📋 G3. Page Protection Sweep (re-enable)
-После packer revoke WRITE — re-add `page_protection_check.cpp` с
-probe'ом собственной `.mxvm` секции (`lea rdx, [rip + 0]`).
+### ⏳ S2. Binary-level `.rdata` string transform pass
+Следующая цель. См. секцию "String protection" ниже — планируется
+объединить с S4 (decryptor в VM-protected регионе) чтобы сразу получить
+максимальный uplift для reverse engineering cost, а не делать два
+последовательных прохода через одну и ту же кодовую область.
 
 ### 📋 G3 extensions. Additional anti-tamper checks
 - **Thread context poisoning**: `NtQueryInformationThread` (через Hell's
