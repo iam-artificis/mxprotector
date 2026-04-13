@@ -300,6 +300,22 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
         }
     }
 
+    // S3 additional filter: the ephemeral decryptor has a fixed
+    // scratch-slot size, so any string whose plaintext wouldn't fit
+    // (leaving room for a trailing NUL) is dropped from protection.
+    // The bound is enforced here rather than at the encrypt step so
+    // the rng draw order stays identical between --strings=stub and
+    // --strings=ephemeral builds of the same binary.
+    const bool is_ephemeral_mode =
+        ctx.config().string_protection == StringProtectionMode::ephemeral;
+    if (is_ephemeral_mode) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (candidates[i].length > string_protect::kEphemeralMaxStringLength) {
+                keep_string[i] = 0;
+            }
+        }
+    }
+
     // Filter xrefs: drop those whose LEA is not a clean 7-byte form,
     // whose register is not a plain 64-bit GPR 0..15 excluding rsp,
     // or whose target string was filtered out by the reloc check.
@@ -345,7 +361,39 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     auto encrypted = string_protect::encrypt_all(kept_strings, rng);
 
     // (6) Emit mx_str_get + per-xref trampolines.
-    auto emitted_decryptor = string_protect::emit_mx_str_get();
+    //
+    // Two decryptor variants:
+    //   - S2b/S2c stub: `emit_mx_str_get()` — sticky flag caching,
+    //     XOR decrypt in place in the data pool. Returns a pointer
+    //     that stays valid forever.
+    //   - S3 ephemeral: `emit_mx_str_get_ephemeral()` — scratch-ring
+    //     allocator, copy+decrypt per call, no caching. Returns a
+    //     pointer that's valid until the ring wraps around.
+    //
+    // Common fields (`code`, `desc_table_disp32_offset`,
+    // `data_base_disp32_offset`) are copied into local variables so
+    // the downstream patch logic only branches on the extra
+    // scratch-ring disp32 once.
+    std::vector<uint8_t> decryptor_code;
+    size_t               decryptor_desc_disp32_off = 0;
+    size_t               decryptor_data_disp32_off = 0;
+    size_t               decryptor_ring_disp32_off = 0;  // S3 only
+    size_t               decryptor_size_bytes      = 0;
+    if (is_ephemeral_mode) {
+        auto emitted = string_protect::emit_mx_str_get_ephemeral();
+        decryptor_code             = std::move(emitted.code);
+        decryptor_desc_disp32_off  = emitted.desc_table_disp32_offset;
+        decryptor_data_disp32_off  = emitted.data_base_disp32_offset;
+        decryptor_ring_disp32_off  = emitted.scratch_ring_disp32_offset;
+        decryptor_size_bytes       = string_protect::kMxStrGetEphemeralSize;
+    } else {
+        auto emitted = string_protect::emit_mx_str_get();
+        decryptor_code             = std::move(emitted.code);
+        decryptor_desc_disp32_off  = emitted.desc_table_disp32_offset;
+        decryptor_data_disp32_off  = emitted.data_base_disp32_offset;
+        decryptor_size_bytes       = string_protect::kMxStrGetSize;
+    }
+    (void) decryptor_size_bytes;  // kept for clarity / future asserts
 
     std::vector<EmittedTrampoline> trampolines;
     trampolines.reserve(usable_xrefs.size());
@@ -363,15 +411,17 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     //     section-local once the section has an assigned RVA.
     std::vector<uint8_t> section_buf;
     section_buf.reserve(
-        emitted_decryptor.code.size() +
+        decryptor_code.size() +
         trampolines.size() * string_protect::kTrampolineSizeVolatile +
         encrypted.size() * string_protect::kDescriptorSize +
-        /* worst-case data pool: */ encrypted.size() * 4096);
+        /* worst-case data pool: */ encrypted.size() * 4096 +
+        /* S3 scratch ring (always reserved, even for stub builds): */
+        string_protect::kEphemeralRingTotalSize);
 
     const size_t decryptor_offset = section_buf.size();
     section_buf.insert(section_buf.end(),
-                       emitted_decryptor.code.begin(),
-                       emitted_decryptor.code.end());
+                       decryptor_code.begin(),
+                       decryptor_code.end());
 
     // Trampoline offsets are remembered so we can patch their call
     // rel32 AFTER the section RVA is known, and so we can compute
@@ -416,6 +466,36 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
                            enc.ciphertext.end());
     }
 
+    // S3 scratch ring. Only appended in ephemeral mode; sticks at
+    // the tail of the section so the data_pool and descriptor table
+    // layouts are unchanged for stub/vm builds.
+    //
+    // Layout:
+    //   [ring_counter : u32 = 0]          (kEphemeralRingHeaderSize)
+    //   [slot 0 : kEphemeralSlotSize bytes of 0]
+    //   [slot 1 : ...]
+    //   ...
+    //   [slot kEphemeralRingSlots-1 : ...]
+    //
+    // The counter is zero-initialised so the first `lock xadd` at
+    // runtime returns 0 and picks slot index 0; subsequent calls
+    // monotonically advance it. The slots are pre-zeroed so stale
+    // bytes don't leak out the first time each slot is used (before
+    // the copy loop overwrites them).
+    size_t scratch_ring_offset = 0;
+    if (is_ephemeral_mode) {
+        // Align the ring to 4 bytes so the `lock xadd` on the counter
+        // hits a naturally aligned dword. `section_buf.size()` may be
+        // odd at this point because ciphertexts are byte-packed.
+        while (section_buf.size() % 4 != 0) {
+            section_buf.push_back(0x00);
+        }
+        scratch_ring_offset = section_buf.size();
+        section_buf.insert(section_buf.end(),
+                           string_protect::kEphemeralRingTotalSize,
+                           static_cast<uint8_t>(0));
+    }
+
     // (7a) S2c — optional VM-lifted decryptor body.
     //
     // If the caller asked for `--strings=vm` (`virtualized`), lift the
@@ -440,7 +520,14 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     size_t   vm_blob_offset         = 0;
     uint32_t vm_blob_entry_offset   = 0;
     bool     vm_lift_succeeded      = false;
-    if (ctx.config().string_protection == StringProtectionMode::virtualized) {
+    // VM-lift is exclusive with the S3 ephemeral decryptor — the two
+    // variants have different body shapes and the loop-window offsets
+    // kMxStrGetLoopOffset/End are S2b-specific. S3 doesn't need VM
+    // protection anyway: its per-call scratch allocator already
+    // prevents the sticky-plaintext leak that VM lifting exists to
+    // hide.
+    if (ctx.config().string_protection == StringProtectionMode::virtualized &&
+        !is_ephemeral_mode) {
         // Preconditions: lifting needs a disassembler.
         auto* disasm = ctx.disassembler().get();
         if (disasm == nullptr) {
@@ -448,7 +535,7 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
                     "откат на S2b stub");
         } else {
             ByteView body_view{
-                emitted_decryptor.code.data() + string_protect::kMxStrGetLoopOffset,
+                decryptor_code.data() + string_protect::kMxStrGetLoopOffset,
                 string_protect::kMxStrGetLoopSize};
 
             vm::VmLifter lifter(*disasm);
@@ -547,7 +634,7 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     auto&          added_sec  = image.sections()[added_idx];
     const Rva      section_rva = added_sec.virtual_address;
 
-    // (9) Patch the two rip+disp32 slots inside `mx_str_get`.
+    // (9) Patch the rip+disp32 slots inside `mx_str_get`.
     //
     // mx_str_get is at section_rva + decryptor_offset. The disp32
     // offsets reported by the codegen are relative to the decryptor's
@@ -560,27 +647,25 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
     //
     //     lea_end_rva = section_rva + disp32_abs + 4
     //     rel32       = target_rva - lea_end_rva
+    //
+    // Stub and VM variants use two LEAs (desc_table, data_pool).
+    // The S3 ephemeral variant adds a third LEA for the scratch ring.
     {
-        const Rva desc_table_target_rva = section_rva + static_cast<Rva>(desc_table_offset);
-        const Rva data_pool_target_rva  = section_rva + static_cast<Rva>(data_pool_offset);
+        const auto patch_lea = [&](size_t disp_offset_in_code, size_t target_offset) {
+            const size_t disp_abs    = decryptor_offset + disp_offset_in_code;
+            const Rva    target_rva  = section_rva + static_cast<Rva>(target_offset);
+            const Rva    lea_end_rva = section_rva + static_cast<Rva>(disp_abs) + 4;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(target_rva) -
+                static_cast<int64_t>(lea_end_rva));
+            write_i32_le(added_sec.data, disp_abs, rel);
+        };
 
-        const size_t disp_desc_abs = decryptor_offset +
-            emitted_decryptor.desc_table_disp32_offset;
-        const size_t disp_data_abs = decryptor_offset +
-            emitted_decryptor.data_base_disp32_offset;
-
-        const Rva lea_end_rva_desc = section_rva + static_cast<Rva>(disp_desc_abs) + 4;
-        const Rva lea_end_rva_data = section_rva + static_cast<Rva>(disp_data_abs) + 4;
-
-        const int32_t rel_desc = static_cast<int32_t>(
-            static_cast<int64_t>(desc_table_target_rva) -
-            static_cast<int64_t>(lea_end_rva_desc));
-        const int32_t rel_data = static_cast<int32_t>(
-            static_cast<int64_t>(data_pool_target_rva) -
-            static_cast<int64_t>(lea_end_rva_data));
-
-        write_i32_le(added_sec.data, disp_desc_abs, rel_desc);
-        write_i32_le(added_sec.data, disp_data_abs, rel_data);
+        patch_lea(decryptor_desc_disp32_off, desc_table_offset);
+        patch_lea(decryptor_data_disp32_off, data_pool_offset);
+        if (is_ephemeral_mode) {
+            patch_lea(decryptor_ring_disp32_off, scratch_ring_offset);
+        }
     }
 
     // (10) Patch each trampoline's call rel32 → mx_str_get.
@@ -666,9 +751,10 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
 
     ctx.log_fmt(
         "StringProtectionPass: защищено {} строк, переписано {} LEA xref'ов, "
-        "секция '{}' RVA=0x{:08X} размер={} байт",
+        "режим={}, секция '{}' RVA=0x{:08X} размер={} байт",
         encrypted.size(),
         usable_xrefs.size(),
+        string_protection_mode_name(ctx.config().string_protection),
         str_section_name,
         section_rva,
         static_cast<uint32_t>(added_sec.data.size()));

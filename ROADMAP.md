@@ -17,45 +17,42 @@ Legend:
 Do these in order. Each item is a one-liner; see the detailed sections
 below for the full spec.
 
-1. ⏳ **S3 — ephemeral per-session string keys.** Derive XOR key per string
-   from `f(string_id, TEB.Tid, GetTickCount() >> 10)` so a memory dump
-   captures at most one decrypted string at a time. § "String protection" → S3.
-2. 📋 **DLL packer.** DllMain-aware stub variant. Today `PackerPass`
+1. ⏳ **DLL packer.** DllMain-aware stub variant. Today `PackerPass`
    auto-skips on `.dll` (see `STABILITY.md` §6) and the result is
    mutation/obfuscation/VM/CFF only. A DllMain stub unlocks full `-l strong`
    on DLLs: on `DLL_PROCESS_ATTACH` run the decrypt loop then call the real
    DllMain; forward other reasons verbatim; preserve export table + IAT
    across unpacking. § "Packer strengthening" (new subsection to add when
    work starts).
-3. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
+2. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
    kernel-mode entry ABI. Blocked on test-signing infrastructure, not on
    code. Lower priority than DLL.
-4. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
+3. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
    256-byte XOR key in the packer. Largest single uplift against
    static unpackers. § "Packer strengthening" → P1.
-5. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
+4. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
    (anti-debug, key derivation, decrypt loop) itself virtualized through
    the existing VM engine. § "Packer strengthening" → P3.
-6. 📋 **Packer strengthening — P5 import hashing.** Replace plain
+5. 📋 **Packer strengthening — P5 import hashing.** Replace plain
    `LoadLibrary` + `GetProcAddress(name)` in the packer stub with DJB2/FNV-1a
    hash resolution from kernel32/ntdll export tables. Kills `strings` on
    packed binaries. § "Packer strengthening" → P5.
-7. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
+6. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-8. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
+7. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
     (load, store, key derivation). § "Gap vs коммерческие" → G2.
-9. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
+8. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
     opcodes, opaque bytecode branches, handler id polymorphism, rolling
     key per handler. § "Gap vs коммерческие" → G4.
-10. 📋 **VM strengthening — G5 handler call graph obfuscation.**
+9. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
-11. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
+10. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
     memory-dependent control flow, loop-based key schedules. Hardest,
     lowest on the list. § "Gap vs коммерческие" → G6.
-12. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
+11. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
     poisoning (`NtQueryInformationThread` self-inspect), guard-page
     VEH-integrity trap. Independent of the main chain, can slot in any
     time.
@@ -201,9 +198,22 @@ refs — только exact `LEA reg, [rip+disp32]` с dest_rva == string_start.
 могут сделать double-XOR обратно в ciphertext. Fix (S3): `lock cmpxchg`
 claim на flag byte.
 
-### 📋 S3. Per-string unique key + ephemeral lifetime *(низкий, сверху S2)*
-Derive key per-string через `f(string_id, TEB->Tid, GetTickCount() >> 10)`.
-Dump ловит максимум одну строку в моменте.
+### ✅ S3. Per-string unique key + ephemeral lifetime
+Shipped as `--strings=ephemeral`. The decryptor allocates a scratch-
+ring slot via `lock xadd` on every call, copies + XOR-decrypts the
+ciphertext into that slot, and returns the slot pointer. No sticky
+caching — each call pays the full decrypt. The data pool stays
+ciphertext at rest and a memory dump catches at most
+`kEphemeralRingSlots` (currently 16) concurrently-decrypted strings
+across the whole process, not every string forever. Mutually
+exclusive with `--strings=vm` in MVP; string plaintext longer than
+`kEphemeralMaxStringLength` (255 bytes) is filtered out of S3
+protection and kept as a plaintext LEA. The roadmap's original
+proposal of `f(string_id, TEB.Tid, GetTickCount() >> 10)` keyed
+decryption turned out to be infeasible (runtime variables can't
+derive a key the build already encrypted under), and the
+`lock xadd`-based allocator achieves the same "bounded memory
+footprint for decrypted strings" goal more cleanly.
 
 ### 📋 S4. Decryptor в VM-protected регионе *(средний, сверху S2)*
 `__mx_str_decrypt` сам обернут в `MX_VM_BEGIN/END`. Комбинируется с P3.

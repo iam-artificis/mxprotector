@@ -257,6 +257,107 @@ TEST(MxStrGet, PatchOffsetsAreDistinctAndInsideCode) {
 }
 
 // ---------------------------------------------------------------------------
+// S3 ephemeral decryptor byte-level invariants
+// ---------------------------------------------------------------------------
+
+TEST(MxStrGetEphemeral, ExactSize) {
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    EXPECT_EQ(d.code.size(), mx::string_protect::kMxStrGetEphemeralSize);
+    // Pinned: any codegen drift reshapes the loop and changes the size.
+    EXPECT_EQ(d.code.size(), 94u);
+}
+
+TEST(MxStrGetEphemeral, PatchOffsetsAreDistinctAndInsideCode) {
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    EXPECT_NE(d.desc_table_disp32_offset,   d.data_base_disp32_offset);
+    EXPECT_NE(d.desc_table_disp32_offset,   d.scratch_ring_disp32_offset);
+    EXPECT_NE(d.data_base_disp32_offset,    d.scratch_ring_disp32_offset);
+    EXPECT_LE(d.desc_table_disp32_offset   + 4, d.code.size());
+    EXPECT_LE(d.data_base_disp32_offset    + 4, d.code.size());
+    EXPECT_LE(d.scratch_ring_disp32_offset + 4, d.code.size());
+    // disp32 slots must be zero-initialised — the pass fills them in
+    // post-section-add with the final rel32 values.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(d.code[d.desc_table_disp32_offset   + i], 0u);
+        EXPECT_EQ(d.code[d.data_base_disp32_offset    + i], 0u);
+        EXPECT_EQ(d.code[d.scratch_ring_disp32_offset + i], 0u);
+    }
+}
+
+TEST(MxStrGetEphemeral, StartsWithLeaR10RipRelDescTable) {
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    ASSERT_GE(d.code.size(), 7u);
+    EXPECT_EQ(d.code[0], 0x4Cu);
+    EXPECT_EQ(d.code[1], 0x8Du);
+    EXPECT_EQ(d.code[2], 0x15u);
+    EXPECT_EQ(d.desc_table_disp32_offset, 3u);
+}
+
+TEST(MxStrGetEphemeral, ContainsLockXaddRingCounter) {
+    // F0 45 0F C1 08  — lock xadd dword [r8], r9d
+    // The atomic slot allocator: fetches the old counter value into
+    // r9d and post-increments the shared counter. The LOCK prefix is
+    // required for cross-thread consistency — without it two threads
+    // could pick the same slot index and stomp each other's plaintext.
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    const auto off = find_bytes(d.code, {0xF0, 0x45, 0x0F, 0xC1, 0x08});
+    EXPECT_LT(off, d.code.size()) << "lock xadd ring allocator missing";
+}
+
+TEST(MxStrGetEphemeral, ContainsAndSlotIndexMask) {
+    // 41 83 E1 0F  — and r9d, 0x0F   (mask to slot index mod 16)
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    const auto off = find_bytes(d.code, {0x41, 0x83, 0xE1, 0x0F});
+    EXPECT_LT(off, d.code.size())
+        << "slot-index mask `and r9d, 15` missing";
+}
+
+TEST(MxStrGetEphemeral, ContainsShlSlotOffsetByEight) {
+    // 41 C1 E1 08  — shl r9d, 8   (multiply slot index by 256)
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    const auto off = find_bytes(d.code, {0x41, 0xC1, 0xE1, 0x08});
+    EXPECT_LT(off, d.code.size())
+        << "slot-offset shift `shl r9d, 8` missing";
+}
+
+TEST(MxStrGetEphemeral, ContainsLeaRaxRingSlot) {
+    // 4B 8D 44 08 04  — lea rax, [r8 + r9*1 + 4]
+    // rax = ring_base + slot_offset + kEphemeralRingHeaderSize.
+    // This is the S3 return value (scratch slot pointer).
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    const auto off = find_bytes(d.code, {0x4B, 0x8D, 0x44, 0x08, 0x04});
+    EXPECT_LT(off, d.code.size()) << "lea rax,[r8+r9+4] missing";
+}
+
+TEST(MxStrGetEphemeral, ContainsCopyDecryptLoopBody) {
+    // 45 8A 0B  — mov r9b, [r11]     ; load ciphertext byte
+    // 41 30 D1  — xor r9b, dl        ; decrypt with per-string key
+    // 45 88 08  — mov [r8], r9b      ; store plaintext into scratch
+    // These three instructions must appear in sequence; the loop
+    // increments the source and destination cursors and decrements
+    // the length counter around them.
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    const auto off = find_bytes(d.code,
+        {0x45, 0x8A, 0x0B, 0x41, 0x30, 0xD1, 0x45, 0x88, 0x08});
+    EXPECT_LT(off, d.code.size())
+        << "copy+decrypt loop body (mov/xor/mov) missing";
+}
+
+TEST(MxStrGetEphemeral, EndsWithRet) {
+    const auto d = mx::string_protect::emit_mx_str_get_ephemeral();
+    ASSERT_FALSE(d.code.empty());
+    EXPECT_EQ(d.code.back(), 0xC3u);
+}
+
+TEST(MxStrGetEphemeral, RingHasPowerOfTwoSlots) {
+    // The allocator is optimised for a power-of-two ring (uses `and`
+    // instead of `imul`/`div`). Pin the invariant so future edits to
+    // kEphemeralRingSlots can't silently break the mask.
+    using mx::string_protect::kEphemeralRingSlots;
+    EXPECT_EQ(kEphemeralRingSlots & (kEphemeralRingSlots - 1), 0u);
+}
+
+// ---------------------------------------------------------------------------
 // Volatile-class classification
 // ---------------------------------------------------------------------------
 

@@ -42,6 +42,16 @@ namespace mx {
  * фазы вместо одной. Overhead на первом вызове каждой строки равен одному
  * VM entry (~50×), hot path после кэширования тот же.
  *
+ * `ephemeral` — S3. The decryptor never caches. Every call allocates a
+ * fresh scratch-ring slot via `lock xadd`, copies the ciphertext in,
+ * XOR-decrypts into the slot, and returns the slot pointer. The data
+ * pool stays encrypted at rest and a memory dump catches at most
+ * `kEphemeralRingSlots` concurrently decrypted strings (per process),
+ * not all of them forever. Slower than `stub` for hot-path strings
+ * (full decrypt per call) and doesn't combine with `virtualized` in
+ * MVP — the S3 body has a different shape and patch offsets than the
+ * sticky-flag S2b body the VM lifter knows about.
+ *
  * Auto-fallback: если выбран `virtualized` но `enable_vm=false`, проход
  * откатывается на `stub` с предупреждением. Комбинация не имеет смысла
  * и скорее всего ошибка конфигурации.
@@ -50,6 +60,7 @@ enum class StringProtectionMode : uint8_t {
     disabled    = 0,
     stub        = 1,
     virtualized = 2,
+    ephemeral   = 3,
 };
 
 [[nodiscard]] constexpr std::string_view
@@ -58,6 +69,7 @@ string_protection_mode_name(StringProtectionMode m) noexcept {
         case StringProtectionMode::disabled:    return "disabled";
         case StringProtectionMode::stub:        return "stub";
         case StringProtectionMode::virtualized: return "virtualized";
+        case StringProtectionMode::ephemeral:   return "ephemeral";
     }
     return "unknown";
 }

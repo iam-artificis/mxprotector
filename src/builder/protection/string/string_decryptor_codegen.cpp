@@ -280,6 +280,211 @@ EmittedDecryptor emit_mx_str_get()
 }
 
 // ---------------------------------------------------------------------------
+// S3 ephemeral decryptor
+// ---------------------------------------------------------------------------
+//
+// The ephemeral variant keeps the ciphertext at rest in the `.mxstr`
+// data pool and, on every call, allocates a fresh slot from a
+// power-of-two scratch ring via `lock xadd`. The ciphertext is copied
+// byte-by-byte into the slot and XOR-decrypted in the same loop, so
+// at most `kEphemeralRingSlots` plaintext strings exist concurrently
+// in the whole process. No sticky flag, no in-place decrypt in the
+// data pool, no cached pointer. Callers pay a full decrypt per call
+// in exchange for a bounded memory footprint for decrypted strings.
+//
+// mx_str_get_ephemeral:
+//
+//   input:  ecx = string_id
+//   output: rax = pointer to a scratch slot containing the plaintext
+//                 (valid until the ring wraps around — typically 16
+//                 more calls)
+//
+//     lea    r10, [rip + desc_table_disp32]      ; r10 = desc base
+//     lea    r10, [r10 + rcx*8]                  ; r10 = desc entry
+//     mov    eax, [r10]                          ; eax = data_offset
+//     movzx  ecx, word  [r10 + 4]                ; ecx = length
+//     movzx  edx, byte  [r10 + 6]                ; edx = key
+//     lea    r11, [rip + data_base_disp32]       ; r11 = data pool base
+//     add    r11, rax                            ; r11 = ciphertext ptr
+//
+//     ; Allocate a scratch slot from the ring.
+//     lea    r8,  [rip + scratch_ring_disp32]    ; r8 = ring base
+//     mov    r9d, 1                              ; r9d = 1
+//     lock xadd dword [r8], r9d                  ; r9d = old counter
+//     and    r9d, kEphemeralRingSlots - 1        ; slot idx mod N
+//     shl    r9d, log2(kEphemeralSlotSize)       ; slot offset
+//     lea    rax, [r8 + r9 + kEphemeralRingHeaderSize]
+//                                                 ; rax = slot ptr
+//                                                 ;     (return value)
+//
+//     ; Copy + XOR-decrypt the ciphertext into the slot.
+//     mov    r8,  rax                             ; cursor = slot start
+//     test   rcx, rcx
+//     jz     .done                                 ; len == 0 guard
+//   .loop:
+//     mov    r9b, [r11]                           ; r9b = ciphertext byte
+//     xor    r9b, dl                              ; decrypt
+//     mov    [r8], r9b                            ; write plaintext
+//     inc    r11
+//     inc    r8
+//     dec    rcx
+//     jnz    .loop
+//   .done:
+//     ret
+//
+// The assertions in `emit_mx_str_get_ephemeral` pin each instruction's
+// byte offset so any accidental size drift is caught at build time.
+
+EmittedEphemeralDecryptor emit_mx_str_get_ephemeral()
+{
+    static_assert((kEphemeralRingSlots & (kEphemeralRingSlots - 1)) == 0,
+                  "kEphemeralRingSlots must be a power of two");
+    static_assert(kEphemeralSlotSize == 256,
+                  "kEphemeralSlotSize fixed at 256 for the emitted shl r9d,8");
+    static_assert(kEphemeralRingSlots == 16,
+                  "kEphemeralRingSlots fixed at 16 for the emitted and r9d,0x0F");
+    static_assert(kEphemeralRingHeaderSize == 4,
+                  "ring header size must match the disp8 in lea rax,[r8+r9+4]");
+
+    EmittedEphemeralDecryptor out;
+    out.code.reserve(kMxStrGetEphemeralSize);
+    auto& c = out.code;
+
+    // [offset 0]
+    // lea r10, [rip + desc_table_disp32]           (7 bytes)
+    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x15);
+    out.desc_table_disp32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // [offset 7]
+    // lea r10, [r10 + rcx*8]                       (4 bytes)
+    // REX.W|R|B (0x4D) + 0x8D + ModRM(00 010 100 = 0x14) + SIB(11 001 010)
+    c.push_back(0x4D); c.push_back(0x8D); c.push_back(0x14); c.push_back(0xCA);
+
+    // [offset 11]
+    // mov eax, dword [r10]                         (3 bytes)
+    c.push_back(0x41); c.push_back(0x8B); c.push_back(0x02);
+
+    // [offset 14]
+    // movzx ecx, word [r10 + 4]                    (5 bytes)
+    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB7);
+    c.push_back(0x4A); c.push_back(0x04);
+
+    // [offset 19]
+    // movzx edx, byte [r10 + 6]                    (5 bytes)
+    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB6);
+    c.push_back(0x52); c.push_back(0x06);
+
+    // [offset 24]
+    // lea r11, [rip + data_base_disp32]            (7 bytes)
+    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x1D);
+    out.data_base_disp32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // [offset 31]
+    // add r11, rax                                 (3 bytes)
+    // REX.W|B (0x49) + 0x01 + ModRM(11 000 011 = 0xC3)
+    //   `add r11, rax` — rax source, r11 dest (result in r11).
+    c.push_back(0x49); c.push_back(0x01); c.push_back(0xC3);
+
+    // [offset 34]
+    // lea r8, [rip + scratch_ring_disp32]          (7 bytes)
+    // REX.W|R (0x4C) + 0x8D + ModRM(00 000 101 = 0x05) + disp32
+    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x05);
+    out.scratch_ring_disp32_offset = c.size();
+    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // [offset 41]
+    // mov r9d, 1                                   (6 bytes)
+    // REX.B (0x41) + 0xB9 + imm32=0x00000001
+    c.push_back(0x41); c.push_back(0xB9);
+    c.push_back(0x01); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+
+    // [offset 47]
+    // lock xadd dword [r8], r9d                    (5 bytes)
+    // LOCK (F0) + REX.R|B (0x45) + 0x0F C1 + ModRM(00 001 000 = 0x08)
+    //   Atomic: r9d_new = [r8]; [r8] = [r8] + r9d_old (== 1).
+    //   r9d now holds the pre-increment counter value.
+    c.push_back(0xF0); c.push_back(0x45); c.push_back(0x0F);
+    c.push_back(0xC1); c.push_back(0x08);
+
+    // [offset 52]
+    // and r9d, 0x0F                                (4 bytes)
+    // REX.B (0x41) + 0x83 + ModRM(11 100 001 = 0xE1, /4) + imm8=0x0F
+    //   Reduce the monotonic counter to a slot index mod 16.
+    c.push_back(0x41); c.push_back(0x83); c.push_back(0xE1); c.push_back(0x0F);
+
+    // [offset 56]
+    // shl r9d, 8                                   (4 bytes)
+    // REX.B (0x41) + 0xC1 + ModRM(11 100 001 = 0xE1, /4) + imm8=8
+    //   Multiply slot index by kEphemeralSlotSize (256) via shift.
+    c.push_back(0x41); c.push_back(0xC1); c.push_back(0xE1); c.push_back(0x08);
+
+    // [offset 60]
+    // lea rax, [r8 + r9 + 4]                       (5 bytes)
+    // REX.W|X|B (0x4B) + 0x8D + ModRM(01 000 100 = 0x44, SIB follows)
+    //   + SIB(00 001 000 = 0x08, scale=1 index=r9 base=r8) + disp8=0x04
+    //   rax = r8 + r9 + kEphemeralRingHeaderSize = scratch slot pointer.
+    //   This becomes the return value.
+    c.push_back(0x4B); c.push_back(0x8D); c.push_back(0x44);
+    c.push_back(0x08); c.push_back(0x04);
+
+    // [offset 65]
+    // mov r8, rax                                  (3 bytes)
+    // REX.W|B (0x49) + 0x89 + ModRM(11 000 000 = 0xC0)
+    //   r8 = cursor (advances in the copy loop).
+    c.push_back(0x49); c.push_back(0x89); c.push_back(0xC0);
+
+    // [offset 68]
+    // test rcx, rcx                                (3 bytes)
+    c.push_back(0x48); c.push_back(0x85); c.push_back(0xC9);
+
+    // [offset 71]
+    // jz rel8 → .done  (+20 to offset 93)          (2 bytes)
+    c.push_back(0x74); c.push_back(0x14);
+
+    // [offset 73] .loop:
+    // mov r9b, byte [r11]                          (3 bytes)
+    // REX.R|B (0x45) + 0x8A + ModRM(00 001 011 = 0x0B)
+    c.push_back(0x45); c.push_back(0x8A); c.push_back(0x0B);
+
+    // [offset 76]
+    // xor r9b, dl                                  (3 bytes)
+    // REX.B (0x41) + 0x30 + ModRM(11 010 001 = 0xD1)
+    //   r9b ^= dl — XOR decrypt one byte in a working register.
+    c.push_back(0x41); c.push_back(0x30); c.push_back(0xD1);
+
+    // [offset 79]
+    // mov byte [r8], r9b                           (3 bytes)
+    // REX.R|B (0x45) + 0x88 + ModRM(00 001 000 = 0x08)
+    //   Store the decrypted byte into the scratch slot.
+    c.push_back(0x45); c.push_back(0x88); c.push_back(0x08);
+
+    // [offset 82]
+    // inc r11                                      (3 bytes)
+    c.push_back(0x49); c.push_back(0xFF); c.push_back(0xC3);
+
+    // [offset 85]
+    // inc r8                                       (3 bytes)
+    c.push_back(0x49); c.push_back(0xFF); c.push_back(0xC0);
+
+    // [offset 88]
+    // dec rcx                                      (3 bytes)
+    c.push_back(0x48); c.push_back(0xFF); c.push_back(0xC9);
+
+    // [offset 91]
+    // jnz rel8 → .loop  (-20 to offset 73)         (2 bytes)
+    c.push_back(0x75); c.push_back(0xEC);
+
+    // [offset 93] .done:
+    // ret                                          (1 byte)
+    c.push_back(0xC3);
+
+    assert(c.size() == kMxStrGetEphemeralSize);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Per-xref trampolines
 // ---------------------------------------------------------------------------
 

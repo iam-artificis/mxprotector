@@ -125,8 +125,12 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
                 config.string_protection = StringProtectionMode::virtualized;
                 continue;
             }
+            if (mode_str == "ephemeral" || mode_str == "eph") {
+                config.string_protection = StringProtectionMode::ephemeral;
+                continue;
+            }
             return std::unexpected(error::config(
-                std::format("--strings: ожидается off|stub|vm, получено '{}'",
+                std::format("--strings: ожидается off|stub|vm|ephemeral, получено '{}'",
                             mode_str)));
         }
 
@@ -213,9 +217,10 @@ void CliHandler::print_usage() {
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
         "  --strings=<режим>           Защита строк в .rdata:\n"
-        "                                off  — оставить plaintext\n"
-        "                                stub — decryptor как обычный x64 asm\n"
-        "                                vm   — decryptor лифтится в VM bytecode\n"
+        "                                off       — оставить plaintext\n"
+        "                                stub      — decryptor как обычный x64 asm\n"
+        "                                vm        — decryptor лифтится в VM bytecode\n"
+        "                                ephemeral — S3 scratch-ring, no sticky cache\n"
         "                                (auto-fallback vm→stub при --no-vm)\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
         "\n"

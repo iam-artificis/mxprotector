@@ -145,6 +145,27 @@ struct EmittedDecryptor {
     size_t               data_base_disp32_offset  = 0;
 };
 
+/// S3 ephemeral decryptor. Same input/output ABI as the S2b variant
+/// (ecx = string_id in, rax = decrypted char* out) but the body is
+/// different: instead of XOR-decrypting the data pool in place and
+/// returning a sticky cached pointer, the S3 code allocates a fresh
+/// scratch-ring slot via `lock xadd` and copies + decrypts the
+/// ciphertext into that slot on every call. The data pool stays
+/// ciphertext at rest, and the number of concurrently-decrypted
+/// strings in memory is bounded by `kEphemeralRingSlots`.
+///
+/// The returned struct reports THREE disp32 patch offsets because
+/// the body uses three `lea rip+disp32` header loads — one each for
+/// the descriptor table, the ciphertext data pool, and the scratch
+/// ring base. Each defaults to zero; the pass rewrites them after
+/// the section RVA is assigned.
+struct EmittedEphemeralDecryptor {
+    std::vector<uint8_t> code;
+    size_t               desc_table_disp32_offset   = 0;
+    size_t               data_base_disp32_offset    = 0;
+    size_t               scratch_ring_disp32_offset = 0;
+};
+
 /// A single per-xref trampoline. `call_rel32_offset` is the byte
 /// offset inside `code` of the `call rel32` operand; the caller
 /// patches it with `mx_str_get_section_offset - (trampoline_offset +
@@ -202,6 +223,45 @@ inline constexpr size_t kMxStrGetLoopEndOffset     = 84;
 inline constexpr size_t kMxStrGetLoopSize          =
     kMxStrGetLoopEndOffset - kMxStrGetLoopOffset;
 
+// ---------------------------------------------------------------------------
+// S3 ephemeral decryptor constants
+// ---------------------------------------------------------------------------
+
+/// Number of bytes emitted by `emit_mx_str_get_ephemeral()`. The S3
+/// body is larger than S2b because it carries a scratch-ring allocator
+/// and a copy-then-decrypt loop instead of a sticky flag check.
+inline constexpr size_t kMxStrGetEphemeralSize     = 94;
+
+/// Number of scratch slots in the ephemeral ring. Must be a power of
+/// two because the allocator masks the `lock xadd` counter with
+/// `kEphemeralRingSlots - 1`. 16 is enough headroom for printf-style
+/// call sites that consume several mx_str_get return values before
+/// the oldest slot gets recycled.
+inline constexpr uint32_t kEphemeralRingSlots      = 16;
+
+/// Byte size of one scratch slot. Must be a power of two so the
+/// allocator can compute the slot offset with `shl` instead of
+/// `imul`. Strings whose plaintext length exceeds
+/// `kEphemeralMaxStringLength` are filtered out of S3 protection by
+/// the pass — the caller keeps a plaintext LEA to those.
+inline constexpr uint32_t kEphemeralSlotSize       = 256;
+
+/// Maximum plaintext length (in bytes) that fits inside one scratch
+/// slot. One byte is reserved for a trailing NUL so callers that
+/// treat the return value as a C string do not read past the end.
+inline constexpr uint32_t kEphemeralMaxStringLength = kEphemeralSlotSize - 1;
+
+/// Byte size of the ring counter. Lives at offset 0 of the scratch
+/// ring area; the first slot starts at offset `kEphemeralRingHeaderSize`.
+inline constexpr uint32_t kEphemeralRingHeaderSize  = 4;
+
+/// Total size of the scratch ring area that the pass appends to the
+/// `.mxstr` section after the ciphertext pool: one header-sized
+/// counter followed by `kEphemeralRingSlots` slots.
+inline constexpr size_t kEphemeralRingTotalSize =
+    kEphemeralRingHeaderSize +
+    static_cast<size_t>(kEphemeralRingSlots) * kEphemeralSlotSize;
+
 /// Trampoline byte sizes by target category.
 inline constexpr size_t kTrampolineSizeVolatile    = 40;
 inline constexpr size_t kTrampolineSizeNonVolatile = 38;
@@ -234,6 +294,12 @@ struct TrampolineRequest {
 /// operands are left zeroed; their offsets are recorded in the
 /// returned struct so the caller can patch them later.
 [[nodiscard]] EmittedDecryptor emit_mx_str_get();
+
+/// Emit the S3 ephemeral mx_str_get decryptor. All three
+/// `lea rip+disp32` operands (desc table, data pool, scratch ring)
+/// are left zeroed; the returned struct reports their offsets for
+/// the pass to patch once section RVAs are final.
+[[nodiscard]] EmittedEphemeralDecryptor emit_mx_str_get_ephemeral();
 
 /// Emit a single trampoline for the xref described by `req`. The
 /// string_id is baked into the bytes. The `call rel32` operand is
