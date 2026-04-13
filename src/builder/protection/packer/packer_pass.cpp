@@ -29,6 +29,7 @@
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -106,6 +107,20 @@ struct StubPatches {
     uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
     uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
     uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
+
+    // --- Reprotect block patches ---
+    // The reprotect block emits a Hell's Gate resolver + loop over an
+    // embedded section table so the stub can revoke WRITE from every
+    // decrypted section via `NtProtectVirtualMemory`. The table contains
+    // `reprotect_entry_count` entries of {rva: u32, size: u32} and the
+    // caller fills it with the actual RVAs/sizes right after stub assembly.
+    //
+    // `rel_to_reprotect_table_at` is the rel32 offset inside the
+    // `lea r14, [rip + table]` that points at the table. Filled in by
+    // the caller once the stub's section RVA is known.
+    uint32_t rel_to_reprotect_table_at;
+    uint32_t reprotect_table_offset;
+    uint32_t reprotect_entry_count;
 };
 
 /// Minimum number of bytes we want to steal from the OEP. We walk whole
@@ -405,6 +420,197 @@ struct StolenPlan {
         u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
     }
 
+    // (4.5) Reprotect decrypted sections to PAGE_EXECUTE_READ.
+    //
+    // The decrypt loop above wrote through each section, which means
+    // those sections had IMAGE_SCN_MEM_WRITE in the loader's eyes and
+    // were mapped PAGE_EXECUTE_READWRITE. Leaving them RWX at runtime
+    // is a security hazard — it means (a) a reverser's in-memory
+    // patch doesn't need to call VirtualProtect first (no detection
+    // opportunity), and (b) the anti-tamper `page_protection_sweep`
+    // check can't meaningfully probe our own VM blob section because
+    // a legitimate state of RWX is indistinguishable from a tampered
+    // one. Both problems disappear if we revoke WRITE after the
+    // decrypt loop finishes.
+    //
+    // The reprotect block does:
+    //
+    //   1. Save rsp to r12 and allocate a 16-byte-aligned 0x50-byte
+    //      scratch frame for the syscall args and output buffer.
+    //
+    //   2. Emit the Hell's Gate SSN resolver targeting
+    //      `NtProtectVirtualMemory`. It walks
+    //      `PEB.Ldr.InMemoryOrderModuleList` → ntdll (2nd entry) →
+    //      PE export table → DJB2 scan → prologue validation → SSN
+    //      into r13d. ~155 bytes of emitted code.
+    //
+    //   3. Skip the reprotect loop entirely if r13 came back 0
+    //      (resolver failure). The decrypted sections stay RWX,
+    //      which is the pre-fix state — safe, just not hardened.
+    //
+    //   4. Load one-time constants that survive across syscalls:
+    //      rbx = PEB.ImageBase, rdx = &base_var, r8 = &size_var,
+    //      r9d = PAGE_EXECUTE_READ, [rsp+0x28] = &old_protect_var,
+    //      r14 = section table pointer, r15 = N section count.
+    //
+    //   5. Loop over each {rva, size} entry in the table:
+    //        compute base = ImageBase + rva
+    //        write base into base_var
+    //        write size into size_var
+    //        mov rcx, -1 (NtCurrentProcess)
+    //        mov r10, rcx (syscall ABI)
+    //        mov eax, r13d (SSN)
+    //        syscall
+    //
+    //   6. Restore rsp from r12.
+    //
+    // All clobbered registers (rax, rbx, rcx, rdx, rdi, rsi, r8–r15)
+    // are either already dirty from the decrypt loop, or are loader-
+    // initialised values that the original OEP code doesn't depend
+    // on. r12 is new state we introduce specifically for the rsp
+    // save, and we restore it before returning control.
+
+    const uint32_t reprotect_entry_count = section_count;
+    patches.reprotect_entry_count = reprotect_entry_count;
+
+    // mov r12, rsp                           49 89 E4
+    u8(0x49); u8(0x89); u8(0xE4);
+
+    // sub rsp, 0x50                          48 81 EC 50 00 00 00
+    u8(0x48); u8(0x81); u8(0xEC);
+    u32(0x00000050u);
+
+    // and rsp, -16                           48 83 E4 F0
+    u8(0x48); u8(0x83); u8(0xE4); u8(0xF0);
+
+    // Hell's Gate SSN resolver → r13d = NtProtectVirtualMemory SSN.
+    // The target hash is computed at build time; the literal ASCII
+    // name never appears in the stub.
+    {
+        mx::RawEmitter tmp{};
+        constexpr uint32_t kNtProtectHash =
+            anti_tamper::djb2_ascii_hash("NtProtectVirtualMemory");
+        anti_tamper::emit_hells_gate_resolver(tmp, kNtProtectHash);
+        for (uint8_t b : tmp.buf) u8(b);
+    }
+
+    // test r13, r13                          4D 85 ED
+    u8(0x4D); u8(0x85); u8(0xED);
+    // jz short .reprotect_done               74 rel8 (patched below)
+    u8(0x74);
+    const uint32_t patch_jz_reprotect_done = static_cast<uint32_t>(buf.size());
+    u8(0x00);
+
+    // --- One-time setup: pointers, constants, ImageBase cache ---
+
+    // mov rax, gs:[0x60]                     65 48 8B 04 25 60 00 00 00
+    u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
+    u8(0x60); u8(0x00); u8(0x00); u8(0x00);
+    // mov rbx, [rax + 0x10]                  48 8B 58 10
+    //   rbx = PEB.ImageBase — preserved across syscall, reused by loop.
+    u8(0x48); u8(0x8B); u8(0x58); u8(0x10);
+
+    // lea rdx, [rsp + 0x20]                  48 8D 54 24 20
+    //   arg2: &base_var — same slot every iteration.
+    u8(0x48); u8(0x8D); u8(0x54); u8(0x24); u8(0x20);
+
+    // lea r8, [rsp + 0x30]                   4C 8D 44 24 30
+    //   arg3: &size_var
+    u8(0x4C); u8(0x8D); u8(0x44); u8(0x24); u8(0x30);
+
+    // mov r9d, 0x20                          41 B9 20 00 00 00
+    //   arg4: PAGE_EXECUTE_READ
+    u8(0x41); u8(0xB9);
+    u32(0x00000020u);
+
+    // lea rax, [rsp + 0x38]                  48 8D 44 24 38
+    // mov [rsp + 0x28], rax                  48 89 44 24 28
+    //   arg5: &old_protect_var (stored at [rsp+0x28], kernel reads it
+    //   from there as the 5th syscall arg).
+    u8(0x48); u8(0x8D); u8(0x44); u8(0x24); u8(0x38);
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x28);
+
+    // lea r14, [rip + reprotect_table_rel32]  4C 8D 35 rel32
+    //   r14 = pointer to the embedded section table. The rel32 is
+    //   patched at the end of build_stub_bytes once the table's
+    //   position in the stub is known.
+    u8(0x4C); u8(0x8D); u8(0x35);
+    patches.rel_to_reprotect_table_at = static_cast<uint32_t>(buf.size());
+    u32(0);
+
+    // mov r15d, <reprotect_entry_count>      41 BF imm32
+    u8(0x41); u8(0xBF);
+    u32(reprotect_entry_count);
+
+    // --- Loop body ---
+
+    const uint32_t loop_start = static_cast<uint32_t>(buf.size());
+
+    // test r15, r15                          4D 85 FF
+    u8(0x4D); u8(0x85); u8(0xFF);
+    // jz short .reprotect_done               74 rel8 (patched below)
+    u8(0x74);
+    const uint32_t patch_jz_loop_done = static_cast<uint32_t>(buf.size());
+    u8(0x00);
+
+    // mov eax, [r14]                         41 8B 06
+    //   rva (zero-extends to 64-bit in rax)
+    u8(0x41); u8(0x8B); u8(0x06);
+    // lea rax, [rbx + rax*1]                 48 8D 04 03
+    //   rax = ImageBase + rva
+    u8(0x48); u8(0x8D); u8(0x04); u8(0x03);
+    // mov [rsp + 0x20], rax                  48 89 44 24 20
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x20);
+
+    // mov eax, [r14 + 4]                     41 8B 46 04
+    //   size (zero-extends)
+    u8(0x41); u8(0x8B); u8(0x46); u8(0x04);
+    // mov [rsp + 0x30], rax                  48 89 44 24 30
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x30);
+
+    // mov rcx, -1                            48 C7 C1 FF FF FF FF
+    //   arg1: NtCurrentProcess pseudo-handle (re-set each iteration
+    //   because syscall clobbered rcx with the saved RIP).
+    u8(0x48); u8(0xC7); u8(0xC1);
+    u32(0xFFFFFFFFu);
+    // mov r10, rcx                           49 89 CA
+    u8(0x49); u8(0x89); u8(0xCA);
+    // mov eax, r13d                          44 89 E8
+    u8(0x44); u8(0x89); u8(0xE8);
+    // syscall                                0F 05
+    u8(0x0F); u8(0x05);
+
+    // add r14, 8                             49 83 C6 08
+    u8(0x49); u8(0x83); u8(0xC6); u8(0x08);
+    // dec r15                                49 FF CF
+    u8(0x49); u8(0xFF); u8(0xCF);
+    // jmp short .loop_start                  EB rel8
+    u8(0xEB);
+    {
+        const uint32_t jmp_end = static_cast<uint32_t>(buf.size()) + 1;
+        const int32_t rel8 = static_cast<int32_t>(loop_start) -
+                             static_cast<int32_t>(jmp_end);
+        u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+    }
+
+    // .reprotect_done:
+    {
+        const uint32_t done_at = static_cast<uint32_t>(buf.size());
+        // Patch the two forward rel8 jumps that both target this
+        // label: the "resolver failed" bail and the "loop counter
+        // reached 0" exit.
+        buf[patch_jz_reprotect_done] = static_cast<uint8_t>(
+            static_cast<int8_t>(static_cast<int32_t>(done_at) -
+                                static_cast<int32_t>(patch_jz_reprotect_done + 1)));
+        buf[patch_jz_loop_done] = static_cast<uint8_t>(
+            static_cast<int8_t>(static_cast<int32_t>(done_at) -
+                                static_cast<int32_t>(patch_jz_loop_done + 1)));
+    }
+
+    // Restore rsp from r12.
+    // mov rsp, r12                           4C 89 E4
+    u8(0x4C); u8(0x89); u8(0xE4);
+
     // (5) IAT destruction: zero the Import Directory region in memory.
     // After decryption, the loader has already resolved all imports into the
     // IAT. Zeroing the Import Directory + ILT makes the resolved addresses
@@ -609,6 +815,14 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), key.begin(), key.end());
 
+    // Embed the reprotect section table right after the key: one
+    // {rva: u32, size: u32} entry per encrypted section. The content
+    // is zero-filled here and patched in step (7) once section RVAs
+    // are final.
+    const uint32_t reprotect_table_offset_in_stub =
+        static_cast<uint32_t>(stub_buf.size());
+    stub_buf.insert(stub_buf.end(), encrypted.size() * 8, uint8_t{0});
+
     // The jmp rel32 lands AFTER the stolen bytes: OEP + stolen_size.
     const Rva oep_rva = oep_rva_initial + stolen_size;
 
@@ -658,6 +872,27 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         const int32_t rel = static_cast<int32_t>(
             static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
         write_i32(pack_sec.data, patches.rel_to_key_at, rel);
+    }
+
+    // lea r14, [rip + rel] → reprotect section table (one {rva,size} per
+    // encrypted section). The table itself lives right after the key in
+    // the stub buffer; each entry is filled with the final section RVA
+    // and byte count.
+    {
+        const Rva lea_end_rva = stub_rva + patches.rel_to_reprotect_table_at + 4;
+        const Rva table_rva   = stub_rva + reprotect_table_offset_in_stub;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(table_rva) - static_cast<int64_t>(lea_end_rva));
+        write_i32(pack_sec.data, patches.rel_to_reprotect_table_at, rel);
+
+        for (size_t i = 0; i < encrypted.size(); ++i) {
+            const uint32_t entry_off =
+                reprotect_table_offset_in_stub + static_cast<uint32_t>(i * 8);
+            write_i32(pack_sec.data, entry_off + 0,
+                      static_cast<int32_t>(encrypted[i].rva));
+            write_i32(pack_sec.data, entry_off + 4,
+                      static_cast<int32_t>(encrypted[i].size));
+        }
     }
 
     // jmp rel32 → OEP + stolen_size
