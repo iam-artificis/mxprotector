@@ -30,6 +30,9 @@ _deps/
 x64/
 x86/
 ipch/
+# Negation: source subdirs named x64/ for the per-arch VM backend split
+!include/mxprotector/protection/vm/x64/
+!src/builder/protection/vm/x64/
 
 # Compiled binaries
 *.exe
