@@ -19,6 +19,7 @@ set(TEST_SOURCES
     mx_string_test.cpp
     x64_specialized_handlers_test.cpp
     anti_tamper_test.cpp
+    string_scanner_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests
@@ -45,6 +46,12 @@ set(ANTI_TAMPER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/import_hook_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/self_crc_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/page_protection_check.cpp
+)
+
+# S2 string-protection sources needed for string_scanner_test (and future
+# xref/encryptor/runtime tests as they're added)
+set(STRING_PROTECT_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_scanner.cpp
 )
 
 # ==============================================================================
@@ -77,7 +84,14 @@ set(CFF_SOURCES
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES} ${ANTI_EMU_SOURCES} ${ANTI_TAMPER_SOURCES})
+add_executable(mxprotector_tests
+    ${TEST_SOURCES}
+    ${MUTATION_SOURCES}
+    ${CFF_SOURCES}
+    ${VM_SOURCES}
+    ${ANTI_EMU_SOURCES}
+    ${ANTI_TAMPER_SOURCES}
+    ${STRING_PROTECT_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

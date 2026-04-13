@@ -75,6 +75,9 @@ set(BUILDER_SOURCES
     # Phase 5: Self-unpacking packer (multi-section XOR + anti-debug + IAT wipe)
     protection/packer/packer_pass.cpp
 
+    # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
+    protection/string/string_scanner.cpp
+
     # Phase 6: Anti-emulation checks — one file per technique
     protection/anti_emulation/check_registry.cpp
     protection/anti_emulation/rdtsc_timing_check.cpp
