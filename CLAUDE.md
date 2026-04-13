@@ -38,7 +38,7 @@ Protect тестовую программу:
 ```bash
 cd build_testapp
 ../build/src/builder/Release/mxprotector_builder.exe \
-  -i test_vm_showcase.exe -o t.exe -l strong --no-cfg-flattening
+  -i test_vm_showcase.exe -o t.exe -l strong
 ./t.exe   # должно вывести "ALL 22 CHECKS PASSED"
 ```
 
@@ -47,7 +47,7 @@ cd build_testapp
 ```bash
 for i in $(seq 1 15); do
   ../build/src/builder/Release/mxprotector_builder.exe \
-    -i test_vm_showcase.exe -o t.exe -l strong --no-cfg-flattening >/dev/null 2>&1
+    -i test_vm_showcase.exe -o t.exe -l strong >/dev/null 2>&1
   ./t.exe >/dev/null 2>&1 || echo "FAIL"
 done
 ```
@@ -98,11 +98,11 @@ MxProtector добавляет 3 секции (vm / cff / packer). Имена pe
 
 ## Слои с известными багами
 
-### CFG Flattening нестабилен
-`--cfg-flattening` ломает 30-80% билдов. Pre-existing. Первый подозреваемый —
-`MbaTransitionGenerator::SimulationCorrectness` (падает в unit-тестах). См. ROADMAP.
-
-**Обход**: `--no-cfg-flattening`.
+*(чисто на момент обновления этого документа; не стесняйся добавлять новые
+при обнаружении и удалять fixed'ы. Исторически здесь жил CFG Flattening —
+был починен, подтверждён 280/280 stress-run'ов: 40× на каждом из 6 EXE
+test apps + 40× на test_dll_basic.dll. Если обнаружишь регресс, верни
+запись и опиши reproducer.)*
 
 ## Как правильно расширять
 

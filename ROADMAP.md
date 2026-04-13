@@ -12,23 +12,68 @@ Legend:
 
 ---
 
-## Непосредственные следующие шаги
+## Sequential Implementation Plan
 
-В этом порядке:
+Do these in order. Each item is a one-liner; see the detailed sections
+below for the full spec.
 
-### ⏳ S2. Binary-level `.rdata` string transform pass
-Следующая цель. См. секцию "String protection" ниже — планируется
-объединить с S4 (decryptor в VM-protected регионе) чтобы сразу получить
-максимальный uplift для reverse engineering cost, а не делать два
-последовательных прохода через одну и ту же кодовую область.
-
-### 📋 G3 extensions. Additional anti-tamper checks
-- **Thread context poisoning**: `NtQueryInformationThread` (через Hell's
-  Gate) на свой же TID, проверять `ContextFlags` — трассировщики часто
-  оставляют aberrant context bits
-- **Guard page trap**: malloc'ить страницу в heap, ставить PAGE_GUARD, в
-  check'е read'ить byte из неё — если exception не приходит, VEH
-  скомпрометирован (EDR перехватил раньше нашего handler'a)
+1. ⏳ **S2a — string protection orchestrator pass.** Leaf modules landed
+   (scanner, xref finder, XOR encryptor, `mx_str_get` + trampoline codegen,
+   all with unit tests). Remaining: `StringProtectionPass` that assembles
+   the `.mxstr` section (decryptor + trampolines + descriptor table +
+   encrypted data pool), patches the two rip+disp32 slots inside `mx_str_get`
+   and the `call rel32` inside each trampoline, rewrites LEA xrefs to
+   `call trampoline` + NOP padding, and registers in PassManager so
+   `--strings=stub` goes from no-op to functional. § "String protection" → S2.
+2. 📋 **S2b — thread-safe decrypt.** `lock cmpxchg` on the sticky flag byte
+   inside `mx_str_get` so concurrent callers for the same string_id cannot
+   double-XOR back to ciphertext. Correctness bug, not hardening. § "String
+   protection" → S2 (thread safety note).
+3. 📋 **S2c — `--strings=vm`.** Wrap `mx_str_get` in `MX_VM_BEGIN/END` so
+   the emitted decryptor gets lifted through the existing VM pipeline.
+   Trivial once S2a is in place. § "String protection" → S4.
+4. 📋 **S3 — ephemeral per-session string keys.** Derive XOR key per string
+   from `f(string_id, TEB.Tid, GetTickCount() >> 10)` so a memory dump
+   captures at most one decrypted string at a time. § "String protection" → S3.
+5. 📋 **DLL packer.** DllMain-aware stub variant. Today `PackerPass`
+   auto-skips on `.dll` (see `STABILITY.md` §6) and the result is
+   mutation/obfuscation/VM/CFF only. A DllMain stub unlocks full `-l strong`
+   on DLLs: on `DLL_PROCESS_ATTACH` run the decrypt loop then call the real
+   DllMain; forward other reasons verbatim; preserve export table + IAT
+   across unpacking. § "Packer strengthening" (new subsection to add when
+   work starts).
+6. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
+   kernel-mode entry ABI. Blocked on test-signing infrastructure, not on
+   code. Lower priority than DLL.
+7. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
+   256-byte XOR key in the packer. Largest single uplift against
+   static unpackers. § "Packer strengthening" → P1.
+8. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
+   (anti-debug, key derivation, decrypt loop) itself virtualized through
+   the existing VM engine. § "Packer strengthening" → P3.
+9. 📋 **Packer strengthening — P5 import hashing.** Replace plain
+   `LoadLibrary` + `GetProcAddress(name)` in the packer stub with DJB2/FNV-1a
+   hash resolution from kernel32/ntdll export tables. Kills `strings` on
+   packed binaries. § "Packer strengthening" → P5.
+10. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
+    unpacking, TLS-callback secondary entry, CFI in decrypt loop,
+    header stripping, guard pages. Lower priority polish. § "Packer
+    strengthening".
+11. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
+    (load, store, key derivation). § "Gap vs коммерческие" → G2.
+12. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
+    opcodes, opaque bytecode branches, handler id polymorphism, rolling
+    key per handler. § "Gap vs коммерческие" → G4.
+13. 📋 **VM strengthening — G5 handler call graph obfuscation.**
+    Trampolined dispatch, handler-body flattening, handler-body
+    interleaving. § "Gap vs коммерческие" → G5.
+14. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
+    memory-dependent control flow, loop-based key schedules. Hardest,
+    lowest on the list. § "Gap vs коммерческие" → G6.
+15. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
+    poisoning (`NtQueryInformationThread` self-inspect), guard-page
+    VEH-integrity trap. Independent of the main chain, can slot in any
+    time.
 
 ---
 
@@ -138,20 +183,34 @@ Detection signal, не защита от dump.
 
 ## String protection
 
-### 📋 S2. Binary-level `.rdata` string transform pass *(средний, высокая ценность)*
+### ⏳ S2. Binary-level `.rdata` string transform pass *(средний, высокая ценность)*
 Для unannotated strings (RTTI, std::exception msgs, third-party libs, логи):
 
-1. Scan `.rdata` на printable ASCII/UTF-16 runs ≥ 4 chars, filter
-   false-positives (export names, section names, COFF metadata)
-2. Build XREF table: для каждой найденной строки — список `LEA rip+disp32` в
-   `.text` которые на неё ссылаются
-3. Заменить XREF'ы на `call __mx_str_decrypt(string_id)`
-4. Исходные байты в `.rdata` перезаписать encrypted'ом
-5. `__mx_str_decrypt` возвращает указатель на TLS buffer с ephemeral decoded
-   копией; caller освобождает либо полагается на auto-wipe через LRU
+1. ✅ Scan `.rdata` на printable ASCII runs ≥ 4 chars, filter false-positives.
+   `string_scanner.{hpp,cpp}` + unit tests.
+2. ✅ Build XREF table: для каждой найденной строки — список `LEA rip+disp32`
+   в `.text`. `string_xref_finder.{hpp,cpp}` + unit tests (Zydis-based).
+3. ✅ Per-string XOR encryptor: `string_encryptor.{hpp,cpp}` + unit tests.
+4. ✅ `mx_str_get` decryptor + per-xref trampoline codegen:
+   `string_decryptor_codegen.{hpp,cpp}` + byte-level unit tests.
+   Layout: `[mx_str_get (~66B)] [trampolines (~40B each)] [descriptor
+   table (8B per string)] [encrypted pool]`.
+5. 📋 **Orchestrator pass** (`StringProtectionPass`): собирает `.mxstr`
+   секцию из вышеперечисленных блоков, патчит две rip+disp32 ссылки
+   внутри `mx_str_get` и call rel32 внутри каждого трамплина, переписывает
+   LEA xref'ы на `call trampoline` + NOP padding, регистрируется в
+   PassManager, консьюмит `--strings=stub`.
+6. 📋 Подключение `--strings=vm`: обернуть `mx_str_get` в `MX_VM_BEGIN/END`
+   перед lifting'ом.
 
-Сложность: XREF discovery надо делать аккуратно (jump tables, switch tables,
-vtable data false-positives). MVP версия игнорирует ambiguous refs.
+Сложность: XREF discovery надо делать аккуратно (jump tables, switch
+tables, vtable data false-positives). MVP версия игнорирует ambiguous
+refs — только exact `LEA reg, [rip+disp32]` с dest_rva == string_start.
+
+**Thread safety**: текущий XOR loop не атомарен. Два потока, входящие
+в `mx_str_get` для одного string_id до того, как sticky flag установлен,
+могут сделать double-XOR обратно в ciphertext. Fix (S3): `lock cmpxchg`
+claim на flag byte.
 
 ### 📋 S3. Per-string unique key + ephemeral lifetime *(низкий, сверху S2)*
 Derive key per-string через `f(string_id, TEB->Tid, GetTickCount() >> 10)`.
