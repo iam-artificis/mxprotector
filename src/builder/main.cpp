@@ -40,6 +40,7 @@
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/vm/virtualization_pass.hpp"
 #include "mxprotector/protection/packer/packer_pass.hpp"
+#include "mxprotector/protection/string/string_protection_pass.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -189,11 +190,12 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
             .vm     = ".mxvm",
             .cff    = ".mxprot1",
             .packer = ".mxpack",
+            .str    = ".mxstr",
         };
     }
 
     auto pool = stealth_section_pool();
-    // Fisher-Yates shuffle so we can just take the first 3.
+    // Fisher-Yates shuffle so we can just take the first 4.
     for (size_t i = pool.size() - 1; i > 0; --i) {
         const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
         std::swap(pool[i], pool[j]);
@@ -202,6 +204,7 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
         .vm     = pool[0],
         .cff    = pool[1],
         .packer = pool[2],
+        .str    = pool[3],
     };
 }
 
@@ -330,6 +333,7 @@ int main(int argc, char** argv) {
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
     pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());
+    pass_manager.register_pass(std::make_unique<mx::StringProtectionPass>());
     pass_manager.register_pass(std::make_unique<mx::PackerPass>());
 
     auto pass_result = pass_manager.execute_all(ctx);

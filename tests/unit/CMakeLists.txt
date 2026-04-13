@@ -23,6 +23,7 @@ set(TEST_SOURCES
     string_xref_finder_test.cpp
     string_encryptor_test.cpp
     string_decryptor_codegen_test.cpp
+    string_protection_pass_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests
@@ -58,6 +59,7 @@ set(STRING_PROTECT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_xref_finder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_encryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_decryptor_codegen.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_protection_pass.cpp
 )
 
 # ==============================================================================

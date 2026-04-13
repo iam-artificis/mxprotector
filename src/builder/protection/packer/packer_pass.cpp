@@ -704,6 +704,17 @@ void disable_relocations(PeImage& image) {
 /// ".text". If a CFF trampoline section (`ctx.section_names().cff`) or a VM
 /// blob (`ctx.section_names().vm`) was added earlier, they are also encrypted
 /// so neither is left in the clear.
+///
+/// The S2 string-protection section (`ctx.section_names().str`) is NOT
+/// included: the packer's post-decrypt `NtProtectVirtualMemory` loop
+/// revokes the write bit on every encrypted section, but `mx_str_get`
+/// does an in-place XOR over the `.mxstr` data pool on the first call
+/// to each string and flips a sticky flag inside the descriptor. Both
+/// operations require the section to stay writable, so `.mxstr` is left
+/// out of the packer target list. Its data pool is still ciphertext at
+/// rest thanks to the per-string XOR encryption built into the pass,
+/// and strong packer protection for the decryptor itself is a job for
+/// S2c (`--strings=vm`) which lifts `mx_str_get` into a VM region.
 std::vector<size_t> collect_target_sections(const PeImage& image,
                                              const SectionNameMap& names) {
     std::vector<size_t> indices;
