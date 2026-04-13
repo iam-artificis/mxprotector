@@ -110,67 +110,9 @@ constraint solver:
 
 ## Packer strengthening *(высокий приоритет)*
 
-Packer субъективно самое слабое звено: multi-section XOR с 256-байтным
-ключом, быстро разворачивается Unicorn'ом. План усиления:
-
-### ✅ P1. Замена XOR на stream cipher — RC4
-Shipped. The 256-byte XOR keystream (which a known-plaintext attack
-could recover in seconds from the predictable prologue bytes of
-`.text`) has been replaced by RC4 with a 32-byte per-build random
-key. Build-time `rc4_init` + `rc4_process` helpers in
-`packer_pass.cpp` mirror the runtime KSA + PRGA byte-for-byte.
-
-The stub now emits:
-
-- `lea rsi, key` and `lea r8, sbox` (two new rip-relative patch sites)
-- KSA phase 1: `S[k] = k for k in 0..255`
-- KSA phase 2: mix with the 32-byte key, seeded with `j = edx` so
-  the anti-debug probe silently invalidates the whole S-box if
-  `edx == 1`
-- PRGA loop per protected section, with `i`/`j` carried across
-  sections in `r9b`/`r10b` — same "streaming" semantics the old
-  `dl`-carrying XOR used to have
-
-`.mxpack` picks up `IMAGE_SCN_MEM_WRITE` because the S-box scratch
-lives inside the stub section itself (no separate data section,
-no stack alloc, all rip-relative). The reprotect loop at the tail
-only runs over `encrypted` — never over `.mxpack` — so the stub
-page stays R+W+X for the lifetime of the process. Acceptable
-because it's a one-shot entry stub that no anti-tamper probe
-targets.
-
-ChaCha20 was the first-choice in the original plan; RC4 is the
-stated "acceptable compromise" there and arrived at the same
-practical goal (kills the known-plaintext attack) at dramatically
-lower code size. ChaCha20 can still replace RC4 later if a stronger
-cryptographic floor is needed against a dedicated adversary.
-
 ### 📋 P2. Multi-layer unpacking *(высокий)*
 VMProtect делает 3-5 слоёв: layer N раскрывает layer N+1, затем сам себя
 стирает (`VirtualProtect` + memset). Reverser должен пройти все слои trace'ом.
-
-### ✅ P3. Entry stub как VM regions
-Shipped. The packer's RC4 KSA block (init loop + mix loop + PRGA
-state reset) is lifted through `VmLifter` + `VmRuntimeGenerator`
-inside `PackerPass::execute`, and the plaintext KSA bytes in the
-emitted stub are overwritten with `call rel32 <vm_entry>` + NOP
-padding. The VM blob is appended to `.mxpack` alongside the RC4
-key, S-box scratch, and reprotect table.
-
-Runtime flow: the packer stub still does `lea rsi, key` +
-`lea r8, sbox` as plaintext (the VM lifter rejects rip-relative),
-then `call vm_entry` dispatches into the VM for the whole KSA, and
-the VM's exit leaves `r8` and `rsi` unchanged while zeroing
-`r9`/`r10` for the subsequent PRGA loops. The per-section PRGA
-loops and the reprotect block remain plaintext — they're the
-hottest part of the stub and wrapping them in the VM would be a
-perf regression for negligible static-analysis value once the
-KSA is already hidden.
-
-VmGenOptions: `skip_anti_tamper_checks = true` (the same opt-out
-S2c uses, because `.mxpack` is R+W+X and the page-protection
-probe would misfire), `use_imagebase_key = true` (packer strips
-ASLR so runtime ImageBase matches preferred).
 
 ### 📋 P4. TLS callback как secondary entry *(средний)*
 Entry point сейчас один — наш stub. TLS callback выполняется ДО entry point'а
@@ -201,60 +143,6 @@ Detection signal, не защита от dump.
 
 ## String protection
 
-### ⏳ S2. Binary-level `.rdata` string transform pass *(средний, высокая ценность)*
-Для unannotated strings (RTTI, std::exception msgs, third-party libs, логи):
-
-1. ✅ Scan `.rdata` на printable ASCII runs ≥ 4 chars, filter false-positives.
-   `string_scanner.{hpp,cpp}` + unit tests.
-2. ✅ Build XREF table: для каждой найденной строки — список `LEA rip+disp32`
-   в `.text`. `string_xref_finder.{hpp,cpp}` + unit tests (Zydis-based).
-3. ✅ Per-string XOR encryptor: `string_encryptor.{hpp,cpp}` + unit tests.
-4. ✅ `mx_str_get` decryptor + per-xref trampoline codegen:
-   `string_decryptor_codegen.{hpp,cpp}` + byte-level unit tests.
-   Layout: `[mx_str_get (~66B)] [trampolines (~40B each)] [descriptor
-   table (8B per string)] [encrypted pool]`.
-5. ✅ **Orchestrator pass** (`StringProtectionPass`): собирает `.mxstr`
-   секцию из вышеперечисленных блоков, патчит две rip+disp32 ссылки
-   внутри `mx_str_get` и call rel32 внутри каждого трамплина, переписывает
-   LEA xref'ы на `call trampoline` + NOP padding, регистрируется в
-   PassManager, консьюмит `--strings=stub`.
-6. ✅ Подключение `--strings=vm`: XOR decrypt loop lifted via
-   `VmLifter` + `VmRuntimeGenerator`, VM blob embedded in `.mxstr`,
-   loop body overwritten with `call vm_entry` + NOP pad. S2c's inner
-   VM passes `skip_anti_tamper_checks=true` — `page_protection_sweep`
-   assumes the packer revoked WRITE on the VM section, but `.mxstr`
-   stays R+W+X on purpose for the in-place XOR decrypt.
-
-Сложность: XREF discovery надо делать аккуратно (jump tables, switch
-tables, vtable data false-positives). MVP версия игнорирует ambiguous
-refs — только exact `LEA reg, [rip+disp32]` с dest_rva == string_start.
-
-**Thread safety**: текущий XOR loop не атомарен. Два потока, входящие
-в `mx_str_get` для одного string_id до того, как sticky flag установлен,
-могут сделать double-XOR обратно в ciphertext. Fix (S3): `lock cmpxchg`
-claim на flag byte.
-
-### ✅ S3. Per-string unique key + ephemeral lifetime
-Shipped as `--strings=ephemeral`. The decryptor allocates a scratch-
-ring slot via `lock xadd` on every call, copies + XOR-decrypts the
-ciphertext into that slot, and returns the slot pointer. No sticky
-caching — each call pays the full decrypt. The data pool stays
-ciphertext at rest and a memory dump catches at most
-`kEphemeralRingSlots` (currently 16) concurrently-decrypted strings
-across the whole process, not every string forever. Mutually
-exclusive with `--strings=vm` in MVP; string plaintext longer than
-`kEphemeralMaxStringLength` (255 bytes) is filtered out of S3
-protection and kept as a plaintext LEA. The roadmap's original
-proposal of `f(string_id, TEB.Tid, GetTickCount() >> 10)` keyed
-decryption turned out to be infeasible (runtime variables can't
-derive a key the build already encrypted under), and the
-`lock xadd`-based allocator achieves the same "bounded memory
-footprint for decrypted strings" goal more cleanly.
-
-### 📋 S4. Decryptor в VM-protected регионе *(средний, сверху S2)*
-`__mx_str_decrypt` сам обернут в `MX_VM_BEGIN/END`. Комбинируется с P3.
-Overhead ~50-100× slowdown на decryption, но strings обычно на cold paths.
-
 ### 📋 S5. Scan-resistant format: split across sections *(низкий, polish)*
 String bytes разбросаны по нескольким non-`.rdata` секциям. Reassembly в
 runtime decoder'е. `strings` и entropy scanners видят fragments.
@@ -263,7 +151,7 @@ runtime decoder'е. `strings` и entropy scanners видят fragments.
 MSVC embeds class names в RTTI, exception messages в `std::exception::what()`.
 Частичное решение: `#pragma` вывод RTTI в отдельную секцию, packer
 stream-cipher'ит, S2 pass проходит по XREF. Нерешаемые остатки — документировать
-как known leak и рекомендовать `/GR-` для release builds.
+как known leak и рекомендовать `/GR-` for release builds.
 
 ---
 
