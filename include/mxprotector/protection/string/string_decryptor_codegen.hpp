@@ -44,13 +44,17 @@
  * The orchestrator is responsible for translating the
  * `StringXref::dest_reg` Zydis opaque value into this index.
  *
- * Thread-safety note: the XOR decrypt loop is not atomic. If two
- * threads race into `mx_str_get` for the same string_id before
- * either has flipped the "decrypted" flag, one will observe the
- * other's partially-decrypted bytes or double-xor the buffer back to
- * ciphertext. MVP does not guard against this; a lock-free
- * `lock cmpxchg` claim on the flag byte is the obvious future fix
- * and belongs to S3.
+ * Thread-safety (S2b): the flag byte is a 3-state word — `0 = idle`,
+ * `1 = claimed`, `2 = done`. The first thread to call `mx_str_get`
+ * for a given string_id tries a `lock cmpxchg` to atomically flip
+ * the flag from 0 → 1; the winner runs the XOR loop, then plain-
+ * stores `2` to mark the string decrypted. Concurrent callers that
+ * lose the cmpxchg spin-wait on `pause` until they observe the
+ * `done` bit set, then return the plaintext pointer. There is no
+ * window in which two threads can race into the XOR loop for the
+ * same string, and no window in which a caller reads partially-
+ * decrypted bytes. S2a had a known race (mvp skipped the claim);
+ * S2b closes it.
  */
 
 #pragma once
@@ -153,7 +157,14 @@ struct EmittedTrampoline {
 
 /// Shared decryptor byte size. Asserted in unit tests so that any
 /// accidental divergence in `emit_mx_str_get` is caught.
-inline constexpr size_t kMxStrGetSize              = 66;
+///
+/// The S2b variant uses a 3-state flag (0 = idle, 1 = claimed,
+/// 2 = done) and a `lock cmpxchg` atomic claim so concurrent callers
+/// for the same string_id cannot race into a double-XOR back to
+/// ciphertext. This is longer than the original S2a body because it
+/// must preserve `rax` across the cmpxchg (which clobbers `al`) and
+/// includes a pause-based spin-wait for the contended path.
+inline constexpr size_t kMxStrGetSize              = 93;
 
 /// Trampoline byte sizes by target category.
 inline constexpr size_t kTrampolineSizeVolatile    = 40;

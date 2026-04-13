@@ -17,60 +17,52 @@ Legend:
 Do these in order. Each item is a one-liner; see the detailed sections
 below for the full spec.
 
-1. ⏳ **S2a — string protection orchestrator pass.** Leaf modules landed
-   (scanner, xref finder, XOR encryptor, `mx_str_get` + trampoline codegen,
-   all with unit tests). Remaining: `StringProtectionPass` that assembles
-   the `.mxstr` section (decryptor + trampolines + descriptor table +
-   encrypted data pool), patches the two rip+disp32 slots inside `mx_str_get`
-   and the `call rel32` inside each trampoline, rewrites LEA xrefs to
-   `call trampoline` + NOP padding, and registers in PassManager so
-   `--strings=stub` goes from no-op to functional. § "String protection" → S2.
-2. 📋 **S2b — thread-safe decrypt.** `lock cmpxchg` on the sticky flag byte
+1. ⏳ **S2b — thread-safe decrypt.** `lock cmpxchg` on the sticky flag byte
    inside `mx_str_get` so concurrent callers for the same string_id cannot
    double-XOR back to ciphertext. Correctness bug, not hardening. § "String
    protection" → S2 (thread safety note).
-3. 📋 **S2c — `--strings=vm`.** Wrap `mx_str_get` in `MX_VM_BEGIN/END` so
+2. 📋 **S2c — `--strings=vm`.** Wrap `mx_str_get` in `MX_VM_BEGIN/END` so
    the emitted decryptor gets lifted through the existing VM pipeline.
    Trivial once S2a is in place. § "String protection" → S4.
-4. 📋 **S3 — ephemeral per-session string keys.** Derive XOR key per string
+3. 📋 **S3 — ephemeral per-session string keys.** Derive XOR key per string
    from `f(string_id, TEB.Tid, GetTickCount() >> 10)` so a memory dump
    captures at most one decrypted string at a time. § "String protection" → S3.
-5. 📋 **DLL packer.** DllMain-aware stub variant. Today `PackerPass`
+4. 📋 **DLL packer.** DllMain-aware stub variant. Today `PackerPass`
    auto-skips on `.dll` (see `STABILITY.md` §6) and the result is
    mutation/obfuscation/VM/CFF only. A DllMain stub unlocks full `-l strong`
    on DLLs: on `DLL_PROCESS_ATTACH` run the decrypt loop then call the real
    DllMain; forward other reasons verbatim; preserve export table + IAT
    across unpacking. § "Packer strengthening" (new subsection to add when
    work starts).
-6. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
+5. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
    kernel-mode entry ABI. Blocked on test-signing infrastructure, not on
    code. Lower priority than DLL.
-7. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
+6. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
    256-byte XOR key in the packer. Largest single uplift against
    static unpackers. § "Packer strengthening" → P1.
-8. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
+7. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
    (anti-debug, key derivation, decrypt loop) itself virtualized through
    the existing VM engine. § "Packer strengthening" → P3.
-9. 📋 **Packer strengthening — P5 import hashing.** Replace plain
+8. 📋 **Packer strengthening — P5 import hashing.** Replace plain
    `LoadLibrary` + `GetProcAddress(name)` in the packer stub with DJB2/FNV-1a
    hash resolution from kernel32/ntdll export tables. Kills `strings` on
    packed binaries. § "Packer strengthening" → P5.
-10. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
+9. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-11. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
+10. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
     (load, store, key derivation). § "Gap vs коммерческие" → G2.
-12. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
+11. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
     opcodes, opaque bytecode branches, handler id polymorphism, rolling
     key per handler. § "Gap vs коммерческие" → G4.
-13. 📋 **VM strengthening — G5 handler call graph obfuscation.**
+12. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
-14. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
+13. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
     memory-dependent control flow, loop-based key schedules. Hardest,
     lowest on the list. § "Gap vs коммерческие" → G6.
-15. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
+14. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
     poisoning (`NtQueryInformationThread` self-inspect), guard-page
     VEH-integrity trap. Independent of the main chain, can slot in any
     time.
@@ -195,7 +187,7 @@ Detection signal, не защита от dump.
    `string_decryptor_codegen.{hpp,cpp}` + byte-level unit tests.
    Layout: `[mx_str_get (~66B)] [trampolines (~40B each)] [descriptor
    table (8B per string)] [encrypted pool]`.
-5. 📋 **Orchestrator pass** (`StringProtectionPass`): собирает `.mxstr`
+5. ✅ **Orchestrator pass** (`StringProtectionPass`): собирает `.mxstr`
    секцию из вышеперечисленных блоков, патчит две rip+disp32 ссылки
    внутри `mx_str_get` и call rel32 внутри каждого трамплина, переписывает
    LEA xref'ы на `call trampoline` + NOP padding, регистрируется в

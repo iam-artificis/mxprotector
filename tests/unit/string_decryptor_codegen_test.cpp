@@ -134,7 +134,10 @@ TEST(StringDecryptorDescriptor, PackZeroDescriptorIsAllZeros) {
 TEST(MxStrGet, ExactSize) {
     const auto d = emit_mx_str_get();
     EXPECT_EQ(d.code.size(), kMxStrGetSize);
-    EXPECT_EQ(d.code.size(), 66u);
+    // S2b added a lock-cmpxchg claim loop and an rax-preserving stash
+    // in r9, bringing the body to 93 bytes. Hard-coded here so any
+    // accidental size drift is caught by the test.
+    EXPECT_EQ(d.code.size(), 93u);
 }
 
 TEST(MxStrGet, StartsWithLeaR10RipRelDescTable) {
@@ -181,18 +184,63 @@ TEST(MxStrGet, ContainsXorByteR8Dl) {
     EXPECT_LT(off, d.code.size()) << "xor decrypt instruction missing";
 }
 
-TEST(MxStrGet, ContainsStickyFlagSet) {
-    // 41 80 4A 07 01  — or byte [r10+7], 1
+TEST(MxStrGet, ContainsFastPathDoneTest) {
+    // 41 F6 42 07 02  — test byte [r10+7], 2
+    // Acquire-load check on the done bit. Plain mov is acquire on x86
+    // so observing bit 1 set implies the decrypted bytes are visible.
     const auto d = emit_mx_str_get();
-    const auto off = find_bytes(d.code, {0x41, 0x80, 0x4A, 0x07, 0x01});
-    EXPECT_LT(off, d.code.size()) << "sticky-flag OR is missing";
+    const auto off = find_bytes(d.code, {0x41, 0xF6, 0x42, 0x07, 0x02});
+    EXPECT_LT(off, d.code.size()) << "fast-path done-bit test missing";
 }
 
-TEST(MxStrGet, ContainsFlagShortCircuitTest) {
-    // 41 F6 42 07 01  — test byte [r10+7], 1
+TEST(MxStrGet, ContainsFinalDoneStore) {
+    // 41 C6 42 07 02  — mov byte [r10+7], 2
+    // Plain store of the final "done" flag value. Plain store is safe
+    // here because the claim bit serializes writes: every other thread
+    // observes 1 and spins until this thread switches to 2.
     const auto d = emit_mx_str_get();
-    const auto off = find_bytes(d.code, {0x41, 0xF6, 0x42, 0x07, 0x01});
-    EXPECT_LT(off, d.code.size()) << "decrypted-flag test is missing";
+    const auto off = find_bytes(d.code, {0x41, 0xC6, 0x42, 0x07, 0x02});
+    EXPECT_LT(off, d.code.size()) << "final done-store is missing";
+}
+
+TEST(MxStrGet, ContainsLockCmpxchgClaim) {
+    // F0 45 0F B0 42 07  — lock cmpxchg byte [r10+7], r8b
+    //
+    // The atomic claim: expected = al (= 0), new = r8b (= 1). On a
+    // successful exchange (byte was 0) ZF is set and the winning
+    // thread runs the decrypt loop. Every other thread observes a
+    // non-zero value, branches on `cmp al, 2`, and either returns
+    // (done) or spins on `pause` (still claimed).
+    const auto d = emit_mx_str_get();
+    const auto off = find_bytes(d.code, {0xF0, 0x45, 0x0F, 0xB0, 0x42, 0x07});
+    EXPECT_LT(off, d.code.size()) << "lock cmpxchg claim is missing";
+}
+
+TEST(MxStrGet, ContainsPauseSpinHint) {
+    // F3 90  — pause. Hints to the CPU that this is a spin-wait loop,
+    // reducing power draw and avoiding pipeline-order penalties on
+    // the contended path.
+    const auto d = emit_mx_str_get();
+    const auto off = find_bytes(d.code, {0xF3, 0x90});
+    EXPECT_LT(off, d.code.size()) << "pause hint is missing from spin path";
+}
+
+TEST(MxStrGet, ContainsStashRaxIntoR9) {
+    // 49 89 C1  — mov r9, rax
+    // Save the plaintext pointer before cmpxchg clobbers `al` on
+    // contended paths, so we can restore `rax` before `ret`.
+    const auto d = emit_mx_str_get();
+    const auto off = find_bytes(d.code, {0x49, 0x89, 0xC1});
+    EXPECT_LT(off, d.code.size()) << "rax→r9 stash is missing";
+}
+
+TEST(MxStrGet, ContainsRestoreRaxFromR9) {
+    // 4C 89 C8  — mov rax, r9
+    // Restore the plaintext pointer from the r9 stash. Must appear
+    // after the cmpxchg loop and before the final ret.
+    const auto d = emit_mx_str_get();
+    const auto off = find_bytes(d.code, {0x4C, 0x89, 0xC8});
+    EXPECT_LT(off, d.code.size()) << "r9→rax restore is missing";
 }
 
 TEST(MxStrGet, EndsWithRet) {
