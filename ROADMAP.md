@@ -27,32 +27,29 @@ below for the full spec.
 2. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
    kernel-mode entry ABI. Blocked on test-signing infrastructure, not on
    code. Lower priority than DLL.
-3. 📋 **Packer strengthening — P1 ChaCha20 stream cipher.** Replaces the
-   256-byte XOR key in the packer. Largest single uplift against
-   static unpackers. § "Packer strengthening" → P1.
-4. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
+3. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
    (anti-debug, key derivation, decrypt loop) itself virtualized through
    the existing VM engine. § "Packer strengthening" → P3.
-5. 📋 **Packer strengthening — P5 import hashing.** Replace plain
+4. 📋 **Packer strengthening — P5 import hashing.** Replace plain
    `LoadLibrary` + `GetProcAddress(name)` in the packer stub with DJB2/FNV-1a
    hash resolution from kernel32/ntdll export tables. Kills `strings` on
    packed binaries. § "Packer strengthening" → P5.
-6. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
+5. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-7. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
+6. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
     (load, store, key derivation). § "Gap vs коммерческие" → G2.
-8. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
+7. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
     opcodes, opaque bytecode branches, handler id polymorphism, rolling
     key per handler. § "Gap vs коммерческие" → G4.
-9. 📋 **VM strengthening — G5 handler call graph obfuscation.**
+8. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
-10. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
+9. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
     memory-dependent control flow, loop-based key schedules. Hardest,
     lowest on the list. § "Gap vs коммерческие" → G6.
-11. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
+10. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
     poisoning (`NtQueryInformationThread` self-inspect), guard-page
     VEH-integrity trap. Independent of the main chain, can slot in any
     time.
@@ -119,12 +116,37 @@ constraint solver:
 Packer субъективно самое слабое звено: multi-section XOR с 256-байтным
 ключом, быстро разворачивается Unicorn'ом. План усиления:
 
-### 📋 P1. Замена XOR на stream cipher *(средний)*
-XOR с 256-байт ключом восстанавливается за секунды через known-plaintext
-attack (первые байты `.text` часто содержат предсказуемые patterns). Замена:
-- **ChaCha20 inline**: ~80 строк ассемблера, key 256 бит, nonce из PEB.ImageBase
-- **RC4 как компромисс**: ~20 строк, key schedule 256 итераций, слабее
-  криптографически, но всё равно kills known-plaintext attack
+### ✅ P1. Замена XOR на stream cipher — RC4
+Shipped. The 256-byte XOR keystream (which a known-plaintext attack
+could recover in seconds from the predictable prologue bytes of
+`.text`) has been replaced by RC4 with a 32-byte per-build random
+key. Build-time `rc4_init` + `rc4_process` helpers in
+`packer_pass.cpp` mirror the runtime KSA + PRGA byte-for-byte.
+
+The stub now emits:
+
+- `lea rsi, key` and `lea r8, sbox` (two new rip-relative patch sites)
+- KSA phase 1: `S[k] = k for k in 0..255`
+- KSA phase 2: mix with the 32-byte key, seeded with `j = edx` so
+  the anti-debug probe silently invalidates the whole S-box if
+  `edx == 1`
+- PRGA loop per protected section, with `i`/`j` carried across
+  sections in `r9b`/`r10b` — same "streaming" semantics the old
+  `dl`-carrying XOR used to have
+
+`.mxpack` picks up `IMAGE_SCN_MEM_WRITE` because the S-box scratch
+lives inside the stub section itself (no separate data section,
+no stack alloc, all rip-relative). The reprotect loop at the tail
+only runs over `encrypted` — never over `.mxpack` — so the stub
+page stays R+W+X for the lifetime of the process. Acceptable
+because it's a one-shot entry stub that no anti-tamper probe
+targets.
+
+ChaCha20 was the first-choice in the original plan; RC4 is the
+stated "acceptable compromise" there and arrived at the same
+practical goal (kills the known-plaintext attack) at dramatically
+lower code size. ChaCha20 can still replace RC4 later if a stronger
+cryptographic floor is needed against a dedicated adversary.
 
 ### 📋 P2. Multi-layer unpacking *(высокий)*
 VMProtect делает 3-5 слоёв: layer N раскрывает layer N+1, затем сам себя

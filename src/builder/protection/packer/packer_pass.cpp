@@ -43,42 +43,101 @@ namespace mx {
 
 namespace {
 
-/// 256-byte XOR key stream. The stub counts bytes with `inc dl` so the key
-/// wraps automatically at 256.
-constexpr uint32_t kKeySize = 256;
+/// RC4 key size in bytes. 32 bytes = 256 bits — matches the roadmap's
+/// P1 target ("key 256 бит") and is the length the KSA modular index
+/// `i mod kKeySize` is hard-coded to in the emitted stub.
+///
+/// Historically this was 256 bytes for the vanilla-XOR stream cipher;
+/// the number and the name have been kept so the existing patch-site
+/// plumbing ("embedded key" → "lea rsi, key") reads the same, but the
+/// semantics are now "KSA input key" rather than "XOR key stream".
+constexpr uint32_t kKeySize = 32;
+
+/// S-box size for RC4 (fixed by the algorithm).
+constexpr uint32_t kSboxSize = 256;
+
+// ---------------------------------------------------------------------------
+// Build-time RC4 stream cipher — mirrors the runtime stub byte-for-byte.
+//
+// The decryptor emitted by `build_stub_bytes` below implements standard
+// RC4 (KSA + PRGA). This helper runs the same algorithm at build time
+// so the encrypted output matches what the stub will decrypt.
+//
+// The state deliberately starts with `j = anti_debug_bias`, which is
+// the build's prediction of what `edx` will hold at stub entry —
+// normally 0 (no debugger). At runtime, if a debugger is present and
+// the anti-debug probe flips `edx` to 1, the KSA starts with a
+// different `j`, produces an entirely different S-box, and the PRGA
+// stream decrypts the sections into garbage. There is no explicit
+// "if debugger then die" branch; the cipher itself silently fails.
+// ---------------------------------------------------------------------------
+
+struct Rc4State {
+    std::array<uint8_t, kSboxSize> sbox{};
+    uint8_t i = 0;
+    uint8_t j = 0;
+};
+
+void rc4_init(Rc4State& s, ByteView key, uint8_t anti_debug_bias) noexcept {
+    for (uint32_t k = 0; k < kSboxSize; ++k) {
+        s.sbox[k] = static_cast<uint8_t>(k);
+    }
+    uint8_t j = anti_debug_bias;
+    for (uint32_t k = 0; k < kSboxSize; ++k) {
+        j = static_cast<uint8_t>(
+            j + s.sbox[k] + key[k % key.size()]);
+        std::swap(s.sbox[k], s.sbox[j]);
+    }
+    s.i = 0;
+    s.j = 0;
+}
+
+/// Encrypt (or decrypt — RC4 is self-inverse through XOR) `data` in
+/// place. State carries over across calls so the cipher can stream
+/// through several sections with one KSA.
+void rc4_process(Rc4State& s, MutableByteView data) noexcept {
+    for (auto& b : data) {
+        s.i = static_cast<uint8_t>(s.i + 1);
+        s.j = static_cast<uint8_t>(s.j + s.sbox[s.i]);
+        std::swap(s.sbox[s.i], s.sbox[s.j]);
+        const uint8_t k = s.sbox[
+            static_cast<uint8_t>(s.sbox[s.i] + s.sbox[s.j])];
+        b = static_cast<uint8_t>(b ^ k);
+    }
+}
 
 /// Approximate size of the stub code (before the key). The actual size varies
 /// a little across builds because the push/pop and setup order is randomised,
 /// but the patch offsets are tracked dynamically so this is only a sanity
 /// reference for documentation.
 ///
-/// Layout (all sizes in bytes):
+/// Layout (approximate — the stub is polymorphic and grew in P1 from
+/// a 256-byte XOR keystream to full RC4 KSA + PRGA):
 ///   push rdi/rsi/rcx/rdx/rax          = 5
-///   mov  rax, gs:[0x60]                = 9    — read PEB
-///   movzx eax, byte [rax+2]            = 4    — BeingDebugged (0 or 1)
-///   mov  edx, eax                       = 2    — edx = 0 normally, 1 under a dbg
-///   lea  rdi, [rip + rel32]             = 7
-///   lea  rsi, [rip + rel32]             = 7
-///   mov  ecx, imm32                     = 5
-///   .loop:
-///     mov  al, [rdi]                    = 2
-///     xor  al, [rsi + rdx]              = 3
-///     mov  [rdi], al                    = 2
-///     inc  rdi                          = 3
-///     inc  dl                           = 2
-///     dec  rcx                          = 3
-///     jnz  .loop                        = 2
-///   pop  rax/rdx/rcx/rsi/rdi            = 5
-///   jmp  rel32                          = 5
-///   -------------------------------------
-///   total                               = 66
+///   anti-debug probe (variant 0/1/2) = 10..20
+///   lea  rsi, [rip + rel32]           = 7    — 32-byte RC4 key
+///   lea  r8,  [rip + rel32]           = 7    — 256-byte S-box scratch
+///   KSA phase 1 (init S[k]=k loop)   ~10
+///   KSA phase 2 (mix with key loop)  ~34
+///   PRGA state reset (xor r9/r10)     = 6
+///   per section:
+///     lea  rdi, [rip + rel32]         = 7
+///     mov  ecx, imm32                 = 5
+///     PRGA loop body                 ~42
+///   reprotect block                 ~250
+///   pop rax/rdx/rcx/rsi/rdi           = 5
+///   jmp  rel32                        = 5
 ///
-/// The anti-debug is woven *into* the decryption: if the process is being
-/// debugged, edx starts at 1 instead of 0 and the entire key stream is
-/// shifted by one byte, producing garbage on the first instruction executed.
-/// A reverser cannot simply NOP the check — they must also un-shift the
-/// byte counter, which would require detecting that the shift is present.
-constexpr uint32_t kStubCodeSize = 66;
+/// The anti-debug is woven *into* the cipher: the probe writes `edx`
+/// ∈ {0, 1}, the KSA seeds its `j` register from `edx`. On a clean
+/// run both build-time and runtime KSAs see j=0 and produce the same
+/// S-box. Under a debugger the runtime j starts at 1 — the very first
+/// KSA iteration swaps different entries than the build, the S-box
+/// diverges, and the PRGA keystream is unrelated to the build-time
+/// one. Every protected section decrypts to garbage before the stub
+/// even reaches its reprotect block, and the process crashes before
+/// the debugger can inspect anything meaningful.
+constexpr uint32_t kStubCodeSize = 0; // polymorphic; see comment above
 
 /// A single section the packer stub decrypts at runtime.
 ///
@@ -102,7 +161,8 @@ struct StubPatches {
     // and byte count.
     std::vector<DecryptSection> sections;
 
-    uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded key)
+    uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded 32-byte RC4 key)
+    uint32_t rel_to_sbox_at;       ///< patch offset (rel32 from end-of-lea to 256-byte scratch S-box)
     uint32_t rel_to_oep_at;        ///< patch offset (rel32 from end-of-jmp to OEP + stolen_size)
     uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
     uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
@@ -348,35 +408,107 @@ struct StolenPlan {
         }
     }
 
-    // (3) lea rsi, [rip + key_rel32]   — load key pointer, shared by all loops.
+    // (3) RC4 setup — load the key and scratch S-box pointers.
+    //
+    // `rsi` holds the 32-byte key. `r8` holds the 256-byte S-box
+    // scratch area. Both are `lea rip+disp32` loads whose disp32
+    // slots the caller patches after the stub section RVA is known.
+    //
+    //   lea rsi, [rip + key_rel32]   48 8D 35 rel32
     u8(0x48); u8(0x8D); u8(0x35);
     patches.rel_to_key_at = static_cast<uint32_t>(buf.size());
     u32(0);
+    //   lea r8,  [rip + sbox_rel32]  4C 8D 05 rel32
+    u8(0x4C); u8(0x8D); u8(0x05);
+    patches.rel_to_sbox_at = static_cast<uint32_t>(buf.size());
+    u32(0);
 
-    // (4) Per-section decrypt loop. dl (key index) is carried across
-    //     iterations. Two equivalent loop shapes are picked per-build:
+    // (3a) RC4 Key Scheduling Algorithm (KSA).
     //
-    //     V0 "load-xor-store":
-    //         mov al, [rdi]            8A 07
-    //         xor al, [rsi + rdx*1]    32 04 16
-    //         mov [rdi], al            88 07
-    //         inc rdi                  48 FF C7
-    //         inc dl                   FE C2
-    //         dec ecx                  FF C9
-    //         jnz .loop                75 rel8
+    //   Phase 1 — initialise S[k] = k for k ∈ [0, 256):
+    //     xor  ecx, ecx               ; k = 0
+    //   .init:
+    //     mov  [r8 + rcx], cl         ; S[k] = k (low byte)
+    //     inc  cl                     ; k++
+    //     jnz  .init                  ; wraps at 256 → exit
     //
-    //     V1 "memory-xor":
-    //         mov al, [rsi + rdx*1]    8A 04 16
-    //         xor [rdi], al            30 07
-    //         inc rdi                  48 FF C7
-    //         inc dl                   FE C2
-    //         dec ecx                  FF C9
-    //         jnz .loop                75 rel8
+    //   Phase 2 — mix with the key, seeded by the anti-debug bias:
+    //     xor  ecx, ecx               ; k = 0
+    //     mov  ebx, edx               ; j  = edx (0 normally, 1 under a debugger)
+    //   .ksa:
+    //     movzx eax, byte [r8 + rcx]  ; al = S[k]
+    //     mov  dl, cl                 ; dl = k
+    //     and  dl, 0x1F               ; dl = k mod 32 (key length)
+    //     add  bl, al                 ; j += S[k]
+    //     add  bl, [rsi + rdx]        ; j += key[k mod 32]
+    //     movzx edx, byte [r8 + rbx]  ; dl = S[j]
+    //     mov  [r8 + rbx], al         ; S[j] = S[k]
+    //     mov  [r8 + rcx], dl         ; S[k] = S[j]   (old S[j])
+    //     inc  cl                     ; k++
+    //     jnz  .ksa                   ; wraps at 256
     //
-    //     The same variant is used for every section in a single build so
-    //     the stream cipher stays consistent; sections are laid out back
-    //     to back with the dl index carrying through.
-    const uint32_t loop_variant = rng.next_range(0, 1);
+    //   Phase 3 — reset PRGA state:
+    //     xor  r9,  r9                ; i = 0
+    //     xor  r10, r10               ; j = 0
+
+    // Phase 1: init S[k] = k.
+    u8(0x31); u8(0xC9);                          // xor ecx, ecx
+    const uint32_t init_loop_start = static_cast<uint32_t>(buf.size());
+    u8(0x41); u8(0x88); u8(0x0C); u8(0x08);      // mov [r8+rcx], cl
+    u8(0xFE); u8(0xC1);                          // inc cl
+    {
+        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+        const int32_t  rel8    = static_cast<int32_t>(init_loop_start) -
+                                 static_cast<int32_t>(jnz_end);
+        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+    }
+
+    // Phase 2: KSA mix.
+    u8(0x31); u8(0xC9);                          // xor ecx, ecx    (k = 0)
+    u8(0x89); u8(0xD3);                          // mov ebx, edx    (j = anti-debug bias)
+    const uint32_t ksa_loop_start = static_cast<uint32_t>(buf.size());
+    u8(0x41); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08); // movzx eax, byte [r8+rcx]
+    u8(0x88); u8(0xCA);                          // mov dl, cl
+    u8(0x80); u8(0xE2); u8(0x1F);                // and dl, 0x1F
+    u8(0x00); u8(0xC3);                          // add bl, al        (j += S[k])
+    u8(0x02); u8(0x1C); u8(0x16);                // add bl, [rsi+rdx] (j += key[k mod 32])
+    u8(0x41); u8(0x0F); u8(0xB6); u8(0x14); u8(0x18); // movzx edx, byte [r8+rbx] (dl = S[j])
+    u8(0x41); u8(0x88); u8(0x04); u8(0x18);      // mov [r8+rbx], al  (S[j] = S[k])
+    u8(0x41); u8(0x88); u8(0x14); u8(0x08);      // mov [r8+rcx], dl  (S[k] = old S[j])
+    u8(0xFE); u8(0xC1);                          // inc cl
+    {
+        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+        const int32_t  rel8    = static_cast<int32_t>(ksa_loop_start) -
+                                 static_cast<int32_t>(jnz_end);
+        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+    }
+
+    // Phase 3: zero the PRGA (i, j) state. These are carried across all
+    // per-section decrypt loops so the cipher streams through every
+    // protected section end-to-end — the same way the old XOR carried
+    // `dl` across sections.
+    u8(0x4D); u8(0x31); u8(0xC9);                // xor r9, r9     (i  = 0)
+    u8(0x4D); u8(0x31); u8(0xD2);                // xor r10, r10   (j  = 0)
+
+    // (4) Per-section decrypt loop — RC4 PRGA.
+    //
+    // State at entry: r8 = S-box ptr, r9b = PRGA i, r10b = PRGA j,
+    //                 rdi/ecx = per-section dest ptr and length.
+    //
+    //   .loop:
+    //     inc   r9b                           ; i++
+    //     movzx eax, byte [r8 + r9]           ; al = S[i]
+    //     add   r10b, al                      ; j += S[i]
+    //     movzx edx, byte [r8 + r10]          ; dl = S[j]
+    //     mov   [r8 + r10], al                ; S[j] = S[i]
+    //     mov   [r8 + r9],  dl                ; S[i] = S[j] (swap)
+    //     add   al, dl                        ; al = (S[i]+S[j]) mod 256
+    //     movzx eax, al                       ; zero-extend sum
+    //     mov   al, [r8 + rax]                ; K = S[sum]
+    //     xor   [rdi], al                     ; decrypt one byte
+    //     inc   rdi                           ; advance dst
+    //     dec   ecx                           ; length--
+    //     jnz   .loop
     for (uint32_t s = 0; s < section_count; ++s) {
         DecryptSection ds{};
 
@@ -394,30 +526,24 @@ struct StolenPlan {
 
         const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
 
-        if (loop_variant == 0) {
-            //   mov al, [rdi]           8A 07
-            u8(0x8A); u8(0x07);
-            //   xor al, [rsi + rdx*1]   32 04 16
-            u8(0x32); u8(0x04); u8(0x16);
-            //   mov [rdi], al           88 07
-            u8(0x88); u8(0x07);
-        } else {
-            //   mov al, [rsi + rdx*1]   8A 04 16
-            u8(0x8A); u8(0x04); u8(0x16);
-            //   xor [rdi], al           30 07
-            u8(0x30); u8(0x07);
+        u8(0x41); u8(0xFE); u8(0xC1);                      // inc r9b
+        u8(0x43); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08);  // movzx eax, [r8+r9]
+        u8(0x41); u8(0x00); u8(0xC2);                      // add r10b, al
+        u8(0x43); u8(0x0F); u8(0xB6); u8(0x14); u8(0x10);  // movzx edx, [r8+r10]
+        u8(0x43); u8(0x88); u8(0x04); u8(0x10);            // mov [r8+r10], al
+        u8(0x43); u8(0x88); u8(0x14); u8(0x08);            // mov [r8+r9],  dl
+        u8(0x00); u8(0xD0);                                // add al, dl
+        u8(0x0F); u8(0xB6); u8(0xC0);                      // movzx eax, al
+        u8(0x41); u8(0x8A); u8(0x04); u8(0x00);            // mov al, [r8+rax]
+        u8(0x30); u8(0x07);                                // xor [rdi], al
+        u8(0x48); u8(0xFF); u8(0xC7);                      // inc rdi
+        u8(0xFF); u8(0xC9);                                // dec ecx
+        {
+            const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+            const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
+                                     static_cast<int32_t>(jnz_end);
+            u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
         }
-        //   inc rdi                 48 FF C7
-        u8(0x48); u8(0xFF); u8(0xC7);
-        //   inc dl                  FE C2
-        u8(0xFE); u8(0xC2);
-        //   dec ecx                 FF C9   (32-bit form)
-        u8(0xFF); u8(0xC9);
-        //   jnz .loop (rel8)
-        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-        const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
-                                 static_cast<int32_t>(jnz_end);
-        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
     }
 
     // (4.5) Reprotect decrypted sections to PAGE_EXECUTE_READ.
@@ -809,16 +935,29 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // (3) Generate the per-build random 256-byte key.
+    // (3) Generate the per-build random 32-byte RC4 key.
     Randomizer rng;
     ByteBuffer key(kKeySize);
     for (auto& b : key) b = rng.next_u8();
 
-    // (4) Encrypt every target section in place. The key index `dl` wraps
-    //     at 256 and is carried across sections — mirrored exactly by the
-    //     stub's decrypt loop. We start at dl=0 (builder isn't debugged);
-    //     at runtime the stub's anti-debug step shifts dl by 1 if PEB
-    //     reports a debugger.
+    // (4) Encrypt every target section with RC4. The S-box and
+    //     (i, j) state are carried across sections so the cipher
+    //     streams through every protected section end-to-end — the
+    //     runtime stub rebuilds the same stream once via KSA and
+    //     consumes it in the same order.
+    //
+    //     We seed the KSA with `j = 0` at build time because the
+    //     builder is not running under a debugger. The stub starts
+    //     its KSA with `j = edx`, where edx is 0 under normal
+    //     execution and 1 if the anti-debug probe fires. If a
+    //     debugger is present the stub's S-box diverges on the very
+    //     first KSA iteration and the PRGA keystream is incompatible
+    //     with the build-time one — every protected section decrypts
+    //     to garbage and the process crashes before the reverser
+    //     reaches the real OEP.
+    Rc4State rc4{};
+    rc4_init(rc4, ByteView{key.data(), key.size()}, /*anti_debug_bias=*/0);
+
     struct EncryptedTarget {
         size_t   image_index;
         Rva      rva;
@@ -827,22 +966,18 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     std::vector<EncryptedTarget> encrypted;
     encrypted.reserve(target_indices.size());
 
-    uint8_t key_index = 0;
     for (const size_t idx : target_indices) {
         auto& sec = ctx.pe_image().sections()[idx];
         const uint32_t sec_size = static_cast<uint32_t>(sec.data.size());
         if (sec_size == 0) continue;
 
-        for (uint32_t i = 0; i < sec_size; ++i) {
-            sec.data[i] ^= key[key_index];
-            key_index = static_cast<uint8_t>(key_index + 1); // wraps at 256
-        }
+        rc4_process(rc4, MutableByteView{sec.data.data(), sec.data.size()});
 
         // Allow the stub to decrypt in place.
         sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
 
         encrypted.push_back({idx, sec.virtual_address, sec_size});
-        ctx.log_fmt("PackerPass: зашифрована '{}' (RVA=0x{:08X}, {} байт)",
+        ctx.log_fmt("PackerPass: зашифрована (RC4) '{}' (RVA=0x{:08X}, {} байт)",
             sec.name, sec.virtual_address, sec_size);
     }
 
@@ -852,14 +987,24 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     }
 
     // (5) Build the stub code (includes stolen OEP bytes) + append the
-    //     256-byte key. Size is not fixed because the stub is polymorphic.
+    //     32-byte RC4 key, the 256-byte S-box scratch area, and the
+    //     reprotect section table. Size is not fixed because the stub
+    //     is polymorphic.
     auto [stub_buf, patches] = build_stub_bytes(
         rng, ByteView{stolen_bytes.data(), stolen_bytes.size()},
         static_cast<uint32_t>(encrypted.size()));
     const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), key.begin(), key.end());
 
-    // Embed the reprotect section table right after the key: one
+    // S-box scratch: 256 bytes of zeros. At runtime the KSA overwrites
+    // the whole region — the build-time content doesn't matter, we
+    // just need the space inside the section so `lea r8, sbox` points
+    // at valid memory. Putting the scratch inside `.mxpack` keeps
+    // everything rip-relative and avoids per-process stack frames.
+    const uint32_t sbox_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
+    stub_buf.insert(stub_buf.end(), kSboxSize, uint8_t{0});
+
+    // Embed the reprotect section table right after the S-box: one
     // {rva: u32, size: u32} entry per encrypted section. The content
     // is zero-filled here and patched in step (7) once section RVAs
     // are final.
@@ -871,10 +1016,20 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     const Rva oep_rva = oep_rva_initial + stolen_size;
 
     // (6) Add the .mxpack section and figure out its RVA.
+    //
+    // Characteristics include MEM_WRITE because the RC4 KSA rebuilds
+    // the S-box scratch area at runtime (and the scratch lives inside
+    // the stub section itself). The reprotect loop at the tail of
+    // the stub only revokes WRITE from sections in `encrypted` — it
+    // never touches `.mxpack` — so the section stays R+W+X for the
+    // lifetime of the process. That's tolerable here because the
+    // stub is only used once at startup and the page is a single
+    // 4KB region no anti-tamper probe targets.
     constexpr uint32_t pack_characteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
-        pe::IMAGE_SCN_MEM_READ;
+        pe::IMAGE_SCN_MEM_READ |
+        pe::IMAGE_SCN_MEM_WRITE;
 
     SectionManager sec_mgr(ctx.pe_image());
     const std::string& packer_section_name = ctx.section_names().packer;
@@ -909,13 +1064,22 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         write_i32(pack_sec.data, ds.patch_size_at, static_cast<int32_t>(tgt.size));
     }
 
-    // lea rsi, [rip + rel] → embedded 256-byte key
+    // lea rsi, [rip + rel] → embedded 32-byte RC4 key
     {
         const Rva lea_end_rva = stub_rva + patches.rel_to_key_at + 4;
         const Rva key_rva     = stub_rva + key_offset_in_stub;
         const int32_t rel = static_cast<int32_t>(
             static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
         write_i32(pack_sec.data, patches.rel_to_key_at, rel);
+    }
+
+    // lea r8, [rip + rel] → 256-byte S-box scratch area
+    {
+        const Rva lea_end_rva = stub_rva + patches.rel_to_sbox_at + 4;
+        const Rva sbox_rva    = stub_rva + sbox_offset_in_stub;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
+        write_i32(pack_sec.data, patches.rel_to_sbox_at, rel);
     }
 
     // lea r14, [rip + rel] → reprotect section table (one {rva,size} per
