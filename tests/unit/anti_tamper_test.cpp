@@ -53,6 +53,22 @@ TEST(AntiTamperSyscallResolver, ResolvesNtGetContextThread) {
     EXPECT_LT(ssn, 0x1000u)
         << "SSN looks suspiciously large: 0x" << std::hex << ssn;
 }
+
+TEST(AntiTamperSyscallResolver, ResolvesNtCloseToDifferentSsn) {
+    // Sanity: the manual PEB walk must work for more than one name.
+    // If the walk is broken it may still return 0 for everything, OR
+    // it may accidentally return the same SSN from a wrong spot. Two
+    // different functions must resolve to two different SSNs.
+    SyscallResolver r;
+    const uint32_t ctx_ssn   = r.resolve("NtGetContextThread");
+    const uint32_t close_ssn = r.resolve("NtClose");
+    EXPECT_NE(ctx_ssn,   0u) << "NtGetContextThread should resolve";
+    EXPECT_NE(close_ssn, 0u) << "NtClose should resolve";
+    EXPECT_NE(ctx_ssn, close_ssn)
+        << "two distinct ntdll exports must have distinct SSNs — "
+           "the PEB walk or export-table parse is broken";
+    EXPECT_LT(close_ssn, 0x1000u);
+}
 #endif
 
 TEST(AntiTamperSyscallResolver, ReturnsZeroForUnknownFunction) {

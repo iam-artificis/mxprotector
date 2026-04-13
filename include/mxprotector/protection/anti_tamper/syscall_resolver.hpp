@@ -9,24 +9,29 @@
  * `ntdll.dll` and hands it to the check at construction time, where
  * it gets baked into the emitted code as an imm32.
  *
- * ### Why build-time and not runtime
+ * ### Build-time vs runtime
  *
- * Runtime resolution would walk the loaded NTDLL via PEB.Ldr, parse
- * its export table, find the function by name, and read the SSN out
- * of the prologue. That works on every Windows version regardless of
- * which build the protector was compiled on, but it's ~150 bytes of
- * carefully encoded x64 emission per resolved function plus the
- * parsing logic.
+ * The resolver runs once at builder startup. It extracts the SSN
+ * from the builder host's loaded `ntdll.dll`, which is correct for
+ * targets running on the same Windows build as the builder. Major
+ * Windows feature updates routinely renumber syscalls, so a binary
+ * built on Win11 22H2 but shipped to Win10 20H2 may `syscall` the
+ * wrong service. Emitting a full runtime Hell's Gate resolver in
+ * the entry stub itself is a clean follow-up — the check semantics
+ * would not change, only the portability story.
  *
- * Build-time extraction is dramatically simpler — the builder is a
- * Windows binary and can call `GetModuleHandleA` / `GetProcAddress`
- * directly — but the resulting SSN is **only valid on Windows builds
- * with the same syscall numbering as the builder host**. Major
- * Windows feature updates routinely renumber syscalls.
+ * ### No Win32 API
  *
- * For now this is acceptable: the builder and target are typically
- * the same machine in a research workflow, and adding runtime Hell's
- * Gate is a clean follow-up that doesn't change the check semantics.
+ * This implementation does NOT use `GetModuleHandleA` /
+ * `GetProcAddress` / any Win32 loader surface. It walks the PEB
+ * directly via the `__readgsqword(0x60)` compiler intrinsic (which
+ * lowers to a single `mov rax, gs:[0x60]`), iterates
+ * `InMemoryOrderModuleList` to find ntdll by name, and parses the
+ * PE export table by hand to locate the target function. The only
+ * thing that reads memory owned by the OS loader is the manual PE
+ * walk, and nothing on the path can be intercepted by a user-mode
+ * API hook installed via inline patching of `kernel32` /
+ * `ntdll` exports.
  *
  * ### Failure mode
  *
