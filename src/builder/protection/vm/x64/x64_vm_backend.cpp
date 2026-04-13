@@ -608,37 +608,35 @@ MxResult<VmRuntime> X64VmBackend::generate(
         // G3 — Anti-tamper checks.
         //
         // These probe the running process for live debuggers, hardware
-        // breakpoints, and EDR hooks. Each emitted check is dramatically
-        // bigger than an anti-emulation check (~90 bytes vs ~30) because
-        // it scaffolds a direct `syscall` to NTDLL bypassing user-mode
-        // hooks, so we cap at one check per build to keep the entry
-        // stub compact. Anti-tamper checks XOR into the same key slot
-        // the anti-emulation pass writes — every probe stacks.
+        // breakpoints, EDR hooks, and suspicious memory permissions.
+        // The registry contains a mix of syscall-based checks
+        // (hw_breakpoint_sweep, page_protection_sweep) and user-mode
+        // checks (import_hook_detect, self_crc). We cap at one
+        // pick per build: anti-tamper check bodies range from ~50 to
+        // ~150 bytes each, and stacking several would bloat the entry
+        // stub without proportional gain.
         //
-        // G3.2: before the check runs, emit a Hell's Gate SSN resolver
-        // that walks the PEB, finds ntdll, parses its export table,
-        // and places the NtGetContextThread SSN in r13d. The check
-        // reads from r13d instead of a baked-in imm32, so the
-        // protected binary works on any Windows version regardless
-        // of what the builder host happens to be.
+        // The check's `required_syscall_hash()` tells us whether we
+        // need to emit a Hell's Gate resolver before the check runs,
+        // and which function it should resolve. For non-syscall
+        // checks the hash is 0 and we skip the ~155-byte resolver
+        // block entirely — this is what makes it cheap to add new
+        // user-mode checks without touching the orchestration here.
         {
             static const anti_tamper::CheckRegistry tamper_registry;
             if (tamper_registry.size() > 0) {
                 const auto picks = tamper_registry.pick_random(1, rng);
                 if (!picks.empty()) {
-                    // Resolve NtGetContextThread at runtime. The hash
-                    // is computed at build time so the literal ASCII
-                    // name never appears in the VM blob. The resolver
-                    // leaves the SSN in r13d; checks that don't need
-                    // a syscall (import hook, self-crc) simply ignore
-                    // it, at a small cost of ~155 wasted bytes in the
-                    // entry stub for those picks. That's acceptable —
-                    // picking a single check at random means we never
-                    // pay the cost twice in one build.
-                    constexpr uint32_t kNtGetContextThreadHash =
-                        anti_tamper::djb2_ascii_hash("NtGetContextThread");
-                    anti_tamper::emit_hells_gate_resolver(
-                        rt, kNtGetContextThreadHash);
+                    const anti_tamper::ICheck* picked = picks[0];
+
+                    // Emit the Hell's Gate SSN resolver ONLY when
+                    // the picked check actually needs a syscall.
+                    const uint32_t target_hash =
+                        picked->required_syscall_hash();
+                    if (target_hash != 0u) {
+                        anti_tamper::emit_hells_gate_resolver(
+                            rt, target_hash);
+                    }
 
                     // Build the per-region context. Self-CRC reads
                     // `entry_offset` from here to compute the rip-
@@ -649,9 +647,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                     anti_tamper::CheckContext ctx{};
                     ctx.entry_offset     = entry_offset;
                     ctx.self_crc_patches = &self_crc_patches;
-                    for (const auto* check : picks) {
-                        check->emit(rt, imagebase_key_disp, rng, ctx);
-                    }
+                    picked->emit(rt, imagebase_key_disp, rng, ctx);
                 }
             }
         }

@@ -140,6 +140,25 @@ public:
                       Randomizer& rng,
                       const CheckContext& ctx) const = 0;
 
+    /**
+     * @brief DJB2 hash of the NTDLL function whose SSN this check
+     *        needs in `r13d` at runtime, or 0 if it does not call
+     *        the kernel.
+     *
+     * The X64 backend uses this to decide whether to emit a
+     * Hell's Gate resolver before the check runs, and which
+     * function to resolve. A result of 0 means "no resolver
+     * emission needed", keeping the entry stub compact for checks
+     * like Self-CRC and Import Hook Detection that work purely on
+     * user-mode memory reads.
+     *
+     * Default implementation returns 0; only override in concrete
+     * checks that issue `syscall` instructions.
+     */
+    [[nodiscard]] virtual uint32_t required_syscall_hash() const noexcept {
+        return 0;
+    }
+
     /// Short human-readable name, for logs and tests.
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 };

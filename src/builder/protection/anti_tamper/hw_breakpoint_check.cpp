@@ -87,6 +87,7 @@
  */
 
 #include "mxprotector/protection/anti_tamper/check.hpp"
+#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 #include <memory>
 
@@ -188,6 +189,14 @@ public:
 
     [[nodiscard]] const char* name() const noexcept override {
         return "hw_breakpoint_sweep";
+    }
+
+    [[nodiscard]] uint32_t required_syscall_hash() const noexcept override {
+        // HW BP sweep calls NtGetContextThread to read DR0..DR3.
+        // The X64 backend emits a Hell's Gate resolver that walks
+        // the PEB, finds ntdll, and places this SSN in r13d before
+        // the check runs.
+        return djb2_ascii_hash("NtGetContextThread");
     }
 };
 

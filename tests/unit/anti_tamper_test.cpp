@@ -45,6 +45,15 @@ using mx::anti_tamper::ICheck;
 /// Self-CRC testing supplies its own with a non-zero offset.
 const CheckContext kEmptyContext{};
 
+/// Look up a check by its `name()` — keeps tests independent of the
+/// registry's iteration order.
+const ICheck* find_check(const CheckRegistry& reg, const char* name) {
+    for (size_t i = 0; i < reg.size(); ++i) {
+        if (std::string_view{reg.at(i).name()} == name) return &reg.at(i);
+    }
+    return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // DJB2 hash — constexpr correctness
 // ---------------------------------------------------------------------------
@@ -176,6 +185,28 @@ TEST(AntiTamperRegistry, ContainsAllExpectedChecks) {
     EXPECT_TRUE(has_self_crc);
 }
 
+TEST(AntiTamperRegistry, RequiredSyscallHashPerCheck) {
+    // Each check must declare whether it needs a syscall-resolver
+    // emission in front of it. HW BP → non-zero hash;
+    // Import Hook + Self-CRC → 0.
+    CheckRegistry reg;
+    const ICheck* hw_bp      = find_check(reg, "hw_breakpoint_sweep");
+    const ICheck* import_hk  = find_check(reg, "import_hook_detect");
+    const ICheck* self_crc   = find_check(reg, "self_crc");
+    ASSERT_NE(hw_bp, nullptr);
+    ASSERT_NE(import_hk, nullptr);
+    ASSERT_NE(self_crc, nullptr);
+
+    // Syscall-needing checks advertise a non-zero hash.
+    EXPECT_NE(hw_bp->required_syscall_hash(), 0u);
+    EXPECT_EQ(hw_bp->required_syscall_hash(),
+              djb2_ascii_hash("NtGetContextThread"));
+
+    // User-mode checks don't need a resolver.
+    EXPECT_EQ(import_hk->required_syscall_hash(), 0u);
+    EXPECT_EQ(self_crc->required_syscall_hash(), 0u);
+}
+
 TEST(AntiTamperRegistry, PickRandomReturnsDistinct) {
     CheckRegistry reg;
     Randomizer rng(0xCAFE);
@@ -192,15 +223,6 @@ TEST(AntiTamperRegistry, PickRandomZeroIsEmpty) {
 // ---------------------------------------------------------------------------
 // HwBreakpointSweepCheck — byte-level invariants
 // ---------------------------------------------------------------------------
-
-namespace {
-const ICheck* find_check(const CheckRegistry& reg, const char* name) {
-    for (size_t i = 0; i < reg.size(); ++i) {
-        if (std::string_view{reg.at(i).name()} == name) return &reg.at(i);
-    }
-    return nullptr;
-}
-}  // namespace
 
 TEST(AntiTamperHwBreakpoint, EmitsNonEmptyAndEndsWithXorRspDisp8) {
     CheckRegistry reg;
@@ -559,6 +581,165 @@ TEST(AntiTamperSelfCrc, DifferentPrefixProducesDifferentExpectedCrc) {
       | (static_cast<uint32_t>(eb.buf[off+3]) << 24);
     EXPECT_NE(crc_a, crc_b)
         << "different prefixes should produce different finalised CRCs";
+}
+
+// ---------------------------------------------------------------------------
+// Self-CRC behaviour tests — simulate clean + tampered buffers and verify
+// the finalised check body would detect the tamper at runtime.
+//
+// These are build-time logical tests, not in-process execution of the
+// emitted bytes (which would require VirtualAlloc + unsafe rsp
+// manipulation + SEH). They instead verify the invariant that makes
+// the runtime detection work: the baked imm32 in the check body
+// corresponds exactly to `crc32c_sw(unchanged_prefix)`, which means:
+//
+//   * In a clean environment, the runtime loop computes the same
+//     value, the `cmp` branch takes the clean path, key untouched.
+//   * After ANY one-byte tamper in the prefix, the runtime loop
+//     computes a different value, the `cmp` branch falls through,
+//     the corruption mask is ORed into the key slot, the binary
+//     crashes on the next VM dispatch.
+// ---------------------------------------------------------------------------
+
+TEST(AntiTamperSelfCrcBehavior, CleanBufferMatchesBakedCrc) {
+    // Emit a check over a known prefix, finalize, then verify the
+    // baked imm32 equals `crc32c_sw(prefix)`. This is the invariant
+    // the runtime loop relies on — if it holds, a clean runtime run
+    // will see eax == expected and take the no-op path.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    RawEmitter e;
+    constexpr size_t kPrefixLen = 48;
+    for (size_t i = 0; i < kPrefixLen; ++i) {
+        e.u8(static_cast<uint8_t>((i * 13u + 5u) & 0xFFu));
+    }
+
+    std::vector<mx::anti_tamper::SelfCrcPatchRecord> patches;
+    CheckContext ctx{};
+    ctx.entry_offset     = 0;
+    ctx.self_crc_patches = &patches;
+
+    Randomizer rng(0xAABB);
+    check->emit(e, 0x10, rng, ctx);
+
+    ASSERT_EQ(patches.size(), 1u);
+    mx::anti_tamper::finalize_self_crc_patches(e, patches);
+
+    // Compute the expected CRC the same way the runtime loop would:
+    // CRC32C over the first `kPrefixLen` bytes of the buffer.
+    const uint32_t runtime_would_compute =
+        mx::anti_tamper::crc32c_sw(e.buf.data(), kPrefixLen);
+
+    // Read the imm32 baked at the placeholder.
+    const size_t off = patches[0].placeholder_offset;
+    const uint32_t baked =
+         static_cast<uint32_t>(e.buf[off])
+      | (static_cast<uint32_t>(e.buf[off+1]) << 8)
+      | (static_cast<uint32_t>(e.buf[off+2]) << 16)
+      | (static_cast<uint32_t>(e.buf[off+3]) << 24);
+
+    EXPECT_EQ(baked, runtime_would_compute)
+        << "baked imm32 must match what the runtime loop will compute";
+}
+
+TEST(AntiTamperSelfCrcBehavior, OneByteTamperInvalidatesCrc) {
+    // After finalization, flip one byte in the prefix (simulating an
+    // attacker patching the entry-stub code at runtime) and verify
+    // the baked imm32 NO LONGER matches `crc32c_sw(tampered_prefix)`.
+    // At runtime, this mismatch is exactly what drives the branch
+    // that corrupts the key slot.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    RawEmitter e;
+    constexpr size_t kPrefixLen = 48;
+    for (size_t i = 0; i < kPrefixLen; ++i) {
+        e.u8(static_cast<uint8_t>((i * 13u + 5u) & 0xFFu));
+    }
+
+    std::vector<mx::anti_tamper::SelfCrcPatchRecord> patches;
+    CheckContext ctx{};
+    ctx.entry_offset     = 0;
+    ctx.self_crc_patches = &patches;
+
+    Randomizer rng(0xCCDD);
+    check->emit(e, 0x10, rng, ctx);
+    mx::anti_tamper::finalize_self_crc_patches(e, patches);
+
+    // Snapshot the baked CRC.
+    const size_t off = patches[0].placeholder_offset;
+    const uint32_t baked =
+         static_cast<uint32_t>(e.buf[off])
+      | (static_cast<uint32_t>(e.buf[off+1]) << 8)
+      | (static_cast<uint32_t>(e.buf[off+2]) << 16)
+      | (static_cast<uint32_t>(e.buf[off+3]) << 24);
+
+    // Now simulate a runtime tamper: flip byte 10 of the prefix.
+    // Do NOT re-finalize — the point is to show that the PRE-TAMPER
+    // baked value disagrees with the POST-TAMPER buffer contents,
+    // which is exactly what the runtime check catches.
+    e.buf[10] ^= 0x01;
+
+    // Compute what the runtime loop would see over the tampered
+    // prefix.
+    const uint32_t tampered_crc =
+        mx::anti_tamper::crc32c_sw(e.buf.data(), kPrefixLen);
+
+    EXPECT_NE(baked, tampered_crc)
+        << "a one-byte tamper must invalidate the baked CRC — this "
+           "mismatch is what drives runtime key corruption";
+}
+
+TEST(AntiTamperSelfCrcBehavior, TamperIsDetectedForEveryByte) {
+    // Stronger version: verify every single byte of the prefix
+    // contributes to the CRC, so tampering ANYWHERE triggers
+    // detection. Iterates each byte, flips it, and confirms the
+    // baked CRC never matches the tampered computation.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "self_crc");
+    ASSERT_NE(check, nullptr);
+
+    RawEmitter e;
+    constexpr size_t kPrefixLen = 32;
+    for (size_t i = 0; i < kPrefixLen; ++i) {
+        e.u8(static_cast<uint8_t>(i * 7u + 1u));
+    }
+
+    std::vector<mx::anti_tamper::SelfCrcPatchRecord> patches;
+    CheckContext ctx{};
+    ctx.entry_offset     = 0;
+    ctx.self_crc_patches = &patches;
+
+    Randomizer rng(0xEEFF);
+    check->emit(e, 0x10, rng, ctx);
+    mx::anti_tamper::finalize_self_crc_patches(e, patches);
+
+    const size_t off = patches[0].placeholder_offset;
+    const uint32_t baked =
+         static_cast<uint32_t>(e.buf[off])
+      | (static_cast<uint32_t>(e.buf[off+1]) << 8)
+      | (static_cast<uint32_t>(e.buf[off+2]) << 16)
+      | (static_cast<uint32_t>(e.buf[off+3]) << 24);
+
+    // Make a working copy of the prefix so each iteration can
+    // mutate and restore without affecting the next.
+    std::vector<uint8_t> prefix(e.buf.begin(), e.buf.begin() + kPrefixLen);
+
+    int false_clean = 0;
+    for (size_t i = 0; i < kPrefixLen; ++i) {
+        const uint8_t original = prefix[i];
+        prefix[i] ^= 0xFF;  // flip all bits of the byte
+        const uint32_t tampered =
+            mx::anti_tamper::crc32c_sw(prefix.data(), kPrefixLen);
+        if (tampered == baked) ++false_clean;
+        prefix[i] = original;
+    }
+    EXPECT_EQ(false_clean, 0)
+        << false_clean << " byte positions did NOT change the CRC — "
+           "a real attacker flipping one of them would bypass detection";
 }
 
 TEST(AntiTamperSelfCrc, FinalizePatchesUpdatesImm32) {
