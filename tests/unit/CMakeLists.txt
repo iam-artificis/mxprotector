@@ -17,11 +17,15 @@ set(TEST_SOURCES
     vm_stack_layout_test.cpp
     anti_emulation_check_test.cpp
     mx_string_test.cpp
+    x64_specialized_handlers_test.cpp
 )
 
-# VM sources needed for VmStackLayout tests
+# VM sources needed for VmStackLayout + x64 handler tests
 set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_emitters.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vflags.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handlers.cpp
 )
 
 # Anti-emulation sources needed for check registry tests

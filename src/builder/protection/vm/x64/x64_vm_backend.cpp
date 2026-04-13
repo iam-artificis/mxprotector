@@ -49,6 +49,74 @@ constexpr uint8_t variant_count_for(VmOp op) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// G1 — Per-build handler specialisation
+// ----------------------------------------------------------------------------
+//
+// A `Specialization` is a (op, dst_vreg, src_vreg) tuple for which the
+// backend will emit a dedicated handler with the destination and source
+// slot displacements baked in. Instructions that match a specialisation
+// emit only the specialised handler_id (1 byte of bytecode) instead of
+// the generic 3-byte form (handler_id + dst byte + src byte).
+//
+// Per-build random selection. Two builds of the same input get different
+// specialisations, with different handler_ids, in different positions in
+// the handler table.
+struct Specialization {
+    VmOp    op{};         // mov_rr / add_rr / sub_rr / xor_rr / and_rr / or_rr
+    uint8_t dst_vreg{};   // 0..15, ≠ junk_slot
+    uint8_t src_vreg{};   // 0..15, ≠ junk_slot
+    uint8_t handler_id{}; // assigned during slot allocation
+};
+
+/// Maximum specialisations per build. Each one consumes one handler_id
+/// and adds ~10 bytes of body (plus the standard tail dispatch). Eight
+/// fits comfortably under the 255-handler budget even for regions with
+/// dozens of native escapes.
+constexpr size_t kMaxSpecializations = 8;
+
+/// Ops whose r-r form has a tractable specialised body. imul_rr is
+/// excluded because its opcode is `48 0F AF` (4 prefix bytes) and would
+/// need a different specialised emitter; can be added later.
+constexpr VmOp kSpecializableOps[] = {
+    VmOp::mov_rr,
+    VmOp::add_rr,
+    VmOp::sub_rr,
+    VmOp::xor_rr,
+    VmOp::and_rr,
+    VmOp::or_rr,
+};
+
+/// True if a VmOp is a candidate for specialisation. Used in the bytecode
+/// encoder to skip the spec_match search for non-r-r ops.
+constexpr bool is_specializable_op(VmOp op) {
+    switch (op) {
+        case VmOp::mov_rr:
+        case VmOp::add_rr:
+        case VmOp::sub_rr:
+        case VmOp::xor_rr:
+        case VmOp::and_rr:
+        case VmOp::or_rr:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// Maps a specialisable VmOp to the `op_mr` byte expected by
+/// `emit_handler_alu_rr_specialized`. mov_rr is special-cased by the
+/// caller (it uses the dedicated `emit_handler_mov_rr_specialized`).
+constexpr uint8_t alu_op_mr_for(VmOp op) {
+    switch (op) {
+        case VmOp::add_rr: return 0x01;
+        case VmOp::sub_rr: return 0x29;
+        case VmOp::xor_rr: return 0x31;
+        case VmOp::and_rr: return 0x21;
+        case VmOp::or_rr:  return 0x09;
+        default:           return 0x00;  // unreachable for specialisations
+    }
+}
+
 } // anonymous namespace
 
 MxResult<VmRuntime> X64VmBackend::generate(
@@ -101,7 +169,60 @@ MxResult<VmRuntime> X64VmBackend::generate(
         generic_variant_total += variant_count_for(static_cast<VmOp>(i));
     }
 
-    const uint32_t total_handlers = generic_variant_total + native_count;
+    // ------------------------------------------------------------------------
+    // G1 — Generate per-build handler specialisations.
+    //
+    // We pick at most `kMaxSpecializations` random (op, dst_vreg, src_vreg)
+    // tuples from {mov_rr, add_rr, sub_rr, xor_rr, and_rr, or_rr} × non-junk
+    // slots. Duplicates are skipped. Cap by the available handler-id budget
+    // so total_handlers never exceeds 255 (the encoder uses uint8 IDs).
+    // ------------------------------------------------------------------------
+    std::vector<Specialization> specializations;
+    {
+        // Build the candidate vreg pool: every slot index except the junk
+        // slot (which holds the rolling key — writing to it would corrupt
+        // the cipher).
+        std::vector<uint8_t> non_junk_slots;
+        non_junk_slots.reserve(VmStackLayout::kSlotCount - 1);
+        for (uint8_t v = 0; v < VmStackLayout::kSlotCount; ++v) {
+            if (v != layout.junk_slot) non_junk_slots.push_back(v);
+        }
+
+        // Compute remaining handler-id budget after generic + native.
+        const size_t base_count = generic_variant_total + native_count;
+        const size_t spec_budget = (base_count >= 255)
+            ? 0u
+            : std::min<size_t>(kMaxSpecializations, 255 - base_count);
+
+        // Try up to 4× the budget to find unique tuples (collisions on
+        // small `non_junk_slots` are common with 6 ops × 15 slots × 15
+        // slots = 1350 possible values, so 4× headroom is generous).
+        for (size_t attempts = 0;
+             specializations.size() < spec_budget && attempts < spec_budget * 4u;
+             ++attempts)
+        {
+            Specialization s{};
+            s.op = kSpecializableOps[
+                rng.next_range(0, static_cast<uint32_t>(std::size(kSpecializableOps)) - 1)];
+            s.dst_vreg = non_junk_slots[
+                rng.next_range(0, static_cast<uint32_t>(non_junk_slots.size()) - 1)];
+            s.src_vreg = non_junk_slots[
+                rng.next_range(0, static_cast<uint32_t>(non_junk_slots.size()) - 1)];
+
+            const bool dup = std::any_of(
+                specializations.begin(), specializations.end(),
+                [&](const Specialization& existing) {
+                    return existing.op == s.op
+                        && existing.dst_vreg == s.dst_vreg
+                        && existing.src_vreg == s.src_vreg;
+                });
+            if (!dup) specializations.push_back(s);
+        }
+    }
+
+    const uint32_t total_handlers =
+        generic_variant_total + native_count +
+        static_cast<uint32_t>(specializations.size());
     if (total_handlers > 255) {
         return std::unexpected(MxError(
             ProtectionErrorCode::vm_translation_error,
@@ -134,14 +255,29 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
     std::vector<uint8_t> native_handler_ids;
     native_handler_ids.reserve(native_count);
-    for (uint32_t i = generic_variant_total; i < total_handlers; ++i) {
+    for (uint32_t i = generic_variant_total;
+         i < generic_variant_total + native_count; ++i) {
         native_handler_ids.push_back(slots[i]);
+    }
+
+    // G1 — assign the remaining shuffled slots to specialisations.
+    for (size_t s = 0; s < specializations.size(); ++s) {
+        specializations[s].handler_id =
+            slots[generic_variant_total + native_count + s];
     }
 
     // ------------------------------------------------------------------------
     // Step 2 — build plain bytecode stream, then stream-encrypt with rolling
     // key. The encryption walks bytes in fetch order (opcode, operands, next
     // opcode, ...) so the runtime decryption order matches.
+    //
+    // Plumbing order:
+    //   1. Define the operand remap helper (uses the per-region layout).
+    //   2. Precompute spec_match[i]: whether each instruction matches one
+    //      of the per-build specialisations. Drives BOTH the bytecode size
+    //      table and the encoding loop.
+    //   3. Compute bc_offset[] using the spec-aware sizes.
+    //   4. Emit bytecode using the same spec_match decisions.
     // ------------------------------------------------------------------------
     ByteBuffer bytecode_plain;
     bytecode_plain.reserve(instructions.size() * 4);
@@ -149,16 +285,50 @@ MxResult<VmRuntime> X64VmBackend::generate(
     uint32_t next_native_idx = 0;
     std::vector<uint32_t> native_handler_of_insn(instructions.size(), UINT32_MAX);
 
-    // Phase 1: compute bytecode size per instruction to get offsets, since
-    // vjmp/vjcc rel32 depends on the target instruction's bytecode offset.
-    auto insn_bc_size = [](const VmInstruction& vi) -> uint32_t {
-        return 1 + vm_op_operand_size(vi.op);
+    // Translate a native-reg operand (as emitted by the lifter) to its
+    // per-build virtual slot. The lifter refuses to emit RSP operands for
+    // generic ops, so native_to_slot[n] must be valid here.
+    auto remap_reg = [&](uint8_t native_reg) -> uint8_t {
+        const uint8_t slot = layout.native_to_slot[native_reg];
+        return (slot == VmStackLayout::kJunkMarker) ? layout.junk_slot : slot;
     };
 
+    // G1 — Precompute specialisation matches.
+    //
+    // spec_match[i] = index into `specializations[]`, or -1 for "no match,
+    // emit via the generic path". We do this BEFORE bc_offset[] because a
+    // matched instruction's bytecode size shrinks from 3 bytes (handler_id
+    // + 2 operand bytes) to 1 byte (handler_id only), and vjmp/vjcc rel32
+    // values depend on bc_offset[].
+    std::vector<int> spec_match(instructions.size(), -1);
+    if (!specializations.empty()) {
+        for (size_t i = 0; i < instructions.size(); ++i) {
+            const auto& vi = instructions[i];
+            if (!is_specializable_op(vi.op)) continue;
+            const uint8_t dst_v = remap_reg(vi.dst);
+            const uint8_t src_v = remap_reg(vi.src);
+            for (size_t s = 0; s < specializations.size(); ++s) {
+                const auto& spec = specializations[s];
+                if (spec.op == vi.op
+                 && spec.dst_vreg == dst_v
+                 && spec.src_vreg == src_v)
+                {
+                    spec_match[i] = static_cast<int>(s);
+                    break;  // first match wins
+                }
+            }
+        }
+    }
+
+    // Phase 1: compute bytecode offsets using spec-aware sizes.
+    // vjmp/vjcc rel32 depends on the target instruction's bytecode offset.
     std::vector<uint32_t> bc_offset(instructions.size() + 1);
     bc_offset[0] = 0;
     for (size_t i = 0; i < instructions.size(); ++i) {
-        bc_offset[i + 1] = bc_offset[i] + insn_bc_size(instructions[i]);
+        const uint32_t size = (spec_match[i] >= 0)
+            ? 1u   // specialised: just handler_id, no operand bytes
+            : (1u + vm_op_operand_size(instructions[i].op));
+        bc_offset[i + 1] = bc_offset[i] + size;
     }
 
     // Phase 2: encode bytecode.
@@ -169,16 +339,19 @@ MxResult<VmRuntime> X64VmBackend::generate(
         bytecode_plain.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
         bytecode_plain.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
     };
-    // Translate a native-reg operand (as emitted by the lifter) to its
-    // per-build virtual slot. The lifter refuses to emit RSP operands for
-    // generic ops, so native_to_slot[n] must be valid here.
-    auto remap_reg = [&](uint8_t native_reg) -> uint8_t {
-        const uint8_t slot = layout.native_to_slot[native_reg];
-        return (slot == VmStackLayout::kJunkMarker) ? layout.junk_slot : slot;
-    };
 
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& vi = instructions[i];
+
+        // G1 — Specialised path: emit only the handler_id, no operand bytes.
+        // The matched specialised handler has dst/src disps baked in, so the
+        // runtime decoder needs no operand fetch.
+        if (spec_match[i] >= 0) {
+            bytecode_plain.push_back(
+                specializations[static_cast<size_t>(spec_match[i])].handler_id);
+            continue;
+        }
+
         uint8_t handler_id;
         if (vi.op == VmOp::native) {
             handler_id = native_handler_ids[next_native_idx];
@@ -677,6 +850,23 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                               imagebase_key_disp);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
+    }
+
+    // ---- Specialised handlers (G1) -----------------------------------------
+    // Each specialisation emits a body with hard-coded slot disps. No
+    // operand fetch, no remap, no reusable shape — every specialised
+    // handler differs from the others and from every generic handler.
+    for (const auto& spec : specializations) {
+        begin_handler(spec.handler_id);
+        const uint8_t dst_disp = static_cast<uint8_t>(spec.dst_vreg * 8);
+        const uint8_t src_disp = static_cast<uint8_t>(spec.src_vreg * 8);
+        if (spec.op == VmOp::mov_rr) {
+            emit_handler_mov_rr_specialized(rt, dst_disp, src_disp);
+        } else {
+            emit_handler_alu_rr_specialized(rt, alu_op_mr_for(spec.op),
+                                             dst_disp, src_disp);
+        }
+        end_handler_tail();
     }
 
     // ---- Handler table -----------------------------------------------------

@@ -442,4 +442,36 @@ void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
     // Both paths converge → tail dispatch follows (emitted by caller).
 }
 
+// ============================================================================
+// Specialised handlers (G1)
+// ============================================================================
+//
+// Both bodies emit exactly 10 bytes followed by the standard tail dispatch
+// (appended by the caller). The operand fetch present in every generic
+// handler — `movzx eax, byte [r11]; xor al, [rsp + key_disp]; ...; shl rcx, 3;
+// lea rsi, [rsp + rcx]` — is gone. Reverser pattern matching for that
+// fetch shape will not catch specialised bodies.
+
+void emit_handler_mov_rr_specialized(RawEmitter& e,
+                                     uint8_t dst_disp, uint8_t src_disp)
+{
+    // mov rax, [rsp + src_disp]    48 8B 44 24 disp8
+    //   ModRM: mod=01, reg=rax=0, rm=100 (SIB)
+    //   SIB:   scale=00, index=100 (none), base=100 (rsp)
+    e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(src_disp);
+    // mov [rsp + dst_disp], rax    48 89 44 24 disp8
+    e.u8(0x48); e.u8(0x89); e.u8(0x44); e.u8(0x24); e.u8(dst_disp);
+}
+
+void emit_handler_alu_rr_specialized(RawEmitter& e, uint8_t op_mr,
+                                     uint8_t dst_disp, uint8_t src_disp)
+{
+    // mov rax, [rsp + src_disp]    48 8B 44 24 disp8
+    e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(src_disp);
+    // OP [rsp + dst_disp], rax     48 op_mr 44 24 disp8
+    //   op_mr is the ALU r/m, r form opcode: add=01, sub=29, xor=31,
+    //   and=21, or=09. Same ModRM/SIB as the mov above.
+    e.u8(0x48); e.u8(op_mr); e.u8(0x44); e.u8(0x24); e.u8(dst_disp);
+}
+
 } // namespace mx::vm::x64

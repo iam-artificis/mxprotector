@@ -133,4 +133,39 @@ void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
                        uint8_t cc, uint32_t vflags_key, uint32_t vflags_rol,
                        int32_t rflags_disp, Randomizer& rng);
 
+// ----------------------------------------------------------------------------
+// Specialized handlers (G1 — Virtual CPU per-build handler specialisation)
+//
+// A specialised handler hard-codes a specific (op, dst_vreg, src_vreg) tuple
+// at emit time. The bytecode for an instruction that matches such a tuple
+// then carries ONLY the handler_id (1 byte) — no operand bytes. This:
+//
+//   * shrinks the bytecode for matching instructions from 3 bytes to 1;
+//   * makes the bytecode VARIABLE-LENGTH per instruction, so a static
+//     disassembler that assumes a fixed 1+operand_size encoding cannot
+//     even tell where the next instruction starts;
+//   * adds K extra distinct handler bodies per build, each with its own
+//     hard-coded `[rsp + slot*8]` disps — different from the generic
+//     handler's `shl/lea/[rsi]` operand-fetch shape.
+//
+// Specialised handlers always use disp8 (slot disps ≤ 120). They never
+// touch the rolling-key slot because the `Specialization` generator
+// excludes the per-region junk slot.
+// ----------------------------------------------------------------------------
+
+/// Specialised mov_rr: emit
+///     mov rax, [rsp + src_disp]
+///     mov [rsp + dst_disp], rax
+/// Both displacements MUST fit in disp8 (caller ensures slot ≤ 15).
+void emit_handler_mov_rr_specialized(RawEmitter& e,
+                                     uint8_t dst_disp, uint8_t src_disp);
+
+/// Specialised r-r ALU: emit
+///     mov rax, [rsp + src_disp]
+///     OP  [rsp + dst_disp], rax
+/// where `op_mr` is the ALU r/m, r opcode byte (add=01, sub=29, xor=31,
+/// and=21, or=09).
+void emit_handler_alu_rr_specialized(RawEmitter& e, uint8_t op_mr,
+                                     uint8_t dst_disp, uint8_t src_disp);
+
 } // namespace mx::vm::x64
