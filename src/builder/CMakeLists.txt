@@ -62,6 +62,7 @@ set(BUILDER_SOURCES
 
     # Phase 4: Virtualization (VM engine)
     protection/vm/vm_lifter.cpp
+    protection/vm/vm_stack_layout.cpp
     protection/vm/vm_runtime_gen.cpp
     protection/vm/virtualization_pass.cpp
 

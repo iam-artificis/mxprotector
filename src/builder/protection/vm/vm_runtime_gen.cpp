@@ -33,34 +33,42 @@
  *       key[i+1] = key[i] ^ plain[i]
  *     Initial key = INITIAL_KEY (per-build random byte).
  *
- * VM stack layout after entry (rsp = caller_rsp - 144):
+ * VM stack layout after entry (see `vm_stack_layout.hpp` for details):
  *
  *   [rsp +   0] = slot 0  \
  *   [rsp +   8] = slot 1   \
  *       ...                 > 16 slots total (one is the "junk slot", host
  *   [rsp + 120] = slot 15  /  of the rolling-key byte; the other 15 hold
  *                         /   the saved native GPRs in a per-build order).
- *   [rsp + 128] = rflags
- *   [rsp + 136] = CALL return address (back to caller instruction stream)
+ *   [rsp + 128] .. [rsp + 128 + 8*P]  = G7 extra padding (0..7 qwords)
+ *   [rsp + 128 + 8*P]                 = rflags      (layout.rflags_offset())
+ *   [rsp + 136 + 8*P]                 = CALL return address
  *
- * Per-build, `VmRegLayout` randomizes:
+ * All per-build randomization of the frame is centralized in
+ * `mx::vm::VmStackLayout` (see vm_stack_layout.hpp):
  *   - which slot each native GPR lives in (native_to_slot / slot_to_native)
  *   - which slot is the junk / rolling-key host (junk_slot)
- *   - consequently, the rolling-key disp = junk_slot * 8
+ *   - the rolling-key disp (= junk_slot * 8)
+ *   - the extra-pad-slot count P ∈ [0..7], which scales rflags_offset,
+ *     context_size, and native_frame_shift
  *
  * The bytecode operand bytes are remapped at emission time from native-reg
  * indices (produced by the lifter) to virtual-slot indices, so the handlers
  * don't need a runtime lookup — they just use `slot * 8` as the offset.
+ * Handler bodies are BYTE-IDENTICAL regardless of P, because GPR slots
+ * [0..15] always live at [rsp + 0..120]. Only the entry/exit stubs and
+ * the RFLAGS/native-shift disps depend on P.
  *
- * The native-escape handler additionally `sub rsp, 16` to reserve a vpc save
- * slot, then `add rsp, 168` around the raw native bytes so the instruction
- * sees the caller's frame. Context loads/stores during native use
- * [rsp + 24 + slot*8].
+ * The native-escape handler additionally `sub rsp, 24` to reserve a vpc
+ * save slot, then `lea rsp, [rsp + native_frame_shift]` around the raw
+ * native bytes so the instruction sees the caller's frame. Context
+ * loads/stores during native use `[rsp + 24 + slot*8]`.
  *
  * Per-build randomization summary:
  *   - INITIAL_KEY (non-zero)
  *   - handler_id permutation (VmOp → handler_id)
- *   - register layout (native → slot permutation + junk-slot selection)
+ *   - stack layout (native → slot permutation + junk-slot + G7 pad count)
+ *   - padding slot contents (random imm32 per slot)
  *   - vflags_key (xor scramble for saved RFLAGS)
  *   - table_xor_key (handler-table encryption)
  *   - NO central dispatcher (threaded code — every handler ends with a
@@ -74,6 +82,7 @@
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/anti_emulation/check_registry.hpp"
+#include "mxprotector/protection/vm/vm_stack_layout.hpp"
 
 #include <algorithm>
 #include <array>
@@ -86,67 +95,25 @@ namespace mx::vm {
 namespace {
 
 // ============================================================================
-// Stack layout constants (must match entry prologue below)
+// Stack layout (see vm_stack_layout.hpp for the per-build randomized
+// VmStackLayout struct that owns all GPR permutation and G7 padding state)
 // ============================================================================
-
-/// VM context layout constants. Virtual slot v lives at `[rsp + v*8]` regardless
-/// of which native reg is stored there — the native-to-slot mapping is randomized
-/// per-build (see VmRegLayout below). Slot-to-native mapping is captured by the
-/// entry stub's push order and by bytecode operand remapping at emission time.
-///
-/// The "junk slot" is one of the 16 slots that does NOT host a real native reg;
-/// it hosts the rolling-key scratch byte. Which slot it is, is chosen at random
-/// per-build.
-constexpr int32_t kRflagsOffset      = 128;  ///< rflags at [rsp + 128]
-constexpr int32_t kContextSize       = 136;  ///< 16*8 (regs) + rflags(8) = 136
-
-/// Per-build random mapping between native GPRs (0..15, minus 4=RSP) and
-/// virtual context slots (0..15, minus the junk slot).
-///
-/// Properties:
-///   - slot_to_native[v] ∈ [0..15], or 0xFF if v is the junk slot
-///   - native_to_slot[n] is the slot holding native reg n; 0xFF if n == 4 (RSP)
-///   - exactly one v has slot_to_native[v] == 0xFF, and that v == junk_slot
-///   - rolling_key_disp = junk_slot * 8
-struct VmRegLayout {
-    std::array<uint8_t, 16> slot_to_native{};
-    std::array<uint8_t, 16> native_to_slot{};
-    uint8_t  junk_slot         = 0;
-    int32_t  rolling_key_disp  = 0;
-};
-
-/// Build a random register layout. RSP (native 4) is never pushed; the slot
-/// that "would" hold it is instead the junk / rolling-key slot.
-[[nodiscard]] inline VmRegLayout make_random_layout(Randomizer& rng) {
-    VmRegLayout L{};
-    // Start with identity permutation of 16 slots...
-    std::array<uint8_t, 16> perm{};
-    std::iota(perm.begin(), perm.end(), static_cast<uint8_t>(0));
-    // ...then Fisher–Yates shuffle.
-    for (size_t i = 15; i > 0; --i) {
-        const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
-        std::swap(perm[i], perm[j]);
-    }
-    // perm[v] == native reg stored at slot v.
-    L.slot_to_native = perm;
-    L.native_to_slot.fill(0xFF);
-    for (uint8_t v = 0; v < 16; ++v) {
-        L.native_to_slot[perm[v]] = v;
-    }
-    // Native 4 = RSP cannot really be pushed; its slot becomes the junk slot.
-    L.junk_slot = L.native_to_slot[4];
-    L.slot_to_native[L.junk_slot] = 0xFF;
-    L.native_to_slot[4] = 0xFF;
-    L.rolling_key_disp = static_cast<int32_t>(L.junk_slot) * 8;
-    return L;
-}
-
-/// Frame shift between the caller's rsp (at CALL time) and vm_rsp inside a
-/// native handler after `sub rsp, 16` (vpc scratch). Used to restore the
-/// caller's rsp for the native instruction body.
-///
-///   8 (ret)  + 8 (rflags)  + 128 (16 regs)  + 16 (native scratch)  =  160
-constexpr int32_t kNativeFrameShift = 168;
+//
+// Virtual slot v lives at `[rsp + v*8]` for v ∈ [0..15] regardless of which
+// native reg is stored there — the native-to-slot mapping is randomized
+// per-build (VmStackLayout::slot_to_native / native_to_slot). Slot-to-native
+// is captured by the entry stub's push order and by bytecode operand
+// remapping at emission time.
+//
+// The "junk slot" is the slot that does NOT host a real native reg; it
+// hosts the rolling-key scratch byte. Its index is chosen at random per-build.
+//
+// The RFLAGS slot lives at `layout.rflags_offset()` — `kBaseRflagsOffset`
+// (128) plus `extra_pad_slots * 8`. G7 padding is inserted ABOVE the GPR
+// area so handler bodies see slot disps unchanged.
+//
+// The native handler frame shift is `layout.native_frame_shift()` —
+// `kBaseNativeShift` (168) plus the same padding amount.
 
 // ============================================================================
 // RawEmitter — see include/mxprotector/core/raw_emitter.hpp.
@@ -943,6 +910,7 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      std::vector<size_t>& table_key_patches,
                                      uint32_t vflags_key,
                                      uint32_t vflags_rol,
+                                     int32_t rflags_disp,
                                      Randomizer* rng,
                                      int32_t imagebase_key_disp = -1) {
     // Optionally save CPU rflags into the VM context BEFORE clobbering them
@@ -952,7 +920,7 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     if (save_rflags) {
         const auto v = (rng != nullptr) ? pick_store_variant(*rng)
                                          : VflagsStoreV::RaxRolFirst;
-        emit_vflags_store(e, v, vflags_key, vflags_rol, kRflagsOffset);
+        emit_vflags_store(e, v, vflags_key, vflags_rol, rflags_disp);
     }
 
     emit_movzx_r32_byte_mem(e, 0 /*rax*/, 11, 0);
@@ -1174,29 +1142,6 @@ void emit_handler_shift(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t s
 }
 
 // ---------------------------------------------------------------------------
-// RFLAGS save — needed so VJCC can read flags set by prior ALU handlers
-// ---------------------------------------------------------------------------
-
-/// Save current CPU rflags into the VM context slot so that a subsequent
-/// VJCC handler can evaluate branch conditions. Called at the END of every
-/// handler body that may modify arithmetic flags (ADD, SUB, XOR, AND, OR,
-/// IMUL, NOT, NEG, SHL, SHR, SAR, ROL, ROR and native escape).
-void emit_save_rflags_to_ctx(RawEmitter& e) {
-    // pushfq          9C
-    e.u8(0x9C);
-    // pop rax         58
-    e.u8(0x58);
-    // mov [rsp + kRflagsOffset], rax
-    // kRflagsOffset = 128: needs disp32 form.
-    // 48 89 84 24 80 00 00 00
-    e.u8(0x48); e.u8(0x89); e.u8(0x84); e.u8(0x24);
-    e.u8(static_cast<uint8_t>(kRflagsOffset & 0xFF));
-    e.u8(static_cast<uint8_t>((kRflagsOffset >> 8) & 0xFF));
-    e.u8(static_cast<uint8_t>((kRflagsOffset >> 16) & 0xFF));
-    e.u8(static_cast<uint8_t>((kRflagsOffset >> 24) & 0xFF));
-}
-
-// ---------------------------------------------------------------------------
 // VJMP / VJCC handlers
 // ---------------------------------------------------------------------------
 
@@ -1228,14 +1173,15 @@ void emit_handler_vjmp(RawEmitter& e, int32_t key_disp, bool rolling) {
 /// Multi-bit conditions (CC 6,7,12-15) are supported via compound tests.
 void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
                        uint8_t cc, uint32_t vflags_key,
-                       uint32_t vflags_rol, Randomizer& rng) {
+                       uint32_t vflags_rol, int32_t rflags_disp,
+                       Randomizer& rng) {
     emit_fetch_dword(e, key_disp, rolling);      // eax = rel32
     // movsxd rax, eax        48 63 C0
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);
 
     // Load and fully descramble saved RFLAGS into ecx (polymorphic).
     emit_vflags_to_ecx(e, pick_to_ecx_variant(rng),
-                       vflags_key, vflags_rol, kRflagsOffset);
+                       vflags_key, vflags_rol, rflags_disp);
 
     // Determine which RFLAGS bit(s) to test and whether to jump-if-set or
     // jump-if-clear. We emit: `test rcx, MASK; jnz taken` or `jz taken`.
@@ -1386,11 +1332,15 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const uint32_t vflags_key = rng.next_u32() | 1;      // any non-zero u32
     const uint32_t vflags_rol = rng.next_range(1, 31);   // rotate amount 1..31
 
-    // Per-build random register layout: which virtual slot hosts each native
-    // GPR. Cross-VM sub-VMs use independent layouts — register state flows
+    // Per-build random VM stack layout: which virtual slot hosts each native
+    // GPR, which slot is the junk slot, AND how many extra padding qwords
+    // sit between the GPR area and the RFLAGS slot (G7 randomization).
+    // Cross-VM sub-VMs use independent layouts — register state flows
     // between them via CPU, not via slots.
-    const VmRegLayout layout = make_random_layout(rng);
-    const int32_t rolling_key_disp = layout.rolling_key_disp;
+    const VmStackLayout layout      = VmStackLayout::make_random(rng);
+    const int32_t rolling_key_disp  = layout.rolling_key_disp;
+    const int32_t rflags_disp       = layout.rflags_offset();
+    const int32_t native_shift      = layout.native_frame_shift();
 
     const uint32_t native_count = static_cast<uint32_t>(std::count_if(
         instructions.begin(), instructions.end(),
@@ -1479,8 +1429,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     auto remap_reg = [&](uint8_t native_reg) -> uint8_t {
         const uint8_t slot = layout.native_to_slot[native_reg];
         // Defensive: if the lifter ever lets RSP through, fall back to junk
-        // slot rather than writing 0xFF into the bytecode.
-        return (slot == 0xFF) ? layout.junk_slot : slot;
+        // slot rather than writing the kJunkMarker sentinel into the bytecode.
+        return (slot == VmStackLayout::kJunkMarker) ? layout.junk_slot : slot;
     };
 
     for (size_t i = 0; i < instructions.size(); ++i) {
@@ -1619,6 +1569,18 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const size_t entry_offset = rt.size();
 
     emit_pushfq(rt);
+
+    // G7: extra padding slots between RFLAGS and the GPR area. After pushfq,
+    // before the 16 reg pushes, emit `extra_pad_slots` × `push imm32` so the
+    // GPR area still lands at [rsp + 0..120] but RFLAGS sits 8*N bytes higher.
+    // Each `push imm32` is 5 bytes (68 imm32) and pushes a sign-extended
+    // 64-bit qword, so the padding values vary per-build — they contribute
+    // both to the entry stub size variance AND to the bytewise content.
+    for (uint8_t p = 0; p < layout.extra_pad_slots; ++p) {
+        rt.u8(0x68);
+        rt.u32(rng.next_u32());
+    }
+
     // 16 register pushes, permuted per-build. Push at position K lands at
     // offset (15-K)*8, so to put slot V at [rsp + V*8] we push it at K=15-V.
     // The junk slot (native RSP's would-be home) is filled with a dummy
@@ -1645,7 +1607,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // descrambles before popfq, every entry re-scrambles unconditionally.
     if (vflags_key != 0 || vflags_rol != 0) {
         emit_vflags_inslot_scramble(rt, pick_inslot_variant(rng),
-                                     vflags_key, vflags_rol, kRflagsOffset);
+                                     vflags_key, vflags_rol, rflags_disp);
     }
 
     // Handler-table key derivation: if `opts.use_imagebase_key` is set,
@@ -1838,7 +1800,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     // random table-base reg and dispatch shape just like handler tails.
     const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                 false, table_key_patches,
-                                                vflags_key, vflags_rol, &rng,
+                                                vflags_key, vflags_rol,
+                                                rflags_disp, &rng,
                                                 imagebase_key_disp);
     table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 
@@ -1860,7 +1823,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     auto end_handler_tail = [&]() {
         const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                           has_branches, table_key_patches,
-                                          vflags_key, vflags_rol, &rng,
+                                          vflags_key, vflags_rol,
+                                          rflags_disp, &rng,
                                           imagebase_key_disp);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
     };
@@ -1918,7 +1882,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             case VmOp::vjcc:
                 emit_handler_vjcc(rt, rolling_key_disp, rolling,
                                   static_cast<uint8_t>(variant),
-                                  vflags_key, vflags_rol, rng);
+                                  vflags_key, vflags_rol,
+                                  rflags_disp, rng);
                 return true;
 
             case VmOp::native:
@@ -1935,7 +1900,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                 if (vflags_key != 0 || vflags_rol != 0) {
                     emit_vflags_inslot_descramble(rt, pick_inslot_variant(rng),
                                                    vflags_key, vflags_rol,
-                                                   kRflagsOffset);
+                                                   rflags_disp);
                 }
 
                 // Exit: pop all 16 slots in slot order (slot 0 at [rsp+0]
@@ -1949,6 +1914,15 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
                         emit_pop_reg(rt, layout.slot_to_native[v]);
                     }
                 }
+
+                // G7: discard the extra padding slots that entry pushed
+                // between the GPR area and RFLAGS. Single `add rsp, imm8`
+                // (imm8 max is 56 for extra_pad_slots==7, fits in i8).
+                if (layout.extra_pad_slots > 0) {
+                    rt.u8(0x48); rt.u8(0x83); rt.u8(0xC4);
+                    rt.u8(static_cast<uint8_t>(layout.extra_pad_slots * 8));
+                }
+
                 emit_popfq(rt);
                 if (emit_exit_as_jmp) {
                     // Cross-VM: jmp rel32 to next sub-VM entry (patched later)
@@ -2029,7 +2003,9 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         // reg-based variants clobber rax, so we save it to scratch [rsp+8]
         // first; the InPlace variant uses no registers at all.
         {
-            const int32_t rf_disp = 24 + kRflagsOffset;
+            // rsp was shifted by `sub rsp, 24` above, so ctx disps add 24
+            // to the layout-relative `rflags_disp`.
+            const int32_t rf_disp = 24 + rflags_disp;
             const auto popfq_v = pick_popfq_variant(rng);
             const bool uses_rax = (popfq_v != VflagsPopfqV::InPlace);
             if (uses_rax) {
@@ -2045,7 +2021,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
         // Shift rsp to caller frame via LEA (flag-preserving).
         rt.u8(0x48); rt.u8(0x8D); rt.u8(0xA4); rt.u8(0x24);
-        rt.u32(static_cast<uint32_t>(kNativeFrameShift));
+        rt.u32(static_cast<uint32_t>(native_shift));
 
         // Execute native bytes (sees correct GPRs, flags, and caller frame).
         rt.bytes(ByteView{
@@ -2054,13 +2030,13 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
 
         // Shift rsp back via LEA (flag-preserving).
         rt.u8(0x48); rt.u8(0x8D); rt.u8(0xA4); rt.u8(0x24);
-        rt.u32(static_cast<uint32_t>(-kNativeFrameShift));
+        rt.u32(static_cast<uint32_t>(-native_shift));
 
         // Save CPU flags after native execution into ctx so the NEXT
         // handler (or VJCC) sees the correct flags. Polymorphic — reg
         // variants clobber rax and need the scratch dance, InPlace does not.
         {
-            const int32_t rf_disp = 24 + kRflagsOffset;
+            const int32_t rf_disp = 24 + rflags_disp;
             const auto store_v = pick_store_variant(rng);
             const bool uses_rax = (store_v != VflagsStoreV::InPlace);
             if (uses_rax) {
@@ -2085,7 +2061,8 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         {
             const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,
-                                              vflags_key, vflags_rol, &rng,
+                                              vflags_key, vflags_rol,
+                                              rflags_disp, &rng,
                                               imagebase_key_disp);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }

@@ -14,6 +14,12 @@ cmake_minimum_required(VERSION 3.20)
 set(TEST_SOURCES
     mutation_engine_test.cpp
     cfg_flattening_test.cpp
+    vm_stack_layout_test.cpp
+)
+
+# VM sources needed for VmStackLayout tests
+set(VM_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
 )
 
 # ==============================================================================
@@ -46,7 +52,7 @@ set(CFF_SOURCES
 # Цель: mxprotector_tests
 # ==============================================================================
 
-add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES})
+add_executable(mxprotector_tests ${TEST_SOURCES} ${MUTATION_SOURCES} ${CFF_SOURCES} ${VM_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 
