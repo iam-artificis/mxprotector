@@ -27,29 +27,26 @@ below for the full spec.
 2. 📋 **SYS packer.** DriverEntry stub variant. Same shape as DLL but for
    kernel-mode entry ABI. Blocked on test-signing infrastructure, not on
    code. Lower priority than DLL.
-3. 📋 **Packer strengthening — P3 VM-protected entry stub.** Entry stub
-   (anti-debug, key derivation, decrypt loop) itself virtualized through
-   the existing VM engine. § "Packer strengthening" → P3.
-4. 📋 **Packer strengthening — P5 import hashing.** Replace plain
+3. 📋 **Packer strengthening — P5 import hashing.** Replace plain
    `LoadLibrary` + `GetProcAddress(name)` in the packer stub with DJB2/FNV-1a
    hash resolution from kernel32/ntdll export tables. Kills `strings` on
    packed binaries. § "Packer strengthening" → P5.
-5. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
+4. 📋 **Packer strengthening — P2 / P4 / P6 / P7 / P8.** Multi-layer
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-6. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
+5. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
     (load, store, key derivation). § "Gap vs коммерческие" → G2.
-7. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
+6. 📋 **VM strengthening — G4 bytecode semantic obfuscation.** Dead
     opcodes, opaque bytecode branches, handler id polymorphism, rolling
     key per handler. § "Gap vs коммерческие" → G4.
-8. 📋 **VM strengthening — G5 handler call graph obfuscation.**
+7. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
-9. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
+8. 📋 **G6 symbolic-execution hardening.** Hash-based opaque predicates,
     memory-dependent control flow, loop-based key schedules. Hardest,
     lowest on the list. § "Gap vs коммерческие" → G6.
-10. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
+9. 📋 **G3 extensions — extra anti-tamper checks.** Thread context
     poisoning (`NtQueryInformationThread` self-inspect), guard-page
     VEH-integrity trap. Independent of the main chain, can slot in any
     time.
@@ -152,11 +149,28 @@ cryptographic floor is needed against a dedicated adversary.
 VMProtect делает 3-5 слоёв: layer N раскрывает layer N+1, затем сам себя
 стирает (`VirtualProtect` + memset). Reverser должен пройти все слои trace'ом.
 
-### 📋 P3. Entry stub как VM regions *(высокий)*
-Packer entry-stub (anti-debug, key derivation, decrypt loop) сам
-виртуализируется через существующий VM engine. Рекурсивная защита: packer
-обеспечивает secrecy на диске, VM обеспечивает difficulty reverse'а самой
-распаковки.
+### ✅ P3. Entry stub как VM regions
+Shipped. The packer's RC4 KSA block (init loop + mix loop + PRGA
+state reset) is lifted through `VmLifter` + `VmRuntimeGenerator`
+inside `PackerPass::execute`, and the plaintext KSA bytes in the
+emitted stub are overwritten with `call rel32 <vm_entry>` + NOP
+padding. The VM blob is appended to `.mxpack` alongside the RC4
+key, S-box scratch, and reprotect table.
+
+Runtime flow: the packer stub still does `lea rsi, key` +
+`lea r8, sbox` as plaintext (the VM lifter rejects rip-relative),
+then `call vm_entry` dispatches into the VM for the whole KSA, and
+the VM's exit leaves `r8` and `rsi` unchanged while zeroing
+`r9`/`r10` for the subsequent PRGA loops. The per-section PRGA
+loops and the reprotect block remain plaintext — they're the
+hottest part of the stub and wrapping them in the VM would be a
+perf regression for negligible static-analysis value once the
+KSA is already hidden.
+
+VmGenOptions: `skip_anti_tamper_checks = true` (the same opt-out
+S2c uses, because `.mxpack` is R+W+X and the page-protection
+probe would misfire), `use_imagebase_key = true` (packer strips
+ASLR so runtime ImageBase matches preferred).
 
 ### 📋 P4. TLS callback как secondary entry *(средний)*
 Entry point сейчас один — наш stub. TLS callback выполняется ДО entry point'а

@@ -30,6 +30,8 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/vm/vm_lifter.hpp"
+#include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -164,6 +166,17 @@ struct StubPatches {
     uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded 32-byte RC4 key)
     uint32_t rel_to_sbox_at;       ///< patch offset (rel32 from end-of-lea to 256-byte scratch S-box)
     uint32_t rel_to_oep_at;        ///< patch offset (rel32 from end-of-jmp to OEP + stolen_size)
+
+    // P3 — VM-protected entry stub. The range
+    // `[ksa_block_start_offset, ksa_block_end_offset)` inside the emitted
+    // stub holds the RC4 KSA (init loop + mix loop + PRGA state reset).
+    // If the caller succeeds in lifting those bytes through the VM engine
+    // they overwrite the range with `call rel32 <vm_entry>` + NOP padding
+    // and append the runtime blob elsewhere in the stub buffer. On lift
+    // failure the range stays as plaintext — the packer still runs
+    // correctly, it just isn't VM-wrapped.
+    uint32_t ksa_block_start_offset = 0;
+    uint32_t ksa_block_end_offset   = 0;
     uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
     uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
     uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
@@ -451,6 +464,13 @@ struct StolenPlan {
     //     xor  r9,  r9                ; i = 0
     //     xor  r10, r10               ; j = 0
 
+    // Mark the start of the VM-liftable KSA block. Everything from
+    // here through `xor r10, r10` (PRGA state reset) is pure
+    // register / r8-or-rsi-relative code — no rip-relative memory
+    // operands, no syscalls, no external branches. Safe for the
+    // VmLifter.
+    patches.ksa_block_start_offset = static_cast<uint32_t>(buf.size());
+
     // Phase 1: init S[k] = k.
     u8(0x31); u8(0xC9);                          // xor ecx, ecx
     const uint32_t init_loop_start = static_cast<uint32_t>(buf.size());
@@ -489,6 +509,12 @@ struct StolenPlan {
     // `dl` across sections.
     u8(0x4D); u8(0x31); u8(0xC9);                // xor r9, r9     (i  = 0)
     u8(0x4D); u8(0x31); u8(0xD2);                // xor r10, r10   (j  = 0)
+
+    // End of the VM-liftable KSA block. The caller may replace the
+    // range `[ksa_block_start_offset, ksa_block_end_offset)` with a
+    // `call rel32 <vm_entry>` + NOP pad, hiding the RC4 setup inside
+    // a VM region.
+    patches.ksa_block_end_offset = static_cast<uint32_t>(buf.size());
 
     // (4) Per-section decrypt loop — RC4 PRGA.
     //
@@ -1004,7 +1030,92 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     const uint32_t sbox_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), kSboxSize, uint8_t{0});
 
-    // Embed the reprotect section table right after the S-box: one
+    // (5a) P3 — VM-protected entry stub.
+    //
+    // If a disassembler is available, lift the RC4 KSA block (init
+    // loop + mix loop + PRGA state reset — see `ksa_block_*_offset`
+    // recorded by `build_stub_bytes`) through the existing VM engine
+    // and append the runtime blob to the stub buffer. The original
+    // KSA bytes inside the stub are later overwritten with
+    // `call rel32 <vm_entry>` + NOP padding (step 7a below) so the
+    // entry stub dispatches the key derivation through a VM region
+    // instead of executing it as plaintext x64.
+    //
+    // Two things the lifted block deliberately includes:
+    //   * The `xor r9, r9; xor r10, r10` PRGA state reset, so the
+    //     PRGA loops that run AFTER the VM exits see a consistent
+    //     initial (i=0, j=0). The VM's exit writes these back to
+    //     the real registers.
+    //   * No rip-relative operands. `r8` and `rsi` are loaded BEFORE
+    //     the KSA block via plaintext `lea` pairs; the VM just uses
+    //     the values the caller handed it.
+    //
+    // Anti-tamper checks are skipped for this VM: `.mxpack` is
+    // R+W+X on purpose (the KSA writes the S-box in place) and the
+    // page-protection probe would trip on that.
+    size_t   packer_vm_blob_offset       = 0;
+    uint32_t packer_vm_entry_offset      = 0;
+    bool     packer_vm_lift_succeeded    = false;
+    if (ctx.disassembler() != nullptr &&
+        patches.ksa_block_end_offset > patches.ksa_block_start_offset)
+    {
+        const size_t ksa_size =
+            patches.ksa_block_end_offset - patches.ksa_block_start_offset;
+        ByteView ksa_view{
+            stub_buf.data() + patches.ksa_block_start_offset,
+            ksa_size};
+
+        vm::VmLifter lifter(*ctx.disassembler());
+        // Fake base VA — the lift only uses it for intra-region
+        // branch resolution, and the KSA block has no external
+        // branches.
+        constexpr Va kFakeKsaBase = 0x0000000140000000ULL;
+        auto lift_result = lifter.lift(ksa_view, kFakeKsaBase);
+        if (!lift_result) {
+            ctx.log_fmt("PackerPass: P3 VM-lift KSA failed ({}), keeping plaintext",
+                lift_result.error().message());
+        } else {
+            auto [vm_insns, report] = *lift_result;
+            ctx.log_fmt("PackerPass: P3 VM-lift OK — total={}, generic={}, native={}",
+                report.total_insns, report.generic_ops, report.native_ops);
+
+            vm::VmRuntimeGenerator gen;
+            const vm::VmGenOptions opts{
+                .emit_exit_as_jmp        = false,
+                // Packer strips ASLR so runtime ImageBase matches
+                // preferred — same condition VirtualizationPass uses.
+                .use_imagebase_key       = true,
+                .preferred_image_base    =
+                    static_cast<uint64_t>(ctx.pe_image().image_base()),
+                // `.mxpack` stays R+W+X for the S-box — the
+                // page-protection probe would misfire.
+                .skip_anti_tamper_checks = true,
+            };
+            auto runtime = gen.generate(vm_insns, rng, opts);
+            if (!runtime) {
+                ctx.log_fmt("PackerPass: P3 VM-lift generate failed ({}), keeping plaintext",
+                    runtime.error().message());
+            } else {
+                // Align the blob to 16 bytes so handler loads land
+                // on naturally aligned addresses.
+                while (stub_buf.size() % 16 != 0) {
+                    stub_buf.push_back(0xCC);
+                }
+                packer_vm_blob_offset   = stub_buf.size();
+                packer_vm_entry_offset  = runtime->entry_offset;
+                stub_buf.insert(stub_buf.end(),
+                                runtime->blob.begin(),
+                                runtime->blob.end());
+                packer_vm_lift_succeeded = true;
+                ctx.log_fmt("PackerPass: P3 VM blob {} байт, entry @ stub+0x{:X}",
+                    runtime->blob.size(),
+                    packer_vm_blob_offset + packer_vm_entry_offset);
+            }
+        }
+    }
+
+    // Embed the reprotect section table right after the VM blob (or
+    // right after the S-box if no blob was appended): one
     // {rva: u32, size: u32} entry per encrypted section. The content
     // is zero-filled here and patched in step (7) once section RVAs
     // are final.
@@ -1080,6 +1191,49 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         const int32_t rel = static_cast<int32_t>(
             static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
         write_i32(pack_sec.data, patches.rel_to_sbox_at, rel);
+    }
+
+    // P3 — if the KSA block was successfully lifted, overwrite the
+    // plaintext KSA bytes with `call rel32 <vm_entry>` + NOP pad.
+    // Runtime flow becomes:
+    //
+    //   save regs
+    //   anti-debug → edx
+    //   lea rsi, key; lea r8, sbox
+    //   call vm_entry                   ; [NEW] KSA dispatched through VM
+    //   <NOPs filling the rest of the old KSA range>
+    //   per-section PRGA loop           ; unchanged, reads r8/r9/r10 state
+    //   reprotect block
+    //   ...
+    //
+    // When the VM exits, guest r8 / rsi are still the same pointers
+    // (the KSA only writes the S-box through r8, doesn't overwrite
+    // the pointer itself), and guest r9 / r10 are zero (the PRGA
+    // state reset at the end of the lifted block). The PRGA loops
+    // read those values unchanged, so the post-VM state is
+    // bit-for-bit identical to the old plaintext path.
+    if (packer_vm_lift_succeeded) {
+        const Rva vm_entry_rva =
+            stub_rva +
+            static_cast<Rva>(packer_vm_blob_offset) +
+            static_cast<Rva>(packer_vm_entry_offset);
+        const uint32_t ksa_off = patches.ksa_block_start_offset;
+        const Rva    call_rva   = stub_rva + ksa_off;
+        const Rva    call_end_rva = call_rva + 5;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(vm_entry_rva) -
+            static_cast<int64_t>(call_end_rva));
+
+        pack_sec.data[ksa_off + 0] = 0xE8;  // call rel32
+        pack_sec.data[ksa_off + 1] = static_cast<uint8_t>(rel        & 0xFF);
+        pack_sec.data[ksa_off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
+        pack_sec.data[ksa_off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
+        pack_sec.data[ksa_off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
+        for (uint32_t i = ksa_off + 5; i < patches.ksa_block_end_offset; ++i) {
+            pack_sec.data[i] = 0x90;
+        }
+        ctx.log_fmt("PackerPass: P3 KSA replaced with call vm_entry @ RVA=0x{:08X}",
+            vm_entry_rva);
     }
 
     // lea r14, [rip + rel] → reprotect section table (one {rva,size} per
