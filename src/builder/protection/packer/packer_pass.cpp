@@ -722,7 +722,21 @@ std::vector<size_t> collect_target_sections(const PeImage& image,
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     // The self-unpacking stub is assembled in x64 PE form; other targets
     // need their own packer implementations.
-    return ctx.config().enable_packer && ctx.target().is_windows_pe_x64();
+    if (!ctx.config().enable_packer)      return false;
+    if (!ctx.target().is_windows_pe_x64()) return false;
+
+    // The stub assumes executable entry-point semantics: a single
+    // thread enters at OEP with no arguments and runs the unpack
+    // loop before jumping to the real OEP. DLLs enter via DllMain
+    // with a (HINSTANCE, DWORD reason, LPVOID) ABI; kernel drivers
+    // via DriverEntry with (PDRIVER_OBJECT, PUNICODE_STRING).
+    // Dropping the exe-shaped stub on either of those produces a
+    // binary that crashes on load. Auto-skip until the packer grows
+    // a DLL/SYS-aware variant.
+    const auto pe_type = ctx.pe_image().pe_type();
+    if (pe_type != PeType::executable) return false;
+
+    return true;
 }
 
 MxStatus PackerPass::execute(ProtectionContext& ctx) {

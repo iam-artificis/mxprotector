@@ -126,14 +126,20 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     vm::VmRuntimeGenerator gen;
 
     // Build-wide VM generator options. `use_imagebase_key` is gated on the
-    // packer being enabled — the packer strips ASLR (IMAGE_FILE_RELOCS_STRIPPED
-    // + DllCharacteristics.DYNAMIC_BASE cleared) so runtime ImageBase matches
-    // the build-time preferred ImageBase. Without the packer, ASLR stays on
-    // and the runtime ImageBase is unpredictable, so we must keep the legacy
-    // imm32 table key.
+    // packer being enabled AND the target being an executable — the packer
+    // strips ASLR (IMAGE_FILE_RELOCS_STRIPPED + DllCharacteristics.DYNAMIC_BASE
+    // cleared) so runtime ImageBase matches the build-time preferred
+    // ImageBase. The packer only supports EXE today (see
+    // `PackerPass::is_applicable`); DLLs and kernel drivers get relocated at
+    // load time, so their runtime ImageBase is unknown at build time and the
+    // key would decrypt to garbage. Without both conditions we keep the
+    // legacy imm32 table key.
+    const bool packer_will_run =
+        ctx.config().enable_packer &&
+        ctx.pe_image().pe_type() == PeType::executable;
     const vm::VmGenOptions default_opts{
         .emit_exit_as_jmp     = false,
-        .use_imagebase_key    = ctx.config().enable_packer,
+        .use_imagebase_key    = packer_will_run,
         .preferred_image_base = static_cast<uint64_t>(ctx.pe_image().image_base()),
     };
     if (default_opts.use_imagebase_key) {
