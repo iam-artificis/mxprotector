@@ -166,6 +166,42 @@ struct EmittedTrampoline {
 /// includes a pause-based spin-wait for the contended path.
 inline constexpr size_t kMxStrGetSize              = 93;
 
+/// Offset inside `emit_mx_str_get()` where the XOR decrypt loop
+/// starts. This is the S2c "virtualizable window": four instructions,
+/// all of them simple register / r10-or-r8-relative forms that lift
+/// cleanly through the existing VM engine.
+///
+///   .loop:
+///     xor  byte [r8], dl    ; 3 bytes
+///     inc  r8               ; 3 bytes
+///     dec  rcx              ; 3 bytes
+///     jnz  .loop            ; 2 bytes
+///
+/// Narrower than "whole body" on purpose — the VM engine is stress-
+/// tested against arbitrary arithmetic, but exotic primitives we
+/// carry (`lock cmpxchg`, `pause`, 8-bit memory ops) interact
+/// unpredictably with polymorphic handler variants when chained
+/// back-to-back as consecutive `VmOp::native` handlers. Lifting only
+/// the decrypt loop keeps the VM region small (1 vjcc + 3 natives)
+/// and deterministic enough to be stable across per-build RNG draws.
+///
+/// S2c replaces this range in place with `call rel32 <vm_entry>` +
+/// NOP padding. The `jz .mark_done` that precedes the loop targets
+/// byte `kMxStrGetLoopEndOffset` (= `.mark_done`), which is outside
+/// this range, so the rcx==0 fast-path still bypasses the VM.
+inline constexpr size_t kMxStrGetLoopOffset        = 73;
+
+/// Offset (exclusive) of the last byte of the VM-protectable loop.
+/// Byte 84 is `.mark_done` (the plain-store of the done flag), which
+/// stays plaintext so the lifter's "target == region_end_va" sentinel
+/// routes `jnz .loop` fall-through to a VM exit that returns to the
+/// instruction immediately after the loop.
+inline constexpr size_t kMxStrGetLoopEndOffset     = 84;
+
+/// Number of bytes in the VM-protectable loop window.
+inline constexpr size_t kMxStrGetLoopSize          =
+    kMxStrGetLoopEndOffset - kMxStrGetLoopOffset;
+
 /// Trampoline byte sizes by target category.
 inline constexpr size_t kTrampolineSizeVolatile    = 40;
 inline constexpr size_t kTrampolineSizeNonVolatile = 38;

@@ -26,12 +26,18 @@ set(TEST_SOURCES
     string_protection_pass_test.cpp
 )
 
-# VM sources needed for VmStackLayout + x64 handler tests
+# VM sources needed for VmStackLayout + x64 handler tests and for
+# StringProtectionPass --strings=vm lift/generate symbols pulled in by
+# the S2c orchestrator.
 set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_lifter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_runtime_gen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_emitters.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vflags.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handlers.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_backend.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/zydis_disassembler.cpp
 )
 
 # Anti-emulation sources needed for check registry tests

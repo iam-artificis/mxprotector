@@ -592,8 +592,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
         rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
         rt.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
 
-        // Anti-emulation checks.
-        {
+        // Anti-emulation checks. Suppressed when the caller opted
+        // out via `skip_anti_tamper_checks` — see VmGenOptions docs
+        // for why S2c's inner VM needs this.
+        if (!opts.skip_anti_tamper_checks) {
             static const anti_emulation::CheckRegistry registry;
             if (registry.size() > 0) {
                 const size_t upper = std::min<size_t>(registry.size(), 2);
@@ -622,7 +624,16 @@ MxResult<VmRuntime> X64VmBackend::generate(
         // checks the hash is 0 and we skip the ~155-byte resolver
         // block entirely — this is what makes it cheap to add new
         // user-mode checks without touching the orchestration here.
-        {
+        //
+        // Suppressed when the caller opted out via
+        // `skip_anti_tamper_checks`. Specifically, `page_protection_check`
+        // reads its containing section's protection mask via
+        // NtQueryVirtualMemory and expects the packer to have revoked
+        // WRITE; S2c's inner VM lives in `.mxstr` which is
+        // intentionally R+W+X (for the in-place XOR decrypt + sticky
+        // flag), so the check would corrupt the handler-table key
+        // on roughly one build in four.
+        if (!opts.skip_anti_tamper_checks) {
             static const anti_tamper::CheckRegistry tamper_registry;
             if (tamper_registry.size() > 0) {
                 const auto picks = tamper_registry.pick_random(1, rng);

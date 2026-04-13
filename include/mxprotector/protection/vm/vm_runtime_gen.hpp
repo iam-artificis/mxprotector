@@ -69,6 +69,24 @@ struct VmGenOptions {
     /// Preferred ImageBase from the input PE (OptionalHeader.ImageBase).
     /// Only consulted when `use_imagebase_key == true`.
     uint64_t preferred_image_base = 0;
+
+    /// Skip the anti-tamper entry-stub checks (page_protection_sweep,
+    /// self_crc, hw_breakpoint_check, import_hook_detect) for this
+    /// runtime.
+    ///
+    /// Intended for callers whose VM blob lives in a section that
+    /// stays writable at runtime — e.g. S2c's string decryptor, which
+    /// sits in `.mxstr` alongside the descriptor table and ciphertext
+    /// pool. The page-protection probe assumes the packer has revoked
+    /// WRITE on the VM section (as `VirtualizationPass` does for
+    /// `.mxvm`), and tripping on an intentionally-writable section
+    /// corrupts the handler-table key → random crashes.
+    ///
+    /// Disables BOTH the anti-tamper and anti-emulation random picks
+    /// for the affected blob; the outer `VirtualizationPass` still
+    /// emits them for the user's VM regions, so overall protection
+    /// is preserved.
+    bool skip_anti_tamper_checks = false;
 };
 
 class VmRuntimeGenerator final {

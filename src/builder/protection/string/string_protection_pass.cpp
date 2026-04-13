@@ -39,6 +39,8 @@
 #include "mxprotector/protection/string/string_encryptor.hpp"
 #include "mxprotector/protection/string/string_scanner.hpp"
 #include "mxprotector/protection/string/string_xref_finder.hpp"
+#include "mxprotector/protection/vm/vm_lifter.hpp"
+#include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -414,6 +416,108 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
                            enc.ciphertext.end());
     }
 
+    // (7a) S2c — optional VM-lifted decryptor body.
+    //
+    // If the caller asked for `--strings=vm` (`virtualized`), lift the
+    // middle of `mx_str_get` (everything past the two `lea rip+disp32`
+    // header instructions and before the final `ret`) into a VM runtime
+    // blob and append it to the section. The decryptor prefix stays
+    // plaintext — it only uses RIP-relative LEAs which the lifter
+    // rejects — and the final `ret` stays plaintext too because `ret`
+    // is unconditionally rejected as control-flow by the lifter.
+    //
+    // The body range between them is pure register / r10-relative code
+    // (test, lock cmpxchg, pause, xor byte, inc/dec, mov byte, ...),
+    // which either lifts generically or escapes to `VmOp::native`. The
+    // post-section step patches bytes [34..91) inside the decryptor
+    // with `call rel32 <vm_entry>` + NOP padding so the first-time
+    // caller enters the VM, runs the lifted body, and falls back into
+    // the plaintext `ret` via the NOP slide.
+    //
+    // On any lift / generate failure we log, fall back to the plain
+    // S2b body (the protected binary still works correctly) and mark
+    // `vm_lift_succeeded = false` so the post-add patching is skipped.
+    size_t   vm_blob_offset         = 0;
+    uint32_t vm_blob_entry_offset   = 0;
+    bool     vm_lift_succeeded      = false;
+    if (ctx.config().string_protection == StringProtectionMode::virtualized) {
+        // Preconditions: lifting needs a disassembler.
+        auto* disasm = ctx.disassembler().get();
+        if (disasm == nullptr) {
+            ctx.log("StringProtectionPass: --strings=vm: disassembler отсутствует, "
+                    "откат на S2b stub");
+        } else {
+            ByteView body_view{
+                emitted_decryptor.code.data() + string_protect::kMxStrGetLoopOffset,
+                string_protect::kMxStrGetLoopSize};
+
+            vm::VmLifter lifter(*disasm);
+            // `base_va` only affects intra-body branch resolution; the
+            // concrete value is arbitrary as long as it's consistent
+            // within this lift.
+            constexpr Va kFakeBaseVa = 0x0000000140000000ULL;
+            auto lift_result = lifter.lift(body_view, kFakeBaseVa);
+            if (!lift_result) {
+                ctx.log_fmt("StringProtectionPass: --strings=vm: лифтинг mx_str_get "
+                            "не удался ({}), откат на S2b stub",
+                    lift_result.error().message());
+            } else {
+                auto [vm_insns, report] = *lift_result;
+                ctx.log_fmt("StringProtectionPass: --strings=vm: лифтинг mx_str_get "
+                            "OK — total={}, generic={}, native={}",
+                    report.total_insns, report.generic_ops, report.native_ops);
+
+                vm::VmRuntimeGenerator gen;
+                // Use the same imagebase-key heuristic as VirtualizationPass:
+                // only enable when the packer will disable ASLR, so the
+                // runtime ImageBase matches the preferred one baked into
+                // the handler-table decryption key.
+                const bool packer_will_run =
+                    ctx.config().enable_packer &&
+                    ctx.pe_image().pe_type() == PeType::executable;
+                vm::VmGenOptions opts{
+                    .emit_exit_as_jmp     = false,
+                    .use_imagebase_key    = packer_will_run,
+                    .preferred_image_base =
+                        static_cast<uint64_t>(ctx.pe_image().image_base()),
+                    // The S2c sub-VM lives inside `.mxstr`, which stays
+                    // R+W+X at runtime (the decryptor XOR-writes the
+                    // data pool and flips the descriptor sticky flag).
+                    // The default anti-tamper page-protection probe
+                    // asks its own section's protection mask and
+                    // corrupts the handler-table key when it observes
+                    // WRITE — that's the correct signal for the main
+                    // `.mxvm` section but a false positive here.
+                    .skip_anti_tamper_checks = true,
+                };
+
+                auto gen_result = gen.generate(vm_insns, rng, opts);
+                if (!gen_result) {
+                    ctx.log_fmt("StringProtectionPass: --strings=vm: генерация "
+                                "VM runtime не удалась ({}), откат на S2b stub",
+                        gen_result.error().message());
+                } else {
+                    // Align the VM blob to a 16-byte boundary inside the
+                    // section so the handler table loads are naturally
+                    // aligned — same convention VirtualizationPass uses.
+                    while (section_buf.size() % 16 != 0) {
+                        section_buf.push_back(0xCC);
+                    }
+                    vm_blob_offset       = section_buf.size();
+                    vm_blob_entry_offset = gen_result->entry_offset;
+                    section_buf.insert(section_buf.end(),
+                                       gen_result->blob.begin(),
+                                       gen_result->blob.end());
+                    vm_lift_succeeded = true;
+                    ctx.log_fmt("StringProtectionPass: --strings=vm: VM blob {} байт, "
+                                "entry @ section+0x{:X}",
+                        gen_result->blob.size(),
+                        vm_blob_offset + vm_blob_entry_offset);
+                }
+            }
+        }
+    }
+
     // (8) Add the section. SectionManager assigns the final RVA.
     //
     // The section holds both code (mx_str_get + trampolines) and data
@@ -491,6 +595,58 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
                 static_cast<int64_t>(call_end_rva));
             write_i32_le(added_sec.data, call_rel_abs, rel);
         }
+    }
+
+    // (10a) S2c — if the VM-lifted loop was generated, overwrite the
+    // plaintext decrypt loop inside `mx_str_get` with `call vm_entry`
+    // + NOP padding. Execution flow becomes:
+    //
+    //   [header + claim + setup] (bytes 0..72, unchanged)
+    //   [call vm_entry]          (bytes 73..77, 5 bytes)
+    //   [nop slide]              (bytes 78..83, 6 bytes)
+    //   [mark_done + restore]    (bytes 84..92, unchanged)
+    //
+    // When the VM's exit handler runs its own `ret`, control returns to
+    // byte 78, slides through the NOPs to `.mark_done` at byte 84, then
+    // the plaintext done-flag store, `mov rax, r9`, and final `ret`
+    // run verbatim. The `jz .mark_done` fast-skip for empty strings at
+    // byte 71 still targets byte 84 directly, so the rcx==0 short path
+    // bypasses the VM entirely.
+    if (vm_lift_succeeded) {
+        const Rva vm_entry_rva =
+            section_rva +
+            static_cast<Rva>(vm_blob_offset) +
+            static_cast<Rva>(vm_blob_entry_offset);
+        const size_t loop_start_abs =
+            decryptor_offset + string_protect::kMxStrGetLoopOffset;
+        const Rva    loop_start_rva = section_rva + static_cast<Rva>(loop_start_abs);
+        const Rva    call_end_rva   = loop_start_rva + 5;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(vm_entry_rva) -
+            static_cast<int64_t>(call_end_rva));
+
+        // Bounds-check: the loop window must be at least 5 bytes so we
+        // can fit a `call rel32`. This is a constant-time invariant —
+        // kept as an assert-shaped guard so codegen drift shows up at
+        // build time rather than in a protected binary.
+        static_assert(string_protect::kMxStrGetLoopSize >= 5,
+                      "VM loop window must hold at least a call rel32");
+
+        added_sec.data[loop_start_abs + 0] = 0xE8;  // call rel32
+        added_sec.data[loop_start_abs + 1] = static_cast<uint8_t>(rel        & 0xFF);
+        added_sec.data[loop_start_abs + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
+        added_sec.data[loop_start_abs + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
+        added_sec.data[loop_start_abs + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
+        // NOP pad from byte loop_start+5 up to `.mark_done` at
+        // decryptor_offset + kMxStrGetLoopEndOffset.
+        for (size_t i = loop_start_abs + 5;
+             i < decryptor_offset + string_protect::kMxStrGetLoopEndOffset;
+             ++i)
+        {
+            added_sec.data[i] = 0x90;
+        }
+        ctx.log_fmt("StringProtectionPass: --strings=vm: mx_str_get XOR loop replaced "
+                    "with call vm_entry @ RVA=0x{:08X}", vm_entry_rva);
     }
 
     // (11) Rewrite each source LEA in place with `call trampoline_i`,
