@@ -118,4 +118,24 @@ namespace mx::anti_tamper {
 /// never appears in the emitted code.
 void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash);
 
+/// Variant that returns the FUNCTION ADDRESS (not SSN) in `r13`.
+///
+/// Used by callers that want to invoke the ntdll syscall stub via a
+/// regular `call r13` instead of issuing a direct `syscall`. Going
+/// through the stub lets ntdll handle the Windows x64 stack-argument
+/// ABI for 5+ argument syscalls, which direct-syscall callers have
+/// to replicate by hand and which some kernel builds validate more
+/// strictly than others. The tradeoff is visibility to user-mode
+/// hooks: a CALL through the resolved address will run any inline
+/// hook installed at the function's prologue, whereas a direct
+/// `syscall` bypasses them. The caller chooses based on the threat
+/// model — anti-tamper checks that must defeat EDR use the SSN
+/// variant; the packer's post-decrypt reprotect uses the address
+/// variant because it runs before user-mode hooks have any motive
+/// to interfere.
+///
+/// On success r13 holds the full 64-bit function address. On failure
+/// r13 is left at 0, same contract as the SSN variant.
+void emit_hells_gate_address_resolver(RawEmitter& e, uint32_t target_name_hash);
+
 } // namespace mx::anti_tamper

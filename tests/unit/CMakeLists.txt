@@ -44,6 +44,7 @@ set(ANTI_TAMPER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/hw_breakpoint_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/import_hook_check.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/self_crc_check.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/page_protection_check.cpp
 )
 
 # ==============================================================================

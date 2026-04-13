@@ -473,24 +473,39 @@ struct StolenPlan {
     const uint32_t reprotect_entry_count = section_count;
     patches.reprotect_entry_count = reprotect_entry_count;
 
-    // mov r12, rsp                           49 89 E4
+    // Save rsp, align, and allocate our scratch+call frame.
+    //
+    //   mov r12, rsp                 49 89 E4
+    //   and rsp, -16                 48 83 E4 F0
+    //   sub rsp, 0x50                48 81 EC 50 00 00 00
+    //
+    // After sub the frame looks like:
+    //   [rsp+0x00..0x1F]  shadow space for the callee's arg1..4 homes
+    //   [rsp+0x20]        arg5 slot = &old_protect_var (set once)
+    //   [rsp+0x28]        pad / unused
+    //   [rsp+0x30]        base_var  (rdx target, rewritten per iter)
+    //   [rsp+0x38]        size_var  (r8 target, rewritten per iter)
+    //   [rsp+0x40]        old_protect_var (PULONG output)
+    //   [rsp+0x48..0x4F]  pad
+    //
+    // `and rsp, -16` ensures rsp is 16-aligned BEFORE the `call r13`
+    // below — the CALL push will then leave rsp at mod16==8 inside
+    // ntdll's stub, which is what the Windows x64 ABI expects.
     u8(0x49); u8(0x89); u8(0xE4);
-
-    // sub rsp, 0x50                          48 81 EC 50 00 00 00
+    u8(0x48); u8(0x83); u8(0xE4); u8(0xF0);
     u8(0x48); u8(0x81); u8(0xEC);
     u32(0x00000050u);
 
-    // and rsp, -16                           48 83 E4 F0
-    u8(0x48); u8(0x83); u8(0xE4); u8(0xF0);
-
-    // Hell's Gate SSN resolver → r13d = NtProtectVirtualMemory SSN.
-    // The target hash is computed at build time; the literal ASCII
-    // name never appears in the stub.
+    // Hell's Gate address resolver → r13 = NtProtectVirtualMemory
+    // function body address. The resolver walks the PEB, finds
+    // ntdll, and looks up the export by DJB2 hash. On failure r13
+    // is left at 0 and we skip the reprotect loop entirely —
+    // pre-fix behaviour.
     {
         mx::RawEmitter tmp{};
         constexpr uint32_t kNtProtectHash =
             anti_tamper::djb2_ascii_hash("NtProtectVirtualMemory");
-        anti_tamper::emit_hells_gate_resolver(tmp, kNtProtectHash);
+        anti_tamper::emit_hells_gate_address_resolver(tmp, kNtProtectHash);
         for (uint8_t b : tmp.buf) u8(b);
     }
 
@@ -501,44 +516,34 @@ struct StolenPlan {
     const uint32_t patch_jz_reprotect_done = static_cast<uint32_t>(buf.size());
     u8(0x00);
 
-    // --- One-time setup: pointers, constants, ImageBase cache ---
+    // --- One-time setup outside the loop: ImageBase, arg5, table ---
 
     // mov rax, gs:[0x60]                     65 48 8B 04 25 60 00 00 00
     u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
     u8(0x60); u8(0x00); u8(0x00); u8(0x00);
     // mov rbx, [rax + 0x10]                  48 8B 58 10
-    //   rbx = PEB.ImageBase — preserved across syscall, reused by loop.
+    //   rbx = PEB.ImageBase. rbx is nonvolatile across the CALL, so
+    //   we cache it once and reuse it for every iteration's base
+    //   computation.
     u8(0x48); u8(0x8B); u8(0x58); u8(0x10);
 
-    // lea rdx, [rsp + 0x20]                  48 8D 54 24 20
-    //   arg2: &base_var — same slot every iteration.
-    u8(0x48); u8(0x8D); u8(0x54); u8(0x24); u8(0x20);
-
-    // lea r8, [rsp + 0x30]                   4C 8D 44 24 30
-    //   arg3: &size_var
-    u8(0x4C); u8(0x8D); u8(0x44); u8(0x24); u8(0x30);
-
-    // mov r9d, 0x20                          41 B9 20 00 00 00
-    //   arg4: PAGE_EXECUTE_READ
-    u8(0x41); u8(0xB9);
-    u32(0x00000020u);
-
-    // lea rax, [rsp + 0x38]                  48 8D 44 24 38
-    // mov [rsp + 0x28], rax                  48 89 44 24 28
-    //   arg5: &old_protect_var (stored at [rsp+0x28], kernel reads it
-    //   from there as the 5th syscall arg).
-    u8(0x48); u8(0x8D); u8(0x44); u8(0x24); u8(0x38);
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x28);
+    // lea rax, [rsp + 0x40]                  48 8D 44 24 40
+    // mov [rsp + 0x20], rax                  48 89 44 24 20
+    //   arg5 slot (pointer to old_protect_var) — constant, set once.
+    u8(0x48); u8(0x8D); u8(0x44); u8(0x24); u8(0x40);
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x20);
 
     // lea r14, [rip + reprotect_table_rel32]  4C 8D 35 rel32
     //   r14 = pointer to the embedded section table. The rel32 is
-    //   patched at the end of build_stub_bytes once the table's
-    //   position in the stub is known.
+    //   patched in `execute()` once the stub's section RVA and the
+    //   table's offset inside the stub are final. r14 is also
+    //   nonvolatile so it survives the CALL.
     u8(0x4C); u8(0x8D); u8(0x35);
     patches.rel_to_reprotect_table_at = static_cast<uint32_t>(buf.size());
     u32(0);
 
     // mov r15d, <reprotect_entry_count>      41 BF imm32
+    //   r15 = loop countdown. Nonvolatile, so the CALL won't stomp it.
     u8(0x41); u8(0xBF);
     u32(reprotect_entry_count);
 
@@ -559,26 +564,43 @@ struct StolenPlan {
     // lea rax, [rbx + rax*1]                 48 8D 04 03
     //   rax = ImageBase + rva
     u8(0x48); u8(0x8D); u8(0x04); u8(0x03);
-    // mov [rsp + 0x20], rax                  48 89 44 24 20
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x20);
+    // mov [rsp + 0x30], rax                  48 89 44 24 30
+    //   store base_var
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x30);
 
     // mov eax, [r14 + 4]                     41 8B 46 04
     //   size (zero-extends)
     u8(0x41); u8(0x8B); u8(0x46); u8(0x04);
-    // mov [rsp + 0x30], rax                  48 89 44 24 30
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x30);
+    // mov [rsp + 0x38], rax                  48 89 44 24 38
+    //   store size_var
+    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x38);
+
+    // Prepare call registers (volatile — re-set every iteration
+    // because the previous CALL clobbered them).
+    //
+    //   rcx = -1              (NtCurrentProcess pseudo-handle)
+    //   rdx = &base_var       ([rsp + 0x30])
+    //   r8  = &size_var       ([rsp + 0x38])
+    //   r9d = PAGE_EXECUTE_READ (0x20)
 
     // mov rcx, -1                            48 C7 C1 FF FF FF FF
-    //   arg1: NtCurrentProcess pseudo-handle (re-set each iteration
-    //   because syscall clobbered rcx with the saved RIP).
     u8(0x48); u8(0xC7); u8(0xC1);
     u32(0xFFFFFFFFu);
-    // mov r10, rcx                           49 89 CA
-    u8(0x49); u8(0x89); u8(0xCA);
-    // mov eax, r13d                          44 89 E8
-    u8(0x44); u8(0x89); u8(0xE8);
-    // syscall                                0F 05
-    u8(0x0F); u8(0x05);
+    // lea rdx, [rsp + 0x30]                  48 8D 54 24 30
+    u8(0x48); u8(0x8D); u8(0x54); u8(0x24); u8(0x30);
+    // lea r8, [rsp + 0x38]                   4C 8D 44 24 38
+    u8(0x4C); u8(0x8D); u8(0x44); u8(0x24); u8(0x38);
+    // mov r9d, 0x20                          41 B9 20 00 00 00
+    u8(0x41); u8(0xB9);
+    u32(0x00000020u);
+
+    // call r13                               41 FF D5
+    //   Invoke ntdll!NtProtectVirtualMemory. Going through the real
+    //   stub means ntdll handles the Windows x64 ABI for the stack
+    //   argument at [rsp+0x20] → [rsp+0x28] inside the stub, which
+    //   a hand-rolled direct `syscall` from a 16-aligned rsp does
+    //   not replicate correctly on Win11 with CET / shadow stack.
+    u8(0x41); u8(0xFF); u8(0xD5);
 
     // add r14, 8                             49 83 C6 08
     u8(0x49); u8(0x83); u8(0xC6); u8(0x08);
@@ -596,9 +618,6 @@ struct StolenPlan {
     // .reprotect_done:
     {
         const uint32_t done_at = static_cast<uint32_t>(buf.size());
-        // Patch the two forward rel8 jumps that both target this
-        // label: the "resolver failed" bail and the "loop counter
-        // reached 0" exit.
         buf[patch_jz_reprotect_done] = static_cast<uint8_t>(
             static_cast<int8_t>(static_cast<int32_t>(done_at) -
                                 static_cast<int32_t>(patch_jz_reprotect_done + 1)));

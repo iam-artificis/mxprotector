@@ -29,9 +29,27 @@ inline void patch_rel8(RawEmitter& e, size_t patch, size_t target) noexcept {
     e.buf[patch] = static_cast<uint8_t>(static_cast<int8_t>(delta));
 }
 
+/// Shared body emitter — `return_address` flips the final extract
+/// between SSN (r13d = [rdi+4]) and function-address (r13 = rdi).
+void emit_hells_gate_common(RawEmitter& e,
+                            uint32_t target_name_hash,
+                            bool return_address);
+
 } // anonymous namespace
 
 void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash) {
+    emit_hells_gate_common(e, target_name_hash, /*return_address=*/false);
+}
+
+void emit_hells_gate_address_resolver(RawEmitter& e, uint32_t target_name_hash) {
+    emit_hells_gate_common(e, target_name_hash, /*return_address=*/true);
+}
+
+namespace {
+void emit_hells_gate_common(RawEmitter& e,
+                            uint32_t target_name_hash,
+                            bool return_address)
+{
     // ------------------------------------------------------------
     // Pre-scan setup: locate ntdll (2nd module in Ldr list) and
     // cache pointers to its export name/ordinal/function tables.
@@ -231,9 +249,15 @@ void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash) {
     const size_t patch_jne_done = e.size();
     e.u8(0x00);
 
-    // mov r13d, [rdi + 4]                44 8B 6F 04                  (4)
-    //   SSN is the imm32 right after the 4-byte prologue.
-    e.u8(0x44); e.u8(0x8B); e.u8(0x6F); e.u8(0x04);
+    if (return_address) {
+        // mov r13, rdi                    49 89 FD                     (3)
+        //   Return the full 64-bit function body address.
+        e.u8(0x49); e.u8(0x89); e.u8(0xFD);
+    } else {
+        // mov r13d, [rdi + 4]             44 8B 6F 04                  (4)
+        //   SSN is the imm32 right after the 4-byte prologue.
+        e.u8(0x44); e.u8(0x8B); e.u8(0x6F); e.u8(0x04);
+    }
 
     // jmp short .done                    EB rel8                      (2)
     e.u8(0xEB);
@@ -261,5 +285,7 @@ void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash) {
     patch_rel8(e, patch_jne_done, label_done);
     patch_rel8(e, patch_jmp_done, label_done);
 }
+
+} // anonymous namespace (emit_hells_gate_common)
 
 } // namespace mx::anti_tamper

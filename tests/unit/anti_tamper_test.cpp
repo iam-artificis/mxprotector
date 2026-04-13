@@ -169,38 +169,47 @@ TEST(AntiTamperHellsGate, DeterministicForSameHash) {
 
 TEST(AntiTamperRegistry, ContainsAllExpectedChecks) {
     CheckRegistry reg;
-    EXPECT_EQ(reg.size(), 3u);
+    EXPECT_EQ(reg.size(), 4u);
 
     bool has_hw_bp = false;
     bool has_import_hook = false;
     bool has_self_crc = false;
+    bool has_page_prot = false;
     for (size_t i = 0; i < reg.size(); ++i) {
         const std::string_view n{reg.at(i).name()};
         if (n == "hw_breakpoint_sweep")  has_hw_bp = true;
         if (n == "import_hook_detect")   has_import_hook = true;
         if (n == "self_crc")             has_self_crc = true;
+        if (n == "page_protection")      has_page_prot = true;
     }
     EXPECT_TRUE(has_hw_bp);
     EXPECT_TRUE(has_import_hook);
     EXPECT_TRUE(has_self_crc);
+    EXPECT_TRUE(has_page_prot);
 }
 
 TEST(AntiTamperRegistry, RequiredSyscallHashPerCheck) {
     // Each check must declare whether it needs a syscall-resolver
-    // emission in front of it. HW BP → non-zero hash;
-    // Import Hook + Self-CRC → 0.
+    // emission in front of it. HW BP + Page Protection → non-zero
+    // hash; Import Hook + Self-CRC → 0.
     CheckRegistry reg;
     const ICheck* hw_bp      = find_check(reg, "hw_breakpoint_sweep");
     const ICheck* import_hk  = find_check(reg, "import_hook_detect");
     const ICheck* self_crc   = find_check(reg, "self_crc");
+    const ICheck* page_prot  = find_check(reg, "page_protection");
     ASSERT_NE(hw_bp, nullptr);
     ASSERT_NE(import_hk, nullptr);
     ASSERT_NE(self_crc, nullptr);
+    ASSERT_NE(page_prot, nullptr);
 
     // Syscall-needing checks advertise a non-zero hash.
     EXPECT_NE(hw_bp->required_syscall_hash(), 0u);
     EXPECT_EQ(hw_bp->required_syscall_hash(),
               djb2_ascii_hash("NtGetContextThread"));
+
+    EXPECT_NE(page_prot->required_syscall_hash(), 0u);
+    EXPECT_EQ(page_prot->required_syscall_hash(),
+              djb2_ascii_hash("NtQueryVirtualMemory"));
 
     // User-mode checks don't need a resolver.
     EXPECT_EQ(import_hk->required_syscall_hash(), 0u);
@@ -302,6 +311,121 @@ TEST(AntiTamperHwBreakpoint, DeterministicForSameSeed) {
 TEST(AntiTamperHwBreakpoint, DiffersAcrossSeeds) {
     CheckRegistry reg;
     const ICheck* check = find_check(reg, "hw_breakpoint_sweep");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(1);
+    Randomizer rng_b(2);
+    RawEmitter ea, eb;
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
+    EXPECT_NE(ea.buf, eb.buf);
+}
+
+// ---------------------------------------------------------------------------
+// PageProtectionCheck — byte-level invariants
+// ---------------------------------------------------------------------------
+
+TEST(AntiTamperPageProtection, EmitsNonEmptyAndEndsWithXorRspDisp8) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(0xC0FFEE);
+    RawEmitter e;
+    constexpr int8_t kProbeDisp = 0x28;
+    check->emit(e, kProbeDisp, rng, kEmptyContext);
+
+    ASSERT_GT(e.size(), 50u) << "check should be ~85 bytes";
+
+    // Tail must be `xor [rsp + disp8], eax`: 31 44 24 disp8
+    const size_t n = e.size();
+    EXPECT_EQ(e.buf[n - 4], 0x31);
+    EXPECT_EQ(e.buf[n - 3], 0x44);
+    EXPECT_EQ(e.buf[n - 2], 0x24);
+    EXPECT_EQ(static_cast<int8_t>(e.buf[n - 1]), kProbeDisp);
+}
+
+TEST(AntiTamperPageProtection, ContainsSyscallInstruction) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(11);
+    RawEmitter e;
+    check->emit(e, 0x10, rng, kEmptyContext);
+
+    bool has_syscall = false;
+    for (size_t i = 0; i + 1 < e.size(); ++i) {
+        if (e.buf[i] == 0x0F && e.buf[i + 1] == 0x05) {
+            has_syscall = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_syscall) << "no `0F 05` syscall byte pair in emitted body";
+}
+
+TEST(AntiTamperPageProtection, LoadsSsnFromR13) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(1);
+    RawEmitter e;
+    check->emit(e, 0x10, rng, kEmptyContext);
+
+    bool has_mov_from_r13 = false;
+    for (size_t i = 0; i + 2 < e.size(); ++i) {
+        if (e.buf[i] == 0x44 && e.buf[i+1] == 0x89 && e.buf[i+2] == 0xE8) {
+            has_mov_from_r13 = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_mov_from_r13)
+        << "page protection check must read SSN from r13d";
+}
+
+TEST(AntiTamperPageProtection, MasksWriteBitsWithCC) {
+    // The check must mask MBI.Protect with 0xCC (PAGE_READWRITE |
+    // PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY).
+    // That's emitted as `and eax, 0xCC` → 25 CC 00 00 00.
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng(5);
+    RawEmitter e;
+    check->emit(e, 0x10, rng, kEmptyContext);
+
+    bool has_and_cc = false;
+    for (size_t i = 0; i + 4 < e.size(); ++i) {
+        if (e.buf[i]   == 0x25 && e.buf[i+1] == 0xCC
+         && e.buf[i+2] == 0x00 && e.buf[i+3] == 0x00
+         && e.buf[i+4] == 0x00)
+        {
+            has_and_cc = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_and_cc)
+        << "expected `and eax, 0xCC` (25 CC 00 00 00) in emitted body";
+}
+
+TEST(AntiTamperPageProtection, DeterministicForSameSeed) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
+    ASSERT_NE(check, nullptr);
+
+    Randomizer rng_a(0xBEEF);
+    Randomizer rng_b(0xBEEF);
+    RawEmitter ea, eb;
+    check->emit(ea, 0x10, rng_a, kEmptyContext);
+    check->emit(eb, 0x10, rng_b, kEmptyContext);
+    EXPECT_EQ(ea.buf, eb.buf);
+}
+
+TEST(AntiTamperPageProtection, DiffersAcrossSeeds) {
+    CheckRegistry reg;
+    const ICheck* check = find_check(reg, "page_protection");
     ASSERT_NE(check, nullptr);
 
     Randomizer rng_a(1);
