@@ -20,6 +20,7 @@ set(TEST_SOURCES
     x64_specialized_handlers_test.cpp
     anti_tamper_test.cpp
     string_scanner_test.cpp
+    string_xref_finder_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests
@@ -48,10 +49,11 @@ set(ANTI_TAMPER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_tamper/page_protection_check.cpp
 )
 
-# S2 string-protection sources needed for string_scanner_test (and future
-# xref/encryptor/runtime tests as they're added)
+# S2 string-protection sources needed for scanner/xref tests (and future
+# encryptor/runtime tests as they're added)
 set(STRING_PROTECT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_xref_finder.cpp
 )
 
 # ==============================================================================

@@ -77,6 +77,7 @@ set(BUILDER_SOURCES
 
     # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
     protection/string/string_scanner.cpp
+    protection/string/string_xref_finder.cpp
 
     # Phase 6: Anti-emulation checks — one file per technique
     protection/anti_emulation/check_registry.cpp
