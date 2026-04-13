@@ -1,46 +1,59 @@
 # MxProtector Roadmap
 
-Статус на 2026-04-13. Фичи перечислены в порядке убывания приоритета.
+Статус на 2026-04-13. Легенда маркеров:
+
+| Маркер | Значение |
+|---|---|
+| ✅ | Реализовано, стабильно работает в пайплайне |
+| ⏳ | В процессе / текущий шаг |
+| 📋 | Запланировано, ещё не начато |
+| ❌ | Отклонено (см. секцию "Отклонённые идеи") |
 
 ---
 
 ## Готово
 
 ### VM движок
-- Threaded-code VM dispatch без центрального dispatcher
-- Зашифрованная handler table (per-build XOR key)
-- Rolling-key stream cipher для bytecode
-- MBA-варианты handlers, junk polymorphism в bytecode
-- VJMP / VJCC (виртуальные ветки внутри VM)
-- Cross-VM jumps: крупные регионы (≥8 insns) делятся на независимые sub-VMs
-- **Dynamic register ordering**: per-build Fisher–Yates перестановка 16 слотов VM-контекста, random junk-slot, remap на этапе эмиссии байткода — хендлеры по-прежнему используют uniform `slot*8` адресацию, но что в каком слоте лежит — per-build random
-- **vEFLAGS с rol/ror + full 32-bit key**: `rol(rflags, n) ^ key`, `n ∈ [1, 31]`, ключ полностью случайный u32. Exit явно descramble перед popfq → cross-VM sub-VMs полностью независимы по (key, rol)
-- **vEFLAGS polymorphism**: 3 варианта для store path (`rax rol-first`, `rax xor-first`, in-place memory), 3 для popfq path, 4 для in-slot transforms, 2 для VJCC-to-ecx. Per-site random выбор
+- ✅ Threaded-code VM dispatch без центрального dispatcher
+- ✅ Зашифрованная handler table (per-build XOR key)
+- ✅ Rolling-key stream cipher для bytecode
+- ✅ MBA-варианты handlers, junk polymorphism в bytecode
+- ✅ VJMP / VJCC (виртуальные ветки внутри VM)
+- ✅ Cross-VM jumps: крупные регионы (≥8 insns) делятся на независимые sub-VMs
+- ✅ **Dynamic register ordering**: per-build Fisher–Yates перестановка 16 слотов VM-контекста, random junk-slot, remap на этапе эмиссии байткода
+- ✅ **vEFLAGS с rol/ror + full 32-bit key**: `rol(rflags, n) ^ key`, `n ∈ [1, 31]`, ключ полностью случайный u32. Exit явно descramble перед popfq → cross-VM sub-VMs полностью независимы по (key, rol)
+- ✅ **vEFLAGS polymorphism**: 3 варианта store, 3 popfq, 4 in-slot, 2 VJCC-to-ecx. Per-site random
+- ✅ **VM-handler polymorphism**: per-handler junk prologue (0–8 NOP bytes), tail dispatch через 13 random base regs × 2 dispatch shapes (`jmp reg` vs `push reg; ret`)
+- ✅ **Handler-table key через PEB.ImageBase**: ключ вычисляется в рантайме из `PEB.ImageBaseAddress`, dispatches используют `xor eax, [rsp+disp8]` вместо `xor eax, imm32`. Работает только когда packer страйпит ASLR
+- ✅ **Entry-stub MBA**: вычисление `ImageBase_low32 → table_xor_key` через случайную цепочку 6–12 arithmetic ops (переиспользует `MbaTransitionGenerator`), вместо одиночного `xor eax, salt`
+- ✅ **Handler-table integrity check**: entry stub XOR-суммирует все encrypted table entries и сравнивает с build-time expected value. При tampering (debugger memory patch) XOR-сумма отличается → silently corrupts key → все dispatches ломаются. Без branch'а — не NOP-нуть
 
 ### PE pipeline
-- **Self-unpacking packer (multi-section)**: `.text`, VM blob, CFF трамплины шифруются одним 256-байтным ключом, stub расшифровывает по per-section циклу. Ключевой индекс `dl` переносится между секциями — разные секции используют непересекающиеся срезы ключа
-- **Anti-debug в stub**: PEB.BeingDebugged сдвигает стартовое значение `dl` на 1 → все расшифрованные байты сдвинуты на 1 → программа молча портится. Невозможно просто zeros'ом отменить проверку
-- **IAT destruction**: stub зануляет Import Directory после того как Windows loader резолвнул импорты → дампер не восстановит таблицу импортов
-- **Stolen bytes**: первые инструкции OEP (~13 байт) переезжают в stub; `.text` имеет дыру на своём OEP'е, но выполнение идёт через stub
-- CFF трамплины, mutation engine, opaque predicates
-- **Random section names**: 3 секции (vm / cff / packer) берутся из пула plausible MSVC/clang имён (`.rdata2`, `.xtors`, `.xdata2`, `.tls1`, `.CRT$XC`, `.00cfg` ...). `--debug-sections` возвращает `.mxvm/.mxprot1/.mxpack`
+- ✅ **Self-unpacking packer (multi-section)**: `.text`, VM blob, CFF трамплины шифруются одним 256-байтным ключом, stub расшифровывает по per-section циклу. Ключевой индекс `dl` переносится между секциями
+- ✅ **Anti-debug variant pool в packer stub**: 3 варианта (`PEB.BeingDebugged`, `PEB.NtGlobalFlag & 0x70`, `KUSER_SHARED_DATA.KdDebuggerEnabled`). Per-build random, result сдвигает start index decrypt loop'а
+- ✅ **Decrypt loop variant**: 2 формы (`load-xor-store` и `memory-xor`). Per-build random
+- ✅ **Randomized push/pop order** в packer stub
+- ✅ **IAT destruction**: stub зануляет Import Directory после того как Windows loader резолвнул импорты
+- ✅ **Stolen bytes**: первые инструкции OEP (~13 байт) переезжают в stub
+- ✅ **CFG Flattening** с мутацией, opaque predicates, MBA state transitions, junk blocks
+- ✅ **Random section names**: 3 секции (vm / cff / packer) берутся из пула plausible MSVC/clang имён (`.rdata2`, `.xtors`, `.xdata2`, `.tls1`, `.CRT$XC`, `.00cfg` ...). `--debug-sections` возвращает `.mxvm/.mxprot1/.mxpack`
 
 ### Cross-platform foundation (container axis)
-- **`mx::target::TargetInfo`** (`include/mxprotector/target/target_info.hpp`): OS × container × arch дескриптор с factory helpers для `windows_pe_x64`, `linux_elf_x64`, `linux_elf_arm64`, `macos_macho_x64`, `macos_macho_arm64`
-- **`mx::target::IBinaryImage`** (`include/mxprotector/target/binary_image.hpp`): sketch абстрактного интерфейса для будущих ELF/Mach-O бекендов. Сейчас не имплементирован — только design contract для Phase 2+
-- `ProtectionContext::target()` заполняется в `main.cpp` из парсенного бинаря
-- Контейнер-специфичный `PackerPass` guard'ит `is_applicable()` через `ctx.target().is_windows_pe_x64()`
+- ✅ **`mx::target::TargetInfo`** (`include/mxprotector/target/target_info.hpp`): OS × container × arch дескриптор с factory helpers для `windows_pe_x64`, `linux_elf_x64`, `linux_elf_arm64`, `macos_macho_x64`, `macos_macho_arm64`
+- ✅ **`mx::target::IBinaryImage`** (`include/mxprotector/target/binary_image.hpp`): sketch абстрактного интерфейса для будущих ELF/Mach-O бекендов. Сейчас не имплементирован — только design contract для Phase 2+
+- ✅ `ProtectionContext::target()` заполняется в `main.cpp` из парсенного бинаря
+- ✅ Контейнер-специфичный `PackerPass` guard'ит `is_applicable()` через `ctx.target().is_windows_pe_x64()`
 
 ### Cross-platform foundation (architecture axis)
-- **`mx::arch::ArchInfo`** (`include/mxprotector/arch/arch_info.hpp`): fine-grained дескриптор — `ArchVariant` (armv8-a, armv8.2-a, cortex-m4, ...), `ArchProfile` (A/R/M), `ArchFeatures` (NEON, crypto, LSE, MTE, PAC). Factory helpers для common конфигураций: `x64_baseline()`, `x64_modern()`, `arm64_v8a_application()`, `arm64_v82a_crypto()`, `cortex_m4()`
-- **`mx::arch::ICodeEmitter`** (`include/mxprotector/arch/code_emitter.hpp`): абстрактный emitter с операциями mov/load/store/arith/jmp/jcc/call/ret + labels. Ровно то что passes реально используют — без попытки покрыть весь ISA
-- **`mx::arch::IVmBackend`** (`include/mxprotector/arch/vm_backend.hpp`): VM runtime generator как target-agnostic engine + per-arch backend. x64 backend = текущий `vm_runtime_gen.cpp` после будущего рефакторинга; arm64 backend — новая реализация с 31 GPR контекстом, NZCV flag handling, LDR/EOR/STR stream cipher
+- ✅ **`mx::arch::ArchInfo`** (`include/mxprotector/arch/arch_info.hpp`): fine-grained дескриптор — `ArchVariant` (armv8-a, armv8.2-a, cortex-m4, ...), `ArchProfile` (A/R/M), `ArchFeatures` (NEON, crypto, LSE, MTE, PAC)
+- ✅ **`mx::arch::ICodeEmitter`** (`include/mxprotector/arch/code_emitter.hpp`): абстрактный emitter — sketch
+- ✅ **`mx::arch::IVmBackend`** (`include/mxprotector/arch/vm_backend.hpp`): VM runtime generator абстрагирован — sketch
 
 ---
 
 ## Критические баги (закрыты)
 
-### Bug B: CFG Flattening нестабилен — FIXED
+### ✅ Bug B: CFG Flattening нестабилен — FIXED
 - **Симптом (был):** билды с `--cfg-flattening` падали ~30-80%
 - **Корневая причина:** два бага в `OpaquePredicateGenerator::gen_quadratic_parity`:
   1. **Hardcoded register**: использовался `test al, 1` (опкод `A8 01`), который всегда
@@ -92,27 +105,13 @@
 
 ## Следующие шаги (по приоритету)
 
-### 1. Packer polymorphism *(следующий — текущий шаг)*
-У packer stub сейчас фиксированная структура (push/anti-debug/key-lea/per-section-loop/IAT-wipe/pop/stolen/jmp). Добавить:
-- Варианты anti-debug: PEB.BeingDebugged, PEB.NtGlobalFlag (bit 0x70), KUSER_SHARED_DATA.KdDebuggerEnabled
-- Несколько форм decrypt loop (byte loop, dword loop, xchg-style)
-- Рандомизация: где IAT wipe (до/после decrypt loops), где anti-debug (inline с decrypt vs отдельно)
+### 📋 1. Анти-unicorn / анти-эмуляция *(средний)*
+Сделать VM resistant к emulator analysis (Unicorn, Triton, angr):
+- Проверки на недокументированные CPU-флаги (AC, ID) в VM-контексте
+- Timing checks через RDTSC внутри handler'ов (редко, не на каждом — ~5% handlers)
+- CPUID-анти-VM проверки в stub (brand string, hypervisor bit)
 
-### 2. Entry-stub MBA для table key derivation *(средний)*
-Сейчас entry stub вычисляет handler-table key через фикс форму
-`xor eax, <salt>`. Заменить на MBA-цепочку (add/sub/xor/rol/ror)
-которая композируется в нужное значение:
-```
-add eax, K1
-rol eax, N
-xor eax, K2
-sub eax, K3
-```
-`MbaTransitionGenerator` уже реализует этот алгоритм для CFF state
-transitions — переиспользовать. Статический анализатор вместо `xor
-imm32` видит 5-10 шагов произвольной арифметики над ImageBase.
-
-### 3. Scattered key composition *(средний, после #2)*
+### 📋 2. Scattered key composition *(средний, высокая сложность)*
 Вместо вычисления всего table key в entry stub, распылить компоненты
 по первым N handlers. Каждый handler применяет один шаг к key slot
 (`[rsp + key_disp]`). Reverser увидит корректный ключ только после
@@ -124,27 +123,16 @@ build-time с финальной композицией. Первые N dispatch
 неправильные targets — для них нужны специальные "burn-in" bytecode
 инструкции, которые выполняют реальную работу, но чей handler id
 совпадает со СТАРТОВЫМ значением key и постепенно доходит до
-финального. Сложно правильно реализовать.
+финального.
 
-### 4. Handler-table integrity check *(средний)*
-Checksum таблицы, проверяемый в entry stub после расшифровки packer'ом.
-Если таблица модифицирована (hardware breakpoints, memory patches,
-runtime injection), checksum не совпадает → бинарь молча корраптится
-(например через +1 к ключу, аналогично anti-debug).
-
-### 5. Анти-unicorn / анти-эмуляция *(средний)*
-- Проверки на недокументированные CPU-флаги (AC, ID) в VM-контексте
-- Timing checks через RDTSC внутри handler'ов (редко, не на каждом)
-- CPUID-анти-VM проверки в stub
-
-### 6. Native handler expansion *(низкий)*
+### 📋 3. Native handler expansion *(низкий)*
 Добавить покрытие generic лифтинга для:
 - `shl/shr/sar` с рег-операндами
 - `imul` r/m64, r64, imm
 - `cmov*` семейство
 - Расширенные bit-ops (`bt`, `bts`, `btr`)
 
-### 7. Инфраструктура тестирования *(низкий)*
+### 📋 4. Инфраструктура тестирования *(низкий)*
 - Smoke-тест, проверяющий что в выходном бинаре реально присутствуют patterns: XOR handler table, XOR vflags scramble, рандомизированный reg mapping
 - Diff-тест двух билдов одного input'а: должны отличаться handler permutation, vflags_key, vflags_rol, XOR keys, reg order, section names, packer key
 - Fuzz-style стресс сотни input'ов × full pipeline

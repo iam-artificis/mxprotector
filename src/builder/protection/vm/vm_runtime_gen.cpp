@@ -1702,11 +1702,20 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
         ? rng.next_u32()
         : (rng.next_u32() | 1);  // legacy path wants non-zero
 
+    // Patch offsets for the integrity check that is emitted inside the
+    // ImageBase block. Zero when integrity is not enabled.
+    size_t integrity_table_lea_patch = 0;
+    size_t integrity_expected_patch  = 0;
+
     if (opts.use_imagebase_key) {
         //   65 48 8B 04 25 60 00 00 00   mov rax, gs:[0x60]    ; PEB
         //   48 8B 40 10                  mov rax, [rax + 0x10] ; ImageBase
         //   <MBA chain>                  transforms eax from IB_low32
         //                                to table_xor_key via random ops
+        //   <integrity check>            xor'd into eax; zero if table
+        //                                matches build-time, corrupts
+        //                                eax if the encrypted handler
+        //                                table has been tampered with
         //   89 44 24 <disp8>             mov [rsp + key_disp], eax
         //
         // The MOV [rax+0x10] is a 64-bit load — upper 32 of rax hold
@@ -1727,6 +1736,73 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             ib_low32, table_xor_key, x86::Reg::rax, rng,
             /*state_preserved=*/true);
         rt.bytes(ByteView{chain.data(), chain.size()});
+
+        // --- Handler-table integrity check ---------------------------------
+        //
+        // Walk every encrypted handler-table entry, XOR them all together,
+        // and XOR the result with a build-time-computed expected value. If
+        // the table is intact, the expected value exactly cancels the
+        // running sum and the final edx is 0. If a debugger patched any
+        // entry (single-byte hardware breakpoint, memory redirect), the
+        // running sum differs and edx is non-zero.
+        //
+        // We then XOR edx into eax (the MBA-derived key). Correct table →
+        // edx=0 → eax unchanged. Tampered table → edx!=0 → eax silently
+        // corrupted → every dispatch XORs with the wrong key → wrong
+        // table entry decrypt → jump to a random address inside .mxvm →
+        // almost always #UD or access violation.
+        //
+        // No branch to NOP out. The check IS the decryption path.
+        //
+        //   48 8D 1D <rel32>       lea rbx, [rip + handler_table]
+        //   B9 <handler_count>     mov ecx, total_handlers
+        //   31 D2                  xor edx, edx
+        //  .loop:
+        //   33 13                  xor edx, dword [rbx]
+        //   48 83 C3 04            add rbx, 4
+        //   FF C9                  dec ecx
+        //   75 F6                  jnz .loop    (rel8 = -10)
+        //   81 F2 <expected32>     xor edx, <build-time expected>
+        //   31 D0                  xor eax, edx
+        //
+        // Both `<rel32>` and `<expected32>` are placeholders patched at
+        // the end of generate().
+
+        // lea rbx, [rip + rel32]    48 8D 1D rel32
+        rt.u8(0x48); rt.u8(0x8D); rt.u8(0x1D);
+        integrity_table_lea_patch = rt.size();
+        rt.u32(0);
+        table_patches.push_back(
+            {integrity_table_lea_patch, rt.size()});
+
+        // mov ecx, total_handlers    B9 imm32
+        rt.u8(0xB9);
+        rt.u32(total_handlers);
+
+        // xor edx, edx               31 D2
+        rt.u8(0x31); rt.u8(0xD2);
+
+        // .loop: xor edx, [rbx]      33 13
+        const size_t loop_start = rt.size();
+        rt.u8(0x33); rt.u8(0x13);
+        // add rbx, 4                 48 83 C3 04
+        rt.u8(0x48); rt.u8(0x83); rt.u8(0xC3); rt.u8(0x04);
+        // dec ecx                    FF C9
+        rt.u8(0xFF); rt.u8(0xC9);
+        // jnz .loop                  75 rel8
+        const size_t jnz_end = rt.size() + 2;
+        const int32_t  rel8    = static_cast<int32_t>(loop_start) -
+                                 static_cast<int32_t>(jnz_end);
+        rt.u8(0x75); rt.u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+
+        // xor edx, <expected>        81 F2 imm32
+        rt.u8(0x81); rt.u8(0xF2);
+        integrity_expected_patch = rt.size();
+        rt.u32(0);
+
+        // xor eax, edx               31 D0
+        rt.u8(0x31); rt.u8(0xD0);
+        // -------------------------------------------------------------------
 
         // mov [rsp + disp8], eax    89 44 24 disp8  (reg=eax=0, SIB=rsp)
         rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
@@ -2037,6 +2113,7 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
     }
 
     // handler_table entries: each = (handler_offset - table_offset) ^ table_xor_key
+    uint32_t table_xor_sum = 0;  // running XOR of encrypted entries, for integrity check
     for (uint32_t h = 0; h < total_handlers; ++h) {
         if (handler_offset_by_id[h] == SIZE_MAX) {
             return std::unexpected(MxError(
@@ -2048,6 +2125,21 @@ MxResult<VmRuntime> VmRuntimeGenerator::generate(
             static_cast<int64_t>(handler_table_offset));
         rel ^= static_cast<int32_t>(table_xor_key); // encrypt
         std::memcpy(rt.buf.data() + handler_table_offset + h * 4, &rel, 4);
+        table_xor_sum ^= static_cast<uint32_t>(rel);
+    }
+
+    // Handler-table integrity check: patch the expected XOR sum into the
+    // entry stub. At runtime the stub walks the table, XOR-accumulates all
+    // entries, and XORs the result with this value. If the table has not
+    // been tampered with, the two cancel and leave 0 in edx — the
+    // subsequent `xor eax, edx` is a no-op. If the table has been patched
+    // (e.g. by a debugger trying to redirect a specific handler), the
+    // running sum differs and edx is non-zero, silently corrupting the
+    // table_xor_key stored on the stack. Every subsequent dispatch then
+    // decrypts wrong, and the VM jumps into garbage on the first opcode.
+    if (integrity_expected_patch != 0) {
+        std::memcpy(rt.buf.data() + integrity_expected_patch,
+                    &table_xor_sum, 4);
     }
 
     VmRuntime result;
