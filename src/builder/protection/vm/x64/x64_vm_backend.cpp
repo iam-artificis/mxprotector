@@ -56,11 +56,9 @@ constexpr uint8_t variant_count_for(VmOp op) {
         case VmOp::and_rr:   // V0 direct, V1 De Morgan, V2 nested
         case VmOp::or_rr:    // V0 direct, V1 De Morgan, V2 nested
         case VmOp::mov_rr:   // V0 mov/mov,  V1 push/pop, V2 nested
+        case VmOp::not_r:    // V0 not r/m64, V1 xor -1,  V2 nested
+        case VmOp::neg_r:    // V0 neg r/m64, V1 not+inc, V2 nested
             return 3;
-        // Canonical body + MBA / alternative x64 sequence (G4 only).
-        case VmOp::not_r:    // V0 not r/m64      V1 xor r/m64, -1
-        case VmOp::neg_r:    // V0 neg r/m64      V1 not + inc
-            return 2;
         case VmOp::vjcc:
             return 16;   // one handler per x86 condition code (0..F)
         default:
@@ -823,13 +821,31 @@ MxResult<VmRuntime> X64VmBackend::generate(
             case VmOp::mov_ri64: emit_handler_mov_ri64(rt, rolling_key_disp, rolling);           return true;
 
             case VmOp::not_r:
-                if (variant == 0) emit_handler_unary(rt, rolling_key_disp, rolling, 2);
-                else              emit_handler_not_r_xor(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_unary(rt, rolling_key_disp, rolling, 2);
+                } else if (variant == 1) {
+                    emit_handler_not_r_xor(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner bytecode
+                    // [iload_dst, inot_r14, istore_dst, iret_noflag].
+                    size_t patch = 0;
+                    emit_handler_not_r_nested(rt, rolling_key_disp, rolling, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::neg_r:
-                if (variant == 0) emit_handler_unary(rt, rolling_key_disp, rolling, 3);
-                else              emit_handler_neg_r_notinc(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_unary(rt, rolling_key_disp, rolling, 3);
+                } else if (variant == 1) {
+                    emit_handler_neg_r_notinc(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner bytecode
+                    // [iload_dst, ineg_r14, istore_dst, iret].
+                    size_t patch = 0;
+                    emit_handler_neg_r_nested(rt, rolling_key_disp, rolling, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::shl_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 4);           return true;

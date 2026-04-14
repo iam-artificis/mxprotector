@@ -2,7 +2,7 @@
  * @file x64_inner_vm.cpp
  * @brief [BUILDER, x64] Inner VM runtime emitter (G2 extended scope).
  *
- * Produces the 132-byte inner-VM runtime block described in
+ * Produces the 152-byte inner-VM runtime block described in
  * `x64_inner_vm.hpp`. Every byte is hand-assembled and
  * cross-referenced against the layout diagram in the header; the
  * final `assert(size == kInnerVmRuntimeSize)` catches any accidental
@@ -53,9 +53,11 @@
  *   +78  H_iret             : push rcx; popfq; ret                (3)
  *   +81  H_iload_src_accum  : mov r14, [rdi]; jmp .loop           (5)
  *   +86  H_iret_noflag      : ret                                 (1)
- *   +87  padding                                                  (1, 0xCC)
- *   +88  handler_table : 11 × int32                              (44)
- *   +132 end
+ *   +87  H_inot_r14         : not r14; jmp .loop                  (5)
+ *   +92  H_ineg_r14         : neg r14; pushfq; pop rcx; jmp .loop (7)
+ *   +99  padding                                                  (1, 0xCC)
+ *   +100 handler_table : 13 × int32                              (52)
+ *   +152 end
  */
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
@@ -87,16 +89,18 @@ constexpr size_t kOffHIorRr          = 71;
 constexpr size_t kOffHIret           = 78;
 constexpr size_t kOffHIloadSrcAccum  = 81;
 constexpr size_t kOffHIretNoFlag     = 86;
-constexpr size_t kOffHandlersEnd     = 87;
-constexpr size_t kOffPaddingEnd      = 88;   // 4-byte aligned
+constexpr size_t kOffHInotR14        = 87;
+constexpr size_t kOffHInegR14        = 92;
+constexpr size_t kOffHandlersEnd     = 99;
+constexpr size_t kOffPaddingEnd      = 100;  // 4-byte aligned
 
-constexpr size_t kOffHandlerTable    = 88;
-constexpr size_t kOffRuntimeEnd      = 132;
+constexpr size_t kOffHandlerTable    = 100;
+constexpr size_t kOffRuntimeEnd      = 152;
 
 static_assert(kOffHandlersEnd + 1 == kOffPaddingEnd,
               "expected exactly 1 byte of padding between handlers and table");
-static_assert(kOffHandlerTable + 11 * 4 == kOffRuntimeEnd,
-              "handler table is 11 × int32, ends the block");
+static_assert(kOffHandlerTable + 13 * 4 == kOffRuntimeEnd,
+              "handler table is 13 × int32, ends the block");
 static_assert(kOffRuntimeEnd == kInnerVmRuntimeSize,
               "runtime size constant must match layout end");
 
@@ -132,7 +136,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     //   disp32 = kOffHandlerTable - (end of LEA = +7)
     constexpr int32_t lea_disp32 =
         static_cast<int32_t>(kOffHandlerTable) - 7;
-    static_assert(lea_disp32 == 81, "handler table must sit at offset 88");
+    static_assert(lea_disp32 == 93, "handler table must sit at offset 100");
     e.u8(0x4C); e.u8(0x8D); e.u8(0x2D);
     e.u32(static_cast<uint32_t>(lea_disp32));
 
@@ -294,6 +298,40 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     assert(e.size() - blob_base == kOffHIretNoFlag);
     e.u8(0xC3);
 
+    // ------------------------------------------------------------------
+    // [+87] H_inot_r14: not r14; jmp .loop
+    //
+    //   not r/m64: REX.W|B + 0xF7 + ModRM(/2)
+    //   For `not r14`: REX = 0x49, opcode 0xF7,
+    //   ModRM(mod=11 reg=010 rm=r14&7=110) = 11 010 110 = 0xD6
+    //
+    // x86 `not` does NOT touch rflags — this handler deliberately
+    // does NOT save to rcx, matching real hardware semantics. `not_r`
+    // lifts pair this with `iret_noflag` to keep the inner-VM round
+    // trip flag-transparent, exactly like V0 `not_r`.
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHInotR14);
+    e.u8(0x49); e.u8(0xF7); e.u8(0xD6);
+    emit_jmp_loop_rel8(e, kOffHInotR14 + 5);
+
+    // ------------------------------------------------------------------
+    // [+92] H_ineg_r14: neg r14; pushfq; pop rcx; jmp .loop
+    //
+    //   neg r/m64: REX.W|B + 0xF7 + ModRM(/3)
+    //   For `neg r14`: REX = 0x49, opcode 0xF7,
+    //   ModRM(mod=11 reg=011 rm=r14&7=110) = 11 011 110 = 0xDE
+    //
+    // Unlike `not`, x86 `neg` DOES set rflags (CF=(operand != 0),
+    // plus SF/ZF/OF/PF from the result). `neg_r` lifts pair this
+    // with the regular `iret` so the saved rcx value is the one
+    // the outer tail dispatch writes to vflags.
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHInegR14);
+    e.u8(0x49); e.u8(0xF7); e.u8(0xDE);
+    e.u8(0x9C);                                         // pushfq
+    e.u8(0x59);                                         // pop rcx
+    emit_jmp_loop_rel8(e, kOffHInegR14 + 7);
+
     assert(e.size() - blob_base == kOffHandlersEnd);
 
     // ------------------------------------------------------------------
@@ -303,12 +341,12 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     assert(e.size() - blob_base == kOffPaddingEnd);
 
     // ------------------------------------------------------------------
-    // [+88] Handler table: 11 × signed int32 offsets, each stored as
+    // [+100] Handler table: 13 × signed int32 offsets, each stored as
     // `handler_offset - kOffHandlerTable`, so the dispatcher's
     // `movsxd rax, eax; add rax, r13` yields the absolute handler
     // address. Indices MUST match InnerVmOp enum values.
     // ------------------------------------------------------------------
-    constexpr int32_t kTableEntries[11] = {
+    constexpr int32_t kTableEntries[13] = {
         static_cast<int32_t>(kOffHIloadSrc)       - static_cast<int32_t>(kOffHandlerTable),  // 0x00
         static_cast<int32_t>(kOffHIloadDst)       - static_cast<int32_t>(kOffHandlerTable),  // 0x01
         static_cast<int32_t>(kOffHIstoreDst)      - static_cast<int32_t>(kOffHandlerTable),  // 0x02
@@ -320,11 +358,15 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
         static_cast<int32_t>(kOffHIret)           - static_cast<int32_t>(kOffHandlerTable),  // 0x08
         static_cast<int32_t>(kOffHIloadSrcAccum)  - static_cast<int32_t>(kOffHandlerTable),  // 0x09
         static_cast<int32_t>(kOffHIretNoFlag)     - static_cast<int32_t>(kOffHandlerTable),  // 0x0A
+        static_cast<int32_t>(kOffHInotR14)        - static_cast<int32_t>(kOffHandlerTable),  // 0x0B
+        static_cast<int32_t>(kOffHInegR14)        - static_cast<int32_t>(kOffHandlerTable),  // 0x0C
     };
-    static_assert(kTableEntries[0]  == -60, "iload_src table entry");
-    static_assert(kTableEntries[8]  == -10, "iret table entry");
-    static_assert(kTableEntries[9]  == -7,  "iload_src_accum table entry");
-    static_assert(kTableEntries[10] == -2,  "iret_noflag table entry");
+    static_assert(kTableEntries[0]  == -72, "iload_src table entry");
+    static_assert(kTableEntries[8]  == -22, "iret table entry");
+    static_assert(kTableEntries[9]  == -19, "iload_src_accum table entry");
+    static_assert(kTableEntries[10] == -14, "iret_noflag table entry");
+    static_assert(kTableEntries[11] == -13, "inot_r14 table entry");
+    static_assert(kTableEntries[12] == -8,  "ineg_r14 table entry");
     for (int32_t entry : kTableEntries) {
         e.u32(static_cast<uint32_t>(entry));
     }

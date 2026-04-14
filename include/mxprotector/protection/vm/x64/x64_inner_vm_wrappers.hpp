@@ -95,15 +95,41 @@ void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
  * @brief `mov_rr` nested V2.
  *
  * Inline bytecode emitted (3 bytes):
- *   [iload_src_accum, istore_dst, iret]
+ *   [iload_src_accum, istore_dst, iret_noflag]
  *
  * `iload_src_accum` (0x09) loads `[rdi]` directly into r14 (the
  * accumulator), which is what `istore_dst` subsequently writes to
- * `[rsi]`. A `mov_rr` needs no ALU step, so no flag is saved —
- * the guest flags from whatever preceded the outer `mov_rr` in the
- * caller's bytecode are preserved untouched.
+ * `[rsi]`. `iret_noflag` matches V0 `mov_rr`'s flag-transparent
+ * behavior — x86 `mov` does not touch rflags.
  */
 void emit_handler_mov_rr_nested(RawEmitter& e, int32_t key_disp,
                                 bool rolling, size_t& call_rel32_patch_out);
+
+/**
+ * @brief `not_r` nested V2.
+ *
+ * Inline bytecode emitted (4 bytes):
+ *   [iload_dst, inot_r14, istore_dst, iret_noflag]
+ *
+ * `inot_r14` (0x0B) toggles every bit of the accumulator r14. x86
+ * `not` is flag-transparent, so we pair with `iret_noflag` — final
+ * rflags match V0 `not_r` (whatever the addr-compute shl produced).
+ */
+void emit_handler_not_r_nested(RawEmitter& e, int32_t key_disp,
+                               bool rolling, size_t& call_rel32_patch_out);
+
+/**
+ * @brief `neg_r` nested V2.
+ *
+ * Inline bytecode emitted (4 bytes):
+ *   [iload_dst, ineg_r14, istore_dst, iret]
+ *
+ * `ineg_r14` (0x0C) negates r14 and saves the resulting rflags to
+ * rcx (unlike `not`, x86 `neg` is flag-producing). The terminal
+ * `iret` restores those flags via `push rcx; popfq; ret` so the
+ * outer tail dispatch writes correct guest flags to `vflags`.
+ */
+void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
+                               bool rolling, size_t& call_rel32_patch_out);
 
 } // namespace mx::vm::x64

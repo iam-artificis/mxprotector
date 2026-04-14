@@ -136,4 +136,46 @@ void emit_handler_mov_rr_nested(RawEmitter& e, int32_t key_disp,
     emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
 }
 
+void emit_handler_not_r_nested(RawEmitter& e, int32_t key_disp,
+                               bool rolling, size_t& call_rel32_patch_out)
+{
+    // Unary handlers only need the dst slot address — no rhs, no
+    // src. Fetch one operand byte into cl (dst vreg), compute rsi.
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+
+    // Inline inner bytecode: load dst into accumulator, invert all
+    // bits, store back, return without touching rflags. `not` is
+    // flag-transparent on real x86, and V0 `not_r` is likewise
+    // flag-transparent at the inner-VM boundary.
+    const uint8_t bc[] = {
+        static_cast<uint8_t>(InnerVmOp::iload_dst),     // 0x01
+        static_cast<uint8_t>(InnerVmOp::inot_r14),      // 0x0B
+        static_cast<uint8_t>(InnerVmOp::istore_dst),    // 0x02
+        static_cast<uint8_t>(InnerVmOp::iret_noflag),   // 0x0A
+    };
+    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+}
+
+void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
+                               bool rolling, size_t& call_rel32_patch_out)
+{
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+
+    // Inline inner bytecode: load dst, negate, store back, restore
+    // the guest-ALU flags from rcx before returning. `neg` IS
+    // flag-producing on real x86 (CF, SF, ZF, OF, PF), so we pair
+    // with the regular `iret` — V0 `neg_r` likewise leaves the
+    // neg's flags in the outer rflags for the tail dispatch to
+    // save into vflags.
+    const uint8_t bc[] = {
+        static_cast<uint8_t>(InnerVmOp::iload_dst),     // 0x01
+        static_cast<uint8_t>(InnerVmOp::ineg_r14),      // 0x0C
+        static_cast<uint8_t>(InnerVmOp::istore_dst),    // 0x02
+        static_cast<uint8_t>(InnerVmOp::iret),          // 0x08
+    };
+    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+}
+
 } // namespace mx::vm::x64

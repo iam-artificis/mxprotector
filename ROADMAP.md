@@ -296,21 +296,27 @@ reverser один раз разбирает наш runtime и дальше ви�
 - [x] Backend wiring (`variant_count_for`, `emit_op_variant`,
   `inner_vm_call_patches`, patch loop).
 - [x] Stress coverage для initial scope (90/90 strong).
-- [x] Расширенная ISA (9 opcode'ов) в `x64_inner_vm.hpp/cpp` — 120-byte
-  runtime, multi-step threaded dispatcher.
+- [x] Расширенная ISA (13 opcode'ов) в `x64_inner_vm.hpp/cpp` —
+  152-byte runtime, multi-step threaded dispatcher.
 - [x] Multi-step dispatch через **rcx-live flag carrier** (scheme 2
   variant). Scratch flag slot в памяти runtime оказался недоступен
   (.mxvm секция R+X, без W) — переиграно на host-register carrier.
 - [x] V2 variant для `and_rr`/`or_rr` (вдобавок к add/sub/xor). 5 из 5
-  r-r ALU хэндлеров теперь лифтятся в nested VM. Stress 90/90 strong.
-- [ ] V2 variant для `mov_rr`.
-- [ ] V2 variant для `not_r` / `neg_r` (unary).
+  r-r ALU хэндлеров лифтятся в nested VM. Stress 90/90 strong.
+- [x] V2 variant для `mov_rr` (через flag-transparent `iload_src_accum`
+  + `iret_noflag` pair).
+- [x] V2 variant для `not_r` / `neg_r` (unary). `inot_r14` —
+  flag-transparent, `ineg_r14` — flag-producing через rcx carrier.
+- [x] Wrappers module `x64_inner_vm_wrappers.{hpp,cpp}`: все
+  `emit_handler_*_nested` вынесены из `x64_handlers.cpp` + shared
+  tail `emit_inner_vm_call`. Open/closed для следующих nested lifts.
+- [x] Unit test `x64_inner_vm_runtime_test.cpp` — byte-for-byte blob
+  pin + structural invariants + enum-index check + per-opcode
+  handler body checks (11 тестов).
 - [ ] `emit_handler_alu_ri32_nested` (после решения по inline imm8/imm32
   в inner bytecode).
 - [ ] Per-build inner-ISA randomization hook.
 - [ ] vjcc-лифт через `ibranch` + scratch flag carrier.
-- [ ] Unit test `x64_inner_vm_runtime_test.cpp` — byte-level stability
-  check (hash runtime'а на fixed seed).
 
 ### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
 
