@@ -345,16 +345,22 @@ reverser один раз разбирает наш runtime и дальше ви�
   2 bodies per targeted op; static opcode-table recovery has to
   distinguish shapes across the full variant set.
 
-- 📋 **Dead opcodes** — deferred. The "reuse an existing ALU op
-  with an identity imm" approach fails because every handler's
-  operand fetch trashes host rflags and the tail dispatch saves
-  them to vflags, so a flag-preserving body like `shl 0` still
-  leaks garbage flags into vflags and a subsequent `vjcc` reads
-  the wrong guest ZF/SF. Stochastic ~3% vjcc miss-branch under
-  stress. Proper fix: custom dead-op handlers that stash vflags on
-  entry and restore before tail dispatch — those are ~20 bytes
-  each, don't reuse the generic emitter, and need new
-  `variant_count_for` entries.
+- ✅ **Dead opcodes** — shipped. New `VmOp::dead` with a
+  zero-operand handler whose body is empty AND whose tail dispatch
+  is emitted inline with `save_rflags=false`, bypassing the
+  standard per-handler `end_handler_tail()`. The
+  `save_rflags=false` override is the key correctness fix: the
+  previous attempt re-used real handlers with identity imm, whose
+  tails saved the fetch-clobbered rflags over the real guest
+  flags (the ~3% vjcc miss-branch). The new dead handler has no
+  ALU, no operand fetch, and its tail refuses to touch vflags —
+  the real guest flags set by the previous real handler's tail
+  remain intact across any number of dead inserts.
+  The encoder randomly prepends 0..3 dead bytes before each real
+  instruction (skipping positions right after a vjmp/vjcc, where
+  the rel32 calculation would be off by the insert count). Grows
+  bytecode ~2x on average and defeats static "byte = real opcode"
+  recovery. 90/90 stress green with dead inserts on.
 
 - 📋 **Opaque branches inside bytecode**: `VJCC` с всегда-ложным
   условием, уводящая на мертвую ветку handlers (которая сама

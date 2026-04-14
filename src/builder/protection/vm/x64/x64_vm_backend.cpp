@@ -72,6 +72,8 @@ constexpr uint8_t variant_count_for(VmOp op) {
             return 2;
         case VmOp::vjcc:
             return 16;   // one handler per x86 condition code (0..F)
+        case VmOp::dead:
+            return 1;    // G4: one dead-op handler, called from random bc positions
         default:
             return 1;
     }
@@ -348,15 +350,68 @@ MxResult<VmRuntime> X64VmBackend::generate(
         }
     }
 
-    // Phase 1: compute bytecode offsets using spec-aware sizes.
-    // vjmp/vjcc rel32 depends on the target instruction's bytecode offset.
+    // G4 dead-opcode insertion. Pre-decide how many dead bytes to
+    // emit BEFORE each real instruction (position 0..N-1) and after
+    // the last one (position N, before the terminal `exit`). Both
+    // bc_offset computation and the phase-2 emit loop read from
+    // this array, so they stay in sync.
+    //
+    // Insertion density: 0..kMaxDeadPerSlot dead bytes per slot,
+    // uniform draw. With ~3-instruction average spacing the real
+    // bytecode grows by ~1.5x and every vjcc's vflags window gets
+    // mixed with dead-op fetches, making static opcode-table
+    // recovery have to disambiguate "live" vs "dead" bytes without
+    // actually running the VM.
+    //
+    // Regions with virtual branches fall back to static XOR
+    // encryption later on. Dead opcodes work under BOTH encryption
+    // modes — the encryption operates on bytes in fetch order and
+    // doesn't care whether a byte is live or dead.
+    // G4 dead-opcode insertion. Pre-decide how many dead bytes to
+    // emit BEFORE each real instruction (position 0..N-1) and
+    // before the terminal `exit` (position N). Both bc_offset
+    // computation and the phase-2 emit loop read from this array
+    // so they stay in sync.
+    //
+    // Insertion density: 0..kMaxDeadPerSlot dead bytes per slot,
+    // uniform draw. With a 3-byte cap and ~3-instruction average
+    // spacing the real bytecode grows by ~2x. Static opcode-table
+    // recovery now has to disambiguate "live" vs "dead" bytes
+    // without actually running the VM.
+    //
+    // Branch constraint: dead_before[i+1] MUST be 0 when
+    // instruction `i` is a `vjmp` or `vjcc`. The branch's rel32 at
+    // runtime lands r11 at `bc_offset[i] + size(vjmp) =
+    // bc_offset[i+1] - dead_before[i+1]`, but the rel32 value we
+    // emit is `bc_offset[target] - bc_offset[i+1]`, so any nonzero
+    // dead_before[i+1] would leave r11 `dead_before[i+1]` bytes
+    // BEFORE the target. Zeroing it is the simplest correct fix:
+    // bytes after a branch are unreachable on the taken path
+    // anyway (and the fall-through path still advances through
+    // them via the standard dispatch chain, so we lose nothing).
+    constexpr uint32_t kMaxDeadPerSlot = 3;
+    std::vector<uint8_t> dead_before(instructions.size() + 1, 0);
+    for (size_t i = 0; i <= instructions.size(); ++i) {
+        const bool after_branch =
+            (i > 0) &&
+            (instructions[i - 1].op == VmOp::vjmp ||
+             instructions[i - 1].op == VmOp::vjcc);
+        if (after_branch) continue;
+        dead_before[i] =
+            static_cast<uint8_t>(rng.next_range(0, kMaxDeadPerSlot));
+    }
+
+    // Phase 1: compute bytecode offsets using spec-aware sizes +
+    // dead-op insertions. vjmp/vjcc rel32 depends on the target
+    // instruction's bytecode offset, so dead bytes inserted BEFORE
+    // the target are correctly reflected in the computed rel32.
     std::vector<uint32_t> bc_offset(instructions.size() + 1);
-    bc_offset[0] = 0;
+    bc_offset[0] = dead_before[0];
     for (size_t i = 0; i < instructions.size(); ++i) {
         const uint32_t size = (spec_match[i] >= 0)
             ? 1u   // specialised: just handler_id, no operand bytes
             : (1u + vm_op_operand_size(instructions[i].op));
-        bc_offset[i + 1] = bc_offset[i] + size;
+        bc_offset[i + 1] = bc_offset[i] + size + dead_before[i + 1];
     }
 
     // Phase 2: encode bytecode.
@@ -368,7 +423,20 @@ MxResult<VmRuntime> X64VmBackend::generate(
         bytecode_plain.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
     };
 
+    // G4: cached dead-op handler id for the phase-2 inserter below.
+    const uint8_t dead_handler_id =
+        variant_handler_ids[static_cast<uint32_t>(VmOp::dead)][0];
+    auto emit_dead_bytes = [&](uint8_t count) {
+        for (uint8_t k = 0; k < count; ++k) {
+            bytecode_plain.push_back(dead_handler_id);
+        }
+    };
+
     for (size_t i = 0; i < instructions.size(); ++i) {
+        // G4: insert this slot's dead-op bytes BEFORE the real
+        // instruction. bc_offset[i] already accounts for them.
+        emit_dead_bytes(dead_before[i]);
+
         const auto& vi = instructions[i];
 
         // G1 — Specialised path: emit only the handler_id, no operand bytes.
@@ -452,10 +520,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
             case VmOp::native:
             case VmOp::exit:
+            case VmOp::dead:   // never in instructions[], but keep -Wswitch happy
             case VmOp::count_:
                 break;
         }
     }
+
+    // G4: last batch of dead bytes between the final real
+    // instruction and the terminal `exit` opcode.
+    emit_dead_bytes(dead_before[instructions.size()]);
 
     // Terminal exit opcode.
     bytecode_plain.push_back(
@@ -966,6 +1039,46 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 // its own handler. Trap with ud2 (no tail).
                 emit_ud2(rt);
                 return false;
+
+            case VmOp::dead: {
+                // G4 dead opcode — empty handler body. The encoder
+                // inserts `dead` bytes into the bytecode stream at
+                // random positions between real instructions; this
+                // handler consumes its byte, runs NO body, and
+                // dispatches to the next handler without touching
+                // vflags.
+                //
+                // IMPORTANT: the tail dispatch here is emitted with
+                // save_rflags=FALSE even in branch-containing
+                // regions where all other handlers use save=TRUE.
+                //
+                // Why: on entry to this handler, host rflags do NOT
+                // reflect the previous real handler's guest ALU —
+                // they reflect the previous handler's TAIL-DISPATCH
+                // fetch/xor sequence, which clobbered rflags after
+                // the real save happened. If we let the dead
+                // handler's tail call emit_vflags_store, it would
+                // write those fetch-clobbered garbage flags to
+                // `vflags`, overwriting the real guest flags that
+                // were already safely stored there by the previous
+                // handler's tail. A downstream `vjcc` would then
+                // see garbage ZF/SF/CF and mispredict the branch.
+                //
+                // Skipping the save leaves vflags untouched — the
+                // real guest flags remain visible to the next
+                // `vjcc`. Net effect of the dead handler on the VM
+                // state: r11 advanced by 1 (via the fetch inside
+                // the tail), nothing else. That's exactly what a
+                // "no-op insert" should do.
+                const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
+                                                   /*save_rflags=*/false,
+                                                   table_key_patches,
+                                                   vflags_key, vflags_rol,
+                                                   rflags_disp, &rng,
+                                                   imagebase_key_disp);
+                table_patches.push_back({p.rel32_offset, p.instruction_end});
+                return false;  // tail already emitted inline
+            }
 
             case VmOp::exit: {
                 if (vflags_key != 0 || vflags_rol != 0) {

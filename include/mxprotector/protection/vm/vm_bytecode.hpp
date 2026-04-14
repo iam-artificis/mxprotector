@@ -62,6 +62,18 @@ enum class VmOp : uint8_t {
     native,       ///< execute inlined native bytes   no operand bytes (handler is specialized)
     exit,         ///< restore ctx & return           no operand bytes
 
+    // G4 dead opcode. Zero operands, empty handler body. Inserted
+    // by the encoder at random positions between real instructions
+    // to defeat static bytecode analysis (static recovery now has
+    // to distinguish "live" from "dead" opcode bytes without running
+    // the VM). The handler is flag-transparent by construction —
+    // the body is empty, and the standard tail dispatch saves
+    // whatever rflags entered the handler (= previous real
+    // handler's output) straight back to vflags. See the G4
+    // "dead opcodes" note in ROADMAP.md for the failure mode the
+    // first-attempt "reuse ALU with identity imm" approach hit.
+    dead,
+
     count_        ///< sentinel
 };
 
@@ -111,6 +123,7 @@ constexpr uint32_t kVmOpCount = static_cast<uint32_t>(VmOp::count_);
 
         case VmOp::native:
         case VmOp::exit:
+        case VmOp::dead:
             return 0;
 
         case VmOp::count_:
