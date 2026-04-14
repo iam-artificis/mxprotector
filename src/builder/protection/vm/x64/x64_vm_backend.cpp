@@ -59,6 +59,17 @@ constexpr uint8_t variant_count_for(VmOp op) {
         case VmOp::not_r:    // V0 not r/m64, V1 xor -1,  V2 nested
         case VmOp::neg_r:    // V0 neg r/m64, V1 not+inc, V2 nested
             return 3;
+        // Immediate-form ALU / mov: no MBA alternative today, so
+        // V0 direct and V1 nested — 50/50 choice per bytecode
+        // instruction. Adding an MBA-style V2 later is welcome but
+        // out of scope for G2.
+        case VmOp::mov_ri32:
+        case VmOp::add_ri32:
+        case VmOp::sub_ri32:
+        case VmOp::xor_ri32:
+        case VmOp::and_ri32:
+        case VmOp::or_ri32:
+            return 2;
         case VmOp::vjcc:
             return 16;   // one handler per x86 condition code (0..F)
         default:
@@ -811,12 +822,73 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
             case VmOp::imul_rr:  emit_handler_imul_rr(rt, rolling_key_disp, rolling);            return true;
 
-            case VmOp::mov_ri32: emit_handler_mov_ri32(rt, rolling_key_disp, rolling);           return true;
-            case VmOp::add_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x01);     return true;
-            case VmOp::sub_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x29);     return true;
-            case VmOp::xor_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x31);     return true;
-            case VmOp::and_ri32: emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x21);     return true;
-            case VmOp::or_ri32:  emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x09);     return true;
+            // Small helper lambda — the five ALU ri32 cases below only
+            // differ in two bytes: the outer x86 opcode byte (add=01,
+            // sub=29, ...) and the inner VM opcode (iadd_rr=0x03, etc).
+            case VmOp::mov_ri32:
+                if (variant == 0) {
+                    emit_handler_mov_ri32(rt, rolling_key_disp, rolling);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_mov_ri32_nested(rt, rolling_key_disp, rolling, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
+
+            case VmOp::add_ri32:
+                if (variant == 0) {
+                    emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x01);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
+                                                  /*alu_inner_opcode=*/0x03, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
+
+            case VmOp::sub_ri32:
+                if (variant == 0) {
+                    emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x29);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
+                                                  /*alu_inner_opcode=*/0x04, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
+
+            case VmOp::xor_ri32:
+                if (variant == 0) {
+                    emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x31);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
+                                                  /*alu_inner_opcode=*/0x05, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
+
+            case VmOp::and_ri32:
+                if (variant == 0) {
+                    emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x21);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
+                                                  /*alu_inner_opcode=*/0x06, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
+
+            case VmOp::or_ri32:
+                if (variant == 0) {
+                    emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x09);
+                } else {
+                    size_t patch = 0;
+                    emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
+                                                  /*alu_inner_opcode=*/0x07, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
+                return true;
 
             case VmOp::mov_ri64: emit_handler_mov_ri64(rt, rolling_key_disp, rolling);           return true;
 

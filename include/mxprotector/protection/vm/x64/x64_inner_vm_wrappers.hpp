@@ -132,4 +132,45 @@ void emit_handler_not_r_nested(RawEmitter& e, int32_t key_disp,
 void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
                                bool rolling, size_t& call_rel32_patch_out);
 
+/**
+ * @brief `add_ri32` / `sub_ri32` / `xor_ri32` / `and_ri32` / `or_ri32`
+ *        nested V2.
+ *
+ * Semantics: `[dst] <op>= sign_extend(imm32)`. `op` is one of
+ * add / sub / xor / and / or.
+ *
+ * Approach: the outer wrapper uses the existing `emit_fetch_dword`
+ * helper to decrypt the imm32 into `eax`, then does `movsxd r15, eax`
+ * to preload the inner VM's "rhs operand" register. The inner
+ * bytecode can then reuse the regular r-r ALU handlers without
+ * any imm-loading opcode.
+ *
+ * Inline bytecode emitted (4 bytes):
+ *   [iload_dst, alu_inner_opcode, istore_dst, iret]
+ *
+ * @param alu_inner_opcode
+ *   One of `iadd_rr` (0x03) / `isub_rr` (0x04) / `ixor_rr` (0x05) /
+ *   `iand_rr` (0x06) / `ior_rr` (0x07).
+ */
+void emit_handler_alu_ri32_nested(RawEmitter& e, int32_t key_disp,
+                                  bool rolling, uint8_t alu_inner_opcode,
+                                  size_t& call_rel32_patch_out);
+
+/**
+ * @brief `mov_ri32` nested V2.
+ *
+ * Semantics: `[dst] = sign_extend(imm32)`. x86 `mov` is
+ * flag-transparent, so the inner bytecode terminates with
+ * `iret_noflag`.
+ *
+ * Approach: outer wrapper decrypts imm32 into `eax`, does `movsxd
+ * r14, eax` to place the value directly into the accumulator, and
+ * the inner bytecode just stores + returns.
+ *
+ * Inline bytecode emitted (2 bytes):
+ *   [istore_dst, iret_noflag]
+ */
+void emit_handler_mov_ri32_nested(RawEmitter& e, int32_t key_disp,
+                                  bool rolling, size_t& call_rel32_patch_out);
+
 } // namespace mx::vm::x64

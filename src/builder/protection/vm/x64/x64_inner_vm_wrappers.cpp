@@ -178,4 +178,76 @@ void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
     emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
 }
 
+// ===========================================================================
+// Immediate-form wrappers (*_ri32)
+// ===========================================================================
+//
+// The *_ri32 outer handlers fetch an imm32 from the encrypted outer
+// bytecode stream. Since the imm only becomes available at runtime
+// (after the rolling-key decryption), we can't inline it into the
+// inner VM bytecode — inner bytecode is hard-coded at emit time.
+//
+// Workaround: the outer wrapper uses `emit_fetch_dword` (same helper
+// V0 uses) to land the decrypted dword in `eax`, then issues a
+// 3-byte `movsxd r14, eax` (mov_ri32) or `movsxd r15, eax` (ALU
+// ri32) to pre-populate the inner accumulator/rhs BEFORE calling
+// into the inner VM. The inner bytecode then reuses the existing
+// multi-step ISA without needing an `iload_imm32` opcode.
+//
+// Byte encoding of the movsxd:
+//   `movsxd r14, eax` = 4C 63 F0   (REX.W|R, opcode 63, ModRM 11 110 000)
+//   `movsxd r15, eax` = 4C 63 F8   (REX.W|R, opcode 63, ModRM 11 111 000)
+
+void emit_handler_alu_ri32_nested(RawEmitter& e, int32_t key_disp,
+                                  bool rolling, uint8_t alu_inner_opcode,
+                                  size_t& call_rel32_patch_out)
+{
+    // Fetch + decrypt 1 operand byte (dst vreg) and 4 bytes of
+    // imm32, with the rolling key threaded through both — same as
+    // V0 alu_ri32's prologue.
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    emit_fetch_dword(e, key_disp, rolling);
+
+    // movsxd r15, eax — sign-extend the fetched 32-bit imm into
+    // the rhs-operand register. This is the handoff point: after
+    // this instruction the inner VM can treat the imm exactly like
+    // a slot value loaded by `iload_src`, and the regular r-r ALU
+    // opcodes apply unchanged.
+    e.u8(0x4C); e.u8(0x63); e.u8(0xF8);
+
+    // Inline inner bytecode: the same [iload_dst, ALU, istore_dst,
+    // iret] shape as ALU rr, minus the iload_src — r15 is already
+    // loaded by the movsxd above.
+    const uint8_t bc[] = {
+        static_cast<uint8_t>(InnerVmOp::iload_dst),   // 0x01
+        alu_inner_opcode,                              // 0x03..0x07
+        static_cast<uint8_t>(InnerVmOp::istore_dst),  // 0x02
+        static_cast<uint8_t>(InnerVmOp::iret),        // 0x08
+    };
+    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+}
+
+void emit_handler_mov_ri32_nested(RawEmitter& e, int32_t key_disp,
+                                  bool rolling, size_t& call_rel32_patch_out)
+{
+    emit_fetch_1_operand_byte(e, key_disp, rolling);
+    emit_vmreg_addr_rsi_from_rcx(e);
+    emit_fetch_dword(e, key_disp, rolling);
+
+    // movsxd r14, eax — sign-extend the fetched 32-bit imm straight
+    // into the accumulator, bypassing any load opcode. `istore_dst`
+    // will pick it up directly.
+    e.u8(0x4C); e.u8(0x63); e.u8(0xF0);
+
+    // Inline inner bytecode: 2-byte [istore_dst, iret_noflag]. No
+    // loads, no ALU — `mov` is flag-transparent on x86 so we exit
+    // through `iret_noflag`, matching V0 mov_ri32's flag behavior.
+    const uint8_t bc[] = {
+        static_cast<uint8_t>(InnerVmOp::istore_dst),   // 0x02
+        static_cast<uint8_t>(InnerVmOp::iret_noflag),  // 0x0A
+    };
+    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+}
+
 } // namespace mx::vm::x64

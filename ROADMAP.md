@@ -313,8 +313,10 @@ reverser один раз разбирает наш runtime и дальше ви�
 - [x] Unit test `x64_inner_vm_runtime_test.cpp` — byte-for-byte blob
   pin + structural invariants + enum-index check + per-opcode
   handler body checks (11 тестов).
-- [ ] `emit_handler_alu_ri32_nested` (после решения по inline imm8/imm32
-  в inner bytecode).
+- [x] `emit_handler_{alu,mov}_ri32_nested` для всех 6 immediate-form
+  хэндлеров (mov/add/sub/xor/and/or_ri32). Без новых inner opcode'ов:
+  outer wrapper фетчит imm32 через `emit_fetch_dword` → `movsxd
+  r14/r15, eax`, дальше inner runtime работает как обычно.
 - [ ] Per-build inner-ISA randomization hook.
 - [ ] vjcc-лифт через `ibranch` + scratch flag carrier.
 
