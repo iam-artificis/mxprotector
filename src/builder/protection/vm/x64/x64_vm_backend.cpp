@@ -30,6 +30,7 @@
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_handlers.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
+#include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
 #include "mxprotector/protection/vm/x64/x64_vflags.hpp"
 
 namespace mx::vm::x64 {
@@ -54,9 +55,9 @@ constexpr uint8_t variant_count_for(VmOp op) {
         case VmOp::xor_rr:
         case VmOp::and_rr:   // V0 direct, V1 De Morgan, V2 nested
         case VmOp::or_rr:    // V0 direct, V1 De Morgan, V2 nested
+        case VmOp::mov_rr:   // V0 mov/mov,  V1 push/pop, V2 nested
             return 3;
         // Canonical body + MBA / alternative x64 sequence (G4 only).
-        case VmOp::mov_rr:   // V0 mov/mov        V1 push/pop
         case VmOp::not_r:    // V0 not r/m64      V1 xor r/m64, -1
         case VmOp::neg_r:    // V0 neg r/m64      V1 not + inc
             return 2;
@@ -726,8 +727,18 @@ MxResult<VmRuntime> X64VmBackend::generate(
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
             case VmOp::mov_rr:
-                if (variant == 0) emit_handler_mov_rr(rt, rolling_key_disp, rolling);
-                else              emit_handler_mov_rr_pushpop(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_mov_rr(rt, rolling_key_disp, rolling);
+                } else if (variant == 1) {
+                    emit_handler_mov_rr_pushpop(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner bytecode
+                    // [iload_src_accum, istore_dst, iret_noflag].
+                    size_t patch = 0;
+                    emit_handler_mov_rr_nested(rt, rolling_key_disp, rolling,
+                                                patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::add_rr:

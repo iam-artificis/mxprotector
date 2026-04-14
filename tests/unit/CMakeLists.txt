@@ -38,6 +38,7 @@ set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vflags.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handlers.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_inner_vm.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_inner_vm_wrappers.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_backend.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/zydis_disassembler.cpp
 )

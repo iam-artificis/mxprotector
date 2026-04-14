@@ -158,30 +158,10 @@ void emit_handler_not_r_xor(RawEmitter& e, int32_t key_disp, bool rolling);
 /// a NOT+INC pair instead of the atomic NEG of V0.
 void emit_handler_neg_r_notinc(RawEmitter& e, int32_t key_disp, bool rolling);
 
-// ---------------------------------------------------------------------------
-// G2 — nested VM: outer handler that dispatches through the inner VM.
-//
-// Instead of executing its ALU inline, the emitted body loads the
-// source/destination slot addresses as usual and then hands off to
-// the inner VM runtime (emitted once per outer blob by
-// `emit_inner_vm_runtime`). The outer body carries an inlined
-// 5-byte inner bytecode sequence whose opcodes are fixed for the
-// lifted operation:
-//
-//   add_rr → iload_src, iload_dst, iadd, istore_dst, iexit
-//   sub_rr → iload_src, iload_dst, isub, istore_dst, iexit
-//   xor_rr → iload_src, iload_dst, ixor, istore_dst, iexit
-//
-// `alu_inner_opcode` is the single opcode (iadd / isub / ixor)
-// that distinguishes the three variants. `call_rel32_patch_out` is
-// written with the in-blob offset of the 4-byte rel32 operand of
-// the `call inner_vm_entry` instruction, so the backend can fix it
-// up once the inner VM runtime's entry offset is known. (Inner VM
-// is emitted AFTER all outer handlers, so its offset isn't
-// available at handler-emission time.)
-void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
-                                 bool rolling, uint8_t alu_inner_opcode,
-                                 size_t& call_rel32_patch_out);
+// G2 nested-VM wrappers (emit_handler_*_nested) have moved to
+// `x64_inner_vm_wrappers.hpp`. Include that header instead if you
+// need to emit an outer-handler variant that dispatches through the
+// inner VM.
 
 void emit_handler_mov_ri32(RawEmitter& e, int32_t key_disp, bool rolling);
 void emit_handler_mov_ri64(RawEmitter& e, int32_t key_disp, bool rolling);

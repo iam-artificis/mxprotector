@@ -368,81 +368,10 @@ void emit_handler_neg_r_notinc(RawEmitter& e, int32_t key_disp, bool rolling) {
     e.u8(0x48); e.u8(0xFF); e.u8(0x06);
 }
 
-// ---------------------------------------------------------------------------
-// G2 nested-VM outer-handler variant.
-//
-// Body layout (after the standard fetch + address setup):
-//
-//   lea r12, [rip + .inner_bc]     ; 7 bytes — rip-relative forward
-//   jmp .post_bc                   ; 2 bytes — rel8 = 2
-// .inner_bc:                       ; 2 bytes of inner opcodes
-//     iload_src, <i_alu_exit>
-// .post_bc:
-//   call rel32 <inner_vm_entry>    ; 5 bytes — patched later
-//   ; fall through to tail dispatch
-//
-// The bytecode is only two bytes because the terminal `*_exit`
-// handler in the inner VM does the store AND the return in one
-// shot (see `x64_inner_vm.{hpp,cpp}`). Running the ALU as the very
-// last instruction before `ret` is what keeps `rflags` consistent
-// with the guest-ALU semantics — a dispatch-loop trip between the
-// ALU and the return would clobber ZF/SF/CF/OF/PF and break
-// downstream `vjcc` handlers.
-//
-// Sizes:
-//   fetch (2 operand bytes)                ~20 bytes
-//   shl/lea rsi, rdi setup                ~16 bytes
-//   lea r12 / jmp / inner bc / call rel32  = 16 bytes
-// ---------------------------------------------------------------------------
-
-void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
-                                 bool rolling, uint8_t alu_inner_opcode,
-                                 size_t& call_rel32_patch_out)
-{
-    emit_fetch_2_operand_bytes(e, key_disp, rolling);
-    emit_vmreg_addr_rsi_from_rcx(e);
-    emit_vmreg_addr_rdi_from_rdx(e);
-
-    // --- Set r12 to point at the inlined inner bytecode. ---
-    //
-    // `lea r12, [rip + disp32]`
-    //   REX.W|R + 0x8D + ModRM(00 100 101 = 0x25, rip-rel)
-    //   disp32 = 2 (forward past the 2-byte `jmp .post_bc` rel8)
-    //
-    // The +2 is measured from the end of the LEA instruction (rip),
-    // and r12 lands on the first byte of inner bytecode right after
-    // the `jmp rel8` that jumps over the bytecode.
-    e.u8(0x4C); e.u8(0x8D); e.u8(0x25);
-    e.u32(static_cast<uint32_t>(2));
-
-    // --- `jmp .post_bc` — skip the 5-byte bytecode. ---
-    e.u8(0xEB); e.u8(0x05);
-
-    // --- 5 bytes of inner bytecode. ---
-    //
-    //   [0] iload_src   (0x00)  — r14 <- [rdi]
-    //   [1] iload_dst   (0x01)  — r15 <- [rsi]
-    //   [2] alu_inner_opcode    — one of iadd_rr/isub_rr/ixor_rr/iand_rr/ior_rr
-    //                             (r14 <- r14 <op> r15; save rflags)
-    //   [3] istore_dst  (0x02)  — [rsi] <- r14
-    //   [4] iret        (0x08)  — restore rflags; ret to this call site
-    //
-    // Lifter contract: the last flag-producing ALU in the bytecode
-    // must be the one that leaves the correct guest flags in the
-    // scratch slot. For this 5-byte sequence that's the single
-    // `alu_inner_opcode` at position [2] — istore_dst and iret don't
-    // touch the scratch slot.
-    e.u8(0x00);               // iload_src
-    e.u8(0x01);               // iload_dst
-    e.u8(alu_inner_opcode);   // iadd_rr / isub_rr / ixor_rr / iand_rr / ior_rr
-    e.u8(0x02);               // istore_dst
-    e.u8(0x08);               // iret
-
-    // --- `call rel32 <inner_vm_entry>` — patched later. ---
-    e.u8(0xE8);
-    call_rel32_patch_out = e.size();
-    e.u32(0);
-}
+// The G2 nested-VM outer-handler wrappers (emit_handler_*_nested)
+// have moved to `x64_inner_vm_wrappers.cpp` — see that file for
+// the add/sub/xor/and/or/mov nested variants and the shared
+// `emit_inner_vm_call` tail.
 
 void emit_handler_imul_rr(RawEmitter& e, int32_t key_disp, bool rolling) {
     emit_fetch_2_operand_bytes(e, key_disp, rolling);

@@ -2,7 +2,7 @@
  * @file x64_inner_vm.cpp
  * @brief [BUILDER, x64] Inner VM runtime emitter (G2 extended scope).
  *
- * Produces the 120-byte inner-VM runtime block described in
+ * Produces the 132-byte inner-VM runtime block described in
  * `x64_inner_vm.hpp`. Every byte is hand-assembled and
  * cross-referenced against the layout diagram in the header; the
  * final `assert(size == kInnerVmRuntimeSize)` catches any accidental
@@ -42,18 +42,20 @@
  *   +20         movsxd rax, eax                      (3)
  *   +23         add   rax, r13                       (3)
  *   +26         jmp   rax                            (2)
- *   +28  H_iload_src   : mov r15, [rdi];    jmp .loop (5)
- *   +33  H_iload_dst   : mov r14, [rsi];    jmp .loop (5)
- *   +38  H_istore_dst  : mov [rsi], r14;    jmp .loop (5)
- *   +43  H_iadd_rr     : add r14, r15; pushfq; pop rcx; jmp .loop (7)
- *   +50  H_isub_rr     : sub r14, r15; pushfq; pop rcx; jmp .loop (7)
- *   +57  H_ixor_rr     : xor r14, r15; pushfq; pop rcx; jmp .loop (7)
- *   +64  H_iand_rr     : and r14, r15; pushfq; pop rcx; jmp .loop (7)
- *   +71  H_ior_rr      : or  r14, r15; pushfq; pop rcx; jmp .loop (7)
- *   +78  H_iret        : push rcx; popfq; ret                     (3)
- *   +81  padding                                                   (3, 0xCC)
- *   +84  handler_table : 9 × int32                                (36)
- *   +120 end
+ *   +28  H_iload_src        : mov r15, [rdi]; jmp .loop           (5)
+ *   +33  H_iload_dst        : mov r14, [rsi]; jmp .loop           (5)
+ *   +38  H_istore_dst       : mov [rsi], r14; jmp .loop           (5)
+ *   +43  H_iadd_rr          : add r14, r15; pushfq; pop rcx; jmp  (7)
+ *   +50  H_isub_rr          : sub r14, r15; pushfq; pop rcx; jmp  (7)
+ *   +57  H_ixor_rr          : xor r14, r15; pushfq; pop rcx; jmp  (7)
+ *   +64  H_iand_rr          : and r14, r15; pushfq; pop rcx; jmp  (7)
+ *   +71  H_ior_rr           : or  r14, r15; pushfq; pop rcx; jmp  (7)
+ *   +78  H_iret             : push rcx; popfq; ret                (3)
+ *   +81  H_iload_src_accum  : mov r14, [rdi]; jmp .loop           (5)
+ *   +86  H_iret_noflag      : ret                                 (1)
+ *   +87  padding                                                  (1, 0xCC)
+ *   +88  handler_table : 11 × int32                              (44)
+ *   +132 end
  */
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
@@ -83,16 +85,18 @@ constexpr size_t kOffHIxorRr         = 57;
 constexpr size_t kOffHIandRr         = 64;
 constexpr size_t kOffHIorRr          = 71;
 constexpr size_t kOffHIret           = 78;
-constexpr size_t kOffHandlersEnd     = 81;
-constexpr size_t kOffPaddingEnd      = 84;   // 4-byte aligned
+constexpr size_t kOffHIloadSrcAccum  = 81;
+constexpr size_t kOffHIretNoFlag     = 86;
+constexpr size_t kOffHandlersEnd     = 87;
+constexpr size_t kOffPaddingEnd      = 88;   // 4-byte aligned
 
-constexpr size_t kOffHandlerTable    = 84;
-constexpr size_t kOffRuntimeEnd      = 120;
+constexpr size_t kOffHandlerTable    = 88;
+constexpr size_t kOffRuntimeEnd      = 132;
 
-static_assert(kOffHandlersEnd + 3 == kOffPaddingEnd,
-              "expected exactly 3 bytes of padding between handlers and table");
-static_assert(kOffHandlerTable + 9 * 4 == kOffRuntimeEnd,
-              "handler table is 9 × int32, ends the block");
+static_assert(kOffHandlersEnd + 1 == kOffPaddingEnd,
+              "expected exactly 1 byte of padding between handlers and table");
+static_assert(kOffHandlerTable + 11 * 4 == kOffRuntimeEnd,
+              "handler table is 11 × int32, ends the block");
 static_assert(kOffRuntimeEnd == kInnerVmRuntimeSize,
               "runtime size constant must match layout end");
 
@@ -128,7 +132,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     //   disp32 = kOffHandlerTable - (end of LEA = +7)
     constexpr int32_t lea_disp32 =
         static_cast<int32_t>(kOffHandlerTable) - 7;
-    static_assert(lea_disp32 == 77, "handler table must sit at offset 84");
+    static_assert(lea_disp32 == 81, "handler table must sit at offset 88");
     e.u8(0x4C); e.u8(0x8D); e.u8(0x2D);
     e.u32(static_cast<uint32_t>(lea_disp32));
 
@@ -265,33 +269,62 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     assert(e.size() - blob_base == kOffHIret);
     e.u8(0x51); e.u8(0x9D); e.u8(0xC3);
 
+    // ------------------------------------------------------------------
+    // [+81] H_iload_src_accum: mov r14, [rdi]; jmp .loop
+    //
+    //   REX.W|R (0x4C) + 0x8B + ModRM(00 110 111 = 0x37)
+    //
+    // Same encoding as `mov r14, [rdi]` — loads the src slot value
+    // directly into the accumulator. Used by `mov_rr` lifts where
+    // no rhs operand is needed.
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHIloadSrcAccum);
+    e.u8(0x4C); e.u8(0x8B); e.u8(0x37);
+    emit_jmp_loop_rel8(e, kOffHIloadSrcAccum + 5);
+
+    // ------------------------------------------------------------------
+    // [+86] H_iret_noflag: ret
+    //
+    // `mov_rr` and other flag-transparent lifts use this instead of
+    // `iret` — it returns without the `push rcx; popfq` pair, so
+    // `rflags` exits the inner VM exactly as it entered. This
+    // matches V0 `mov_rr`'s flag behavior (flag-transparent at the
+    // inner-VM boundary).
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHIretNoFlag);
+    e.u8(0xC3);
+
     assert(e.size() - blob_base == kOffHandlersEnd);
 
     // ------------------------------------------------------------------
-    // [+81] 3 bytes padding so the int32 handler table lands 4-aligned.
+    // [+87] 1 byte padding so the int32 handler table lands 4-aligned.
     // ------------------------------------------------------------------
-    e.u8(0xCC); e.u8(0xCC); e.u8(0xCC);
+    e.u8(0xCC);
     assert(e.size() - blob_base == kOffPaddingEnd);
 
     // ------------------------------------------------------------------
-    // [+84] Handler table: 9 × signed int32 offsets, each stored as
+    // [+88] Handler table: 11 × signed int32 offsets, each stored as
     // `handler_offset - kOffHandlerTable`, so the dispatcher's
     // `movsxd rax, eax; add rax, r13` yields the absolute handler
-    // address.
+    // address. Indices MUST match InnerVmOp enum values.
     // ------------------------------------------------------------------
-    constexpr int32_t kTableEntries[9] = {
-        static_cast<int32_t>(kOffHIloadSrc)  - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIloadDst)  - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIstoreDst) - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIaddRr)    - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIsubRr)    - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIxorRr)    - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIandRr)    - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIorRr)     - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIret)      - static_cast<int32_t>(kOffHandlerTable),
+    constexpr int32_t kTableEntries[11] = {
+        static_cast<int32_t>(kOffHIloadSrc)       - static_cast<int32_t>(kOffHandlerTable),  // 0x00
+        static_cast<int32_t>(kOffHIloadDst)       - static_cast<int32_t>(kOffHandlerTable),  // 0x01
+        static_cast<int32_t>(kOffHIstoreDst)      - static_cast<int32_t>(kOffHandlerTable),  // 0x02
+        static_cast<int32_t>(kOffHIaddRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x03
+        static_cast<int32_t>(kOffHIsubRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x04
+        static_cast<int32_t>(kOffHIxorRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x05
+        static_cast<int32_t>(kOffHIandRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x06
+        static_cast<int32_t>(kOffHIorRr)          - static_cast<int32_t>(kOffHandlerTable),  // 0x07
+        static_cast<int32_t>(kOffHIret)           - static_cast<int32_t>(kOffHandlerTable),  // 0x08
+        static_cast<int32_t>(kOffHIloadSrcAccum)  - static_cast<int32_t>(kOffHandlerTable),  // 0x09
+        static_cast<int32_t>(kOffHIretNoFlag)     - static_cast<int32_t>(kOffHandlerTable),  // 0x0A
     };
-    static_assert(kTableEntries[0] == -56, "iload_src table entry");
-    static_assert(kTableEntries[8] == -6,  "iret table entry");
+    static_assert(kTableEntries[0]  == -60, "iload_src table entry");
+    static_assert(kTableEntries[8]  == -10, "iret table entry");
+    static_assert(kTableEntries[9]  == -7,  "iload_src_accum table entry");
+    static_assert(kTableEntries[10] == -2,  "iret_noflag table entry");
     for (int32_t entry : kTableEntries) {
         e.u32(static_cast<uint32_t>(entry));
     }

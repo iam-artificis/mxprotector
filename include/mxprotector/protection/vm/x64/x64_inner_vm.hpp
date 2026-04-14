@@ -46,15 +46,17 @@
  *
  * Opcodes (1 byte each, zero operands):
  *
- *   0x00 iload_src    r15 <- [rdi]                   ; rhs = src
- *   0x01 iload_dst    r14 <- [rsi]                   ; accum = dst
- *   0x02 istore_dst   [rsi] <- r14                   ; dst = accum
- *   0x03 iadd_rr      r14 <- r14 + r15;  rcx <- rflags
- *   0x04 isub_rr      r14 <- r14 - r15;  rcx <- rflags
- *   0x05 ixor_rr      r14 <- r14 ^ r15;  rcx <- rflags
- *   0x06 iand_rr      r14 <- r14 & r15;  rcx <- rflags
- *   0x07 ior_rr       r14 <- r14 | r15;  rcx <- rflags
- *   0x08 iret         rflags <- rcx;  ret to outer handler
+ *   0x00 iload_src         r15 <- [rdi]                   ; rhs = src
+ *   0x01 iload_dst         r14 <- [rsi]                   ; accum = dst
+ *   0x02 istore_dst        [rsi] <- r14                   ; dst = accum
+ *   0x03 iadd_rr           r14 <- r14 + r15;  rcx <- rflags
+ *   0x04 isub_rr           r14 <- r14 - r15;  rcx <- rflags
+ *   0x05 ixor_rr           r14 <- r14 ^ r15;  rcx <- rflags
+ *   0x06 iand_rr           r14 <- r14 & r15;  rcx <- rflags
+ *   0x07 ior_rr            r14 <- r14 | r15;  rcx <- rflags
+ *   0x08 iret              rflags <- rcx;  ret to outer handler
+ *   0x09 iload_src_accum   r14 <- [rdi]    ; src goes straight into accum
+ *   0x0A iret_noflag       ret (rflags untouched)
  *
  * ## Flag propagation (scheme 2 — flag live in host reg rcx)
  *
@@ -102,14 +104,16 @@
  *   xor_rr  → [iload_src, iload_dst, ixor_rr, istore_dst, iret]
  *   and_rr  → [iload_src, iload_dst, iand_rr, istore_dst, iret]
  *   or_rr   → [iload_src, iload_dst, ior_rr,  istore_dst, iret]
+ *   mov_rr  → [iload_src_accum, istore_dst, iret_noflag]         (3 bytes)
  *
- * Each outer-handler V2 variant emits exactly 5 bytes of inline inner
- * bytecode between the wrapper's `lea r12 + jmp` and the
- * `call rel32 inner_vm_entry`.
+ * `mov_rr` uses `iret_noflag` instead of `iret` because `mov` is
+ * flag-transparent on real x86 — leaving `rflags` untouched
+ * preserves whatever the prior outer-body ALU set in the outer
+ * VM's `rflags`, matching V0 `mov_rr` semantics.
  *
  * ## Runtime shape
  *
- * `emit_inner_vm_runtime` produces a self-contained 120-byte block:
+ * `emit_inner_vm_runtime` produces a self-contained 132-byte block:
  *
  *   +0   dispatcher:
  *          lea r13, [rip + handler_table_disp32]   (7 bytes)
@@ -121,18 +125,20 @@
  *          add   rax, r13                           (3)
  *          jmp   rax                                (2)
  *
- *   +28  H_iload_src   : mov r15, [rdi];              jmp .loop   (5)
- *   +33  H_iload_dst   : mov r14, [rsi];              jmp .loop   (5)
- *   +38  H_istore_dst  : mov [rsi], r14;              jmp .loop   (5)
- *   +43  H_iadd_rr     : add r14, r15;  save→rcx;     jmp .loop   (7)
- *   +50  H_isub_rr     : sub r14, r15;  save→rcx;     jmp .loop   (7)
- *   +57  H_ixor_rr     : xor r14, r15;  save→rcx;     jmp .loop   (7)
- *   +64  H_iand_rr     : and r14, r15;  save→rcx;     jmp .loop   (7)
- *   +71  H_ior_rr      : or  r14, r15;  save→rcx;     jmp .loop   (7)
- *   +78  H_iret        : push rcx; popfq;             ret         (3)
- *   +81  padding                                                   (3, 0xCC)
- *   +84  handler_table : 9 × int32 (handler_off - table_off)      (36)
- *   +120 end
+ *   +28  H_iload_src        : mov r15, [rdi];           jmp .loop  (5)
+ *   +33  H_iload_dst        : mov r14, [rsi];           jmp .loop  (5)
+ *   +38  H_istore_dst       : mov [rsi], r14;           jmp .loop  (5)
+ *   +43  H_iadd_rr          : add r14, r15; save→rcx;   jmp .loop  (7)
+ *   +50  H_isub_rr          : sub r14, r15; save→rcx;   jmp .loop  (7)
+ *   +57  H_ixor_rr          : xor r14, r15; save→rcx;   jmp .loop  (7)
+ *   +64  H_iand_rr          : and r14, r15; save→rcx;   jmp .loop  (7)
+ *   +71  H_ior_rr           : or  r14, r15; save→rcx;   jmp .loop  (7)
+ *   +78  H_iret             : push rcx; popfq;          ret        (3)
+ *   +81  H_iload_src_accum  : mov r14, [rdi];           jmp .loop  (5)
+ *   +86  H_iret_noflag      : ret                                  (1)
+ *   +87  padding                                                   (1, 0xCC)
+ *   +88  handler_table : 11 × int32 (handler_off - table_off)     (44)
+ *   +132 end
  *
  * Flag save/restore byte-level:
  *
@@ -183,25 +189,27 @@ namespace mx::vm::x64 {
 
 /// Inner VM opcodes. See file header for semantics.
 enum class InnerVmOp : uint8_t {
-    iload_src  = 0x00,  ///< r14 <- [rdi]
-    iload_dst  = 0x01,  ///< r15 <- [rsi]
-    istore_dst = 0x02,  ///< [rsi] <- r14
-    iadd_rr    = 0x03,  ///< r14 <- r14 + r15; save rflags
-    isub_rr    = 0x04,  ///< r14 <- r14 - r15; save rflags
-    ixor_rr    = 0x05,  ///< r14 <- r14 ^ r15; save rflags
-    iand_rr    = 0x06,  ///< r14 <- r14 & r15; save rflags
-    ior_rr     = 0x07,  ///< r14 <- r14 | r15; save rflags
-    iret       = 0x08,  ///< restore rflags; ret to outer handler
+    iload_src       = 0x00,  ///< r15 <- [rdi]        (rhs = src)
+    iload_dst       = 0x01,  ///< r14 <- [rsi]        (accum = dst)
+    istore_dst      = 0x02,  ///< [rsi] <- r14
+    iadd_rr         = 0x03,  ///< r14 <- r14 + r15; rcx <- rflags
+    isub_rr         = 0x04,  ///< r14 <- r14 - r15; rcx <- rflags
+    ixor_rr         = 0x05,  ///< r14 <- r14 ^ r15; rcx <- rflags
+    iand_rr         = 0x06,  ///< r14 <- r14 & r15; rcx <- rflags
+    ior_rr          = 0x07,  ///< r14 <- r14 | r15; rcx <- rflags
+    iret            = 0x08,  ///< rflags <- rcx; ret
+    iload_src_accum = 0x09,  ///< r14 <- [rdi]        (for flag-transparent mov)
+    iret_noflag     = 0x0A,  ///< ret (rflags untouched)
 };
 
 /// Size of the emitted inner VM runtime, in bytes.
 ///
 /// Breakdown:
 ///   28 bytes dispatcher (lea r13 + fetch/decode/dispatch loop)
-///   53 bytes handler bodies (5+5+5+5*7+3)
-///    3 bytes padding to 4-byte align the handler table
-///   36 bytes handler table (9 × int32 relative offsets)
-inline constexpr size_t kInnerVmRuntimeSize = 120;
+///   59 bytes handler bodies (5+5+5+5*7+3+5+1)
+///    1 byte  padding to 4-byte align the handler table
+///   44 bytes handler table (11 × int32 relative offsets)
+inline constexpr size_t kInnerVmRuntimeSize = 132;
 
 /// Emit the inner VM runtime (dispatcher + 9 handlers + handler
 /// table + flag scratch) into `e`. Returns the offset of the
