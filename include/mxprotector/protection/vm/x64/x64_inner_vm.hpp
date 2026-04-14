@@ -59,6 +59,7 @@
  *   0x0A iret_noflag       ret (rflags untouched)
  *   0x0B inot_r14          r14 <- ~r14     (rflags untouched)
  *   0x0C ineg_r14          r14 <- -r14;  rcx <- rflags
+ *   0x0D itake_branch      r11 <- r11 + r15  (advance outer VPC; for vjcc V2)
  *
  * ## Flag propagation (scheme 2 — flag live in host reg rcx)
  *
@@ -109,15 +110,25 @@
  *   mov_rr  → [iload_src_accum, istore_dst, iret_noflag]         (3 bytes)
  *   not_r   → [iload_dst, inot_r14, istore_dst, iret_noflag]     (4 bytes)
  *   neg_r   → [iload_dst, ineg_r14, istore_dst, iret]            (4 bytes)
+ *   vjcc    → [itake_branch, iret_noflag]                        (2 bytes, taken path only)
  *
  * `mov_rr` and `not_r` use `iret_noflag` because both are
  * flag-transparent on real x86 (`mov` and `not` do not touch
  * rflags). `neg_r` DOES set rflags on real x86, so it uses the
  * regular `iret` which restores the ALU's saved flags from `rcx`.
  *
+ * `vjcc` is unusual: the outer wrapper still performs the native
+ * condition test in x64, then conditionally calls into the inner
+ * VM only on the taken path. The inner bytecode just does
+ * `add r11, r15; ret` — advancing the outer VPC by the pre-loaded
+ * `r15 = rel32` offset. `iret_noflag` keeps the outer vflags
+ * untouched (the cc test itself clobbered them, but the next tail
+ * dispatch saves the post-test flags anyway, which is what V0 does
+ * as well).
+ *
  * ## Runtime shape
  *
- * `emit_inner_vm_runtime` produces a self-contained 152-byte block:
+ * `emit_inner_vm_runtime` produces a self-contained 160-byte block:
  *
  *   +0   dispatcher:
  *          lea r13, [rip + handler_table_disp32]   (7 bytes)
@@ -142,9 +153,9 @@
  *   +86  H_iret_noflag      : ret                                  (1)
  *   +87  H_inot_r14         : not r14;                  jmp .loop  (5)
  *   +92  H_ineg_r14         : neg r14; save→rcx;        jmp .loop  (7)
- *   +99  padding                                                   (1, 0xCC)
- *   +100 handler_table : 13 × int32 (handler_off - table_off)     (52)
- *   +152 end
+ *   +99  H_itake_branch     : add r11, r15;             jmp .loop  (5)
+ *   +104 handler_table : 14 × int32 (handler_off - table_off)     (56)
+ *   +160 end
  *
  * Flag save/restore byte-level:
  *
@@ -220,11 +231,12 @@ enum class InnerVmOp : uint8_t {
     iret_noflag     = 0x0A,  ///< ret (rflags untouched)
     inot_r14        = 0x0B,  ///< r14 <- ~r14         (rflags untouched; x86 `not` is flag-transparent)
     ineg_r14        = 0x0C,  ///< r14 <- -r14;  rcx <- rflags
+    itake_branch    = 0x0D,  ///< r11 <- r11 + r15    (vjcc taken path: advance outer VPC by rel32)
 };
 
 /// Total number of defined `InnerVmOp` values. Handler table size
 /// and `InnerVmIsa::to_byte` length both derive from this.
-inline constexpr size_t kInnerVmOpCount = 13;
+inline constexpr size_t kInnerVmOpCount = 14;
 
 /// Per-build permutation of inner VM opcode byte values.
 ///
@@ -267,10 +279,10 @@ struct InnerVmIsa {
 ///
 /// Breakdown:
 ///   28 bytes dispatcher (lea r13 + fetch/decode/dispatch loop)
-///   71 bytes handler bodies (5+5+5+5*7+3+5+1+5+7)
-///    1 byte  padding to 4-byte align the handler table
-///   52 bytes handler table (13 × int32 relative offsets)
-inline constexpr size_t kInnerVmRuntimeSize = 152;
+///   76 bytes handler bodies (5+5+5+5*7+3+5+1+5+7+5)
+///    0 bytes padding (handlers end at +104, already 4-aligned)
+///   56 bytes handler table (14 × int32 relative offsets)
+inline constexpr size_t kInnerVmRuntimeSize = 160;
 
 /// Emit the inner VM runtime (dispatcher + 13 handlers + handler
 /// table) into `e`. Returns the offset of the dispatcher entry

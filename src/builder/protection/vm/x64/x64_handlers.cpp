@@ -14,6 +14,7 @@
 #include <iterator>
 
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
+#include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 #include "mxprotector/protection/vm/x64/x64_vflags.hpp"
 
 namespace mx::vm::x64 {
@@ -454,8 +455,30 @@ void emit_handler_vjmp(RawEmitter& e, int32_t key_disp, bool rolling) {
 void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
                        uint8_t cc, uint32_t vflags_key,
                        uint32_t vflags_rol, int32_t rflags_disp,
-                       Randomizer& rng)
+                       Randomizer& rng,
+                       const InnerVmIsa* isa,
+                       size_t* inner_vm_call_patch_out)
 {
+    // V2 (nested) taken-path layout, byte by byte:
+    //
+    //   mov r15, rax                  49 89 C7       (3 bytes)
+    //   lea r12, [rip + 2]            4C 8D 25 02 00 00 00  (7)
+    //   jmp +2                         EB 02          (2)
+    //   <bc[0]> <bc[1]>                               (2)
+    //   call rel32 inner_vm_entry     E8 ?? ?? ?? ??  (5)
+    //
+    // Total: 19 bytes (vs 3 bytes for V0's direct `add r11, rax`).
+    //
+    // bc[0] = byte value of InnerVmOp::itake_branch in this ISA
+    // bc[1] = byte value of InnerVmOp::iret_noflag in this ISA
+    //
+    // `itake_branch` does `add r11, r15; jmp .loop`. `r15` was
+    // pre-loaded with the sign-extended rel32 by the `mov r15, rax`
+    // above. `iret_noflag` then returns to the instruction after
+    // the `call`, converging with the "not taken" path.
+    const bool nested_taken = (isa != nullptr);
+    const uint8_t jmp_short_over_taken = nested_taken ? 19u : 3u;
+
     emit_fetch_dword(e, key_disp, rolling);      // eax = rel32
     e.u8(0x48); e.u8(0x63); e.u8(0xC0);          // movsxd rax, eax
 
@@ -522,14 +545,51 @@ void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
         }
     }
 
-    // jcc/jnc + jmp short / add r11, rax — branchless target select.
+    // jcc/jnc + jmp short / taken body — branchless target select.
     const uint8_t jcc_opcode = info.jump_if_set ? 0x75 : 0x74;
     e.u8(jcc_opcode);
-    e.u8(0x02);                  // skip the `jmp short +3` below
+    e.u8(0x02);                      // skip the `jmp short` below
     // NOT TAKEN
-    e.u8(0xEB); e.u8(0x03);      // jmp short +3
+    e.u8(0xEB); e.u8(jmp_short_over_taken);
+
     // TAKEN
-    e.u8(0x49); e.u8(0x01); e.u8(0xC3);  // add r11, rax
+    if (!nested_taken) {
+        // V0 direct path: `add r11, rax`.
+        e.u8(0x49); e.u8(0x01); e.u8(0xC3);
+    } else {
+        // V2 nested path. Pre-load r15 with the rel32 target, set
+        // r12 to the inline inner bytecode, jump over the bytecode,
+        // call into the inner VM which will `add r11, r15; ret`.
+
+        // mov r15, rax   — REX.W|B (dst=r15 high) + 0x89 + ModRM
+        //                  (mod=11 reg=rax=000 rm=r15&7=111 → 0xC7)
+        e.u8(0x49); e.u8(0x89); e.u8(0xC7);
+
+        // lea r12, [rip + 2]  — 7 bytes, points at the inline bc
+        e.u8(0x4C); e.u8(0x8D); e.u8(0x25);
+        e.u32(static_cast<uint32_t>(2));
+
+        // jmp short +2   — skip the 2-byte inline bytecode
+        e.u8(0xEB); e.u8(0x02);
+
+        // Inline inner bytecode: [itake_branch, iret_noflag]
+        //
+        // Both opcodes go through the active ISA's permutation,
+        // so the byte values emitted here depend on the current
+        // build. The corresponding handler table entries (emitted
+        // by `emit_inner_vm_runtime` under the same ISA) line up
+        // by construction.
+        e.u8(isa->byte_of(InnerVmOp::itake_branch));
+        e.u8(isa->byte_of(InnerVmOp::iret_noflag));
+
+        // call rel32 <inner_vm_entry>  — rel32 patched by backend
+        // once the inner VM entry offset is known.
+        e.u8(0xE8);
+        if (inner_vm_call_patch_out != nullptr) {
+            *inner_vm_call_patch_out = e.size();
+        }
+        e.u32(0);
+    }
 
     // Both paths converge → tail dispatch follows (emitted by caller).
 }

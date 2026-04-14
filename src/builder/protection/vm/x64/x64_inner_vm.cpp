@@ -2,7 +2,7 @@
  * @file x64_inner_vm.cpp
  * @brief [BUILDER, x64] Inner VM runtime emitter (G2 extended scope).
  *
- * Produces the 152-byte inner-VM runtime block described in
+ * Produces the 160-byte inner-VM runtime block described in
  * `x64_inner_vm.hpp`. Every byte is hand-assembled and
  * cross-referenced against the layout diagram in the header; the
  * final `assert(size == kInnerVmRuntimeSize)` catches any accidental
@@ -55,9 +55,9 @@
  *   +86  H_iret_noflag      : ret                                 (1)
  *   +87  H_inot_r14         : not r14; jmp .loop                  (5)
  *   +92  H_ineg_r14         : neg r14; pushfq; pop rcx; jmp .loop (7)
- *   +99  padding                                                  (1, 0xCC)
- *   +100 handler_table : 13 × int32                              (52)
- *   +152 end
+ *   +99  H_itake_branch     : add r11, r15; jmp .loop             (5)
+ *   +104 handler_table : 14 × int32                              (56)
+ *   +160 end
  */
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
@@ -113,16 +113,17 @@ constexpr size_t kOffHIloadSrcAccum  = 81;
 constexpr size_t kOffHIretNoFlag     = 86;
 constexpr size_t kOffHInotR14        = 87;
 constexpr size_t kOffHInegR14        = 92;
-constexpr size_t kOffHandlersEnd     = 99;
-constexpr size_t kOffPaddingEnd      = 100;  // 4-byte aligned
+constexpr size_t kOffHItakeBranch    = 99;
+constexpr size_t kOffHandlersEnd     = 104;
+constexpr size_t kOffPaddingEnd      = 104;  // already 4-byte aligned, no pad needed
 
-constexpr size_t kOffHandlerTable    = 100;
-constexpr size_t kOffRuntimeEnd      = 152;
+constexpr size_t kOffHandlerTable    = 104;
+constexpr size_t kOffRuntimeEnd      = 160;
 
-static_assert(kOffHandlersEnd + 1 == kOffPaddingEnd,
-              "expected exactly 1 byte of padding between handlers and table");
-static_assert(kOffHandlerTable + 13 * 4 == kOffRuntimeEnd,
-              "handler table is 13 × int32, ends the block");
+static_assert(kOffHandlersEnd == kOffPaddingEnd,
+              "handlers end on a 4-byte boundary, no padding needed");
+static_assert(kOffHandlerTable + 14 * 4 == kOffRuntimeEnd,
+              "handler table is 14 × int32, ends the block");
 static_assert(kOffRuntimeEnd == kInnerVmRuntimeSize,
               "runtime size constant must match layout end");
 
@@ -158,7 +159,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e, const InnerVmIsa& isa) {
     //   disp32 = kOffHandlerTable - (end of LEA = +7)
     constexpr int32_t lea_disp32 =
         static_cast<int32_t>(kOffHandlerTable) - 7;
-    static_assert(lea_disp32 == 93, "handler table must sit at offset 100");
+    static_assert(lea_disp32 == 97, "handler table must sit at offset 104");
     e.u8(0x4C); e.u8(0x8D); e.u8(0x2D);
     e.u32(static_cast<uint32_t>(lea_disp32));
 
@@ -354,12 +355,31 @@ size_t emit_inner_vm_runtime(RawEmitter& e, const InnerVmIsa& isa) {
     e.u8(0x59);                                         // pop rcx
     emit_jmp_loop_rel8(e, kOffHInegR14 + 7);
 
-    assert(e.size() - blob_base == kOffHandlersEnd);
+    // ------------------------------------------------------------------
+    // [+99] H_itake_branch: add r11, r15; jmp .loop
+    //
+    //   add r/m64, r64: REX.W|R|B + 0x01 + ModRM
+    //   For `add r11, r15`: REX = W|R|B = 0x4D (W=1, R=1 for r15 src,
+    //   B=1 for r11 dst), opcode 0x01,
+    //   ModRM(mod=11 reg=r15&7=111 rm=r11&7=011) = 11 111 011 = 0xFB
+    //
+    // Used ONLY by vjcc V2 wrappers: on the taken branch, the outer
+    // wrapper has pre-loaded `r15 = rel32` and needs to advance the
+    // outer VPC (`r11`) by that amount. The inner VM does exactly
+    // that one operation and returns via `iret_noflag`.
+    //
+    // `add r11, r15` clobbers rflags, which does not matter — the
+    // outer wrapper already ran the cc test before calling into the
+    // inner VM, so whatever flags end up in `vflags` after the
+    // nested call mirror the post-cc-test state (same as V0 vjcc).
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHItakeBranch);
+    e.u8(0x4D); e.u8(0x01); e.u8(0xFB);
+    emit_jmp_loop_rel8(e, kOffHItakeBranch + 5);
 
-    // ------------------------------------------------------------------
-    // [+87] 1 byte padding so the int32 handler table lands 4-aligned.
-    // ------------------------------------------------------------------
-    e.u8(0xCC);
+    // Handlers now end on a 4-byte boundary (offset 104), so no
+    // padding is required before the handler table.
+    assert(e.size() - blob_base == kOffHandlersEnd);
     assert(e.size() - blob_base == kOffPaddingEnd);
 
     // ------------------------------------------------------------------
@@ -389,6 +409,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e, const InnerVmIsa& isa) {
         static_cast<int32_t>(kOffHIretNoFlag),     // 10  iret_noflag
         static_cast<int32_t>(kOffHInotR14),        // 11  inot_r14
         static_cast<int32_t>(kOffHInegR14),        // 12  ineg_r14
+        static_cast<int32_t>(kOffHItakeBranch),    // 13  itake_branch
     };
 
     // Build the final table contents: for each logical op, compute

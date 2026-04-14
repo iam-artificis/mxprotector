@@ -32,6 +32,11 @@
 
 namespace mx::vm::x64 {
 
+// Forward-declared here so `emit_handler_vjcc` can take an optional
+// `const InnerVmIsa*` without pulling `x64_inner_vm.hpp` into every
+// translation unit that only emits non-nested handler bodies.
+struct InnerVmIsa;
+
 // ----------------------------------------------------------------------------
 // Bytecode fetch helpers
 // ----------------------------------------------------------------------------
@@ -171,9 +176,22 @@ void emit_handler_unary(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t s
 void emit_handler_shift(RawEmitter& e, int32_t key_disp, bool rolling, uint8_t sub_op);
 
 void emit_handler_vjmp(RawEmitter& e, int32_t key_disp, bool rolling);
+
+/// VJCC handler emit.
+///
+/// If `isa` is non-null, the taken-path body is emitted as a nested-
+/// VM call (`mov r15, rax; lea r12; jmp; bc; call rel32 inner_vm_entry`)
+/// instead of the direct `add r11, rax`. `inner_vm_call_patch_out`
+/// then receives the in-blob offset of the rel32 operand of that
+/// `call` instruction so the backend can fix it up once the inner VM
+/// runtime's entry offset is known. Passing `isa == nullptr` keeps
+/// the V0 direct form (no patch needed, `inner_vm_call_patch_out`
+/// is ignored).
 void emit_handler_vjcc(RawEmitter& e, int32_t key_disp, bool rolling,
                        uint8_t cc, uint32_t vflags_key, uint32_t vflags_rol,
-                       int32_t rflags_disp, Randomizer& rng);
+                       int32_t rflags_disp, Randomizer& rng,
+                       const InnerVmIsa* isa = nullptr,
+                       size_t* inner_vm_call_patch_out = nullptr);
 
 // ----------------------------------------------------------------------------
 // Specialized handlers (G1 — Virtual CPU per-build handler specialisation)

@@ -35,13 +35,15 @@ below for the full spec.
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-5. ⏳ **VM strengthening — G2 nested VM.** Initial scope shipped —
-    inner VM for `add_rr` / `sub_rr` / `xor_rr` handlers: zero-operand
-    threaded interpreter, 64-byte runtime (dispatcher + 4 handlers +
-    handler table), per-op V2 variant. Remaining: расширенная ISA
-    (10–12 opcode'ов, scratch vflags slot), остальные хэндлеры
-    (mov/and/or/not/neg/ri32/vjcc), per-build randomization.
-    § "Gap vs коммерческие" → G2-extended.
+5. ✅ **VM strengthening — G2 nested VM.** Fully shipped. Inner VM
+    is a 14-opcode multi-step threaded interpreter with per-build
+    ISA randomization (`InnerVmIsa` Fisher–Yates permutation of the
+    opcode byte space). Every r-r ALU, `mov_rr`, unary, `*_ri32`,
+    and `vjcc` taken-path has a V2 variant that dispatches through
+    the nested VM. 160-byte runtime, position-independent, zero
+    external patches beyond the `call rel32 inner_vm_entry` call
+    sites (patched by the backend after runtime emit). § "Gap vs
+    коммерческие" → G2.
 6. 📋 **VM strengthening — G4 bytecode semantic obfuscation (remainder).**
     Handler id polymorphism already shipped (8 canonical ops × 2
     variants each). Still open: dead opcodes via dedicated
@@ -64,7 +66,7 @@ below for the full spec.
 
 Оставшиеся G-пункты. Каждый независимый, реализуемы по одному.
 
-### ⏳ G2. Nested VM / VM-in-VM *(initial scope shipped, extended scope 📋)*
+### ✅ G2. Nested VM / VM-in-VM *(fully shipped)*
 
 Shipped scope: the three register-register ALU handlers (`add_rr`,
 `sub_rr`, `xor_rr`) each gained a third variant (`V2`) whose body
@@ -325,7 +327,13 @@ reverser один раз разбирает наш runtime и дальше ви�
   byte-level pinning; production всегда рандомит из `rng`. Два
   билда одного и того же входа дают разные handler tables и
   разные inline bytecodes при семантически идентичных inner VM.
-- [ ] vjcc-лифт через `ibranch` + scratch flag carrier.
+- [x] vjcc V2 через `itake_branch` opcode. Cc-тест остаётся в outer
+  wrapper (нативный x64), но taken-path вместо `add r11, rax`
+  теперь `mov r15, rax; lea r12; jmp; bc; call inner_vm_entry`,
+  где inner VM делает `add r11, r15; ret_noflag`. Per-handler
+  50/50 coin flip выбирает V0 direct или V2 nested — единственная
+  диверсификация, доступная для vjcc, у которого variant-ось уже
+  занята condition code.
 
 ### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
 

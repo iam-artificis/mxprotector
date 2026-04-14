@@ -939,12 +939,27 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 emit_handler_vjmp(rt, rolling_key_disp, rolling);
                 return true;
 
-            case VmOp::vjcc:
+            case VmOp::vjcc: {
+                // Coin flip per handler body: 50% chance the taken
+                // path is the V0 direct `add r11, rax`, 50% it's
+                // the V2 nested `mov r15, rax; call inner_vm_entry`.
+                // Because vjcc's variant axis is already fully
+                // consumed by the condition code (16 values), this
+                // build-time randomization is the only diversity
+                // knob available for its handler bodies.
+                const bool nested = rng.next_bool();
+                size_t patch = 0;
                 emit_handler_vjcc(rt, rolling_key_disp, rolling,
                                   static_cast<uint8_t>(variant),
                                   vflags_key, vflags_rol,
-                                  rflags_disp, rng);
+                                  rflags_disp, rng,
+                                  nested ? &inner_vm_isa : nullptr,
+                                  nested ? &patch : nullptr);
+                if (nested) {
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
+            }
 
             case VmOp::native:
                 // Generic native slot is never invoked — each native insn gets

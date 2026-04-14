@@ -3,9 +3,9 @@
  * @brief [TESTS] Byte-level stability + structural invariants for the G2
  *        inner VM runtime (`emit_inner_vm_runtime`).
  *
- * Current pinned shape: 152-byte runtime, 13 opcodes (9 r-r ALU
+ * Current pinned shape: 160-byte runtime, 14 opcodes (9 r-r ALU
  * core + 2 helpers for mov_rr: `iload_src_accum` / `iret_noflag` +
- * 2 unary: `inot_r14` / `ineg_r14`).
+ * 2 unary: `inot_r14` / `ineg_r14` + 1 vjcc taken: `itake_branch`).
  *
  * The inner VM runtime is hand-assembled byte by byte. A single wrong
  * bit in a REX prefix, ModRM byte, or jump displacement silently
@@ -59,15 +59,15 @@ using mx::vm::x64::make_random_inner_vm_isa;
 // by the X64InnerVmIsa test suite at the bottom of this file.
 const InnerVmIsa kIdentityIsa = make_identity_inner_vm_isa();
 
-// Expected hex emission of the 152-byte runtime, as of G2-extended
-// with unary (not_r / neg_r) nested support. 13-opcode multi-step
-// ISA. Every byte is cross-referenced against the layout comment in
+// Expected hex emission of the 160-byte runtime, as of G2-extended
+// with vjcc V2 (itake_branch added). 14-opcode multi-step ISA.
+// Every byte is cross-referenced against the layout comment in
 // x64_inner_vm.cpp. If this array needs to change, the runtime
 // source has changed — make sure the change is intentional and
 // update both in lockstep.
-constexpr std::array<uint8_t, 152> kExpectedRuntime = {{
-    // +0  lea r13, [rip+93]   (disp32 = handler_table - end_of_lea = 100 - 7)
-    0x4C, 0x8D, 0x2D, 0x5D, 0x00, 0x00, 0x00,
+constexpr std::array<uint8_t, 160> kExpectedRuntime = {{
+    // +0  lea r13, [rip+97]   (disp32 = handler_table - end_of_lea = 104 - 7)
+    0x4C, 0x8D, 0x2D, 0x61, 0x00, 0x00, 0x00,
     // +7  .loop: movzx eax, byte [r12]
     0x41, 0x0F, 0xB6, 0x04, 0x24,
     // +12 inc r12
@@ -114,36 +114,38 @@ constexpr std::array<uint8_t, 152> kExpectedRuntime = {{
     // +92 H_ineg_r14: neg r14; pushfq; pop rcx; jmp .loop (rel8 = 7 - 99 = -92)
     0x49, 0xF7, 0xDE, 0x9C, 0x59, 0xEB, 0xA4,
 
-    // +99 padding (1 × 0xCC)
-    0xCC,
+    // +99 H_itake_branch: add r11, r15; jmp .loop (rel8 = 7 - 104 = -97)
+    0x4D, 0x01, 0xFB, 0xEB, 0x9F,
 
-    // +100 handler table: 13 × int32 signed offsets from table base
-    //   iload_src       (+28 - +100) = -72  = 0xFFFFFFB8
-    0xB8, 0xFF, 0xFF, 0xFF,
-    //   iload_dst       (+33 - +100) = -67  = 0xFFFFFFBD
-    0xBD, 0xFF, 0xFF, 0xFF,
-    //   istore_dst      (+38 - +100) = -62  = 0xFFFFFFC2
-    0xC2, 0xFF, 0xFF, 0xFF,
-    //   iadd_rr         (+43 - +100) = -57  = 0xFFFFFFC7
-    0xC7, 0xFF, 0xFF, 0xFF,
-    //   isub_rr         (+50 - +100) = -50  = 0xFFFFFFCE
-    0xCE, 0xFF, 0xFF, 0xFF,
-    //   ixor_rr         (+57 - +100) = -43  = 0xFFFFFFD5
-    0xD5, 0xFF, 0xFF, 0xFF,
-    //   iand_rr         (+64 - +100) = -36  = 0xFFFFFFDC
-    0xDC, 0xFF, 0xFF, 0xFF,
-    //   ior_rr          (+71 - +100) = -29  = 0xFFFFFFE3
-    0xE3, 0xFF, 0xFF, 0xFF,
-    //   iret            (+78 - +100) = -22  = 0xFFFFFFEA
-    0xEA, 0xFF, 0xFF, 0xFF,
-    //   iload_src_accum (+81 - +100) = -19  = 0xFFFFFFED
-    0xED, 0xFF, 0xFF, 0xFF,
-    //   iret_noflag     (+86 - +100) = -14  = 0xFFFFFFF2
-    0xF2, 0xFF, 0xFF, 0xFF,
-    //   inot_r14        (+87 - +100) = -13  = 0xFFFFFFF3
-    0xF3, 0xFF, 0xFF, 0xFF,
-    //   ineg_r14        (+92 - +100) = -8   = 0xFFFFFFF8
-    0xF8, 0xFF, 0xFF, 0xFF,
+    // +104 handler table: 14 × int32 signed offsets from table base
+    //   iload_src       (+28 - +104) = -76  = 0xFFFFFFB4
+    0xB4, 0xFF, 0xFF, 0xFF,
+    //   iload_dst       (+33 - +104) = -71  = 0xFFFFFFB9
+    0xB9, 0xFF, 0xFF, 0xFF,
+    //   istore_dst      (+38 - +104) = -66  = 0xFFFFFFBE
+    0xBE, 0xFF, 0xFF, 0xFF,
+    //   iadd_rr         (+43 - +104) = -61  = 0xFFFFFFC3
+    0xC3, 0xFF, 0xFF, 0xFF,
+    //   isub_rr         (+50 - +104) = -54  = 0xFFFFFFCA
+    0xCA, 0xFF, 0xFF, 0xFF,
+    //   ixor_rr         (+57 - +104) = -47  = 0xFFFFFFD1
+    0xD1, 0xFF, 0xFF, 0xFF,
+    //   iand_rr         (+64 - +104) = -40  = 0xFFFFFFD8
+    0xD8, 0xFF, 0xFF, 0xFF,
+    //   ior_rr          (+71 - +104) = -33  = 0xFFFFFFDF
+    0xDF, 0xFF, 0xFF, 0xFF,
+    //   iret            (+78 - +104) = -26  = 0xFFFFFFE6
+    0xE6, 0xFF, 0xFF, 0xFF,
+    //   iload_src_accum (+81 - +104) = -23  = 0xFFFFFFE9
+    0xE9, 0xFF, 0xFF, 0xFF,
+    //   iret_noflag     (+86 - +104) = -18  = 0xFFFFFFEE
+    0xEE, 0xFF, 0xFF, 0xFF,
+    //   inot_r14        (+87 - +104) = -17  = 0xFFFFFFEF
+    0xEF, 0xFF, 0xFF, 0xFF,
+    //   ineg_r14        (+92 - +104) = -12  = 0xFFFFFFF4
+    0xF4, 0xFF, 0xFF, 0xFF,
+    //   itake_branch    (+99 - +104) = -5   = 0xFFFFFFFB
+    0xFB, 0xFF, 0xFF, 0xFF,
 }};
 
 static_assert(kExpectedRuntime.size() == kInnerVmRuntimeSize,
@@ -164,13 +166,13 @@ TEST(X64InnerVmRuntime, EmitsExactlyKInnerVmRuntimeSize) {
            "constant AND the expected-bytes array in this test together";
 }
 
-TEST(X64InnerVmRuntime, DispatcherPrologueIsLeaR13RipPlus93) {
+TEST(X64InnerVmRuntime, DispatcherPrologueIsLeaR13RipPlus97) {
     RawEmitter e;
     (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 7u);
 
-    // lea r13, [rip + 93]
-    //   REX.W|R (0x4C) + 0x8D + ModRM(00 101 101 = 0x2D, rip-rel) + disp32=93
+    // lea r13, [rip + 97]
+    //   REX.W|R (0x4C) + 0x8D + ModRM(00 101 101 = 0x2D, rip-rel) + disp32=97
     EXPECT_EQ(e.buf[0], 0x4C);
     EXPECT_EQ(e.buf[1], 0x8D);
     EXPECT_EQ(e.buf[2], 0x2D);
@@ -179,8 +181,8 @@ TEST(X64InnerVmRuntime, DispatcherPrologueIsLeaR13RipPlus93) {
                              (static_cast<uint32_t>(e.buf[4]) << 8) |
                              (static_cast<uint32_t>(e.buf[5]) << 16)|
                              (static_cast<uint32_t>(e.buf[6]) << 24));
-    EXPECT_EQ(disp32, 93)
-        << "handler table sits at +100; disp32 = 100 - end_of_lea(7) = 93. "
+    EXPECT_EQ(disp32, 97)
+        << "handler table sits at +104; disp32 = 104 - end_of_lea(7) = 97. "
            "If you moved the table, update this expectation.";
 }
 
@@ -205,13 +207,13 @@ TEST(X64InnerVmRuntime, IretHandlerIsPushRcxPopfqRet) {
     EXPECT_EQ(e.buf[80], 0xC3);
 }
 
-TEST(X64InnerVmRuntime, HandlerTableHoldsThirteenInt32Entries) {
+TEST(X64InnerVmRuntime, HandlerTableHoldsFourteenInt32Entries) {
     RawEmitter e;
     (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_EQ(e.size(), kInnerVmRuntimeSize);
 
-    // Table at +100, 13 × int32 = 52 bytes, ends at +152 (end of block).
-    constexpr size_t table_off = 100;
+    // Table at +104, 14 × int32 = 56 bytes, ends at +160 (end of block).
+    constexpr size_t table_off = 104;
     auto read_i32 = [&](size_t at) {
         return static_cast<int32_t>(
             static_cast<uint32_t>(e.buf[at])          |
@@ -221,19 +223,20 @@ TEST(X64InnerVmRuntime, HandlerTableHoldsThirteenInt32Entries) {
     };
 
     // Each entry is (handler_offset - table_offset), signed.
-    EXPECT_EQ(read_i32(table_off +  0), 28 - 100);  // iload_src
-    EXPECT_EQ(read_i32(table_off +  4), 33 - 100);  // iload_dst
-    EXPECT_EQ(read_i32(table_off +  8), 38 - 100);  // istore_dst
-    EXPECT_EQ(read_i32(table_off + 12), 43 - 100);  // iadd_rr
-    EXPECT_EQ(read_i32(table_off + 16), 50 - 100);  // isub_rr
-    EXPECT_EQ(read_i32(table_off + 20), 57 - 100);  // ixor_rr
-    EXPECT_EQ(read_i32(table_off + 24), 64 - 100);  // iand_rr
-    EXPECT_EQ(read_i32(table_off + 28), 71 - 100);  // ior_rr
-    EXPECT_EQ(read_i32(table_off + 32), 78 - 100);  // iret
-    EXPECT_EQ(read_i32(table_off + 36), 81 - 100);  // iload_src_accum
-    EXPECT_EQ(read_i32(table_off + 40), 86 - 100);  // iret_noflag
-    EXPECT_EQ(read_i32(table_off + 44), 87 - 100);  // inot_r14
-    EXPECT_EQ(read_i32(table_off + 48), 92 - 100);  // ineg_r14
+    EXPECT_EQ(read_i32(table_off +  0), 28 - 104);  // iload_src
+    EXPECT_EQ(read_i32(table_off +  4), 33 - 104);  // iload_dst
+    EXPECT_EQ(read_i32(table_off +  8), 38 - 104);  // istore_dst
+    EXPECT_EQ(read_i32(table_off + 12), 43 - 104);  // iadd_rr
+    EXPECT_EQ(read_i32(table_off + 16), 50 - 104);  // isub_rr
+    EXPECT_EQ(read_i32(table_off + 20), 57 - 104);  // ixor_rr
+    EXPECT_EQ(read_i32(table_off + 24), 64 - 104);  // iand_rr
+    EXPECT_EQ(read_i32(table_off + 28), 71 - 104);  // ior_rr
+    EXPECT_EQ(read_i32(table_off + 32), 78 - 104);  // iret
+    EXPECT_EQ(read_i32(table_off + 36), 81 - 104);  // iload_src_accum
+    EXPECT_EQ(read_i32(table_off + 40), 86 - 104);  // iret_noflag
+    EXPECT_EQ(read_i32(table_off + 44), 87 - 104);  // inot_r14
+    EXPECT_EQ(read_i32(table_off + 48), 92 - 104);  // ineg_r14
+    EXPECT_EQ(read_i32(table_off + 52), 99 - 104);  // itake_branch
 }
 
 TEST(X64InnerVmRuntime, OpcodeEnumIndexesHandlerTableCorrectly) {
@@ -253,6 +256,23 @@ TEST(X64InnerVmRuntime, OpcodeEnumIndexesHandlerTableCorrectly) {
     EXPECT_EQ(static_cast<uint8_t>(InnerVmOp::iret_noflag),     0x0A);
     EXPECT_EQ(static_cast<uint8_t>(InnerVmOp::inot_r14),        0x0B);
     EXPECT_EQ(static_cast<uint8_t>(InnerVmOp::ineg_r14),        0x0C);
+    EXPECT_EQ(static_cast<uint8_t>(InnerVmOp::itake_branch),    0x0D);
+}
+
+TEST(X64InnerVmRuntime, ItakeBranchHandlerIsAddR11R15JmpLoop) {
+    RawEmitter e;
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
+    ASSERT_GE(e.size(), 104u);
+
+    // itake_branch at +99: `add r11, r15` = 4D 01 FB, then `jmp
+    // rel8` back to .loop. Used by vjcc V2's taken path to advance
+    // the outer VPC (r11) by the pre-loaded rel32 (r15). If this
+    // handler stops advancing r11 or accidentally touches r14 or
+    // rcx, every nested vjcc in every build goes to a wrong target.
+    EXPECT_EQ(e.buf[99],  0x4D);  // REX.W|R|B
+    EXPECT_EQ(e.buf[100], 0x01);  // add r/m64, r64 opcode
+    EXPECT_EQ(e.buf[101], 0xFB);  // ModRM: reg=r15, rm=r11
+    EXPECT_EQ(e.buf[102], 0xEB);  // jmp rel8 back to .loop
 }
 
 TEST(X64InnerVmRuntime, IretNoFlagHandlerIsBareRet) {
@@ -405,11 +425,11 @@ TEST(X64InnerVmIsa, RandomIsaRuntimeHasSameSizeAndDispatcherShape) {
     (void)emit_inner_vm_runtime(e, isa);
 
     ASSERT_EQ(e.size(), kInnerVmRuntimeSize);
-    // Dispatcher prologue is `lea r13, [rip+93]` regardless of ISA.
+    // Dispatcher prologue is `lea r13, [rip+97]` regardless of ISA.
     EXPECT_EQ(e.buf[0], 0x4C);
     EXPECT_EQ(e.buf[1], 0x8D);
     EXPECT_EQ(e.buf[2], 0x2D);
-    EXPECT_EQ(e.buf[3], 0x5D);  // disp32 low byte = 93
+    EXPECT_EQ(e.buf[3], 0x61);  // disp32 low byte = 97
     EXPECT_EQ(e.buf[4], 0x00);
     EXPECT_EQ(e.buf[5], 0x00);
     EXPECT_EQ(e.buf[6], 0x00);
@@ -435,9 +455,9 @@ TEST(X64InnerVmIsa, HandlerTableEntriesFollowPermutation) {
     // Expected handler offsets — must match the constants in
     // x64_inner_vm.cpp. Listed here in logical-op order.
     constexpr std::array<int32_t, kInnerVmOpCount> kHandlerOffsets = {{
-        28, 33, 38, 43, 50, 57, 64, 71, 78, 81, 86, 87, 92
+        28, 33, 38, 43, 50, 57, 64, 71, 78, 81, 86, 87, 92, 99
     }};
-    constexpr size_t table_off = 100;
+    constexpr size_t table_off = 104;
 
     auto read_i32 = [&](size_t at) {
         return static_cast<int32_t>(
