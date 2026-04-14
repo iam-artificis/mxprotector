@@ -220,6 +220,11 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
 // G5 trampoline
 // ============================================================================
 
+TrampolineShape pick_trampoline_shape(Randomizer& rng) {
+    return static_cast<TrampolineShape>(rng.next_range(
+        0, static_cast<uint32_t>(TrampolineShape::kCount) - 1));
+}
+
 TrampolinePatch emit_trampoline(RawEmitter& e, Randomizer& rng,
                                 uint32_t max_junk_bytes)
 {
@@ -236,14 +241,83 @@ TrampolinePatch emit_trampoline(RawEmitter& e, Randomizer& rng,
     //     pattern-match on "always at least K NOPs before every jmp".
     emit_junk_prologue(e, rng, max_junk_bytes);
 
-    // (2) jmp rel32 → real handler (placeholder, patched by caller).
-    //     Encoding: E9 rel32. `rel32` is `target - (jmp_end)` where
-    //     `jmp_end` is the offset right after the rel32 field.
-    e.u8(0xE9);
-    const size_t rel32_off = e.size();
-    e.u8(0); e.u8(0); e.u8(0); e.u8(0);
-    const size_t instr_end = e.size();
-    return {rel32_off, instr_end};
+    // (2) Polymorphic branch. Each shape computes
+    //     `int32 = target_handler_offset - anchor_offset` at patch
+    //     time, written at `fixup_offset`. The anchor and fixup
+    //     coincide (+4) for the Direct and PushRet shapes but
+    //     diverge for CallPop — the generic formula handles both.
+    const TrampolineShape shape = pick_trampoline_shape(rng);
+    switch (shape) {
+        case TrampolineShape::Direct: {
+            // jmp rel32                       E9 rel32
+            //   5 bytes. rip at runtime right after the rel32
+            //   equals fixup + 4, so `anchor == fixup + 4`.
+            e.u8(0xE9);
+            const size_t fixup = e.size();
+            e.u8(0); e.u8(0); e.u8(0); e.u8(0);
+            const size_t anchor = e.size();
+            return {fixup, anchor};
+        }
+        case TrampolineShape::PushRet: {
+            // lea rax, [rip + rel32]          48 8D 05 rel32
+            //   Loads the target handler address into rax rip-
+            //   relative. rax is a scratch register in the VM's
+            //   register convention (every handler clobbers it
+            //   in its fetch-operand prologue), so the lea has
+            //   no observable side effect on VM state.
+            // push rax                        50
+            // ret                             C3
+            //   The `push rax; ret` pair sends rip to the value
+            //   we just computed. Net rsp change is zero. A
+            //   straight-line disassembly prints this as a
+            //   "return to a computed address" rather than a
+            //   jmp, which frustrates naïve CFG recovery tools
+            //   that treat `ret` as an unconditional end-of-
+            //   function.
+            e.u8(0x48); e.u8(0x8D); e.u8(0x05);
+            const size_t fixup = e.size();
+            e.u8(0); e.u8(0); e.u8(0); e.u8(0);
+            const size_t anchor = e.size();
+            e.u8(0x50);
+            e.u8(0xC3);
+            return {fixup, anchor};
+        }
+        case TrampolineShape::CallPop: {
+            // call $+5                        E8 00 00 00 00
+            //   Pushes the return address (= byte right after
+            //   this call) onto the stack and falls through to
+            //   the next instruction. No actual branch taken.
+            //   That return-address value IS the rip-relative
+            //   anchor for the patch; `add [rsp], imm32` below
+            //   reinterprets it by adding a build-time-fixed
+            //   delta.
+            e.u8(0xE8);
+            e.u8(0); e.u8(0); e.u8(0); e.u8(0);
+            const size_t anchor = e.size();
+            // add qword [rsp], imm32          48 81 04 24 imm32
+            //   Sign-extended 32-bit immediate added to the stack
+            //   top (which holds the call's return address). The
+            //   caller patches `imm32 = handler_offset - anchor`
+            //   so after this add the stack top holds the real
+            //   handler's runtime address.
+            e.u8(0x48); e.u8(0x81); e.u8(0x04); e.u8(0x24);
+            const size_t fixup = e.size();
+            e.u8(0); e.u8(0); e.u8(0); e.u8(0);
+            // ret                             C3
+            //   Pops the patched stack top into rip. rsp is back
+            //   to its pre-call value. rflags is clobbered by
+            //   the `add` but rflags is already dead by the time
+            //   a tail dispatch jumps to this trampoline.
+            e.u8(0xC3);
+            return {fixup, anchor};
+        }
+        case TrampolineShape::kCount:
+            break;
+    }
+    // Unreachable — `pick_trampoline_shape` only returns values in
+    // [0, kCount). Ensures the compiler emits a warning-free
+    // switch.
+    return {0, 0};
 }
 
 // ============================================================================

@@ -145,15 +145,61 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
 // Only Intel-documented multi-byte NOPs (via `emit_nop_run`) are safe.
 // ----------------------------------------------------------------------------
 
+/// Shape of a trampoline's final branch. Each shape produces the
+/// same net effect — control arrives at the real handler — but
+/// uses different x64 opcodes so the trampoline pool reads as a
+/// heterogeneous mix of instruction patterns rather than N copies
+/// of the same `jmp rel32`. See `emit_trampoline` for per-shape
+/// encoding details.
+enum class TrampolineShape : uint8_t {
+    Direct  = 0,  ///< jmp rel32
+    PushRet = 1,  ///< lea rax, [rip+rel32]; push rax; ret
+    CallPop = 2,  ///< call $+5; add qword [rsp], imm32; ret
+    kCount  = 3
+};
+
+[[nodiscard]] TrampolineShape pick_trampoline_shape(Randomizer& rng);
+
+/// Fix-up descriptor returned by `emit_trampoline`. The caller
+/// patches the 32-bit slot at `fixup_offset` with
+/// `int32(target_handler_offset - anchor_offset)`. Both offsets
+/// are absolute positions inside the VM blob.
+///
+/// The two fields are generally the same number + 4 for the
+/// Direct and PushRet shapes (where the `fixup` slot immediately
+/// precedes the next instruction, so the rip-relative anchor
+/// equals the fixup end). CallPop breaks that symmetry: its
+/// `fixup` is the imm32 inside a later `add [rsp], imm32`, while
+/// its `anchor` is the byte after an earlier `call rel32 = 0`
+/// that pushes the anchor onto the stack. The generic
+/// `target - anchor` formula covers both cases without per-shape
+/// branching in the patch code.
 struct TrampolinePatch {
-    size_t jmp_rel32_offset;  ///< offset of the rel32 inside the `jmp rel32`
-    size_t instruction_end;   ///< byte just after the rel32
+    size_t fixup_offset;   ///< where the int32 is written
+    size_t anchor_offset;  ///< int32 = target - anchor_offset
 };
 
 /// Emit a single trampoline: a random 0..`max_junk_bytes` sled of
-/// multi-byte NOPs followed by `jmp rel32`. The rel32 slot is
+/// multi-byte NOPs followed by the polymorphic branch picked via
+/// `pick_trampoline_shape`. The int32 slot inside the branch is
 /// zero-filled; the caller patches it once the target handler's
-/// in-blob offset is known. Returns the patch coordinates.
+/// in-blob offset is known.
+///
+/// Registers clobbered by the branch:
+///
+///   * Direct  — none.
+///   * PushRet — `rax` (holds the lea result), plus a transient
+///                stack push/pop balanced around the ret.
+///   * CallPop — none (the transient `call`/`ret` pair leaves
+///                every GPR intact; the stack slot modified by
+///                the `add [rsp], imm32` in between is the
+///                call's own return address and is popped by
+///                the ret). `rflags` is written by the `add`
+///                but rflags is already dead by the time tail
+///                dispatch jumps to the trampoline.
+///
+/// All three shapes net rsp back to its entry value, so any
+/// subsequent handler sees the VM's stack layout unchanged.
 TrampolinePatch emit_trampoline(RawEmitter& e, Randomizer& rng,
                                 uint32_t max_junk_bytes = 8);
 

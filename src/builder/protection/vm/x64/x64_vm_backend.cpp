@@ -1575,12 +1575,21 @@ MxResult<VmRuntime> X64VmBackend::generate(
         std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
     }
 
-    // G5: patch each trampoline's placeholder `jmp rel32` to point
-    // at the real handler. Every handler that was emitted has a
-    // corresponding trampoline fixup recorded here; a missing fixup
-    // means the emission loop lost track of a handler, which is a
-    // bug, so we surface it explicitly instead of silently leaving
-    // a trampoline that jumps to offset 0.
+    // G5: patch each trampoline's placeholder int32 slot with
+    // `handler_offset - anchor_offset`, sending runtime rip at
+    // the right point to the real handler. The anchor semantics
+    // vary per trampoline shape (see `emit_trampoline`): for
+    // Direct and PushRet it is the byte right after the rel32
+    // slot; for CallPop it is the byte right after the
+    // `call rel32 = 0` that leaked the anchor onto the stack.
+    // The formula is uniform — the shape-specific math is baked
+    // into `anchor_offset` at emit time.
+    //
+    // Every handler that was emitted has a corresponding
+    // trampoline fixup recorded here; a missing fixup means the
+    // emission loop lost track of a handler, which is a bug, so
+    // we surface it explicitly instead of silently leaving a
+    // trampoline whose final jump lands on offset 0.
     for (const auto& tf : trampoline_fixups) {
         if (handler_offset_by_id[tf.handler_id] == SIZE_MAX) {
             return std::unexpected(MxError(
@@ -1589,11 +1598,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
                              tf.handler_id)));
         }
         const size_t handler_off = handler_offset_by_id[tf.handler_id];
-        const size_t jmp_end     = tf.patch.instruction_end;
         const int32_t rel = static_cast<int32_t>(
             static_cast<int64_t>(handler_off) -
-            static_cast<int64_t>(jmp_end));
-        std::memcpy(rt.buf.data() + tf.patch.jmp_rel32_offset, &rel, 4);
+            static_cast<int64_t>(tf.patch.anchor_offset));
+        std::memcpy(rt.buf.data() + tf.patch.fixup_offset, &rel, 4);
     }
 
     // handler_table entries: each = (trampoline_offset - table_offset) ^ table_xor_key.
