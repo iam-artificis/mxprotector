@@ -35,8 +35,11 @@ below for the full spec.
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-5. 📋 **VM strengthening — G2 nested VM.** Inner VM for critical handlers
-    (load, store, key derivation). § "Gap vs коммерческие" → G2.
+5. ✅ **VM strengthening — G2 nested VM.** Inner VM for `add_rr` /
+    `sub_rr` / `xor_rr` handlers — zero-operand threaded interpreter,
+    64-byte runtime (dispatcher + 4 handlers + handler table), per-op
+    V2 variant. Outer handler becomes `setup + lea r12 + call
+    inner_vm_entry`. § "Gap vs коммерческие" → G2.
 6. 📋 **VM strengthening — G4 bytecode semantic obfuscation (remainder).**
     Handler id polymorphism already shipped (8 canonical ops × 2
     variants each). Still open: dead opcodes via dedicated
@@ -59,16 +62,59 @@ below for the full spec.
 
 Оставшиеся G-пункты. Каждый независимый, реализуемы по одному.
 
-### 📋 G2. Nested VM / VM-in-VM *(высокий, очень высокая сложность)*
-Выбранные критические handler'ы (load, store, key derivation, integrity check)
-сами виртуализируются под второй, более простой VM с независимым bytecode и
-handler table. То, что reverser ожидает увидеть как "handler for ADD" — на самом
-деле entry во внутреннюю VM с ещё 5-10 dispatch steps.
+### ✅ G2. Nested VM / VM-in-VM *(shipped, initial scope)*
 
-Реализация: отдельный `InnerVmLifter` с урезанным opcode set (~8 операций),
-`InnerVmRuntimeGen` генерит компактный inner dispatcher. Outer VM handler становится
-`call inner_vm_entry; ret`. Overhead: +30-50% bytecode size на защищённый регион,
-но реверс times умножается на коэффициент inner-VM сложности.
+Shipped scope: the three register-register ALU handlers (`add_rr`,
+`sub_rr`, `xor_rr`) each gained a third variant (`V2`) whose body
+hands the arithmetic off to a nested, independently-dispatched
+bytecode interpreter.
+
+Design (files: `include/mxprotector/protection/vm/x64/x64_inner_vm.hpp`,
+`src/builder/protection/vm/x64/x64_inner_vm.cpp`):
+
+- **Inner ISA — 4 opcodes, zero operands.** `iload_src` (r14 ← [rdi]),
+  `iadd_exit` / `isub_exit` / `ixor_exit` ([rsi] ⊙= r14; ret). No
+  sentinel byte — the terminal handler's ALU op + `ret` is the exit.
+  Lifted bytecodes: `add_rr → [iload_src, iadd_exit]` (2 bytes), same
+  shape for sub / xor.
+- **64-byte position-independent runtime.** 28-byte dispatcher
+  (`lea r13, [rip+ht] → .loop: movzx/inc/mov/movsxd/add/jmp rax`) +
+  4 handler bodies (17 bytes) + 3 bytes padding + 16-byte handler
+  table of signed int32 offsets relative to the table base. Every
+  intra-runtime branch is either a short rel8 back to `.loop` or the
+  rip-relative `lea r13`. Zero external patches.
+- **r14, not rax, is the inner src register.** The dispatcher loop
+  clobbers rax every iteration (opcode fetch → table index → handler
+  address). Using rax for iload_src would overwrite it before the
+  terminal ALU ever runs. An earlier first-pass bug did exactly this
+  and added the handler address to the destination slot — see commit
+  history if you need the 48-bit-pointer fiasco as a cautionary tale.
+- **Flags propagate via `ret` itself.** The terminal ALU op is the
+  last flag-touching instruction before `ret`; `ret` preserves rflags;
+  the outer handler's tail dispatch (`emit_vflags_store`) saves them
+  straight into `vflags`. No stack push/pop, no dispatcher re-entry
+  between ALU and exit. The same trap that killed the G4 dead-opcode
+  experiment applies here — any extra flag-clobbering instruction
+  between ALU and `ret` corrupts downstream `vjcc`.
+- **Outer handler V2 shape.** `emit_handler_alu_rr_nested` emits
+  `fetch operand bytes → compute [rsi]/[rdi] → lea r12, [rip+2] → jmp
+  2 → <2-byte bc> → call rel32 inner_vm_entry`. The backend collects
+  every V2's rel32 patch offset into `inner_vm_call_patches`, emits
+  the 64-byte runtime once (16-byte aligned) after all handlers, and
+  patches all call sites to point at the dispatcher entry.
+
+Verified against the standard 90× stress (6 VM test apps × 3 strings
+modes × 5 runs) at strong level and a maximum-level build of
+`test_vm_showcase`, all green.
+
+Remaining scope (not in this iteration, listed separately as G2-extended):
+
+- More inner-VM opcodes — load/store permutations beyond `iload_src`,
+  binary ALU with both operands in inner regs, shifts.
+- Nesting other outer handler families — `mov_rr`, unary ops,
+  eventually `vjcc` key derivation.
+- Per-build randomization of the inner ISA (opcode byte permutation,
+  handler-table shuffling, dispatcher junk).
 
 ### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
 

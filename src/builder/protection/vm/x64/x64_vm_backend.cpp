@@ -29,6 +29,7 @@
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_handlers.hpp"
+#include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 #include "mxprotector/protection/vm/x64/x64_vflags.hpp"
 
 namespace mx::vm::x64 {
@@ -38,14 +39,22 @@ namespace {
 /// How many handler variants each canonical VmOp emits. Ops with multiple
 /// variants have two (or more) mathematically equivalent emission forms;
 /// the encoder picks one at random per instruction to defeat simple
-/// opcode-table recovery (G4 — handler-id polymorphism).
+/// opcode-table recovery (G4 — handler-id polymorphism) and, for
+/// add/sub/xor_rr, optionally dispatch through a nested inner VM
+/// (G2 — nested VM).
 constexpr uint8_t variant_count_for(VmOp op) {
     switch (op) {
-        // Canonical body + MBA / alternative x64 sequence.
+        // add_rr / sub_rr / xor_rr each have THREE variants:
+        //   V0 canonical direct ALU
+        //   V1 MBA / neg / mba alternative
+        //   V2 G2 nested — outer handler body calls into the inner VM
+        //                  runtime and returns via `ret`
+        case VmOp::add_rr:
+        case VmOp::sub_rr:
+        case VmOp::xor_rr:
+            return 3;
+        // Canonical body + MBA / alternative x64 sequence (G4 only).
         case VmOp::mov_rr:   // V0 mov/mov        V1 push/pop
-        case VmOp::add_rr:   // V0 add direct     V1 MBA
-        case VmOp::sub_rr:   // V0 sub direct     V1 neg+add
-        case VmOp::xor_rr:   // V0 xor direct     V1 MBA
         case VmOp::and_rr:   // V0 and direct     V1 De Morgan
         case VmOp::or_rr:    // V0 or direct      V1 De Morgan
         case VmOp::not_r:    // V0 not r/m64      V1 xor r/m64, -1
@@ -707,6 +716,13 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
     uint32_t exit_jmp_offset = 0;  // patched if emit_exit_as_jmp
 
+    // G2 nested VM: every time an outer handler V2 is emitted, it
+    // leaves a zero-filled `call rel32` operand where the rel32 to
+    // `inner_vm_entry` needs to go. We collect those offsets here
+    // and patch them all at once after the inner VM runtime has
+    // been appended to the blob and its entry offset is known.
+    std::vector<size_t> inner_vm_call_patches;
+
     auto emit_op_variant = [&](VmOp op, uint32_t variant) -> bool {
         switch (op) {
             case VmOp::mov_rr:
@@ -715,18 +731,45 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 return true;
 
             case VmOp::add_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x01);
-                else              emit_handler_add_rr_mba(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x01);
+                } else if (variant == 1) {
+                    emit_handler_add_rr_mba(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner terminal opcode 0x01 = iadd_exit.
+                    size_t patch = 0;
+                    emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
+                                                /*alu_inner_opcode=*/0x01, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::sub_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x29);
-                else              emit_handler_sub_rr_neg(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x29);
+                } else if (variant == 1) {
+                    emit_handler_sub_rr_neg(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner terminal opcode 0x02 = isub_exit.
+                    size_t patch = 0;
+                    emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
+                                                /*alu_inner_opcode=*/0x02, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::xor_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x31);
-                else              emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x31);
+                } else if (variant == 1) {
+                    emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner terminal opcode 0x03 = ixor_exit.
+                    size_t patch = 0;
+                    emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
+                                                /*alu_inner_opcode=*/0x03, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::and_rr:
@@ -958,6 +1001,49 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                              dst_disp, src_disp);
         }
         end_handler_tail();
+    }
+
+    // ---- Inner VM runtime (G2 — nested VM) ---------------------------------
+    //
+    // Emit the 88-byte inner VM runtime (dispatcher + 6 inner
+    // handlers + relative handler table) exactly once per outer VM
+    // blob, and patch every outer handler's `call rel32
+    // inner_vm_entry` that was left zero-filled during emission.
+    //
+    // The inner VM is placed AFTER the last outer handler and
+    // BEFORE the outer handler table. Putting it here means:
+    //   - Outer handlers that use V2 reference it via a forward
+    //     rel32 `call`, which is the normal dispatch direction.
+    //   - The outer handler table still comes last, right before
+    //     the bytecode stream, so the existing rel32 patches to
+    //     `handler_table_offset` aren't affected.
+    //   - If no outer handler ended up choosing V2 for any
+    //     instance, the inner VM block still exists but is dead
+    //     code. 88 bytes of overhead is acceptable.
+    //
+    // The inner VM is self-contained: all of its intra-block
+    // branches (rel8 jumps back to the dispatch loop) and the
+    // rip-relative `lea r13, handler_table` are computed at emit
+    // time from static offsets. No runtime patches are needed.
+    size_t inner_vm_entry_offset = 0;
+    {
+        // Align to 16 so the dispatcher entry is instruction-cache
+        // friendly and so a future self-mutation pass can trivially
+        // find the block by scanning for a 16-byte-aligned
+        // signature.
+        while (rt.size() % 16 != 0) rt.u8(0xCC);
+        inner_vm_entry_offset = rt.size();
+        (void) emit_inner_vm_runtime(rt);
+    }
+
+    // Patch every G2 V2 outer-handler's `call rel32 inner_vm_entry`
+    // now that the inner VM entry has a definite offset.
+    for (const size_t rel32_patch : inner_vm_call_patches) {
+        const size_t call_end = rel32_patch + 4;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(inner_vm_entry_offset) -
+            static_cast<int64_t>(call_end));
+        std::memcpy(rt.buf.data() + rel32_patch, &rel, 4);
     }
 
     // ---- Handler table -----------------------------------------------------
