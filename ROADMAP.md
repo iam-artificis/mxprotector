@@ -35,11 +35,13 @@ below for the full spec.
     unpacking, TLS-callback secondary entry, CFI in decrypt loop,
     header stripping, guard pages. Lower priority polish. § "Packer
     strengthening".
-5. ✅ **VM strengthening — G2 nested VM.** Inner VM for `add_rr` /
-    `sub_rr` / `xor_rr` handlers — zero-operand threaded interpreter,
-    64-byte runtime (dispatcher + 4 handlers + handler table), per-op
-    V2 variant. Outer handler becomes `setup + lea r12 + call
-    inner_vm_entry`. § "Gap vs коммерческие" → G2.
+5. ⏳ **VM strengthening — G2 nested VM.** Initial scope shipped —
+    inner VM for `add_rr` / `sub_rr` / `xor_rr` handlers: zero-operand
+    threaded interpreter, 64-byte runtime (dispatcher + 4 handlers +
+    handler table), per-op V2 variant. Remaining: расширенная ISA
+    (10–12 opcode'ов, scratch vflags slot), остальные хэндлеры
+    (mov/and/or/not/neg/ri32/vjcc), per-build randomization.
+    § "Gap vs коммерческие" → G2-extended.
 6. 📋 **VM strengthening — G4 bytecode semantic obfuscation (remainder).**
     Handler id polymorphism already shipped (8 canonical ops × 2
     variants each). Still open: dead opcodes via dedicated
@@ -62,7 +64,7 @@ below for the full spec.
 
 Оставшиеся G-пункты. Каждый независимый, реализуемы по одному.
 
-### ✅ G2. Nested VM / VM-in-VM *(shipped, initial scope)*
+### ⏳ G2. Nested VM / VM-in-VM *(initial scope shipped, extended scope 📋)*
 
 Shipped scope: the three register-register ALU handlers (`add_rr`,
 `sub_rr`, `xor_rr`) each gained a third variant (`V2`) whose body
@@ -107,14 +109,201 @@ Verified against the standard 90× stress (6 VM test apps × 3 strings
 modes × 5 runs) at strong level and a maximum-level build of
 `test_vm_showcase`, all green.
 
-Remaining scope (not in this iteration, listed separately as G2-extended):
+#### Remaining scope — G2-extended (📋 TODO)
 
-- More inner-VM opcodes — load/store permutations beyond `iload_src`,
-  binary ALU with both operands in inner regs, shifts.
-- Nesting other outer handler families — `mov_rr`, unary ops,
-  eventually `vjcc` key derivation.
-- Per-build randomization of the inner ISA (opcode byte permutation,
-  handler-table shuffling, dispatcher junk).
+Initial scope (4-opcode terminal-producer ISA, 3 ALU хэндлеров, 1
+dispatch step) даёт правильную инфраструктуру — runtime emit, rel32
+patch loop, V2 вариант в `variant_count_for` — но покрывает слишком
+узкое множество и без depth'а не даёт того ROI, который G2 в принципе
+должен обеспечить. Ниже — что нужно, чтобы довести до полноценного
+nested VM.
+
+**1. Расширенная ISA (~10–12 opcode'ов).** Терминал-producer схему
+заменяет честный threaded interpreter с промежуточными значениями.
+Ожидаемый набор:
+
+```
+iload_src        r_inner <- [rdi]                    ; src slot value
+iload_dst        r_inner <- [rsi]                    ; dst slot value (для ALU rr)
+istore_dst       [rsi] <- r_inner                    ; запись результата
+ialu_rr  op      r_inner <- r_inner <op> tmp_inner   ; op в byte-операнде
+ialu_ri  op imm8 r_inner <- r_inner <op> imm8
+ikey_xor imm8    r_inner <- r_inner ^ imm8           ; шаг rolling key
+imov_tmp         tmp_inner <- r_inner                ; сохранить промежуточный
+iswap            r_inner <-> tmp_inner
+iret             возврат во внешний хэндлер; rflags = последний ALU
+ibranch imm8     условный переход внутри inner bc по ZF (для vjcc lift'а)
+```
+
+Точный набор подбирается по тому, какие outer-хэндлеры лифтим, но
+минимум 6–8 opcode'ов необходим — иначе inner VM не даёт ни depth, ни
+полиморфизма, ради которых G2 делается.
+
+**2. Раскладка регистров host'а (расширение текущей).** Строго:
+
+- `rsi` — dst slot addr (set by outer);
+- `rdi` — src slot addr (set by outer);
+- `r12` — inner VPC;
+- `r13` — inner handler-table base;
+- `r14` — inner "r_inner" (НЕ rax — см. урок #1 ниже);
+- `r15` — inner "tmp_inner" *(новое — в initial scope не использовался)*;
+- `r11` — outer VPC (ни в коем случае не трогать).
+
+**3. Flag propagation для multi-step ISA.** Текущая схема
+(`add [rsi], r14; ret` — терминальный ALU последний flag-producer) не
+масштабируется на несколько ALU step'ов: любой промежуточный
+flag-producer клобберит rflags до терминала. Варианты:
+
+1. **Terminal-producer (как сейчас).** Последний ALU перед `iret`
+   обязан быть flag-producer'ом, все nonterminal ALU до него
+   выполняются через `pushfq/popfq` вокруг dispatch step'а. Дороже, но
+   универсально.
+2. **Scratch vflags slot внутри inner VM.** Inner VM сохраняет флаги в
+   отдельный inner-slot после каждой ALU и восстанавливает их перед
+   `iret`. Требует `pushfq` ровно 1 раз на хэндлер, не на step.
+3. **Отложенная семантика (текущий initial scope).** Inner VM не
+   производит guest-ALU промежуточных значений — только терминальный
+   хэндлер делает финальный op напрямую по memory operand. Ограничивает
+   ширину лифтинга, но дёшево.
+
+Рекомендация: **схема 2**. Её легче расширить на vjcc-лифт и на
+полноценный `ialu_ri` без потери гостевых флагов. Схема 3 остаётся как
+fast-path для простых случаев.
+
+**4. Outer-handler coverage (кандидаты в порядке ценности).**
+
+| Outer handler | Inner bc (пример) | Статус |
+|---|---|---|
+| `add_rr`/`sub_rr`/`xor_rr` | `iload_src; iadd_exit`/etc | ✅ shipped |
+| `and_rr`/`or_rr` | `iload_src; iload_dst; ialu_rr op; istore_dst; iret` | 📋 |
+| `mov_rr` | `iload_src; istore_dst; iret` | 📋 |
+| `*_ri32` (add/sub/xor/and/or) | `iload_dst; ialu_ri op imm; istore_dst; iret` | 📋 (зависит от inline imm в inner bc) |
+| `not_r` / `neg_r` | `iload_dst; iunary op; istore_dst; iret` | 📋 |
+| `vjcc` key derivation | серия `ikey_xor imm8` + `ibranch` | 📋 (высокая ценность — vjcc key самый атакуемый хэндлер) |
+| `exit` декриптор / integrity check | длинная серия inner ops | 📋 (максимальный depth, аккуратно с флагами) |
+
+Минимальный целевой scope следующей итерации: все r-r ALU (+and/or),
+`mov_rr`, унарные, хотя бы одна `ri32` форма. Это +5–6 outer хэндлеров
+поверх текущих 3.
+
+**5. Per-build randomization.** Без этого G2 теряет половину смысла —
+reverser один раз разбирает наш runtime и дальше видит его в каждом
+билде:
+
+- permuted opcode byte'ы (substitution inside inner ISA);
+- shuffled handler table;
+- junk в диспетчере (dead byte'ы, alternate encoding `lea r13`);
+- опционально — 2–3 разные формы диспетчера (threaded / switch /
+  indirect-through-jump-table), выбираемые rng в начале билда.
+
+#### Уроки от initial scope (CRITICAL READ перед расширением)
+
+Всё это проверено опытом, не догадки — не наступайте повторно.
+
+1. **Inner src register ≠ rax.** Диспетчер `movzx eax, byte [r12]; mov
+   eax, [r13+rax*4]; movsxd; add rax, r13; jmp rax` клобберит rax
+   каждую итерацию. Любой inner opcode, который читает или пишет в
+   rax для хранения значения между dispatch step'ами, получит в rax
+   адрес следующего хэндлера вместо своего значения. Первая попытка
+   именно так и сложила handler address в dst slot → 0x7FF6xxxxxxxx
+   повсюду. `r14` для r_inner, `r15` для tmp_inner.
+
+2. **Outer-хэндлер fetch клобберит rflags.** Каждый outer handler
+   начинается с `movzx eax, byte [r11]; xor al, key; xor al, rolling;
+   inc r11`. `xor` и `inc` — rflags-producers. Никакой
+   "flag-preserving nop" не работает, если он выполняется ПОСЛЕ
+   fetch'а (тот же самый trap, из-за которого реверт G4 dead opcodes).
+   Вывод: **последний flag-producer перед возвратом во внешний tail
+   dispatch должен быть именно гостевой ALU**. Схема 2 (scratch
+   vflags slot) решает это явно.
+
+3. **`ret` сохраняет rflags.** Единственный способ "протащить" rflags
+   через вложенный call/ret без push/pop — чтобы терминальный ALU был
+   последней flag-touching инструкцией перед `ret`. Никаких dispatch
+   step'ов (`inc r12`, `add rax, r13`) между ALU и `ret`. Initial scope
+   это гарантирует тем что терминал сразу делает `add [rsi], r14; ret`
+   без возврата в диспетчер-loop. При расширении ISA — либо сохранить
+   этот инвариант (схема 1/3), либо явно восстанавливать флаги из
+   scratch slot'а (схема 2).
+
+4. **Position independence — обязательна.** Диспетчер вызывается из
+   outer хэндлера через `call rel32`, а сам живёт в том же .mxvm
+   blob'е на неизвестном заранее offset'е. Весь inner runtime —
+   только rip-relative `lea` и short `jmp rel8`. Handler table —
+   signed int32 offsets от table base (не абсолютные адреса). Backend
+   после emit'а handlers patch'ит список rel32 слотов в outer
+   хэндлерах на абсолютный offset диспетчера — единственное внешнее
+   исправление.
+
+5. **Outer handler body для V2 варианта (подтверждённый шаблон).**
+
+   ```
+   <fetch операндных байтов>
+   <compute rsi = dst slot addr>
+   <compute rdi = src slot addr>
+   lea r12, [rip + 2]     ; inner VPC на inline bytecode
+   jmp  +N                ; перепрыгнуть через N байт bc
+   <N байт inner bc>
+   call rel32 inner_vm_entry  ; rel32 патчится backend'ом
+   ; возврат через ret из терминального inner handler'а
+   ; → выпадает в tail dispatch outer хэндлера
+   ```
+
+   Длина inner bc должна быть известна на момент emit'а outer
+   handler'а (для `jmp +N`), т.е. outer-лифтер заранее знает во что
+   лифтит.
+
+6. **`r11` — outer VPC.** Из inner VM его трогать нельзя. Inner
+   опкоды, которые читают/пишут memory, используют `rsi`/`rdi`, а не
+   `r11`.
+
+7. **Variant count и распределение.** В backend'е `variant_count_for(op)`
+   определяет сколько разных handler body вариантов на opcode. G2
+   добавляет ещё один вариант (V_last) к каждому nested-лифтимому
+   хэндлеру. С тремя вариантами (V0 canonical, V1 MBA, V2 nested)
+   encoder выбирает uniform'но per bytecode instruction — это уже
+   подтверждённо работает.
+
+#### План работы (sequential)
+
+1. **Дизайн расширенной ISA.** Зафиксировать точный opcode set,
+   операнды, register map (`r14` r_inner, `r15` tmp_inner). Прописать
+   в `x64_inner_vm.hpp` как обновлённый header doc.
+2. **Runtime emit для minimal multi-step** (load_src, load_dst,
+   store_dst, ialu_rr, iret) с схемой 2 flag-propagation. Stress-тест
+   на существующих `add_rr` — поведение должно совпасть с initial
+   scope.
+3. **Остальные r-r ALU** (`and_rr`, `or_rr`). Садятся на тот же
+   runtime без изменений — только новые outer wrapper'ы.
+4. **`mov_rr` и unary** (`not_r`, `neg_r`). Тривиально, по паттерну
+   `iload_* / iunary / istore_dst / iret`.
+5. **`*_ri32`** — требует inline imm в inner bc. Решить: либо
+   отдельный `ialu_ri8` opcode с imm8 в bytecode, либо перенос imm32
+   из outer fetch'а в r_inner через `iload_imm32`.
+6. **Per-build randomization.** Opcode permutation, handler table
+   shuffle, junk в диспетчере.
+7. **vjcc-лифт.** Последний — требует `ibranch` и аккуратного vflags
+   handling'а.
+8. Обновить `x64_inner_vm.hpp` header doc + ROADMAP → G2-extended ✅.
+
+#### Deliverables checklist
+
+- [x] `include/mxprotector/protection/vm/x64/x64_inner_vm.hpp` — ISA
+  enum, `kInnerVmRuntimeSize`, `emit_inner_vm_runtime`, ABI контракт.
+- [x] `src/builder/protection/vm/x64/x64_inner_vm.cpp` — hand-assembled
+  runtime с `static_assert` на каждый disp32 и байтовый размер.
+- [x] `emit_handler_alu_rr_nested` в `x64_handlers.cpp`.
+- [x] Backend wiring (`variant_count_for`, `emit_op_variant`,
+  `inner_vm_call_patches`, patch loop).
+- [x] Stress coverage для initial scope (90/90 strong).
+- [ ] Расширенная ISA (10–12 opcode'ов) в `x64_inner_vm.hpp/cpp`.
+- [ ] Multi-step dispatch с scratch vflags slot (схема 2).
+- [ ] `emit_handler_{mov_rr,alu_rr,unary_r}_nested` для and/or/mov/not/neg.
+- [ ] `emit_handler_alu_ri32_nested` (после решения по inline imm).
+- [ ] Per-build inner-ISA randomization hook.
+- [ ] vjcc-лифт через `ibranch`.
+- [ ] Unit test `x64_inner_vm_runtime_test.cpp` — byte-level stability
+  check (hash runtime'а на fixed seed).
 
 ### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
 
