@@ -186,14 +186,26 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 
+#include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 
 namespace mx::vm::x64 {
 
 /// Inner VM opcodes. See file header for semantics.
+///
+/// The values below are the **identity** (canonical) opcode bytes —
+/// the ones a fresh build uses by default. Per-build randomization
+/// permutes them into `InnerVmIsa::to_byte` (see below), so the byte
+/// `0x03` a wrapper emits in one build may be `0x07` in another. The
+/// enum values are stable across builds; the byte values are not.
+///
+/// When indexing into arrays sized by `kInnerVmOpCount`, cast the
+/// enum value to `uint8_t` directly — it doubles as the "logical
+/// index" and never changes.
 enum class InnerVmOp : uint8_t {
     iload_src       = 0x00,  ///< r15 <- [rdi]        (rhs = src)
     iload_dst       = 0x01,  ///< r14 <- [rsi]        (accum = dst)
@@ -210,6 +222,47 @@ enum class InnerVmOp : uint8_t {
     ineg_r14        = 0x0C,  ///< r14 <- -r14;  rcx <- rflags
 };
 
+/// Total number of defined `InnerVmOp` values. Handler table size
+/// and `InnerVmIsa::to_byte` length both derive from this.
+inline constexpr size_t kInnerVmOpCount = 13;
+
+/// Per-build permutation of inner VM opcode byte values.
+///
+/// Two builds of the same input produce two different `InnerVmIsa`
+/// instances, and their inner bytecodes therefore look completely
+/// different at the byte level — even though the logical meaning
+/// (`iload_src`, `iadd_rr`, `iret`, ...) is the same. A reverser
+/// who has reverse-engineered build A's opcode-to-semantic map
+/// cannot reuse that map on build B without starting over.
+///
+/// `to_byte[static_cast<uint8_t>(InnerVmOp::foo)]` is the byte
+/// value the wrapper must emit in the inline bytecode for `foo`,
+/// and the corresponding handler table slot (at position =
+/// that byte) points at `foo`'s handler body.
+///
+/// The identity permutation — where `to_byte[i] == i` — reproduces
+/// the canonical, fully-predictable runtime. Unit tests use it;
+/// production always uses a random instance.
+struct InnerVmIsa {
+    std::array<uint8_t, kInnerVmOpCount> to_byte{};
+
+    /// Look up the byte value assigned to a logical opcode.
+    [[nodiscard]] constexpr uint8_t byte_of(InnerVmOp op) const noexcept {
+        return to_byte[static_cast<uint8_t>(op)];
+    }
+};
+
+/// Identity ISA — `to_byte[i] == i` for every opcode. Useful for
+/// deterministic tests and as the reference layout documented in
+/// `x64_inner_vm.cpp`'s hand-assembled runtime comments.
+[[nodiscard]] InnerVmIsa make_identity_inner_vm_isa() noexcept;
+
+/// Random ISA — Fisher–Yates shuffle of the identity permutation
+/// using `rng`. Every production build calls this exactly once per
+/// VM blob and threads the result through `emit_inner_vm_runtime`
+/// and every `emit_handler_*_nested` wrapper.
+[[nodiscard]] InnerVmIsa make_random_inner_vm_isa(Randomizer& rng);
+
 /// Size of the emitted inner VM runtime, in bytes.
 ///
 /// Breakdown:
@@ -219,11 +272,17 @@ enum class InnerVmOp : uint8_t {
 ///   52 bytes handler table (13 × int32 relative offsets)
 inline constexpr size_t kInnerVmRuntimeSize = 152;
 
-/// Emit the inner VM runtime (dispatcher + 9 handlers + handler
-/// table + flag scratch) into `e`. Returns the offset of the
-/// dispatcher entry point relative to the start of the emitted
-/// bytes — callers add this to their absolute blob offset to get
-/// the inner VM entry's in-blob address for rel32 patching.
+/// Emit the inner VM runtime (dispatcher + 13 handlers + handler
+/// table) into `e`. Returns the offset of the dispatcher entry
+/// point relative to the start of the emitted bytes — callers add
+/// this to their absolute blob offset to get the inner VM entry's
+/// in-blob address for rel32 patching.
+///
+/// `isa` controls which byte value the handler table entry uses for
+/// each logical opcode. Physical handler body offsets are fixed and
+/// do not depend on `isa` — only the table entry ordering does. An
+/// identity ISA reproduces the canonical byte-for-byte layout
+/// documented in the `x64_inner_vm.cpp` layout comment.
 ///
 /// The emitted runtime is position-independent: every intra-runtime
 /// branch is either a short rel8 `jmp` back to the dispatch loop or
@@ -231,6 +290,6 @@ inline constexpr size_t kInnerVmRuntimeSize = 152;
 /// prologue. No external patches are required beyond the outer
 /// handler's `call rel32 inner_vm_entry`, which the backend fixes
 /// up after this runtime is emitted.
-[[nodiscard]] size_t emit_inner_vm_runtime(RawEmitter& e);
+[[nodiscard]] size_t emit_inner_vm_runtime(RawEmitter& e, const InnerVmIsa& isa);
 
 } // namespace mx::vm::x64

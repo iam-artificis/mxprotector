@@ -62,11 +62,33 @@
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <numeric>
 
 namespace mx::vm::x64 {
+
+InnerVmIsa make_identity_inner_vm_isa() noexcept {
+    InnerVmIsa isa;
+    std::iota(isa.to_byte.begin(), isa.to_byte.end(),
+              static_cast<uint8_t>(0));
+    return isa;
+}
+
+InnerVmIsa make_random_inner_vm_isa(Randomizer& rng) {
+    InnerVmIsa isa = make_identity_inner_vm_isa();
+    // Fisher–Yates over the byte permutation. Same algorithm
+    // `VmStackLayout::make_random` uses for the outer VM's slot
+    // permutation, kept here for consistency.
+    for (size_t i = kInnerVmOpCount - 1; i > 0; --i) {
+        const uint32_t j =
+            rng.next_range(0, static_cast<uint32_t>(i));
+        std::swap(isa.to_byte[i], isa.to_byte[j]);
+    }
+    return isa;
+}
 
 namespace {
 
@@ -117,7 +139,7 @@ void emit_jmp_loop_rel8(RawEmitter& e, size_t body_end) {
 
 } // anonymous namespace
 
-size_t emit_inner_vm_runtime(RawEmitter& e) {
+size_t emit_inner_vm_runtime(RawEmitter& e, const InnerVmIsa& isa) {
     const size_t blob_base = e.size();
 
     // ------------------------------------------------------------------
@@ -341,33 +363,47 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     assert(e.size() - blob_base == kOffPaddingEnd);
 
     // ------------------------------------------------------------------
-    // [+100] Handler table: 13 × signed int32 offsets, each stored as
+    // [+100] Handler table: 13 × signed int32 offsets. Each entry is
     // `handler_offset - kOffHandlerTable`, so the dispatcher's
     // `movsxd rax, eax; add rax, r13` yields the absolute handler
-    // address. Indices MUST match InnerVmOp enum values.
+    // address.
+    //
+    // Slot INDEX is the byte value the wrapper emits in the inline
+    // inner bytecode. For an identity ISA the slot for logical op
+    // `foo` is `static_cast<uint8_t>(InnerVmOp::foo)`; for a random
+    // ISA it's `isa.to_byte[foo]`. Under both, the table slot points
+    // at the same handler body — what changes is which byte value
+    // the wrapper uses to reach it.
     // ------------------------------------------------------------------
-    constexpr int32_t kTableEntries[13] = {
-        static_cast<int32_t>(kOffHIloadSrc)       - static_cast<int32_t>(kOffHandlerTable),  // 0x00
-        static_cast<int32_t>(kOffHIloadDst)       - static_cast<int32_t>(kOffHandlerTable),  // 0x01
-        static_cast<int32_t>(kOffHIstoreDst)      - static_cast<int32_t>(kOffHandlerTable),  // 0x02
-        static_cast<int32_t>(kOffHIaddRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x03
-        static_cast<int32_t>(kOffHIsubRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x04
-        static_cast<int32_t>(kOffHIxorRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x05
-        static_cast<int32_t>(kOffHIandRr)         - static_cast<int32_t>(kOffHandlerTable),  // 0x06
-        static_cast<int32_t>(kOffHIorRr)          - static_cast<int32_t>(kOffHandlerTable),  // 0x07
-        static_cast<int32_t>(kOffHIret)           - static_cast<int32_t>(kOffHandlerTable),  // 0x08
-        static_cast<int32_t>(kOffHIloadSrcAccum)  - static_cast<int32_t>(kOffHandlerTable),  // 0x09
-        static_cast<int32_t>(kOffHIretNoFlag)     - static_cast<int32_t>(kOffHandlerTable),  // 0x0A
-        static_cast<int32_t>(kOffHInotR14)        - static_cast<int32_t>(kOffHandlerTable),  // 0x0B
-        static_cast<int32_t>(kOffHInegR14)        - static_cast<int32_t>(kOffHandlerTable),  // 0x0C
+    constexpr int32_t kHandlerOffsets[kInnerVmOpCount] = {
+        static_cast<int32_t>(kOffHIloadSrc),       //  0  iload_src
+        static_cast<int32_t>(kOffHIloadDst),       //  1  iload_dst
+        static_cast<int32_t>(kOffHIstoreDst),      //  2  istore_dst
+        static_cast<int32_t>(kOffHIaddRr),         //  3  iadd_rr
+        static_cast<int32_t>(kOffHIsubRr),         //  4  isub_rr
+        static_cast<int32_t>(kOffHIxorRr),         //  5  ixor_rr
+        static_cast<int32_t>(kOffHIandRr),         //  6  iand_rr
+        static_cast<int32_t>(kOffHIorRr),          //  7  ior_rr
+        static_cast<int32_t>(kOffHIret),           //  8  iret
+        static_cast<int32_t>(kOffHIloadSrcAccum),  //  9  iload_src_accum
+        static_cast<int32_t>(kOffHIretNoFlag),     // 10  iret_noflag
+        static_cast<int32_t>(kOffHInotR14),        // 11  inot_r14
+        static_cast<int32_t>(kOffHInegR14),        // 12  ineg_r14
     };
-    static_assert(kTableEntries[0]  == -72, "iload_src table entry");
-    static_assert(kTableEntries[8]  == -22, "iret table entry");
-    static_assert(kTableEntries[9]  == -19, "iload_src_accum table entry");
-    static_assert(kTableEntries[10] == -14, "iret_noflag table entry");
-    static_assert(kTableEntries[11] == -13, "inot_r14 table entry");
-    static_assert(kTableEntries[12] == -8,  "ineg_r14 table entry");
-    for (int32_t entry : kTableEntries) {
+
+    // Build the final table contents: for each logical op, compute
+    // its `(body_offset - table_offset)` entry and place it at slot
+    // `isa.to_byte[op]`. This is the O(N) inverse of the permutation
+    // — equivalent to iterating slots and finding-the-preimage, but
+    // branchless.
+    std::array<int32_t, kInnerVmOpCount> table{};
+    for (uint8_t op = 0; op < kInnerVmOpCount; ++op) {
+        const uint8_t slot = isa.to_byte[op];
+        assert(slot < kInnerVmOpCount && "InnerVmIsa slot out of range");
+        table[slot] = kHandlerOffsets[op] -
+                      static_cast<int32_t>(kOffHandlerTable);
+    }
+    for (int32_t entry : table) {
         e.u32(static_cast<uint32_t>(entry));
     }
 

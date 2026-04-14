@@ -36,16 +36,28 @@
 
 #include <array>
 #include <cstdint>
+#include <set>
 
+#include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 
 namespace {
 
 using mx::RawEmitter;
+using mx::Randomizer;
 using mx::vm::x64::emit_inner_vm_runtime;
+using mx::vm::x64::InnerVmIsa;
 using mx::vm::x64::InnerVmOp;
+using mx::vm::x64::kInnerVmOpCount;
 using mx::vm::x64::kInnerVmRuntimeSize;
+using mx::vm::x64::make_identity_inner_vm_isa;
+using mx::vm::x64::make_random_inner_vm_isa;
+
+// All tests below emit under the identity ISA by default — that's
+// the shape pinned in `kExpectedRuntime`. Randomization is exercised
+// by the X64InnerVmIsa test suite at the bottom of this file.
+const InnerVmIsa kIdentityIsa = make_identity_inner_vm_isa();
 
 // Expected hex emission of the 152-byte runtime, as of G2-extended
 // with unary (not_r / neg_r) nested support. 13-opcode multi-step
@@ -143,7 +155,7 @@ static_assert(kExpectedRuntime.size() == kInnerVmRuntimeSize,
 
 TEST(X64InnerVmRuntime, EmitsExactlyKInnerVmRuntimeSize) {
     RawEmitter e;
-    const size_t entry = emit_inner_vm_runtime(e);
+    const size_t entry = emit_inner_vm_runtime(e, kIdentityIsa);
 
     EXPECT_EQ(entry, 0u)
         << "dispatcher entry must be at the very start of the emitted blob";
@@ -154,7 +166,7 @@ TEST(X64InnerVmRuntime, EmitsExactlyKInnerVmRuntimeSize) {
 
 TEST(X64InnerVmRuntime, DispatcherPrologueIsLeaR13RipPlus93) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 7u);
 
     // lea r13, [rip + 93]
@@ -174,7 +186,7 @@ TEST(X64InnerVmRuntime, DispatcherPrologueIsLeaR13RipPlus93) {
 
 TEST(X64InnerVmRuntime, DispatcherEndsWithJmpRax) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 28u);
 
     // Dispatcher ends at +28, last two bytes at +26..+27 = FF E0 (jmp rax).
@@ -184,7 +196,7 @@ TEST(X64InnerVmRuntime, DispatcherEndsWithJmpRax) {
 
 TEST(X64InnerVmRuntime, IretHandlerIsPushRcxPopfqRet) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 81u);
 
     // iret lives at +78 and is exactly 3 bytes: push rcx (51), popfq (9D), ret (C3).
@@ -195,7 +207,7 @@ TEST(X64InnerVmRuntime, IretHandlerIsPushRcxPopfqRet) {
 
 TEST(X64InnerVmRuntime, HandlerTableHoldsThirteenInt32Entries) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_EQ(e.size(), kInnerVmRuntimeSize);
 
     // Table at +100, 13 × int32 = 52 bytes, ends at +152 (end of block).
@@ -245,7 +257,7 @@ TEST(X64InnerVmRuntime, OpcodeEnumIndexesHandlerTableCorrectly) {
 
 TEST(X64InnerVmRuntime, IretNoFlagHandlerIsBareRet) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 87u);
 
     // iret_noflag at +86 is exactly one byte: `ret` (0xC3). No push,
@@ -255,7 +267,7 @@ TEST(X64InnerVmRuntime, IretNoFlagHandlerIsBareRet) {
 
 TEST(X64InnerVmRuntime, InotR14DoesNotSaveFlags) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 92u);
 
     // inot_r14 at +87: `not r14` = 49 F7 D6, then `jmp rel8`. No
@@ -272,7 +284,7 @@ TEST(X64InnerVmRuntime, InotR14DoesNotSaveFlags) {
 
 TEST(X64InnerVmRuntime, InegR14SavesFlagsToRcx) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_GE(e.size(), 99u);
 
     // ineg_r14 at +92: `neg r14` = 49 F7 DE, then pushfq/pop rcx,
@@ -295,7 +307,7 @@ TEST(X64InnerVmRuntime, InegR14SavesFlagsToRcx) {
 
 TEST(X64InnerVmRuntime, ByteForByteMatchesExpectedBlob) {
     RawEmitter e;
-    (void)emit_inner_vm_runtime(e);
+    (void)emit_inner_vm_runtime(e, kIdentityIsa);
     ASSERT_EQ(e.size(), kExpectedRuntime.size());
 
     for (size_t i = 0; i < kExpectedRuntime.size(); ++i) {
@@ -305,16 +317,146 @@ TEST(X64InnerVmRuntime, ByteForByteMatchesExpectedBlob) {
     }
 }
 
-TEST(X64InnerVmRuntime, EmissionIsDeterministic) {
-    // Two independent calls must produce identical byte sequences. The
-    // emitter has no hidden state or randomness today, but future
-    // per-build inner-ISA randomization hooks will change that — this
-    // test then needs to take a seed and pin the shape for a fixed seed.
+TEST(X64InnerVmRuntime, EmissionIsDeterministicUnderIdentityIsa) {
+    // Two independent calls with the identity ISA must produce
+    // identical byte sequences — the emitter itself has no hidden
+    // state. Randomization-driven divergence is tested separately
+    // in the X64InnerVmIsa suite below, where different ISAs
+    // intentionally produce different byte sequences.
     RawEmitter a, b;
-    (void)emit_inner_vm_runtime(a);
-    (void)emit_inner_vm_runtime(b);
+    (void)emit_inner_vm_runtime(a, kIdentityIsa);
+    (void)emit_inner_vm_runtime(b, kIdentityIsa);
     ASSERT_EQ(a.size(), b.size());
     EXPECT_EQ(a.buf, b.buf);
+}
+
+// ---------------------------------------------------------------------------
+// InnerVmIsa — per-build ISA permutation
+// ---------------------------------------------------------------------------
+//
+// These tests cover the randomization layer: the `InnerVmIsa` factory
+// functions, the invariant that any ISA (identity or random) is a
+// valid permutation, and the resulting runtime's structural integrity
+// regardless of which permutation is applied. They do NOT pin specific
+// random byte sequences (that would couple the test to the Randomizer
+// implementation); they pin invariants instead.
+
+TEST(X64InnerVmIsa, IdentityIsaMapsEachOpcodeToItsOwnByte) {
+    const InnerVmIsa isa = make_identity_inner_vm_isa();
+    for (uint8_t i = 0; i < kInnerVmOpCount; ++i) {
+        EXPECT_EQ(isa.to_byte[i], i)
+            << "identity ISA must map logical index " << int{i}
+            << " to byte " << int{i};
+    }
+    // byte_of() sugar should match the raw array lookup.
+    EXPECT_EQ(isa.byte_of(InnerVmOp::iload_src),
+              static_cast<uint8_t>(InnerVmOp::iload_src));
+    EXPECT_EQ(isa.byte_of(InnerVmOp::iret_noflag),
+              static_cast<uint8_t>(InnerVmOp::iret_noflag));
+}
+
+TEST(X64InnerVmIsa, RandomIsaIsABijectionOfTheOpcodeSpace) {
+    // A valid ISA must be a permutation of [0, kInnerVmOpCount) —
+    // every byte value in that range appears exactly once. A bug in
+    // the Fisher–Yates could produce duplicates that silently break
+    // the handler table (two table slots would point at the same
+    // body, one body would be unreachable).
+    Randomizer rng(0xCAFE'BABE'D15EA5E1ULL);
+    const InnerVmIsa isa = make_random_inner_vm_isa(rng);
+
+    std::set<uint8_t> seen;
+    for (uint8_t i = 0; i < kInnerVmOpCount; ++i) {
+        const uint8_t bv = isa.to_byte[i];
+        ASSERT_LT(bv, kInnerVmOpCount)
+            << "random ISA produced out-of-range byte " << int{bv};
+        const bool inserted = seen.insert(bv).second;
+        EXPECT_TRUE(inserted)
+            << "random ISA byte " << int{bv}
+            << " appears more than once — not a valid permutation";
+    }
+    EXPECT_EQ(seen.size(), kInnerVmOpCount);
+}
+
+TEST(X64InnerVmIsa, TwoDifferentSeedsYieldDifferentPermutations) {
+    // Determinism guarantee (same seed → same output) is already
+    // covered by the Randomizer's own tests. Here we only assert
+    // that two UNRELATED seeds don't happen to collapse to the
+    // same permutation — the Fisher–Yates is deterministic but
+    // should spread its output space widely enough that two random
+    // draws are almost never equal.
+    Randomizer a(0x1111'2222'3333'4444ULL);
+    Randomizer b(0xAAAA'BBBB'CCCC'DDDDULL);
+    const InnerVmIsa isa_a = make_random_inner_vm_isa(a);
+    const InnerVmIsa isa_b = make_random_inner_vm_isa(b);
+    EXPECT_NE(isa_a.to_byte, isa_b.to_byte)
+        << "two different seeds produced the same inner VM ISA — "
+           "extremely unlikely, possible only if Randomizer is broken";
+}
+
+TEST(X64InnerVmIsa, RandomIsaRuntimeHasSameSizeAndDispatcherShape) {
+    // Whatever permutation the ISA produces, the runtime size and
+    // dispatcher-prologue bytes are FIXED — only the handler table
+    // entries reshuffle. This catches a hypothetical future bug
+    // where a randomization path accidentally affects layout.
+    Randomizer rng(0xBAAD'F00D'DEAD'BEEFULL);
+    const InnerVmIsa isa = make_random_inner_vm_isa(rng);
+
+    RawEmitter e;
+    (void)emit_inner_vm_runtime(e, isa);
+
+    ASSERT_EQ(e.size(), kInnerVmRuntimeSize);
+    // Dispatcher prologue is `lea r13, [rip+93]` regardless of ISA.
+    EXPECT_EQ(e.buf[0], 0x4C);
+    EXPECT_EQ(e.buf[1], 0x8D);
+    EXPECT_EQ(e.buf[2], 0x2D);
+    EXPECT_EQ(e.buf[3], 0x5D);  // disp32 low byte = 93
+    EXPECT_EQ(e.buf[4], 0x00);
+    EXPECT_EQ(e.buf[5], 0x00);
+    EXPECT_EQ(e.buf[6], 0x00);
+    // Every handler body is at its fixed offset too; check iret at +78.
+    EXPECT_EQ(e.buf[78], 0x51);  // push rcx
+    EXPECT_EQ(e.buf[79], 0x9D);  // popfq
+    EXPECT_EQ(e.buf[80], 0xC3);  // ret
+}
+
+TEST(X64InnerVmIsa, HandlerTableEntriesFollowPermutation) {
+    // For a random ISA, the handler table entry at slot `to_byte[op]`
+    // must point at op's fixed handler body. This is the core
+    // correctness invariant that makes the permuted opcode byte
+    // in the wrapper's inline bytecode reach the right handler
+    // through the dispatcher's `mov eax, [r13+rax*4]` lookup.
+    Randomizer rng(0xFEED'FACE'CAFE'D00DULL);
+    const InnerVmIsa isa = make_random_inner_vm_isa(rng);
+
+    RawEmitter e;
+    (void)emit_inner_vm_runtime(e, isa);
+    ASSERT_EQ(e.size(), kInnerVmRuntimeSize);
+
+    // Expected handler offsets — must match the constants in
+    // x64_inner_vm.cpp. Listed here in logical-op order.
+    constexpr std::array<int32_t, kInnerVmOpCount> kHandlerOffsets = {{
+        28, 33, 38, 43, 50, 57, 64, 71, 78, 81, 86, 87, 92
+    }};
+    constexpr size_t table_off = 100;
+
+    auto read_i32 = [&](size_t at) {
+        return static_cast<int32_t>(
+            static_cast<uint32_t>(e.buf[at])          |
+            (static_cast<uint32_t>(e.buf[at + 1]) << 8)  |
+            (static_cast<uint32_t>(e.buf[at + 2]) << 16) |
+            (static_cast<uint32_t>(e.buf[at + 3]) << 24));
+    };
+
+    for (uint8_t op = 0; op < kInnerVmOpCount; ++op) {
+        const uint8_t slot = isa.to_byte[op];
+        const int32_t got = read_i32(table_off + slot * 4);
+        const int32_t expected =
+            kHandlerOffsets[op] - static_cast<int32_t>(table_off);
+        EXPECT_EQ(got, expected)
+            << "logical op " << int{op} << " at permuted slot "
+            << int{slot} << " must point at handler +"
+            << kHandlerOffsets[op];
+    }
 }
 
 } // namespace

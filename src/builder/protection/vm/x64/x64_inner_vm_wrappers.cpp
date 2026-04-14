@@ -4,11 +4,16 @@
  *
  * Every wrapper follows the same three-stage pattern documented in
  * `x64_inner_vm_wrappers.hpp`: fetch operands → compute slot addrs
- * → `emit_inner_vm_call` with an inline inner bytecode. This file
- * owns the shared tail emitter and the wrappers themselves; it does
- * not know anything about the layout of the inner VM runtime beyond
- * what `InnerVmOp` names — all byte-level work is isolated in
- * `x64_inner_vm.cpp`.
+ * → `emit_inner_vm_call` with an inline logical inner bytecode.
+ * This file owns the shared tail emitter and the wrappers themselves;
+ * it does not know anything about the byte-level layout of the inner
+ * VM runtime beyond what `InnerVmOp` names.
+ *
+ * Per-build randomization is handled by the shared
+ * `emit_inner_vm_call`: it translates every logical `InnerVmOp` into
+ * the byte value assigned by the current build's `InnerVmIsa`
+ * permutation before writing it to the blob. Wrappers never touch
+ * raw opcode bytes directly.
  */
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
@@ -22,13 +27,14 @@
 namespace mx::vm::x64 {
 
 void emit_inner_vm_call(RawEmitter& e,
-                        const uint8_t* bytecode,
+                        const InnerVmIsa& isa,
+                        const InnerVmOp* bytecode,
                         size_t bytecode_len,
                         size_t& call_rel32_patch_out)
 {
     // A short rel8 `jmp` has to cover the inline bytecode plus the
     // 5-byte `call rel32`. In practice our bytecodes are tiny
-    // (≤ 16 bytes) so the max-127 window is never close, but guard
+    // (≤ 16 opcodes) so the max-127 window is never close, but guard
     // against a future lifter that stuffs more into one wrapper.
     assert(bytecode_len <= 0x7F &&
            "inner VM inline bytecode must fit in a rel8 jmp");
@@ -50,12 +56,16 @@ void emit_inner_vm_call(RawEmitter& e,
     e.u8(0xEB);
     e.u8(static_cast<uint8_t>(bytecode_len));
 
-    // --- Inline inner VM bytecode -------------------------------------
+    // --- Inline inner VM bytecode (ISA-permuted) ----------------------
     //
-    // The inner VM's dispatcher starts fetching from r12 (which the
-    // LEA above pointed at these exact bytes).
+    // Translate each logical opcode through the ISA's permutation
+    // before emitting. The inner VM dispatcher starts fetching from
+    // r12 (which the LEA above pointed at these exact bytes), and
+    // its handler table — emitted by `emit_inner_vm_runtime` under
+    // the same ISA — maps each permuted byte back to the correct
+    // handler body.
     for (size_t i = 0; i < bytecode_len; ++i) {
-        e.u8(bytecode[i]);
+        e.u8(isa.byte_of(bytecode[i]));
     }
 
     // --- call rel32 <inner_vm_entry> ----------------------------------
@@ -69,11 +79,12 @@ void emit_inner_vm_call(RawEmitter& e,
 }
 
 // ===========================================================================
-// Nested wrappers
+// Register-register ALU + mov + unary wrappers
 // ===========================================================================
 
 void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
-                                bool rolling, uint8_t alu_inner_opcode,
+                                bool rolling, const InnerVmIsa& isa,
+                                InnerVmOp alu_inner_op,
                                 size_t& call_rel32_patch_out)
 {
     // Operand fetch + slot address computation — identical to the
@@ -82,100 +93,82 @@ void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
 
-    // Inline inner bytecode: load rhs (src) into r15, load accumulator
-    // (dst) into r14, run the r14←r14 OP r15 ALU, store r14 back to
-    // [rsi], return. The ALU handler saves rflags into rcx, and
-    // `iret` restores them before `ret`, so the outer tail dispatch
-    // that runs after this `call` sees the correct guest flags.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::iload_src),   // 0x00
-        static_cast<uint8_t>(InnerVmOp::iload_dst),   // 0x01
-        alu_inner_opcode,                              // 0x03..0x07
-        static_cast<uint8_t>(InnerVmOp::istore_dst),  // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret),        // 0x08
+    // Logical inner bytecode: load rhs (src) into r15, load
+    // accumulator (dst) into r14, run the r14←r14 OP r15 ALU,
+    // store r14 back to [rsi], return.
+    const InnerVmOp bc[] = {
+        InnerVmOp::iload_src,
+        InnerVmOp::iload_dst,
+        alu_inner_op,
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 void emit_handler_mov_rr_nested(RawEmitter& e, int32_t key_disp,
-                                bool rolling, size_t& call_rel32_patch_out)
+                                bool rolling, const InnerVmIsa& isa,
+                                size_t& call_rel32_patch_out)
 {
-    // Operand layout is the same as the r-r ALU handlers: two slot-
-    // index bytes (dst first, then src), computed into rsi / rdi.
     emit_fetch_2_operand_bytes(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
     emit_vmreg_addr_rdi_from_rdx(e);
 
-    // Inline inner bytecode: load src into the accumulator (r14),
-    // store accumulator to dst slot, return without touching flags.
-    //
-    // `iload_src_accum` (0x09) writes [rdi] into r14 directly — the
-    // same destination `istore_dst` reads from — so we need exactly
-    // 3 inner ops for a 64-bit memcpy: load, store, return.
-    //
-    // `iret_noflag` (0x0A) is `ret` without the `push rcx; popfq`
-    // pair of normal `iret`. `mov_rr` is flag-transparent on real
-    // x86 — `mov` doesn't touch `rflags` — so we must NOT stomp
-    // rflags before returning to the outer handler's tail dispatch.
-    // If we used `iret` instead, the terminal `popfq` would load
-    // `rflags` from `rcx`, which at this point is a stale
-    // `dst_vreg * 8` left over from `emit_vmreg_addr_rsi_from_rcx`.
-    // That would populate `vflags` with junk on the next tail
-    // dispatch and break downstream `vjcc`.
-    //
-    // With `iret_noflag`, rflags exiting this handler match what a
-    // direct V0 `mov_rr` leaves: the shl-flags from the addr
-    // compute. That's not semantically "the flags mov should not
-    // touch", but it IS exactly what V0 does — so V2 mov_rr has
-    // parity with V0 mov_rr, which is the correctness bar we need.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::iload_src_accum), // 0x09
-        static_cast<uint8_t>(InnerVmOp::istore_dst),      // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret_noflag),     // 0x0A
+    // Load src into the accumulator r14 directly, store to [rsi],
+    // return without touching flags. `mov` is flag-transparent on
+    // real x86; V0 `mov_rr` is likewise flag-transparent at the
+    // inner-VM boundary.
+    const InnerVmOp bc[] = {
+        InnerVmOp::iload_src_accum,
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret_noflag,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 void emit_handler_not_r_nested(RawEmitter& e, int32_t key_disp,
-                               bool rolling, size_t& call_rel32_patch_out)
+                               bool rolling, const InnerVmIsa& isa,
+                               size_t& call_rel32_patch_out)
 {
     // Unary handlers only need the dst slot address — no rhs, no
     // src. Fetch one operand byte into cl (dst vreg), compute rsi.
     emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
 
-    // Inline inner bytecode: load dst into accumulator, invert all
-    // bits, store back, return without touching rflags. `not` is
-    // flag-transparent on real x86, and V0 `not_r` is likewise
-    // flag-transparent at the inner-VM boundary.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::iload_dst),     // 0x01
-        static_cast<uint8_t>(InnerVmOp::inot_r14),      // 0x0B
-        static_cast<uint8_t>(InnerVmOp::istore_dst),    // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret_noflag),   // 0x0A
+    // Load dst into accumulator, invert all bits, store back,
+    // return without touching rflags. `not` is flag-transparent
+    // on real x86.
+    const InnerVmOp bc[] = {
+        InnerVmOp::iload_dst,
+        InnerVmOp::inot_r14,
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret_noflag,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
-                               bool rolling, size_t& call_rel32_patch_out)
+                               bool rolling, const InnerVmIsa& isa,
+                               size_t& call_rel32_patch_out)
 {
     emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
 
-    // Inline inner bytecode: load dst, negate, store back, restore
-    // the guest-ALU flags from rcx before returning. `neg` IS
-    // flag-producing on real x86 (CF, SF, ZF, OF, PF), so we pair
-    // with the regular `iret` — V0 `neg_r` likewise leaves the
-    // neg's flags in the outer rflags for the tail dispatch to
-    // save into vflags.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::iload_dst),     // 0x01
-        static_cast<uint8_t>(InnerVmOp::ineg_r14),      // 0x0C
-        static_cast<uint8_t>(InnerVmOp::istore_dst),    // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret),          // 0x08
+    // Load dst, negate, store back, restore the guest-ALU flags
+    // from rcx before returning. `neg` IS flag-producing on real
+    // x86 (CF, SF, ZF, OF, PF), so we pair with the regular
+    // `iret`.
+    const InnerVmOp bc[] = {
+        InnerVmOp::iload_dst,
+        InnerVmOp::ineg_r14,
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 // ===========================================================================
@@ -199,7 +192,8 @@ void emit_handler_neg_r_nested(RawEmitter& e, int32_t key_disp,
 //   `movsxd r15, eax` = 4C 63 F8   (REX.W|R, opcode 63, ModRM 11 111 000)
 
 void emit_handler_alu_ri32_nested(RawEmitter& e, int32_t key_disp,
-                                  bool rolling, uint8_t alu_inner_opcode,
+                                  bool rolling, const InnerVmIsa& isa,
+                                  InnerVmOp alu_inner_op,
                                   size_t& call_rel32_patch_out)
 {
     // Fetch + decrypt 1 operand byte (dst vreg) and 4 bytes of
@@ -216,20 +210,22 @@ void emit_handler_alu_ri32_nested(RawEmitter& e, int32_t key_disp,
     // opcodes apply unchanged.
     e.u8(0x4C); e.u8(0x63); e.u8(0xF8);
 
-    // Inline inner bytecode: the same [iload_dst, ALU, istore_dst,
+    // Logical inner bytecode: the same [iload_dst, ALU, istore_dst,
     // iret] shape as ALU rr, minus the iload_src — r15 is already
     // loaded by the movsxd above.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::iload_dst),   // 0x01
-        alu_inner_opcode,                              // 0x03..0x07
-        static_cast<uint8_t>(InnerVmOp::istore_dst),  // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret),        // 0x08
+    const InnerVmOp bc[] = {
+        InnerVmOp::iload_dst,
+        alu_inner_op,
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 void emit_handler_mov_ri32_nested(RawEmitter& e, int32_t key_disp,
-                                  bool rolling, size_t& call_rel32_patch_out)
+                                  bool rolling, const InnerVmIsa& isa,
+                                  size_t& call_rel32_patch_out)
 {
     emit_fetch_1_operand_byte(e, key_disp, rolling);
     emit_vmreg_addr_rsi_from_rcx(e);
@@ -240,14 +236,15 @@ void emit_handler_mov_ri32_nested(RawEmitter& e, int32_t key_disp,
     // will pick it up directly.
     e.u8(0x4C); e.u8(0x63); e.u8(0xF0);
 
-    // Inline inner bytecode: 2-byte [istore_dst, iret_noflag]. No
+    // Logical inner bytecode: 2-op [istore_dst, iret_noflag]. No
     // loads, no ALU — `mov` is flag-transparent on x86 so we exit
     // through `iret_noflag`, matching V0 mov_ri32's flag behavior.
-    const uint8_t bc[] = {
-        static_cast<uint8_t>(InnerVmOp::istore_dst),   // 0x02
-        static_cast<uint8_t>(InnerVmOp::iret_noflag),  // 0x0A
+    const InnerVmOp bc[] = {
+        InnerVmOp::istore_dst,
+        InnerVmOp::iret_noflag,
     };
-    emit_inner_vm_call(e, bc, sizeof(bc), call_rel32_patch_out);
+    emit_inner_vm_call(e, isa, bc, sizeof(bc) / sizeof(bc[0]),
+                       call_rel32_patch_out);
 }
 
 } // namespace mx::vm::x64

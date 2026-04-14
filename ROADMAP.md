@@ -317,7 +317,14 @@ reverser один раз разбирает наш runtime и дальше ви�
   хэндлеров (mov/add/sub/xor/and/or_ri32). Без новых inner opcode'ов:
   outer wrapper фетчит imm32 через `emit_fetch_dword` → `movsxd
   r14/r15, eax`, дальше inner runtime работает как обычно.
-- [ ] Per-build inner-ISA randomization hook.
+- [x] Per-build inner-ISA randomization. `InnerVmIsa` — Fisher–Yates
+  permutation of `[0..kInnerVmOpCount)`. Runtime emitter строит
+  handler table по `isa.to_byte[]`, wrappers через shared
+  `emit_inner_vm_call` транслируют логические `InnerVmOp` в
+  permuted байты. Identity ISA используется в unit tests для
+  byte-level pinning; production всегда рандомит из `rng`. Два
+  билда одного и того же входа дают разные handler tables и
+  разные inline bytecodes при семантически идентичных inner VM.
 - [ ] vjcc-лифт через `ibranch` + scratch flag carrier.
 
 ### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
