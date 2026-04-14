@@ -176,14 +176,18 @@ struct CommonStubPatches {
     uint32_t rel_to_oep_at       = 0;
 };
 
-struct ExeStubPatches : CommonStubPatches {
+/// Patch offsets produced by the shared decrypt-body emitter
+/// (`emit_decrypt_body`). Every stub that embeds the cipher pipeline —
+/// EXE today, full DLL next — exposes these through multi-inheritance
+/// so the caller code that patches them stays emitter-agnostic.
+struct CipherBodyPatches {
     // Per-section patch sites (see DecryptSection above). Populated in
     // stub-emission order; the caller patches each one to its section RVA
     // and byte count.
     std::vector<DecryptSection> sections;
 
-    uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded 32-byte RC4 key)
-    uint32_t rel_to_sbox_at;       ///< patch offset (rel32 from end-of-lea to 256-byte scratch S-box)
+    uint32_t rel_to_key_at       = 0;  ///< rel32 from end-of-lea to embedded 32-byte RC4 key
+    uint32_t rel_to_sbox_at      = 0;  ///< rel32 from end-of-lea to 256-byte scratch S-box
 
     // P3 — VM-protected entry stub. The range
     // `[ksa_block_start_offset, ksa_block_end_offset)` inside the emitted
@@ -195,8 +199,9 @@ struct ExeStubPatches : CommonStubPatches {
     // correctly, it just isn't VM-wrapped.
     uint32_t ksa_block_start_offset = 0;
     uint32_t ksa_block_end_offset   = 0;
-    uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
-    uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
+
+    uint32_t rel_to_impdir_at    = 0;  ///< rel32 from end-of-lea to Import Directory
+    uint32_t impdir_size_at      = 0;  ///< offset of the import dir size imm32
 
     // --- Reprotect block patches ---
     // The reprotect block emits a Hell's Gate resolver + loop over an
@@ -208,14 +213,15 @@ struct ExeStubPatches : CommonStubPatches {
     // `rel_to_reprotect_table_at` is the rel32 offset inside the
     // `lea r14, [rip + table]` that points at the table. Filled in by
     // the caller once the stub's section RVA is known.
-    uint32_t rel_to_reprotect_table_at;
-    uint32_t reprotect_table_offset;
-    uint32_t reprotect_entry_count;
+    uint32_t rel_to_reprotect_table_at = 0;
+    uint32_t reprotect_table_offset    = 0;
+    uint32_t reprotect_entry_count     = 0;
 };
 
+struct ExeStubPatches : CommonStubPatches, CipherBodyPatches {};
+
 /// Patches produced by the forwarding DLL stub. The first iteration has
-/// nothing to add beyond the common fields — later steps that introduce
-/// decryption/reprotect/IAT-wipe on the DLL path will extend this.
+/// nothing to add beyond the common fields.
 struct DllForwardingPatches : CommonStubPatches {};
 
 /// A StubEmitter is a stateless (or cheaply copyable) policy type that
@@ -326,43 +332,33 @@ struct StolenPlan {
     return result;
 }
 
-/// Build the stub code bytes (without patching rel32s yet) and report where
-/// the placeholders need to be filled in. The stub protects N sections:
+/// Append the shared decrypt body to `buf`:
+///   anti-debug probe → edx ∈ {0, 1}
+///   lea rsi = key; lea r8 = sbox
+///   RC4 KSA (init + mix + PRGA state reset, VM-liftable range)
+///   per-section RC4 PRGA decrypt loop (state carried across sections)
+///   reprotect loop (Hell's Gate → NtProtectVirtualMemory per section)
+///   Import Directory wipe
 ///
-///   1. Save 5 registers (randomised push order).
-///   2. Anti-debug: read PEB.BeingDebugged into dl (key-stream index). In a
-///      non-debugged process this is 0; under a debugger it becomes 1, so
-///      every byte of every decrypt loop is XOR'd with the wrong key byte
-///      and the decrypted program is silently garbage — no explicit branch
-///      that the reverser can NOP out.
-///   3. Load the 256-byte key pointer into rsi (shared across all sections).
-///   4. For each section to protect, emit:
-///        lea rdi, [rip + section_rel32]
-///        mov ecx, section_size
-///       .loop:
-///          mov al, [rdi]
-///          xor al, [rsi + rdx*1]
-///          mov [rdi], al
-///          inc rdi
-///          inc dl            ; key index wraps at 256
-///          dec ecx
-///          jnz .loop
-///      The `dl` counter is carried across sections so each one uses a
-///      different slice of the key stream — one section's recovered key
-///      doesn't trivially reveal another's offset.
-///   5. IAT destruction: zero the Import Directory region so dumped binaries
-///      lose their resolved import table.
-///   6. Restore registers (mirror of the push order).
-///   7. Execute the stolen OEP bytes inline.
-///   8. jmp rel32 → OEP + stolen_size.
-[[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> build_exe_stub_bytes(
-    Randomizer& rng,
-    ByteView stolen_bytes,
-    uint32_t section_count)
+/// This body is emitter-agnostic: EXE and full-DLL stubs both wrap it in
+/// their own register save/restore (and, for DLL, a `reason != ATTACH`
+/// gate) and inherit `CipherBodyPatches` so their patch descriptors are
+/// fillable by the same post-emit patching code.
+///
+/// Registers clobbered by the body: rax, rbx, rcx, rdx, rsi, rdi,
+/// r8, r9, r10, r12, r13, r14, r15. (r11 is the only volatile GPR
+/// left untouched.) Callers must save any of these that they need
+/// preserved across the body.
+///
+/// On entry, the body assumes it owns rsp and can freely add a
+/// 16-aligned scratch frame for the reprotect block's syscall args.
+/// rsp at entry must be 16-aligned after any caller-side saves so the
+/// reprotect block's `and rsp, -16` is a no-op.
+void emit_decrypt_body(ByteBuffer& buf,
+                       CipherBodyPatches& patches,
+                       Randomizer& rng,
+                       uint32_t section_count)
 {
-    ByteBuffer buf;
-    buf.reserve(128 + 32 * section_count + stolen_bytes.size() + kKeySize);
-
     auto u8 = [&](uint8_t v) { buf.push_back(v); };
     auto u32 = [&](uint32_t v) {
         buf.push_back(static_cast<uint8_t>(v));
@@ -371,14 +367,6 @@ struct StolenPlan {
         buf.push_back(static_cast<uint8_t>(v >> 24));
     };
 
-    // (1) Randomised push/pop register order. Same permutation used for
-    //     pushes (top-down) and pops (reversed) so the stack is balanced.
-    std::array<uint8_t, 5> save_order{0x50 /*rax*/, 0x51 /*rcx*/, 0x52 /*rdx*/,
-                                       0x56 /*rsi*/, 0x57 /*rdi*/};
-    std::shuffle(save_order.begin(), save_order.end(), rng.engine());
-    for (uint8_t op : save_order) u8(op);
-
-    ExeStubPatches patches{};
     patches.sections.reserve(section_count);
 
     // (2) Anti-debug — polymorphic. Each variant reads a different Windows
@@ -834,18 +822,63 @@ struct StolenPlan {
     patches.impdir_size_at = static_cast<uint32_t>(buf.size());
     u32(0);                                   // placeholder size/4
     u8(0xF3); u8(0xAB);                       // rep stosd
+}
 
-    // (6) Restore registers in reverse of the saved order (LIFO).
+/// Build the EXE stub code bytes (without patching rel32s yet) and
+/// report where the placeholders need to be filled in. The stub layout:
+///
+///   1. Save 5 registers (randomised push order — rax/rcx/rdx/rsi/rdi).
+///   2. Emit the shared decrypt body via `emit_decrypt_body`
+///      (anti-debug → KSA → PRGA → reprotect → IAT wipe).
+///   3. Restore registers in reverse of the saved order (LIFO pop).
+///   4. Execute the stolen OEP bytes inline.
+///   5. jmp rel32 → OEP + stolen_size.
+///
+/// EXE semantics: at stub entry the Windows loader has just `call`ed
+/// the entry point, there is no caller to return to that expects
+/// nonvolatile-register preservation (OEP is the initial thread
+/// entry), so we only save the volatile-but-clobbered set.
+[[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> build_exe_stub_bytes(
+    Randomizer& rng,
+    ByteView stolen_bytes,
+    uint32_t section_count)
+{
+    ByteBuffer buf;
+    buf.reserve(128 + 32 * section_count + stolen_bytes.size() + kKeySize);
+
+    auto u8 = [&](uint8_t v) { buf.push_back(v); };
+    auto u32 = [&](uint32_t v) {
+        buf.push_back(static_cast<uint8_t>(v));
+        buf.push_back(static_cast<uint8_t>(v >> 8));
+        buf.push_back(static_cast<uint8_t>(v >> 16));
+        buf.push_back(static_cast<uint8_t>(v >> 24));
+    };
+
+    ExeStubPatches patches{};
+
+    // (1) Randomised push/pop register order. Same permutation used for
+    //     pushes (top-down) and pops (reversed) so the stack is balanced.
+    std::array<uint8_t, 5> save_order{0x50 /*rax*/, 0x51 /*rcx*/, 0x52 /*rdx*/,
+                                       0x56 /*rsi*/, 0x57 /*rdi*/};
+    std::shuffle(save_order.begin(), save_order.end(), rng.engine());
+    for (uint8_t op : save_order) u8(op);
+
+    // (2) Shared decrypt body — anti-debug, KSA, PRGA per section,
+    //     reprotect, IAT wipe. Populates the CipherBodyPatches slots
+    //     of `patches` via the multi-inheritance base.
+    emit_decrypt_body(buf, patches, rng, section_count);
+
+    // (3) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
         u8(static_cast<uint8_t>(*it + 0x08));
     }
 
-    // (7) Stolen OEP bytes run inline — rsp is now back to what the OEP
+    // (4) Stolen OEP bytes run inline — rsp is now back to what the OEP
     //     would have seen at entry. If none were stolen this is empty.
     patches.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
     for (auto b : stolen_bytes) u8(b);
 
-    // (8) jmp rel32 → OEP + stolen_size
+    // (5) jmp rel32 → OEP + stolen_size
     u8(0xE9);
     patches.rel_to_oep_at = static_cast<uint32_t>(buf.size());
     u32(0);
