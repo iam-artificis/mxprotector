@@ -116,6 +116,48 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      int32_t imagebase_key_disp = -1);
 
 // ----------------------------------------------------------------------------
+// G5: trampoline layer
+//
+// A trampoline is a small code blob the handler_table points at INSTEAD of
+// the real handler. It decays into `jmp rel32 <handler>` after an optional
+// random sled of multi-byte NOPs. At dispatch time the call graph becomes:
+//
+//     dispatch → handler_table[i] → trampoline[i] → handler[i]
+//                 (4-byte entry)     (sled + jmp)
+//
+// The extra hop:
+//
+//   * hides the direct `dispatch → handler` edge from static analysers
+//     that recover the handler table — they only see trampoline addresses
+//     and must follow each one to find the real handler;
+//
+//   * lets the backend interleave trampolines with handler bodies so a
+//     linear disassembly of the VM blob reads a mixed stream of handler
+//     fragments and trampoline fragments;
+//
+//   * is a cheap foundation for richer obfuscation in future commits
+//     (polymorphic trampoline shapes, multi-hop trampoline chains,
+//     CFF inside trampolines) without touching the tail-dispatch emitter.
+//
+// Trampolines carry no VM state. They must not modify GPRs, the rolling
+// key slot, or CPU flags — every tail dispatch that follows the trampoline
+// relies on invariants set up by the previous handler's `end_handler_tail`.
+// Only Intel-documented multi-byte NOPs (via `emit_nop_run`) are safe.
+// ----------------------------------------------------------------------------
+
+struct TrampolinePatch {
+    size_t jmp_rel32_offset;  ///< offset of the rel32 inside the `jmp rel32`
+    size_t instruction_end;   ///< byte just after the rel32
+};
+
+/// Emit a single trampoline: a random 0..`max_junk_bytes` sled of
+/// multi-byte NOPs followed by `jmp rel32`. The rel32 slot is
+/// zero-filled; the caller patches it once the target handler's
+/// in-blob offset is known. Returns the patch coordinates.
+TrampolinePatch emit_trampoline(RawEmitter& e, Randomizer& rng,
+                                uint32_t max_junk_bytes = 8);
+
+// ----------------------------------------------------------------------------
 // Handler bodies
 // ----------------------------------------------------------------------------
 

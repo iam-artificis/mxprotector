@@ -895,6 +895,64 @@ MxResult<VmRuntime> X64VmBackend::generate(
     // ---- Handler emission --------------------------------------------------
     std::vector<size_t> handler_offset_by_id(total_handlers, SIZE_MAX);
 
+    // G5 trampoline layer: handler_table points at trampolines, not
+    // real handlers. Each trampoline is a tiny blob (sled + jmp rel32)
+    // interleaved with handler bodies. `trampoline_offset_by_id[h]`
+    // holds the in-blob position of handler h's trampoline; the
+    // handler_table entry for h uses this offset instead of the raw
+    // handler offset. `pending_trampolines` is the queue of handlers
+    // that have already been emitted but whose trampoline has not
+    // yet been flushed — new entries are pushed after every handler
+    // `end_tail`, and `drain_trampolines` pops one or more of them
+    // at randomly-chosen points during the emission loop so handlers
+    // and trampolines end up interleaved in the blob. Each entry in
+    // `trampoline_fixups` records the handler id + the rel32 patch
+    // site that still needs to point back at the real handler; the
+    // rel32 is written once every handler and every trampoline have
+    // landed, at the post-emit patching phase.
+    std::vector<size_t> trampoline_offset_by_id(total_handlers, SIZE_MAX);
+    std::vector<uint8_t> pending_trampolines;
+    pending_trampolines.reserve(total_handlers);
+
+    struct TrampolineFixup {
+        uint8_t             handler_id;
+        vm::x64::TrampolinePatch patch;
+    };
+    std::vector<TrampolineFixup> trampoline_fixups;
+    trampoline_fixups.reserve(total_handlers);
+
+    auto emit_one_pending_trampoline = [&]() {
+        if (pending_trampolines.empty()) return;
+        // Pop a random slot, not FIFO. FIFO would emit the
+        // least-recently-completed handler's trampoline, producing
+        // a predictable "handler followed by its trampoline a few
+        // handlers later" pattern. Random draws make the distance
+        // from handler to its trampoline look uncorrelated.
+        const uint32_t idx = rng.next_range(
+            0, static_cast<uint32_t>(pending_trampolines.size() - 1));
+        const uint8_t hid = pending_trampolines[idx];
+        pending_trampolines[idx] = pending_trampolines.back();
+        pending_trampolines.pop_back();
+
+        trampoline_offset_by_id[hid] = rt.size();
+        const auto tp = vm::x64::emit_trampoline(rt, rng, /*max_junk_bytes=*/8);
+        trampoline_fixups.push_back({hid, tp});
+    };
+
+    // After each handler's end_tail we push a fresh entry to the
+    // pending queue and, with some probability, flush one or more
+    // queued entries right now. The expected number flushed per
+    // call follows a geometric distribution: 0 trampolines ~2/3,
+    // 1 ~2/9, 2 ~2/27, and so on. Over the full run every queued
+    // entry is eventually flushed, so the queue is always empty
+    // by the time we finalise the blob — the tail-end drain below
+    // handles any stragglers left after the last handler.
+    auto maybe_drain_trampolines = [&]() {
+        while (!pending_trampolines.empty() && rng.next_range(0, 2) == 0) {
+            emit_one_pending_trampoline();
+        }
+    };
+
     // G4: captured current handler_id — set by begin_handler, read
     // by emit_handler_key_fold_in before every tail dispatch.
     uint8_t current_handler_id = 0;
@@ -928,6 +986,8 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                           rflags_disp, &rng,
                                           imagebase_key_disp);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
+        pending_trampolines.push_back(current_handler_id);
+        maybe_drain_trampolines();
     };
 
     uint32_t exit_jmp_offset = 0;  // patched if emit_exit_as_jmp
@@ -1407,6 +1467,12 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                               imagebase_key_disp);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
+        // G5: native handlers join the same trampoline queue as
+        // generic/specialised handlers. `current_handler_id` is
+        // the native handler's id set by `begin_handler(hid)` at
+        // the top of this loop body.
+        pending_trampolines.push_back(current_handler_id);
+        maybe_drain_trampolines();
     }
 
     // ---- Specialised handlers (G1) -----------------------------------------
@@ -1424,6 +1490,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                              dst_disp, src_disp);
         }
         end_handler_tail();
+    }
+
+    // G5: flush any trampolines still queued after the last handler.
+    // The random-draw drain inside `end_handler_tail` and the native
+    // loop only flushes when the dice roll picks the drain path, so
+    // the tail of the run usually has a handful of stragglers. This
+    // loop is deterministic and empties the queue fully.
+    while (!pending_trampolines.empty()) {
+        emit_one_pending_trampoline();
     }
 
     // ---- Inner VM runtime (G2 — nested VM) ---------------------------------
@@ -1500,16 +1575,43 @@ MxResult<VmRuntime> X64VmBackend::generate(
         std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
     }
 
-    // handler_table entries: each = (handler_offset - table_offset) ^ table_xor_key
-    uint32_t table_xor_sum = 0;
-    for (uint32_t h = 0; h < total_handlers; ++h) {
-        if (handler_offset_by_id[h] == SIZE_MAX) {
+    // G5: patch each trampoline's placeholder `jmp rel32` to point
+    // at the real handler. Every handler that was emitted has a
+    // corresponding trampoline fixup recorded here; a missing fixup
+    // means the emission loop lost track of a handler, which is a
+    // bug, so we surface it explicitly instead of silently leaving
+    // a trampoline that jumps to offset 0.
+    for (const auto& tf : trampoline_fixups) {
+        if (handler_offset_by_id[tf.handler_id] == SIZE_MAX) {
             return std::unexpected(MxError(
                 ProtectionErrorCode::vm_translation_error,
-                std::format("X64VmBackend: handler id {} not emitted", h)));
+                std::format("X64VmBackend: trampoline {} refers to un-emitted handler",
+                             tf.handler_id)));
+        }
+        const size_t handler_off = handler_offset_by_id[tf.handler_id];
+        const size_t jmp_end     = tf.patch.instruction_end;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(handler_off) -
+            static_cast<int64_t>(jmp_end));
+        std::memcpy(rt.buf.data() + tf.patch.jmp_rel32_offset, &rel, 4);
+    }
+
+    // handler_table entries: each = (trampoline_offset - table_offset) ^ table_xor_key.
+    //
+    // G5: the entry now points at the trampoline pool, not the raw
+    // handler body. The integrity-check XOR sum still works byte-
+    // for-byte — it hashes whatever the entries hold, agnostic of
+    // the target's interpretation — so the check's expected-sum
+    // imm32 patched below remains correct.
+    uint32_t table_xor_sum = 0;
+    for (uint32_t h = 0; h < total_handlers; ++h) {
+        if (trampoline_offset_by_id[h] == SIZE_MAX) {
+            return std::unexpected(MxError(
+                ProtectionErrorCode::vm_translation_error,
+                std::format("X64VmBackend: handler id {} missing trampoline", h)));
         }
         auto rel = static_cast<int32_t>(
-            static_cast<int64_t>(handler_offset_by_id[h]) -
+            static_cast<int64_t>(trampoline_offset_by_id[h]) -
             static_cast<int64_t>(handler_table_offset));
         rel ^= static_cast<int32_t>(table_xor_key);
         std::memcpy(rt.buf.data() + handler_table_offset + h * 4, &rel, 4);

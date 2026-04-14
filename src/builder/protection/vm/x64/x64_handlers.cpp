@@ -217,6 +217,36 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
 }
 
 // ============================================================================
+// G5 trampoline
+// ============================================================================
+
+TrampolinePatch emit_trampoline(RawEmitter& e, Randomizer& rng,
+                                uint32_t max_junk_bytes)
+{
+    // (1) Random multi-byte NOP sled. Reuses the same emitter the
+    //     handler prologues use, so trampoline junk bytes are
+    //     byte-for-byte indistinguishable from handler-body junk —
+    //     a pattern scan cannot tell "this 4-byte sequence belongs
+    //     to a handler prologue" from "this 4-byte sequence belongs
+    //     to a trampoline sled".
+    //
+    //     `emit_junk_prologue` picks a length in [0, max_junk_bytes],
+    //     so roughly 1/N trampolines have a zero-byte sled. That is
+    //     intentional — a mandatory minimum sled would let a tool
+    //     pattern-match on "always at least K NOPs before every jmp".
+    emit_junk_prologue(e, rng, max_junk_bytes);
+
+    // (2) jmp rel32 → real handler (placeholder, patched by caller).
+    //     Encoding: E9 rel32. `rel32` is `target - (jmp_end)` where
+    //     `jmp_end` is the offset right after the rel32 field.
+    e.u8(0xE9);
+    const size_t rel32_off = e.size();
+    e.u8(0); e.u8(0); e.u8(0); e.u8(0);
+    const size_t instr_end = e.size();
+    return {rel32_off, instr_end};
+}
+
+// ============================================================================
 // Handler bodies — ALU / logic / shift / mov / branch
 // ============================================================================
 
