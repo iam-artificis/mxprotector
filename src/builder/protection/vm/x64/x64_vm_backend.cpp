@@ -896,57 +896,133 @@ MxResult<VmRuntime> X64VmBackend::generate(
     std::vector<size_t> handler_offset_by_id(total_handlers, SIZE_MAX);
 
     // G5 trampoline layer: handler_table points at trampolines, not
-    // real handlers. Each trampoline is a tiny blob (sled + jmp rel32)
-    // interleaved with handler bodies. `trampoline_offset_by_id[h]`
-    // holds the in-blob position of handler h's trampoline; the
-    // handler_table entry for h uses this offset instead of the raw
-    // handler offset. `pending_trampolines` is the queue of handlers
-    // that have already been emitted but whose trampoline has not
-    // yet been flushed — new entries are pushed after every handler
-    // `end_tail`, and `drain_trampolines` pops one or more of them
-    // at randomly-chosen points during the emission loop so handlers
-    // and trampolines end up interleaved in the blob. Each entry in
-    // `trampoline_fixups` records the handler id + the rel32 patch
-    // site that still needs to point back at the real handler; the
-    // rel32 is written once every handler and every trampoline have
-    // landed, at the post-emit patching phase.
-    std::vector<size_t> trampoline_offset_by_id(total_handlers, SIZE_MAX);
-    std::vector<uint8_t> pending_trampolines;
-    pending_trampolines.reserve(total_handlers);
+    // real handlers. Each trampoline is a tiny blob (sled + one of
+    // three polymorphic branches) interleaved with handler bodies.
+    //
+    // Phase 3 introduces chains. Each handler is served by a chain
+    // of 1..kMaxChainLen trampolines: a "head" that the handler_table
+    // references, zero or more "intermediate" trampolines chained
+    // via their own branches, and a "terminal" that finally jumps
+    // to the real handler body. Every trampoline in a chain is a
+    // regular trampoline — same emit function, same shape roll,
+    // same junk sled — there is no byte-level marker that
+    // distinguishes a head from an intermediate or a terminal.
+    // Reverse engineers have to trace each trampoline individually
+    // to find where a given handler_table entry eventually lands.
+    //
+    // Slots, not handler ids, drive the bookkeeping now because
+    // multiple trampolines can exist per handler. `next_slot`
+    // allocates a fresh slot per trampoline; `trampoline_offset_by_slot`
+    // records where each slot landed; `head_slot_of_handler[h]`
+    // records which slot the handler_table[h] entry must point at.
+    //
+    // A trampoline's target is an abstract `TrampolineTarget` —
+    // either "handler h" (resolved to handler_offset_by_id[h] at
+    // patch time) or "trampoline s" (resolved to
+    // trampoline_offset_by_slot[s]). Forward references between
+    // trampolines are handled automatically: at emit time the
+    // patch records the target as a slot id; by the time the
+    // post-emit patching pass runs every slot has an offset.
+    constexpr uint32_t kMaxChainLen = 3;
+
+    struct TrampolineTarget {
+        enum class Kind : uint8_t { Handler, Trampoline };
+        Kind     kind;
+        uint32_t id;
+    };
+
+    struct PendingTrampoline {
+        uint32_t          slot;
+        TrampolineTarget  target;
+    };
 
     struct TrampolineFixup {
-        uint8_t             handler_id;
+        TrampolineTarget         target;
         vm::x64::TrampolinePatch patch;
     };
-    std::vector<TrampolineFixup> trampoline_fixups;
-    trampoline_fixups.reserve(total_handlers);
+
+    std::vector<size_t>    trampoline_offset_by_slot;
+    std::vector<uint32_t>  head_slot_of_handler(total_handlers, UINT32_MAX);
+    std::vector<PendingTrampoline> pending_trampolines;
+    std::vector<TrampolineFixup>   trampoline_fixups;
+
+    // Rough reservations: average chain length is roughly 1.5 so
+    // total trampolines ≈ 1.5 * total_handlers. `head_slot_of_handler`
+    // is already sized to `total_handlers` by its constructor; no
+    // reserve needed.
+    trampoline_offset_by_slot.reserve(total_handlers * 2);
+    pending_trampolines.reserve(total_handlers * 2);
+    trampoline_fixups.reserve(total_handlers * 2);
+
+    auto allocate_trampoline_slot = [&]() -> uint32_t {
+        const uint32_t slot = static_cast<uint32_t>(trampoline_offset_by_slot.size());
+        trampoline_offset_by_slot.push_back(SIZE_MAX);
+        return slot;
+    };
+
+    // Register a chain of random length for the just-emitted handler:
+    // allocate `len` slots, wire each slot's target at the next slot
+    // (or at the handler for the terminal), remember the head slot
+    // in `head_slot_of_handler`, and drop every slot into the
+    // pending queue so subsequent drains can flush them in random
+    // order. Chain length distribution is biased toward shorter
+    // chains (len==1 ~50%, len==2 ~33%, len==3 ~17%) to keep
+    // amortised trampoline overhead moderate while still producing
+    // a meaningful fraction of multi-hop chains.
+    auto queue_trampoline_chain = [&](uint8_t handler_id) {
+        const uint32_t roll = rng.next_range(0, 5);
+        uint32_t chain_len;
+        if (roll < 3)      chain_len = 1;   // 3/6
+        else if (roll < 5) chain_len = 2;   // 2/6
+        else               chain_len = 3;   // 1/6
+        if (chain_len > kMaxChainLen) chain_len = kMaxChainLen;
+
+        // Allocate all slots for this chain up front so we can set
+        // every slot's target to point at its successor before any
+        // of them are drained.
+        std::array<uint32_t, kMaxChainLen> slots{};
+        for (uint32_t i = 0; i < chain_len; ++i) {
+            slots[i] = allocate_trampoline_slot();
+        }
+        head_slot_of_handler[handler_id] = slots[0];
+
+        for (uint32_t i = 0; i < chain_len; ++i) {
+            TrampolineTarget tgt{};
+            if (i + 1 < chain_len) {
+                tgt.kind = TrampolineTarget::Kind::Trampoline;
+                tgt.id   = slots[i + 1];
+            } else {
+                tgt.kind = TrampolineTarget::Kind::Handler;
+                tgt.id   = handler_id;
+            }
+            pending_trampolines.push_back({slots[i], tgt});
+        }
+    };
 
     auto emit_one_pending_trampoline = [&]() {
         if (pending_trampolines.empty()) return;
-        // Pop a random slot, not FIFO. FIFO would emit the
-        // least-recently-completed handler's trampoline, producing
-        // a predictable "handler followed by its trampoline a few
-        // handlers later" pattern. Random draws make the distance
-        // from handler to its trampoline look uncorrelated.
+        // Pop a random slot, not FIFO. FIFO would correlate the
+        // physical blob position of trampolines with their handler
+        // completion order; random draws decorrelate them so chains
+        // end up scrambled across the handler block.
         const uint32_t idx = rng.next_range(
             0, static_cast<uint32_t>(pending_trampolines.size() - 1));
-        const uint8_t hid = pending_trampolines[idx];
+        const PendingTrampoline pt = pending_trampolines[idx];
         pending_trampolines[idx] = pending_trampolines.back();
         pending_trampolines.pop_back();
 
-        trampoline_offset_by_id[hid] = rt.size();
+        trampoline_offset_by_slot[pt.slot] = rt.size();
         const auto tp = vm::x64::emit_trampoline(rt, rng, /*max_junk_bytes=*/8);
-        trampoline_fixups.push_back({hid, tp});
+        trampoline_fixups.push_back({pt.target, tp});
     };
 
-    // After each handler's end_tail we push a fresh entry to the
-    // pending queue and, with some probability, flush one or more
-    // queued entries right now. The expected number flushed per
-    // call follows a geometric distribution: 0 trampolines ~2/3,
-    // 1 ~2/9, 2 ~2/27, and so on. Over the full run every queued
-    // entry is eventually flushed, so the queue is always empty
-    // by the time we finalise the blob — the tail-end drain below
-    // handles any stragglers left after the last handler.
+    // After each handler's end_tail we queue a fresh chain for the
+    // handler and, with some probability, flush one or more queued
+    // entries right now. Flushing follows a geometric distribution
+    // (0 ~2/3, 1 ~2/9, 2 ~2/27, ...), so over the full emission
+    // trampolines from different chains end up interleaved with
+    // handler bodies. Any stragglers are flushed by the deterministic
+    // drain after the last handler.
     auto maybe_drain_trampolines = [&]() {
         while (!pending_trampolines.empty() && rng.next_range(0, 2) == 0) {
             emit_one_pending_trampoline();
@@ -986,7 +1062,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                           rflags_disp, &rng,
                                           imagebase_key_disp);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
-        pending_trampolines.push_back(current_handler_id);
+        queue_trampoline_chain(current_handler_id);
         maybe_drain_trampolines();
     };
 
@@ -1467,11 +1543,11 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                               imagebase_key_disp);
             table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
-        // G5: native handlers join the same trampoline queue as
-        // generic/specialised handlers. `current_handler_id` is
-        // the native handler's id set by `begin_handler(hid)` at
-        // the top of this loop body.
-        pending_trampolines.push_back(current_handler_id);
+        // G5: native handlers join the same trampoline chain
+        // mechanism as generic/specialised handlers. The chain
+        // length roll is independent per handler so native
+        // handlers get the same 1..3 distribution.
+        queue_trampoline_chain(current_handler_id);
         maybe_drain_trampolines();
     }
 
@@ -1576,50 +1652,76 @@ MxResult<VmRuntime> X64VmBackend::generate(
     }
 
     // G5: patch each trampoline's placeholder int32 slot with
-    // `handler_offset - anchor_offset`, sending runtime rip at
-    // the right point to the real handler. The anchor semantics
-    // vary per trampoline shape (see `emit_trampoline`): for
-    // Direct and PushRet it is the byte right after the rel32
-    // slot; for CallPop it is the byte right after the
-    // `call rel32 = 0` that leaked the anchor onto the stack.
-    // The formula is uniform — the shape-specific math is baked
-    // into `anchor_offset` at emit time.
+    // `target_offset - anchor_offset`, sending runtime rip to the
+    // next link in the chain. The target can be either a real
+    // handler (for the terminal trampoline) or another trampoline
+    // (for head / intermediate links). The anchor semantics are
+    // shape-specific (see `emit_trampoline`): for Direct and
+    // PushRet it is the byte right after the rel32 slot; for
+    // CallPop it is the byte right after the `call rel32 = 0`
+    // that leaked the anchor onto the stack. The formula is
+    // uniform — the shape-specific math is baked into
+    // `anchor_offset` at emit time.
     //
-    // Every handler that was emitted has a corresponding
-    // trampoline fixup recorded here; a missing fixup means the
-    // emission loop lost track of a handler, which is a bug, so
-    // we surface it explicitly instead of silently leaving a
-    // trampoline whose final jump lands on offset 0.
+    // Every emitted handler has a corresponding chain with every
+    // chain slot allocated up front. A missing handler offset or
+    // trampoline slot offset means the emission loop lost track
+    // of something, which is a bug — we surface it explicitly
+    // instead of silently leaving a trampoline whose final jump
+    // lands on offset 0.
     for (const auto& tf : trampoline_fixups) {
-        if (handler_offset_by_id[tf.handler_id] == SIZE_MAX) {
-            return std::unexpected(MxError(
-                ProtectionErrorCode::vm_translation_error,
-                std::format("X64VmBackend: trampoline {} refers to un-emitted handler",
-                             tf.handler_id)));
+        size_t target_offset = 0;
+        switch (tf.target.kind) {
+            case TrampolineTarget::Kind::Handler: {
+                if (handler_offset_by_id[tf.target.id] == SIZE_MAX) {
+                    return std::unexpected(MxError(
+                        ProtectionErrorCode::vm_translation_error,
+                        std::format("X64VmBackend: trampoline chain targets un-emitted handler {}",
+                                     tf.target.id)));
+                }
+                target_offset = handler_offset_by_id[tf.target.id];
+                break;
+            }
+            case TrampolineTarget::Kind::Trampoline: {
+                if (tf.target.id >= trampoline_offset_by_slot.size() ||
+                    trampoline_offset_by_slot[tf.target.id] == SIZE_MAX) {
+                    return std::unexpected(MxError(
+                        ProtectionErrorCode::vm_translation_error,
+                        std::format("X64VmBackend: trampoline chain targets un-emitted slot {}",
+                                     tf.target.id)));
+                }
+                target_offset = trampoline_offset_by_slot[tf.target.id];
+                break;
+            }
         }
-        const size_t handler_off = handler_offset_by_id[tf.handler_id];
         const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(handler_off) -
+            static_cast<int64_t>(target_offset) -
             static_cast<int64_t>(tf.patch.anchor_offset));
         std::memcpy(rt.buf.data() + tf.patch.fixup_offset, &rel, 4);
     }
 
-    // handler_table entries: each = (trampoline_offset - table_offset) ^ table_xor_key.
+    // handler_table entries: each = (head_trampoline_offset - table_offset) ^ table_xor_key.
     //
-    // G5: the entry now points at the trampoline pool, not the raw
-    // handler body. The integrity-check XOR sum still works byte-
-    // for-byte — it hashes whatever the entries hold, agnostic of
-    // the target's interpretation — so the check's expected-sum
-    // imm32 patched below remains correct.
+    // G5 phase 3: the entry points at the head of each handler's
+    // trampoline chain. Intermediate and terminal trampolines in
+    // the chain are reachable only by following the head, which
+    // itself reads as one of three polymorphic shapes. The
+    // integrity-check XOR sum still works byte-for-byte — it
+    // hashes whatever the entries hold, agnostic of what the
+    // targets represent — so the check's expected-sum imm32
+    // patched below remains correct.
     uint32_t table_xor_sum = 0;
     for (uint32_t h = 0; h < total_handlers; ++h) {
-        if (trampoline_offset_by_id[h] == SIZE_MAX) {
+        const uint32_t head_slot = head_slot_of_handler[h];
+        if (head_slot == UINT32_MAX ||
+            head_slot >= trampoline_offset_by_slot.size() ||
+            trampoline_offset_by_slot[head_slot] == SIZE_MAX) {
             return std::unexpected(MxError(
                 ProtectionErrorCode::vm_translation_error,
-                std::format("X64VmBackend: handler id {} missing trampoline", h)));
+                std::format("X64VmBackend: handler id {} missing trampoline chain", h)));
         }
         auto rel = static_cast<int32_t>(
-            static_cast<int64_t>(trampoline_offset_by_id[h]) -
+            static_cast<int64_t>(trampoline_offset_by_slot[head_slot]) -
             static_cast<int64_t>(handler_table_offset));
         rel ^= static_cast<int32_t>(table_xor_key);
         std::memcpy(rt.buf.data() + handler_table_offset + h * 4, &rel, 4);
