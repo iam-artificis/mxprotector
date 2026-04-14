@@ -14,8 +14,8 @@
 `for i in $(seq 1 15); do ../build/.../mxprotector_builder.exe -i in.exe -o t.exe -l strong >/dev/null; ./t.exe || echo "FAIL"; done`
 
 ## Pipeline (Execution Order)
-1. `MutationPass` (100): Substitutions, junk, splitting.
-2. `ObfuscationPass` (200): Opaque predicates, MBA.
+1. `MutationPass` (100): Substitutions, junk, splitting, register reassignment.
+2. `ObfuscationPass` (200): Opaque predicates, MBA, constant unfolding.
 3. `VirtualizationPass` (300): Lifts `MX_VM_BEGIN/END` to VM bytecode.
 4. `CfgFlatteningPass` (400): Dispatcher, MBA transitions.
 5. `PackerPass` (800): Multi-section XOR, inline stub, anti-debug, IAT wipe.
