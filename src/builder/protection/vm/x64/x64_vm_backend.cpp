@@ -820,12 +820,16 @@ MxResult<VmRuntime> X64VmBackend::generate(
         // ~150 bytes each, and stacking several would bloat the entry
         // stub without proportional gain.
         //
-        // The check's `required_syscall_hash()` tells us whether we
+        // The check's `required_syscall_name()` tells us whether we
         // need to emit a Hell's Gate resolver before the check runs,
         // and which function it should resolve. For non-syscall
-        // checks the hash is 0 and we skip the ~155-byte resolver
+        // checks the name is null and we skip the ~155-byte resolver
         // block entirely — this is what makes it cheap to add new
         // user-mode checks without touching the orchestration here.
+        // The backend folds a per-call random salt into both the
+        // target-hash constant and the runtime DJB2 seed, so the
+        // emitted resolver's `cmp eax, imm32` and `mov eax, imm32`
+        // slots change from build to build.
         //
         // Suppressed when the caller opted out via
         // `skip_anti_tamper_checks`. Specifically, `page_protection_check`
@@ -844,11 +848,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
                     // Emit the Hell's Gate SSN resolver ONLY when
                     // the picked check actually needs a syscall.
-                    const uint32_t target_hash =
-                        picked->required_syscall_hash();
-                    if (target_hash != 0u) {
+                    const char* syscall_name =
+                        picked->required_syscall_name();
+                    if (syscall_name != nullptr && *syscall_name != '\0') {
+                        const uint32_t salt = rng.next_u32();
+                        const uint32_t target_hash =
+                            anti_tamper::djb2_ascii_hash_salted(
+                                syscall_name, salt);
                         anti_tamper::emit_hells_gate_resolver(
-                            rt, target_hash);
+                            rt, target_hash, salt);
                     }
 
                     // Build the per-region context. Self-CRC reads

@@ -698,14 +698,25 @@ void emit_decrypt_body(ByteBuffer& buf,
 
     // Hell's Gate address resolver → r13 = NtProtectVirtualMemory
     // function body address. The resolver walks the PEB, finds
-    // ntdll, and looks up the export by DJB2 hash. On failure r13
-    // is left at 0 and we skip the reprotect loop entirely —
-    // pre-fix behaviour.
+    // ntdll, and looks up the export by salted DJB2 hash. On
+    // failure r13 is left at 0 and we skip the reprotect loop
+    // entirely — pre-fix behaviour.
+    //
+    // The per-build random salt is what kills the "djb2_hash →
+    // ntdll API" reverse-lookup dictionary: every build folds a
+    // different 32-bit constant into the hash seed, so both the
+    // `cmp eax, target_hash` slot and the scan-loop initial seed
+    // slot change from build to build even though the target API
+    // name is the same. Reversers reading the stub can still
+    // extract both constants, but no longer via a static table.
     {
         mx::RawEmitter tmp{};
-        constexpr uint32_t kNtProtectHash =
-            anti_tamper::djb2_ascii_hash("NtProtectVirtualMemory");
-        anti_tamper::emit_hells_gate_address_resolver(tmp, kNtProtectHash);
+        const uint32_t salt = rng.next_u32();
+        const uint32_t ntprotect_hash =
+            anti_tamper::djb2_ascii_hash_salted(
+                "NtProtectVirtualMemory", salt);
+        anti_tamper::emit_hells_gate_address_resolver(
+            tmp, ntprotect_hash, salt);
         for (uint8_t b : tmp.buf) u8(b);
     }
 

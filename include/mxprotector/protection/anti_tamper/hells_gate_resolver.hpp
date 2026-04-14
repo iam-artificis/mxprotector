@@ -88,13 +88,22 @@
 
 namespace mx::anti_tamper {
 
-/// Compile-time DJB2 hash over a null-terminated ASCII string.
-/// Used both to compute the build-time hash constants that are
-/// baked into the resolver and to mirror exactly what the runtime
-/// code does — if the two implementations disagree the lookup
-/// silently fails.
-[[nodiscard]] constexpr uint32_t djb2_ascii_hash(const char* s) noexcept {
-    uint32_t h = 5381u;
+/// Compile-time DJB2 hash with an optional per-call salt folded into
+/// the initial seed. The seed is `5381 XOR salt` — at salt=0 this
+/// degenerates into the classic DJB2 constant 5381, so unsalted
+/// call sites stay bit-for-bit compatible.
+///
+/// The salted form exists for P5 "Packer Hashing" — each Hell's Gate
+/// emission site generates a per-build random salt, so the
+/// `cmp eax, imm32` comparing scanned export names to their hashed
+/// target is a different 32-bit constant on every build. Precomputed
+/// "DJB2 hash → ntdll API name" dictionaries that reverse engineers
+/// keep for common Windows symbols stop being a trivial lookup; the
+/// reverser must extract the salt from the binary first, re-hash
+/// their candidate name list under that salt, and *then* match.
+[[nodiscard]] constexpr uint32_t djb2_ascii_hash_salted(
+    const char* s, uint32_t salt) noexcept {
+    uint32_t h = 5381u ^ salt;
     while (*s != '\0') {
         h = h * 33u
           + static_cast<uint32_t>(static_cast<unsigned char>(*s));
@@ -103,20 +112,31 @@ namespace mx::anti_tamper {
     return h;
 }
 
+/// Unsalted DJB2 hash — equivalent to `djb2_ascii_hash_salted(s, 0)`.
+/// Kept as a terser name for call sites that explicitly want the
+/// legacy zero-salt seed (e.g., tests mirroring a fixed hash).
+[[nodiscard]] constexpr uint32_t djb2_ascii_hash(const char* s) noexcept {
+    return djb2_ascii_hash_salted(s, 0);
+}
+
 /// Emit the runtime Hell's Gate SSN resolver.
 ///
 /// The emitted code walks the PEB, finds ntdll (assuming it is the
 /// second entry in `InMemoryOrderModuleList`, which is true on all
 /// mainstream Windows versions), parses its PE export table, and
-/// looks up the function whose DJB2 hash matches `target_name_hash`.
-/// On success the resolved SSN is placed in `r13d`; on any failure
-/// (export directory missing, name not found, prologue mismatch)
-/// `r13d` is left at 0.
+/// looks up the function whose salted DJB2 hash matches
+/// `target_name_hash`. On success the resolved SSN is placed in
+/// `r13d`; on any failure (export directory missing, name not
+/// found, prologue mismatch) `r13d` is left at 0.
 ///
-/// The caller is responsible for computing `target_name_hash` at
-/// build time via `djb2_ascii_hash(...)` — the literal ASCII name
-/// never appears in the emitted code.
-void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash);
+/// `target_name_hash` must be computed at build time via
+/// `djb2_ascii_hash_salted(name, salt)` using the *same* salt that
+/// is passed here. When `salt == 0` the seed collapses to plain
+/// DJB2, so legacy call sites are bit-compatible with the pre-P5
+/// behaviour.
+void emit_hells_gate_resolver(RawEmitter& e,
+                              uint32_t    target_name_hash,
+                              uint32_t    salt = 0);
 
 /// Variant that returns the FUNCTION ADDRESS (not SSN) in `r13`.
 ///
@@ -135,7 +155,10 @@ void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash);
 /// to interfere.
 ///
 /// On success r13 holds the full 64-bit function address. On failure
-/// r13 is left at 0, same contract as the SSN variant.
-void emit_hells_gate_address_resolver(RawEmitter& e, uint32_t target_name_hash);
+/// r13 is left at 0, same contract as the SSN variant. `salt`
+/// follows the same rules as for `emit_hells_gate_resolver`.
+void emit_hells_gate_address_resolver(RawEmitter& e,
+                                      uint32_t    target_name_hash,
+                                      uint32_t    salt = 0);
 
 } // namespace mx::anti_tamper

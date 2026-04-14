@@ -191,12 +191,13 @@ public:
         return "hw_breakpoint_sweep";
     }
 
-    [[nodiscard]] uint32_t required_syscall_hash() const noexcept override {
+    [[nodiscard]] const char* required_syscall_name() const noexcept override {
         // HW BP sweep calls NtGetContextThread to read DR0..DR3.
-        // The X64 backend emits a Hell's Gate resolver that walks
-        // the PEB, finds ntdll, and places this SSN in r13d before
-        // the check runs.
-        return djb2_ascii_hash("NtGetContextThread");
+        // The X64 backend hashes this name under a per-build salt
+        // and emits a Hell's Gate resolver that walks the PEB,
+        // finds ntdll, and places the SSN in r13d before the check
+        // runs.
+        return "NtGetContextThread";
     }
 };
 

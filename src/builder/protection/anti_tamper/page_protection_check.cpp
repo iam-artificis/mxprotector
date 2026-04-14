@@ -189,8 +189,8 @@ public:
         return "page_protection";
     }
 
-    [[nodiscard]] uint32_t required_syscall_hash() const noexcept override {
-        return djb2_ascii_hash("NtQueryVirtualMemory");
+    [[nodiscard]] const char* required_syscall_name() const noexcept override {
+        return "NtQueryVirtualMemory";
     }
 };
 

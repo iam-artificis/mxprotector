@@ -31,23 +31,30 @@ inline void patch_rel8(RawEmitter& e, size_t patch, size_t target) noexcept {
 
 /// Shared body emitter — `return_address` flips the final extract
 /// between SSN (r13d = [rdi+4]) and function-address (r13 = rdi).
+/// `salt` folds into the DJB2 seed (see header for rationale).
 void emit_hells_gate_common(RawEmitter& e,
                             uint32_t target_name_hash,
+                            uint32_t salt,
                             bool return_address);
 
 } // anonymous namespace
 
-void emit_hells_gate_resolver(RawEmitter& e, uint32_t target_name_hash) {
-    emit_hells_gate_common(e, target_name_hash, /*return_address=*/false);
+void emit_hells_gate_resolver(RawEmitter& e,
+                              uint32_t    target_name_hash,
+                              uint32_t    salt) {
+    emit_hells_gate_common(e, target_name_hash, salt, /*return_address=*/false);
 }
 
-void emit_hells_gate_address_resolver(RawEmitter& e, uint32_t target_name_hash) {
-    emit_hells_gate_common(e, target_name_hash, /*return_address=*/true);
+void emit_hells_gate_address_resolver(RawEmitter& e,
+                                      uint32_t    target_name_hash,
+                                      uint32_t    salt) {
+    emit_hells_gate_common(e, target_name_hash, salt, /*return_address=*/true);
 }
 
 namespace {
 void emit_hells_gate_common(RawEmitter& e,
                             uint32_t target_name_hash,
+                            uint32_t salt,
                             bool return_address)
 {
     // ------------------------------------------------------------
@@ -162,10 +169,21 @@ void emit_hells_gate_common(RawEmitter& e,
     //   rdx = name = DllBase + name_rva.
     e.u8(0x48); e.u8(0x8D); e.u8(0x14); e.u8(0x03);
 
-    // mov eax, 5381                      B8 05 15 00 00               (5)
-    //   Initialise DJB2 hash accumulator.
+    // mov eax, <5381 XOR salt>           B8 imm32                    (5)
+    //   Initialise the DJB2 hash accumulator. The `salt` fold here
+    //   is what breaks precomputed "djb2_hash → ntdll API name"
+    //   lookup tables: every build ships a different initial seed,
+    //   which shifts the full distribution of computed hashes by
+    //   the same (name-independent) delta. The build-time
+    //   `djb2_ascii_hash_salted(target_name, salt)` that produced
+    //   `target_name_hash` uses the identical seed, so the runtime
+    //   comparison still matches.
+    const uint32_t initial_seed = 5381u ^ salt;
     e.u8(0xB8);
-    e.u8(0x05); e.u8(0x15); e.u8(0x00); e.u8(0x00);
+    e.u8(static_cast<uint8_t>(initial_seed));
+    e.u8(static_cast<uint8_t>(initial_seed >> 8));
+    e.u8(static_cast<uint8_t>(initial_seed >> 16));
+    e.u8(static_cast<uint8_t>(initial_seed >> 24));
 
     // --- .hash_loop: ---
     const size_t label_hash_loop = e.size();
