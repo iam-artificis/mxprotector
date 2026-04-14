@@ -37,8 +37,11 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstring>
 #include <format>
+#include <optional>
+#include <utility>
 #include <variant>
 
 namespace mx {
@@ -157,7 +160,23 @@ struct DecryptSection {
     uint32_t patch_size_at;  ///< Stub-relative offset of the `mov ecx, imm32` immediate
 };
 
-struct StubPatches {
+/// Patch offsets every stub emitter is required to produce, regardless of
+/// shape. The shared packer runtime (`finalize_packer_stub`) consumes these
+/// without caring what else the emitter wrote around them.
+///
+/// Both fields are stub-relative byte offsets:
+///   * `stolen_bytes_offset` — first byte of the embedded stolen payload
+///     inside the stub buffer. Used to fix up CALL rel32 sites inside the
+///     stolen range once the stub's final RVA is known.
+///   * `rel_to_oep_at`       — offset of the rel32 slot of the final
+///     `jmp rel32` that branches back into the real entry (OEP for exe,
+///     DllMain for dll) at `real_entry + stolen_size`.
+struct CommonStubPatches {
+    uint32_t stolen_bytes_offset = 0;
+    uint32_t rel_to_oep_at       = 0;
+};
+
+struct ExeStubPatches : CommonStubPatches {
     // Per-section patch sites (see DecryptSection above). Populated in
     // stub-emission order; the caller patches each one to its section RVA
     // and byte count.
@@ -165,7 +184,6 @@ struct StubPatches {
 
     uint32_t rel_to_key_at;        ///< patch offset (rel32 from end-of-lea to embedded 32-byte RC4 key)
     uint32_t rel_to_sbox_at;       ///< patch offset (rel32 from end-of-lea to 256-byte scratch S-box)
-    uint32_t rel_to_oep_at;        ///< patch offset (rel32 from end-of-jmp to OEP + stolen_size)
 
     // P3 — VM-protected entry stub. The range
     // `[ksa_block_start_offset, ksa_block_end_offset)` inside the emitted
@@ -177,7 +195,6 @@ struct StubPatches {
     // correctly, it just isn't VM-wrapped.
     uint32_t ksa_block_start_offset = 0;
     uint32_t ksa_block_end_offset   = 0;
-    uint32_t stolen_bytes_offset;  ///< offset of the first byte of the embedded stolen payload
     uint32_t rel_to_impdir_at;     ///< patch offset (rel32 from end-of-lea to Import Directory)
     uint32_t impdir_size_at;       ///< patch offset of the import dir size imm32
 
@@ -194,6 +211,24 @@ struct StubPatches {
     uint32_t rel_to_reprotect_table_at;
     uint32_t reprotect_table_offset;
     uint32_t reprotect_entry_count;
+};
+
+/// Patches produced by the forwarding DLL stub. The first iteration has
+/// nothing to add beyond the common fields — later steps that introduce
+/// decryption/reprotect/IAT-wipe on the DLL path will extend this.
+struct DllForwardingPatches : CommonStubPatches {};
+
+/// A StubEmitter is a stateless (or cheaply copyable) policy type that
+/// turns `(rng, stolen_bytes_view)` into a concrete stub buffer + an
+/// emitter-specific patch descriptor. The patch descriptor must derive
+/// from `CommonStubPatches` so the shared runtime can patch the rel32
+/// slots (jmp-to-OEP, stolen CALL fixups) uniformly.
+template <class T>
+concept StubEmitter = requires(T& t, Randomizer& rng, ByteView stolen) {
+    typename T::patches_type;
+    requires std::derived_from<typename T::patches_type, CommonStubPatches>;
+    { t.emit(rng, stolen) } ->
+        std::same_as<std::pair<ByteBuffer, typename T::patches_type>>;
 };
 
 /// Minimum number of bytes we want to steal from the OEP. We walk whole
@@ -320,7 +355,7 @@ struct StolenPlan {
 ///   6. Restore registers (mirror of the push order).
 ///   7. Execute the stolen OEP bytes inline.
 ///   8. jmp rel32 → OEP + stolen_size.
-[[nodiscard]] std::pair<ByteBuffer, StubPatches> build_stub_bytes(
+[[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> build_exe_stub_bytes(
     Randomizer& rng,
     ByteView stolen_bytes,
     uint32_t section_count)
@@ -343,7 +378,7 @@ struct StolenPlan {
     std::shuffle(save_order.begin(), save_order.end(), rng.engine());
     for (uint8_t op : save_order) u8(op);
 
-    StubPatches patches{};
+    ExeStubPatches patches{};
     patches.sections.reserve(section_count);
 
     // (2) Anti-debug — polymorphic. Each variant reads a different Windows
@@ -823,15 +858,6 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
     std::memcpy(buf.data() + offset, &value, sizeof(value));
 }
 
-/// Patches produced by `build_stub_bytes_dll_forwarding`. Tiny on purpose —
-/// the first DLL-path iteration does not encrypt, so there is nothing to
-/// keystream, nothing to reprotect, and no IAT to wipe. Only the jmp back
-/// to the real DllMain (after any stolen prologue bytes) needs a rel32.
-struct DllForwardingPatches {
-    uint32_t stolen_bytes_offset;   ///< offset of the first byte of the embedded stolen payload
-    uint32_t rel_to_dllmain_at;     ///< patch offset (rel32 from end-of-jmp to DllMain + stolen_size)
-};
-
 /// Minimal DLL stub: inline any safely-stolen DllMain prologue bytes, then
 /// `jmp rel32` back into the real DllMain body. No register saves, no
 /// anti-debug, no decryption. The Windows loader enters with the standard
@@ -840,7 +866,7 @@ struct DllForwardingPatches {
 /// entered directly. Its `ret` returns to the loader with the DllMain BOOL
 /// in eax.
 [[nodiscard]] std::pair<ByteBuffer, DllForwardingPatches>
-build_stub_bytes_dll_forwarding(ByteView stolen_bytes) {
+build_dll_forwarding_stub_bytes(ByteView stolen_bytes) {
     ByteBuffer buf;
     buf.reserve(stolen_bytes.size() + 5);
 
@@ -852,7 +878,7 @@ build_stub_bytes_dll_forwarding(ByteView stolen_bytes) {
 
     // (2) jmp rel32 → DllMain + stolen_size
     buf.push_back(0xE9);
-    p.rel_to_dllmain_at = static_cast<uint32_t>(buf.size());
+    p.rel_to_oep_at = static_cast<uint32_t>(buf.size());
     buf.push_back(0);
     buf.push_back(0);
     buf.push_back(0);
@@ -860,6 +886,47 @@ build_stub_bytes_dll_forwarding(ByteView stolen_bytes) {
 
     return {std::move(buf), p};
 }
+
+// ---------------------------------------------------------------------------
+// Emitter policy types. Each wraps one of the `build_*_stub_bytes` helpers
+// and exposes it through the `StubEmitter` concept so the shared packer
+// runtime can patch the common rel32 slots uniformly.
+// ---------------------------------------------------------------------------
+
+class ExeStubEmitter {
+public:
+    using patches_type = ExeStubPatches;
+
+    /// `section_count` is the number of encrypted sections the stub will
+    /// iterate over. The decrypt loops are unrolled at build time —
+    /// `ExeStubPatches::sections` ends up with one entry per loop the
+    /// caller needs to patch with (rva, size).
+    explicit ExeStubEmitter(uint32_t section_count) noexcept
+        : section_count_(section_count) {}
+
+    [[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> emit(
+        Randomizer& rng, ByteView stolen_bytes) {
+        return build_exe_stub_bytes(rng, stolen_bytes, section_count_);
+    }
+
+private:
+    uint32_t section_count_;
+};
+
+class DllForwardingStubEmitter {
+public:
+    using patches_type = DllForwardingPatches;
+
+    [[nodiscard]] std::pair<ByteBuffer, DllForwardingPatches> emit(
+        Randomizer& /*rng*/, ByteView stolen_bytes) {
+        return build_dll_forwarding_stub_bytes(stolen_bytes);
+    }
+};
+
+static_assert(StubEmitter<ExeStubEmitter>,
+    "ExeStubEmitter must satisfy the StubEmitter concept");
+static_assert(StubEmitter<DllForwardingStubEmitter>,
+    "DllForwardingStubEmitter must satisfy the StubEmitter concept");
 
 /// Strip base relocations: clear the directory entry, set the file header's
 /// IMAGE_FILE_RELOCS_STRIPPED bit, clear DYNAMIC_BASE in DllCharacteristics,
@@ -918,6 +985,156 @@ std::vector<size_t> collect_target_sections(const PeImage& image,
     return indices;
 }
 
+/// Result of `prepare_oep_steal`: the section the real entry point lives
+/// in, the entry RVA, the safe stolen-byte plan, and the bytes themselves
+/// (empty if no safe prologue could be stolen, in which case the stub is
+/// entered, runs its payload, and jumps straight back to the unchanged
+/// entry RVA).
+struct OepStealResult {
+    size_t     section_index;
+    Rva        oep_rva;
+    StolenPlan plan;
+    ByteBuffer stolen_bytes;
+};
+
+/// Shared packer pre-stub preparation.
+///
+/// Strips base relocations, locates the section that holds the real
+/// entry point, tries to steal a safe prologue range, and overwrites
+/// the stolen range in the source section with 0xCC so memory dumps
+/// are missing the real prologue.
+///
+/// Returns std::nullopt if the entry RVA is zero (no entry at all —
+/// nothing to protect) or falls outside every section; callers
+/// treat that as "skip the packer for this image".
+[[nodiscard]] std::optional<OepStealResult>
+prepare_oep_steal(ProtectionContext& ctx, std::string_view steal_label) {
+    disable_relocations(ctx.pe_image());
+    ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+
+    const Rva oep_rva = ctx.pe_image().entry_point_rva();
+    if (oep_rva == 0) {
+        ctx.log("PackerPass: entry point == 0, пропуск");
+        return std::nullopt;
+    }
+
+    auto& sections = ctx.pe_image().sections();
+    size_t section_index = sections.size();
+    for (size_t i = 0; i < sections.size(); ++i) {
+        const auto& s = sections[i];
+        if (oep_rva >= s.virtual_address &&
+            oep_rva < s.virtual_address + s.virtual_size) {
+            section_index = i;
+            break;
+        }
+    }
+    if (section_index == sections.size()) {
+        ctx.log("PackerPass: entry RVA вне секций, пропуск");
+        return std::nullopt;
+    }
+
+    OepStealResult result{};
+    result.section_index = section_index;
+    result.oep_rva       = oep_rva;
+
+    auto& oep_target = sections[section_index];
+    const uint32_t oep_off = oep_rva - oep_target.virtual_address;
+    result.plan = plan_stolen_bytes(
+        ByteView{oep_target.data.data(), oep_target.data.size()},
+        oep_off, oep_rva);
+
+    if (result.plan.size > 0) {
+        result.stolen_bytes.assign(
+            oep_target.data.begin() + oep_off,
+            oep_target.data.begin() + oep_off + result.plan.size);
+        std::fill(oep_target.data.begin() + oep_off,
+                  oep_target.data.begin() + oep_off + result.plan.size,
+                  static_cast<uint8_t>(0xCC));
+        ctx.log_fmt("PackerPass: украдено {} байт {} (0x{:08X}), {} CALL-fixup",
+            result.plan.size, steal_label, oep_rva,
+            static_cast<uint32_t>(result.plan.relocs.size()));
+    } else {
+        ctx.log_fmt("PackerPass: {} небезопасен для stolen bytes — пропуск",
+            steal_label);
+    }
+    return result;
+}
+
+/// Result of `finalize_packer_stub`.
+struct PackerStubInjection {
+    size_t  pack_section_index;  ///< index into ctx.pe_image().sections()
+    Rva     stub_rva;            ///< RVA where the injected stub was placed
+};
+
+/// Shared packer post-stub finalisation.
+///
+/// Injects a `.mxpack` (or equivalently-named) section carrying the
+/// assembled stub buffer, patches the two rel32 slots every stub
+/// emitter must produce (`rel_to_oep_at` → real entry + stolen_size,
+/// and any CALL rel32 fix-ups inside the embedded stolen payload),
+/// and retargets `AddressOfEntryPoint` at the stub.
+///
+/// Returns {section_index, stub_rva} so the caller can apply any
+/// emitter-specific patches (per-section LEA/ECX slots, key/sbox
+/// rel32, reprotect table, IAT wipe — all EXE-only for now).
+[[nodiscard]] MxResult<PackerStubInjection> finalize_packer_stub(
+    ProtectionContext& ctx,
+    ByteBuffer&&       stub_buf,
+    uint32_t           section_characteristics,
+    const OepStealResult& steal,
+    const CommonStubPatches& common)
+{
+    SectionManager sec_mgr(ctx.pe_image());
+    const std::string& packer_section_name = ctx.section_names().packer;
+    auto add_res = sec_mgr.add_section(
+        packer_section_name,
+        ByteView{stub_buf.data(), stub_buf.size()},
+        section_characteristics);
+    if (!add_res) {
+        return std::unexpected(add_res.error());
+    }
+
+    const uint32_t pack_idx = *add_res;
+    auto& pack_sec = ctx.pe_image().sections()[pack_idx];
+    const Rva stub_rva = pack_sec.virtual_address;
+
+    ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
+        packer_section_name, stub_rva,
+        static_cast<uint32_t>(pack_sec.data.size()));
+
+    // jmp rel32 → real entry + stolen_size
+    {
+        const Rva resume_rva  = steal.oep_rva + steal.plan.size;
+        const Rva jmp_end_rva = stub_rva + common.rel_to_oep_at + 4;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(resume_rva) -
+            static_cast<int64_t>(jmp_end_rva));
+        write_i32(pack_sec.data, common.rel_to_oep_at, rel);
+    }
+
+    // Fix up CALL rel32 inside the stolen payload so each target RVA
+    // stays identical after the move into the stub section.
+    for (const auto& r : steal.plan.relocs) {
+        const uint32_t rel_abs_offset = common.stolen_bytes_offset + r.offset_in_stolen;
+        const uint32_t instr_end_abs  = common.stolen_bytes_offset + r.instr_end_in_stolen;
+        const Rva new_instr_end_rva   = stub_rva + instr_end_abs;
+        const int32_t new_rel = static_cast<int32_t>(
+            static_cast<int64_t>(r.original_target_rva) -
+            static_cast<int64_t>(new_instr_end_rva));
+        write_i32(pack_sec.data, rel_abs_offset, new_rel);
+    }
+
+    ctx.pe_image().set_entry_point_rva(stub_rva);
+    std::visit([&](auto& nt) {
+        nt.OptionalHeader.AddressOfEntryPoint = stub_rva;
+    }, ctx.pe_image().nt_headers());
+
+    ctx.log_fmt("PackerPass: entry перенаправлен 0x{:08X} -> 0x{:08X}",
+        steal.oep_rva, stub_rva);
+
+    return PackerStubInjection{pack_idx, stub_rva};
+}
+
 /// DLL path — forwarding-only stub, no encryption.
 ///
 /// Strips base relocations (so the stub's rel32s survive to runtime
@@ -935,105 +1152,24 @@ std::vector<size_t> collect_target_sections(const PeImage& image,
 MxStatus execute_dll_forwarding(ProtectionContext& ctx) {
     ctx.log("PackerPass: DLL forwarding path (plumbing only, no encryption)");
 
-    disable_relocations(ctx.pe_image());
-    ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+    auto steal_opt = prepare_oep_steal(ctx, "DllMain");
+    if (!steal_opt) return {};
 
-    const Rva oep_rva_initial = ctx.pe_image().entry_point_rva();
-    if (oep_rva_initial == 0) {
-        ctx.log("PackerPass: DLL без DllMain, пропуск");
-        return {};
-    }
-
-    auto& sections = ctx.pe_image().sections();
-    size_t oep_sec_idx = sections.size();
-    for (size_t i = 0; i < sections.size(); ++i) {
-        const auto& s = sections[i];
-        if (oep_rva_initial >= s.virtual_address &&
-            oep_rva_initial < s.virtual_address + s.virtual_size) {
-            oep_sec_idx = i;
-            break;
-        }
-    }
-    if (oep_sec_idx == sections.size()) {
-        ctx.log("PackerPass: DllMain RVA вне секций, пропуск");
-        return {};
-    }
-    auto& oep_target = sections[oep_sec_idx];
-
-    StolenPlan stolen_plan;
-    ByteBuffer stolen_bytes;
-    const uint32_t oep_off = oep_rva_initial - oep_target.virtual_address;
-    stolen_plan = plan_stolen_bytes(
-        ByteView{oep_target.data.data(), oep_target.data.size()},
-        oep_off, oep_rva_initial);
-    if (stolen_plan.size > 0) {
-        stolen_bytes.assign(
-            oep_target.data.begin() + oep_off,
-            oep_target.data.begin() + oep_off + stolen_plan.size);
-        std::fill(oep_target.data.begin() + oep_off,
-                  oep_target.data.begin() + oep_off + stolen_plan.size,
-                  static_cast<uint8_t>(0xCC));
-        ctx.log_fmt("PackerPass: DLL — украдено {} байт DllMain (0x{:08X}), {} CALL-fixup",
-            stolen_plan.size, oep_rva_initial,
-            static_cast<uint32_t>(stolen_plan.relocs.size()));
-    } else {
-        ctx.log("PackerPass: DllMain небезопасен для stolen bytes — пропуск");
-    }
-    const uint32_t stolen_size = stolen_plan.size;
-
-    auto [stub_buf, patches] = build_stub_bytes_dll_forwarding(
-        ByteView{stolen_bytes.data(), stolen_bytes.size()});
+    Randomizer rng;
+    DllForwardingStubEmitter emitter{};
+    auto [stub_buf, patches] = emitter.emit(
+        rng, ByteView{steal_opt->stolen_bytes.data(),
+                      steal_opt->stolen_bytes.size()});
 
     constexpr uint32_t pack_characteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
         pe::IMAGE_SCN_MEM_READ;
 
-    SectionManager sec_mgr(ctx.pe_image());
-    const std::string& packer_section_name = ctx.section_names().packer;
-    auto add_res = sec_mgr.add_section(
-        packer_section_name,
-        ByteView{stub_buf.data(), stub_buf.size()},
-        pack_characteristics);
-    if (!add_res) {
-        return std::unexpected(add_res.error());
-    }
+    auto inject = finalize_packer_stub(
+        ctx, std::move(stub_buf), pack_characteristics, *steal_opt, patches);
+    if (!inject) return std::unexpected(inject.error());
 
-    const uint32_t pack_idx = *add_res;
-    auto& pack_sec = ctx.pe_image().sections()[pack_idx];
-    const Rva stub_rva = pack_sec.virtual_address;
-
-    ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
-        packer_section_name, stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
-
-    // jmp rel32 → DllMain + stolen_size
-    {
-        const Rva dllmain_resume_rva = oep_rva_initial + stolen_size;
-        const Rva jmp_end_rva = stub_rva + patches.rel_to_dllmain_at + 4;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(dllmain_resume_rva) -
-            static_cast<int64_t>(jmp_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_dllmain_at, rel);
-    }
-
-    // Fix up CALL rel32 inside the stolen bytes.
-    for (const auto& r : stolen_plan.relocs) {
-        const uint32_t rel_abs_offset = patches.stolen_bytes_offset + r.offset_in_stolen;
-        const uint32_t instr_end_abs  = patches.stolen_bytes_offset + r.instr_end_in_stolen;
-        const Rva new_instr_end_rva   = stub_rva + instr_end_abs;
-        const int32_t new_rel = static_cast<int32_t>(
-            static_cast<int64_t>(r.original_target_rva) -
-            static_cast<int64_t>(new_instr_end_rva));
-        write_i32(pack_sec.data, rel_abs_offset, new_rel);
-    }
-
-    ctx.pe_image().set_entry_point_rva(stub_rva);
-    std::visit([&](auto& nt) {
-        nt.OptionalHeader.AddressOfEntryPoint = stub_rva;
-    }, ctx.pe_image().nt_headers());
-
-    ctx.log_fmt("PackerPass: DllMain перенаправлен 0x{:08X} -> 0x{:08X}",
-        oep_rva_initial, stub_rva);
     ctx.log("PackerPass: DLL forwarding stub готов");
     return {};
 }
@@ -1074,47 +1210,14 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         return {};
     }
 
-    // The first target must be the one holding the OEP (only .text qualifies
-    // under current policy). plan_stolen_bytes and the OEP retargeting both
-    // reference it below.
-    const size_t oep_target_idx = target_indices.front();
-    auto& oep_target = ctx.pe_image().sections()[oep_target_idx];
-
-    // (1) Kill base relocations so the encrypted bytes survive to runtime
-    //     without the Windows loader touching them.
-    disable_relocations(ctx.pe_image());
-    ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
-
-    // (2) Plan stolen bytes: move the first instructions of OEP into the
-    //     stub (before encryption) so a memory dump of the decrypted .text
-    //     is missing its front. plan_stolen_bytes refuses unsafe sequences;
-    //     in that case we skip stealing and keep the packer semantically
-    //     identical. CALL rel32 sites are carried as relocs and fixed up
-    //     once the stub section gets placed.
-    const Rva oep_rva_initial = ctx.pe_image().entry_point_rva();
-    StolenPlan stolen_plan;
-    ByteBuffer stolen_bytes;
-    if (oep_rva_initial >= oep_target.virtual_address &&
-        oep_rva_initial < oep_target.virtual_address + oep_target.virtual_size) {
-        const uint32_t oep_off = oep_rva_initial - oep_target.virtual_address;
-        stolen_plan = plan_stolen_bytes(
-            ByteView{oep_target.data.data(), oep_target.data.size()},
-            oep_off, oep_rva_initial);
-        if (stolen_plan.size > 0) {
-            stolen_bytes.assign(
-                oep_target.data.begin() + oep_off,
-                oep_target.data.begin() + oep_off + stolen_plan.size);
-            std::fill(oep_target.data.begin() + oep_off,
-                      oep_target.data.begin() + oep_off + stolen_plan.size,
-                      static_cast<uint8_t>(0xCC));
-            ctx.log_fmt("PackerPass: украдено {} байт OEP (0x{:08X}), {} CALL-fixup",
-                stolen_plan.size, oep_rva_initial,
-                static_cast<uint32_t>(stolen_plan.relocs.size()));
-        } else {
-            ctx.log("PackerPass: OEP небезопасен для stolen bytes — пропуск");
-        }
-    }
-    const uint32_t stolen_size = stolen_plan.size;
+    // Shared pre-stub work: strip relocations, locate the section that
+    // holds the OEP, steal a safe prologue range. The first entry in
+    // `target_indices` is required to be the OEP-bearing section (only
+    // `.text` qualifies under current policy); the helper redundantly
+    // rediscovers it by RVA and the two agree by construction.
+    auto steal_opt = prepare_oep_steal(ctx, "OEP");
+    if (!steal_opt) return {};
+    auto& steal = *steal_opt;
 
     // Make .rdata writable so the stub can zero the Import Directory at runtime.
     for (auto& sec : ctx.pe_image().sections()) {
@@ -1178,9 +1281,9 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     //     32-byte RC4 key, the 256-byte S-box scratch area, and the
     //     reprotect section table. Size is not fixed because the stub
     //     is polymorphic.
-    auto [stub_buf, patches] = build_stub_bytes(
-        rng, ByteView{stolen_bytes.data(), stolen_bytes.size()},
-        static_cast<uint32_t>(encrypted.size()));
+    ExeStubEmitter exe_emitter{static_cast<uint32_t>(encrypted.size())};
+    auto [stub_buf, patches] = exe_emitter.emit(
+        rng, ByteView{steal.stolen_bytes.data(), steal.stolen_bytes.size()});
     const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), key.begin(), key.end());
 
@@ -1285,45 +1388,33 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), encrypted.size() * 8, uint8_t{0});
 
-    // The jmp rel32 lands AFTER the stolen bytes: OEP + stolen_size.
-    const Rva oep_rva = oep_rva_initial + stolen_size;
-
-    // (6) Add the .mxpack section and figure out its RVA.
-    //
-    // Characteristics include MEM_WRITE because the RC4 KSA rebuilds
-    // the S-box scratch area at runtime (and the scratch lives inside
-    // the stub section itself). The reprotect loop at the tail of
-    // the stub only revokes WRITE from sections in `encrypted` — it
-    // never touches `.mxpack` — so the section stays R+W+X for the
-    // lifetime of the process. That's tolerable here because the
-    // stub is only used once at startup and the page is a single
-    // 4KB region no anti-tamper probe targets.
+    // (6) Inject the .mxpack section and apply common runtime patches
+    //     (jmp → OEP + stolen_size, stolen CALL fix-ups, entry retarget).
+    //     Characteristics include MEM_WRITE because the RC4 KSA rebuilds
+    //     the S-box scratch area at runtime (and the scratch lives inside
+    //     the stub section itself). The reprotect loop at the tail of
+    //     the stub only revokes WRITE from sections in `encrypted` — it
+    //     never touches `.mxpack` — so the section stays R+W+X for the
+    //     lifetime of the process. That's tolerable here because the
+    //     stub is only used once at startup and the page is a single
+    //     4KB region no anti-tamper probe targets.
     constexpr uint32_t pack_characteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
         pe::IMAGE_SCN_MEM_READ |
         pe::IMAGE_SCN_MEM_WRITE;
 
-    SectionManager sec_mgr(ctx.pe_image());
-    const std::string& packer_section_name = ctx.section_names().packer;
-    auto add_res = sec_mgr.add_section(
-        packer_section_name,
-        ByteView{stub_buf.data(), stub_buf.size()},
-        pack_characteristics);
-    if (!add_res) {
-        return std::unexpected(add_res.error());
-    }
+    auto inject = finalize_packer_stub(
+        ctx, std::move(stub_buf), pack_characteristics, steal, patches);
+    if (!inject) return std::unexpected(inject.error());
 
-    const uint32_t pack_idx = *add_res;
-    auto& pack_sec = ctx.pe_image().sections()[pack_idx];
-    const Rva stub_rva = pack_sec.virtual_address;
+    auto& pack_sec = ctx.pe_image().sections()[inject->pack_section_index];
+    const Rva stub_rva = inject->stub_rva;
 
-    ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
-        packer_section_name, stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
-
-    // (7) Patch all rel32 placeholders. For each `lea reg, [rip + rel32]`
-    //     and each `jmp rel32`, rel32 is computed from the instruction's
-    //     END (= patch_offset + 4) to the target RVA.
+    // (7) Patch EXE-specific rel32 placeholders. For each
+    //     `lea reg, [rip + rel32]` and each `jmp rel32`, rel32 is
+    //     computed from the instruction's END (= patch_offset + 4) to
+    //     the target RVA.
 
     // Per-section: lea rdi → section base, mov ecx → section size
     for (size_t i = 0; i < encrypted.size(); ++i) {
@@ -1419,14 +1510,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // jmp rel32 → OEP + stolen_size
-    {
-        const Rva jmp_end_rva = stub_rva + patches.rel_to_oep_at + 4;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(oep_rva) - static_cast<int64_t>(jmp_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_oep_at, rel);
-    }
-
     // IAT destruction: patch the lea rdi → Import Directory and size.
     // Read Import Directory RVA/size from the NT headers.
     {
@@ -1458,27 +1541,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // Fix up CALL rel32 inside the stolen bytes so each CALL still targets
-    // its original .text function after the move into .mxpack.
-    for (const auto& r : stolen_plan.relocs) {
-        const uint32_t rel_abs_offset = patches.stolen_bytes_offset + r.offset_in_stolen;
-        const uint32_t instr_end_abs  = patches.stolen_bytes_offset + r.instr_end_in_stolen;
-        const Rva new_instr_end_rva   = stub_rva + instr_end_abs;
-        const int32_t new_rel = static_cast<int32_t>(
-            static_cast<int64_t>(r.original_target_rva) -
-            static_cast<int64_t>(new_instr_end_rva));
-        write_i32(pack_sec.data, rel_abs_offset, new_rel);
-    }
-
-    // 7. Point the PE entry at the stub. Update both the cached value and
-    //    the NT header field so PeBuilder emits the redirected OEP.
-    ctx.pe_image().set_entry_point_rva(stub_rva);
-    std::visit([&](auto& nt) {
-        nt.OptionalHeader.AddressOfEntryPoint = stub_rva;
-    }, ctx.pe_image().nt_headers());
-
-    ctx.log_fmt("PackerPass: OEP перенаправлен 0x{:08X} -> 0x{:08X}",
-        oep_rva, stub_rva);
     ctx.log("PackerPass: упаковка завершена");
     return {};
 }
