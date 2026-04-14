@@ -298,6 +298,26 @@ MxResult<VmRuntime> X64VmBackend::generate(
             slots[generic_variant_total + native_count + s];
     }
 
+    // G4 per-handler rolling-key fold-in. Each handler_id gets a
+    // random non-zero byte. When a handler finishes its body (and
+    // is about to enter the tail dispatch), it does
+    // `xor byte [rsp+key_disp], per_handler_key[id]`, folding its
+    // handler_id into the live rolling-key state before the fetch
+    // of the next opcode byte. The encoder applies the matching
+    // XOR to the running encryption key after each instruction's
+    // bytes are emitted. Static decryption without actually
+    // executing handlers therefore needs to know the per-handler
+    // key table — which is itself per-build randomised and only
+    // reachable by tracing handler dispatch.
+    //
+    // Only active in rolling-cipher regions (has_branches == false).
+    // Branch-containing regions use a static XOR where the key
+    // byte is a constant, so folding would break decryption.
+    std::vector<uint8_t> per_handler_key(total_handlers);
+    for (auto& k : per_handler_key) {
+        k = static_cast<uint8_t>(rng.next_range(1, 255));
+    }
+
     // ------------------------------------------------------------------------
     // Step 2 — build plain bytecode stream, then stream-encrypt with rolling
     // key. The encryption walks bytes in fetch order (opcode, operands, next
@@ -446,9 +466,29 @@ MxResult<VmRuntime> X64VmBackend::generate(
         variant_handler_ids[static_cast<uint32_t>(VmOp::dead)][0];
     const uint8_t opq_branch_handler_id =
         variant_handler_ids[static_cast<uint32_t>(VmOp::opq_branch)][0];
+
+    // G4 per-handler-key fold-in events. Each entry marks the end
+    // of one handler's byte range in `bytecode_plain` and the
+    // handler_id that processed those bytes. The rolling-cipher
+    // encryption pass below walks this list and applies
+    // `key ^= per_handler_key[id]` after each range, matching the
+    // `xor [rsp+key_disp], imm8` fold-in the handler body emits
+    // right before its tail dispatch.
+    //
+    // A trailing sentinel event for the terminal `exit` handler
+    // isn't needed: exit doesn't dispatch, so there's no "next
+    // fetch" to fold into.
+    struct FoldInEvent { size_t end_offset; uint8_t handler_id; };
+    std::vector<FoldInEvent> fold_events;
+    fold_events.reserve(instructions.size() * 2);
+    auto record_fold = [&](uint8_t hid) {
+        fold_events.push_back({bytecode_plain.size(), hid});
+    };
+
     auto emit_g4_inserts = [&](size_t i) {
         for (uint8_t k = 0; k < dead_before[i]; ++k) {
             bytecode_plain.push_back(dead_handler_id);
+            record_fold(dead_handler_id);
         }
         if (opq_before[i]) {
             bytecode_plain.push_back(opq_branch_handler_id);
@@ -460,6 +500,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 bytecode_plain.push_back(
                     static_cast<uint8_t>(rng.next_range(0, 255)));
             }
+            record_fold(opq_branch_handler_id);
         }
     };
 
@@ -474,8 +515,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
         // The matched specialised handler has dst/src disps baked in, so the
         // runtime decoder needs no operand fetch.
         if (spec_match[i] >= 0) {
-            bytecode_plain.push_back(
-                specializations[static_cast<size_t>(spec_match[i])].handler_id);
+            const uint8_t spec_hid =
+                specializations[static_cast<size_t>(spec_match[i])].handler_id;
+            bytecode_plain.push_back(spec_hid);
+            record_fold(spec_hid);
             continue;
         }
 
@@ -556,6 +599,14 @@ MxResult<VmRuntime> X64VmBackend::generate(
             case VmOp::count_:
                 break;
         }
+
+        // G4: record fold-in boundary after this instruction's
+        // handler_id + operand bytes. `exit` doesn't dispatch
+        // anywhere afterwards, so its fold would be unused — the
+        // runtime handler emits no fold-in either. Skip it.
+        if (vi.op != VmOp::exit) {
+            record_fold(handler_id);
+        }
     }
 
     // G4: last batch of dummy bytes between the final real
@@ -578,13 +629,34 @@ MxResult<VmRuntime> X64VmBackend::generate(
         });
     const bool rolling = !has_branches;
 
-    // Bytecode encryption: rolling-key or static XOR.
+    // Bytecode encryption: rolling-key (+ G4 per-handler fold-in)
+    // or static XOR.
     if (rolling) {
         uint8_t key = initial_key;
-        for (auto& b : bytecode_plain) {
-            const uint8_t plain = b;
-            b = static_cast<uint8_t>(plain ^ key);
-            key ^= plain;
+        size_t byte_pos = 0;
+        size_t event_idx = 0;
+        while (byte_pos < bytecode_plain.size()) {
+            const size_t next_boundary =
+                (event_idx < fold_events.size())
+                ? fold_events[event_idx].end_offset
+                : bytecode_plain.size();
+
+            // Roll through bytes up to the next handler boundary.
+            while (byte_pos < next_boundary) {
+                const uint8_t plain = bytecode_plain[byte_pos];
+                bytecode_plain[byte_pos] =
+                    static_cast<uint8_t>(plain ^ key);
+                key ^= plain;
+                ++byte_pos;
+            }
+
+            // Apply this handler's fold-in (mirrors the
+            // `xor [rsp+key_disp], imm8` that the handler body
+            // emits right before its tail dispatch).
+            if (event_idx < fold_events.size()) {
+                key ^= per_handler_key[fold_events[event_idx].handler_id];
+                ++event_idx;
+            }
         }
     } else {
         for (auto& b : bytecode_plain) {
@@ -815,12 +887,33 @@ MxResult<VmRuntime> X64VmBackend::generate(
     // ---- Handler emission --------------------------------------------------
     std::vector<size_t> handler_offset_by_id(total_handlers, SIZE_MAX);
 
+    // G4: captured current handler_id — set by begin_handler, read
+    // by emit_handler_key_fold_in before every tail dispatch.
+    uint8_t current_handler_id = 0;
+
     auto begin_handler = [&](uint8_t handler_id) {
+        current_handler_id = handler_id;
         handler_offset_by_id[handler_id] = rt.size();
         emit_junk_prologue(rt, rng, /*max_bytes=*/8);
     };
 
+    // G4: `xor byte [rsp + rolling_key_disp], imm8=per_handler_key[id]`.
+    // Emitted right before the tail dispatch, so the fetch of the
+    // next opcode byte sees the post-fold key. Skipped entirely in
+    // static-cipher regions (rolling == false) where there is no
+    // mutable key state to fold into.
+    auto emit_handler_key_fold_in = [&](uint8_t handler_id) {
+        if (!rolling) return;
+        // 80 /6 ib — xor r/m8, imm8
+        //   ModRM: 01 110 100 = 0x74  (mod=01 disp8, reg=/6=xor, rm=100 SIB)
+        //   SIB:   00 100 100 = 0x24  (scale=00, index=100 none, base=rsp)
+        rt.u8(0x80); rt.u8(0x74); rt.u8(0x24);
+        rt.u8(static_cast<uint8_t>(rolling_key_disp));
+        rt.u8(per_handler_key[handler_id]);
+    };
+
     auto end_handler_tail = [&]() {
+        emit_handler_key_fold_in(current_handler_id);
         const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                           has_branches, table_key_patches,
                                           vflags_key, vflags_rol,
@@ -1102,6 +1195,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 // state: r11 advanced by 1 (via the fetch inside
                 // the tail), nothing else. That's exactly what a
                 // "no-op insert" should do.
+                emit_handler_key_fold_in(current_handler_id);
                 const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                    /*save_rflags=*/false,
                                                    table_key_patches,
@@ -1131,6 +1225,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 // we don't want those garbage flags landing in
                 // vflags where a downstream `vjcc` would read them.
                 emit_fetch_dword(rt, rolling_key_disp, rolling);
+                emit_handler_key_fold_in(current_handler_id);
                 const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                                    /*save_rflags=*/false,
                                                    table_key_patches,
@@ -1291,6 +1386,11 @@ MxResult<VmRuntime> X64VmBackend::generate(
         rt.u8(0x48); rt.u8(0x8D); rt.u8(0x64); rt.u8(0x24); rt.u8(0x18);
 
         // save_rflags=false: native handler already saved flags above.
+        // G4 rolling-key fold-in: current_handler_id was set by
+        // begin_handler(hid) at the top of the native-handler loop
+        // body, so the fold-in folds this native handler's key
+        // into the live rolling-key state before the tail fetch.
+        emit_handler_key_fold_in(current_handler_id);
         {
             const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
                                               false, table_key_patches,

@@ -44,11 +44,14 @@ below for the full spec.
     external patches beyond the `call rel32 inner_vm_entry` call
     sites (patched by the backend after runtime emit). § "Gap vs
     коммерческие" → G2.
-6. 📋 **VM strengthening — G4 bytecode semantic obfuscation (remainder).**
-    Handler id polymorphism already shipped (8 canonical ops × 2
-    variants each). Still open: dead opcodes via dedicated
-    flag-preserving handlers, opaque bytecode branches, rolling key
-    per handler. § "Gap vs коммерческие" → G4.
+6. ✅ **VM strengthening — G4 bytecode semantic obfuscation.**
+    Fully shipped. Handler-id polymorphism (5 r-r ops + unary with
+    alternative bodies), dead opcodes (`VmOp::dead` with save_rflags=
+    false tails), opaque bytecode branches (`VmOp::opq_branch`
+    shape-compatible with vjmp but never branches), and per-handler
+    rolling-key fold-in (each handler_id folds its per-build random
+    byte into the live rolling key before the tail dispatch).
+    § "Gap vs коммерческие" → G4.
 7. 📋 **VM strengthening — G5 handler call graph obfuscation.**
     Trampolined dispatch, handler-body flattening, handler-body
     interleaving. § "Gap vs коммерческие" → G5.
@@ -335,7 +338,7 @@ reverser один раз разбирает наш runtime и дальше ви�
   диверсификация, доступная для vjcc, у которого variant-ось уже
   занята condition code.
 
-### ⏳ G4. Bytecode semantic obfuscation *(высокий, средняя сложность)*
+### ✅ G4. Bytecode semantic obfuscation *(fully shipped)*
 
 - **Handler id polymorphism** ✅ — shipped. 8 canonical ops
   (`mov_rr`, `add_rr`, `sub_rr`, `xor_rr`, `and_rr`, `or_rr`,
@@ -375,9 +378,20 @@ reverser один раз разбирает наш runtime и дальше ви�
   uses save_rflags=false, same as dead opcodes, so the 4-byte
   fetch's flag clobbers don't contaminate vflags.
 
-- 📋 **Bytecode encryption с rolling key per-handler**: каждый
-  handler XOR'ит следующий opcode byte ключом зависящим от своего
-  handler_id. Static decode невозможен — только трассировкой.
+- ✅ **Bytecode encryption с rolling key per-handler** — shipped.
+  Каждый handler_id получает per-build random non-zero byte
+  (`per_handler_key[id]`). Перед tail dispatch handler body
+  эмитит `xor byte [rsp + rolling_key_disp], imm8` фолдом своего
+  ключа в активное состояние rolling-cipher'а. Encoder phase 2
+  трекает handler-boundary events в `fold_events[]`, а
+  encryption loop применяет matching `key ^= per_handler_key[id]`
+  после каждого instruction byte range. Static decryption без
+  трассировки handler dispatch теперь невозможен: каждый
+  прочитанный байт зависит от полной цепочки handler_id'ов
+  предыдущих инструкций. Работает только в rolling-cipher
+  регионах (regions без branches) — в static-XOR regions
+  константный key byte нельзя фолдить, фича там автоматически
+  выключается.
 
 ### 📋 G5. VM handler call graph obfuscation *(средний, средняя сложность)*
 Сейчас dispatcher — один `jmp [table + handler_id*8]`. Добавить:
