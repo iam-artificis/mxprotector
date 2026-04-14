@@ -408,19 +408,35 @@ void emit_handler_alu_rr_nested(RawEmitter& e, int32_t key_disp,
     // `lea r12, [rip + disp32]`
     //   REX.W|R + 0x8D + ModRM(00 100 101 = 0x25, rip-rel)
     //   disp32 = 2 (forward past the 2-byte `jmp .post_bc` rel8)
+    //
+    // The +2 is measured from the end of the LEA instruction (rip),
+    // and r12 lands on the first byte of inner bytecode right after
+    // the `jmp rel8` that jumps over the bytecode.
     e.u8(0x4C); e.u8(0x8D); e.u8(0x25);
     e.u32(static_cast<uint32_t>(2));
 
-    // --- `jmp .post_bc` — skip the 2-byte bytecode. ---
-    e.u8(0xEB); e.u8(0x02);
+    // --- `jmp .post_bc` — skip the 5-byte bytecode. ---
+    e.u8(0xEB); e.u8(0x05);
 
-    // --- 2 bytes of inner bytecode. ---
+    // --- 5 bytes of inner bytecode. ---
     //
-    //   [0] iload_src          — rax = [rdi]
-    //   [1] alu_inner_opcode   — one of iadd_exit / isub_exit / ixor_exit
-    //                            which does `op [rsi], rax; ret`
-    e.u8(0x00);
-    e.u8(alu_inner_opcode);
+    //   [0] iload_src   (0x00)  — r14 <- [rdi]
+    //   [1] iload_dst   (0x01)  — r15 <- [rsi]
+    //   [2] alu_inner_opcode    — one of iadd_rr/isub_rr/ixor_rr/iand_rr/ior_rr
+    //                             (r14 <- r14 <op> r15; save rflags)
+    //   [3] istore_dst  (0x02)  — [rsi] <- r14
+    //   [4] iret        (0x08)  — restore rflags; ret to this call site
+    //
+    // Lifter contract: the last flag-producing ALU in the bytecode
+    // must be the one that leaves the correct guest flags in the
+    // scratch slot. For this 5-byte sequence that's the single
+    // `alu_inner_opcode` at position [2] — istore_dst and iret don't
+    // touch the scratch slot.
+    e.u8(0x00);               // iload_src
+    e.u8(0x01);               // iload_dst
+    e.u8(alu_inner_opcode);   // iadd_rr / isub_rr / ixor_rr / iand_rr / ior_rr
+    e.u8(0x02);               // istore_dst
+    e.u8(0x08);               // iret
 
     // --- `call rel32 <inner_vm_entry>` — patched later. ---
     e.u8(0xE8);

@@ -1,40 +1,59 @@
 /**
  * @file x64_inner_vm.cpp
- * @brief [BUILDER, x64] Inner VM runtime emitter (G2 nested VM).
+ * @brief [BUILDER, x64] Inner VM runtime emitter (G2 extended scope).
  *
- * Produces the 64-byte inner-VM runtime block described in
+ * Produces the 120-byte inner-VM runtime block described in
  * `x64_inner_vm.hpp`. Every byte is hand-assembled and
  * cross-referenced against the layout diagram in the header; the
- * final `assert(size == kInnerVmRuntimeSize)` catches any
- * accidental drift.
+ * final `assert(size == kInnerVmRuntimeSize)` catches any accidental
+ * drift.
  *
- * Flag propagation: the three terminal handlers
- * (`iadd_exit`/`isub_exit`/`ixor_exit`) execute their ALU op
- * DIRECTLY against `[rsi]` and then `ret` to the outer handler.
- * No dispatcher loop runs between the ALU and the return, so the
- * ALU's rflags are the ones the outer handler's tail dispatch
- * sees and stores into `vflags`. Any design that routes through a
- * dispatch-loop `inc r12` or `add rax, r13` between the ALU and
- * the return would clobber the guest flags and break downstream
- * `vjcc` handlers — the earlier G4 dead-opcode attempt ran into
- * exactly this and had to be reverted.
+ * Flag propagation uses a live host register (`rcx`) as the rflags
+ * carrier between the guest ALU and `iret`. The dispatch loop and
+ * all non-ALU handlers leave `rcx` untouched, so the last ALU to
+ * run leaves its correct guest flags in `rcx`, and `iret` does
+ * `push rcx; popfq; ret` to restore them before returning to the
+ * outer handler.
+ *
+ * The runtime lives in the .mxvm code section which is R+X but NOT
+ * writable — an earlier attempt at an 8-byte in-runtime flag scratch
+ * (`pop qword [r13+disp]`) faulted on first use for this reason.
+ * That's why the scratch has to be a register.
+ *
+ * Register convention inside handler bodies:
+ *   r14 = accumulator  (holds dst, then `dst op src` after the ALU)
+ *   r15 = rhs operand  (holds src value, right-hand side of the ALU)
+ *   rcx = flag carrier (holds saved rflags between ALU and iret)
+ *   r12 = inner VPC
+ *   r13 = handler-table base
+ *   rax = dispatcher scratch (clobbered every dispatch cycle)
+ *
+ * The r14/r15 split matters for non-commutative ops: `sub r14, r15`
+ * = dst - src matches the outer VM's `sub_rr` semantics. First-pass
+ * had these reversed and sub_rr produced `src - dst` — see git
+ * history for the triage trail.
  *
  * Layout (offsets inside the emitted block):
  *
- *   +0   lea  r13, [rip + handler_table_disp32]   (7 bytes)
- *   +7   .loop:  movzx eax, byte [r12]            (5)
- *   +12         inc   r12                          (3)
- *   +15         mov   eax, [r13 + rax*4 + 0]       (5)
- *   +20         movsxd rax, eax                    (3)
- *   +23         add   rax, r13                     (3)
- *   +26         jmp   rax                          (2)
- *   +28  H_iload_src:  mov rax, [rdi]; jmp .loop   (5)
- *   +33  H_iadd_exit:  add [rsi], rax; ret         (4)
- *   +37  H_isub_exit:  sub [rsi], rax; ret         (4)
- *   +41  H_ixor_exit:  xor [rsi], rax; ret         (4)
- *   +45  padding                                    (3, 0xCC)
- *   +48  handler_table: 4 × int32                   (16)
- *   +64  end
+ *   +0   lea  r13, [rip + handler_table_disp32]     (7)
+ *   +7   .loop:  movzx eax, byte [r12]              (5)
+ *   +12         inc   r12                            (3)
+ *   +15         mov   eax, [r13 + rax*4 + 0]         (5)
+ *   +20         movsxd rax, eax                      (3)
+ *   +23         add   rax, r13                       (3)
+ *   +26         jmp   rax                            (2)
+ *   +28  H_iload_src   : mov r15, [rdi];    jmp .loop (5)
+ *   +33  H_iload_dst   : mov r14, [rsi];    jmp .loop (5)
+ *   +38  H_istore_dst  : mov [rsi], r14;    jmp .loop (5)
+ *   +43  H_iadd_rr     : add r14, r15; pushfq; pop rcx; jmp .loop (7)
+ *   +50  H_isub_rr     : sub r14, r15; pushfq; pop rcx; jmp .loop (7)
+ *   +57  H_ixor_rr     : xor r14, r15; pushfq; pop rcx; jmp .loop (7)
+ *   +64  H_iand_rr     : and r14, r15; pushfq; pop rcx; jmp .loop (7)
+ *   +71  H_ior_rr      : or  r14, r15; pushfq; pop rcx; jmp .loop (7)
+ *   +78  H_iret        : push rcx; popfq; ret                     (3)
+ *   +81  padding                                                   (3, 0xCC)
+ *   +84  handler_table : 9 × int32                                (36)
+ *   +120 end
  */
 
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
@@ -47,23 +66,46 @@ namespace mx::vm::x64 {
 
 namespace {
 
-// Hard-coded layout offsets — every jump distance, table base, and
+// Hard-coded layout offsets. Every jump distance, table base, and
 // handler-table entry below is derived from these. If the byte-level
 // shape of any chunk changes, update the constant(s) AND the
 // dependent computations in `emit_inner_vm_runtime`.
 constexpr size_t kOffDispatcherStart = 0;
-constexpr size_t kOffLoopStart       = 7;    // right after `lea r13, ...`
-constexpr size_t kOffDispatcherEnd   = 28;   // after `jmp rax`
+constexpr size_t kOffLoopStart       = 7;     // right after `lea r13, ...`
+constexpr size_t kOffDispatcherEnd   = 28;    // after `jmp rax`
+
 constexpr size_t kOffHIloadSrc       = 28;
-constexpr size_t kOffHIaddExit       = 33;
-constexpr size_t kOffHIsubExit       = 37;
-constexpr size_t kOffHIxorExit       = 41;
-constexpr size_t kOffHandlersEnd     = 45;
-constexpr size_t kOffPaddingEnd      = 48;   // 4-byte aligned
-constexpr size_t kOffHandlerTable    = 48;
+constexpr size_t kOffHIloadDst       = 33;
+constexpr size_t kOffHIstoreDst      = 38;
+constexpr size_t kOffHIaddRr         = 43;
+constexpr size_t kOffHIsubRr         = 50;
+constexpr size_t kOffHIxorRr         = 57;
+constexpr size_t kOffHIandRr         = 64;
+constexpr size_t kOffHIorRr          = 71;
+constexpr size_t kOffHIret           = 78;
+constexpr size_t kOffHandlersEnd     = 81;
+constexpr size_t kOffPaddingEnd      = 84;   // 4-byte aligned
+
+constexpr size_t kOffHandlerTable    = 84;
+constexpr size_t kOffRuntimeEnd      = 120;
 
 static_assert(kOffHandlersEnd + 3 == kOffPaddingEnd,
               "expected exactly 3 bytes of padding between handlers and table");
+static_assert(kOffHandlerTable + 9 * 4 == kOffRuntimeEnd,
+              "handler table is 9 × int32, ends the block");
+static_assert(kOffRuntimeEnd == kInnerVmRuntimeSize,
+              "runtime size constant must match layout end");
+
+// Emit a short `jmp .loop` (2 bytes) from the current position back
+// to the dispatcher loop. `body_end` is the offset of the byte
+// AFTER the jmp instruction (used to compute rel8).
+void emit_jmp_loop_rel8(RawEmitter& e, size_t body_end) {
+    const int32_t rel = static_cast<int32_t>(kOffLoopStart) -
+                        static_cast<int32_t>(body_end);
+    assert(rel >= -128 && rel <= 127);
+    e.u8(0xEB);
+    e.u8(static_cast<uint8_t>(static_cast<int8_t>(rel)));
+}
 
 } // anonymous namespace
 
@@ -71,34 +113,29 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     const size_t blob_base = e.size();
 
     // ------------------------------------------------------------------
-    // Dispatcher prologue + fetch/dispatch loop.
+    // [+0..+28] Dispatcher prologue + fetch/dispatch loop.
     //
-    // There is no sentinel byte and no `.done:` branch — the terminal
-    // handlers below `ret` directly instead of looping back, so the
-    // dispatcher's last meaningful flag-clobber is `add rax, r13`
-    // right before `jmp rax` to the next handler. The terminal ALU
-    // op then overwrites those flags with the guest-ALU result.
+    // Last rflags-clobber before jumping into a handler is `add rax,
+    // r13` — all ALU handlers re-clobber rflags on their first op
+    // anyway, and `iret` reloads them from `rcx`, so nothing here
+    // is load-bearing for flag propagation. `rcx` is NOT touched by
+    // anything in this loop.
     // ------------------------------------------------------------------
 
-    // [+0]  lea r13, [rip + handler_table_disp32]
+    // [+0] lea r13, [rip + handler_table_disp32]
     //
     //   REX.W|R (0x4C) + 0x8D + ModRM(mod=00 reg=r13&7=101 rm=101=rip-rel)
-    //   disp32 = handler_table_offset - (lea_end = +7)
-    //
-    //   r13 is encoded with REX.R = 1 and ModRM.reg = 5.
+    //   disp32 = kOffHandlerTable - (end of LEA = +7)
     constexpr int32_t lea_disp32 =
         static_cast<int32_t>(kOffHandlerTable) - 7;
-    static_assert(lea_disp32 == 41, "handler table must sit at offset 48");
+    static_assert(lea_disp32 == 77, "handler table must sit at offset 84");
     e.u8(0x4C); e.u8(0x8D); e.u8(0x2D);
     e.u32(static_cast<uint32_t>(lea_disp32));
 
-    // [+7]  .loop:  movzx eax, byte [r12]
+    // [+7] .loop: movzx eax, byte [r12]
     //
-    //   REX.B (0x41) + 0x0F B6 + ModRM(mod=00 reg=eax=000 rm=100=SIB) = 0x04
-    //   SIB(scale=00 index=100=none base=r12&7=100) = 0x24
-    //
-    //   [r12] always needs a SIB byte because the low 3 bits of r12
-    //   are 100 — which is the ModRM "SIB follows" escape.
+    //   REX.B (0x41) + 0x0F B6 + ModRM(00 000 100 = 0x04) + SIB(00 100 100 = 0x24)
+    //   [r12] needs SIB because r12's low 3 bits are 100 (SIB-escape).
     e.u8(0x41); e.u8(0x0F); e.u8(0xB6); e.u8(0x04); e.u8(0x24);
 
     // [+12] inc r12
@@ -110,8 +147,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     //
     //   REX.B (0x41, r13 base) + 0x8B + ModRM(01 000 100 = 0x44, SIB)
     //   SIB(scale=10 ×4, index=rax=000, base=r13&7=101) = 0x85
-    //   disp8 = 0 (required because base=r13 with mod=00 would mean
-    //             "disp32, no base" per the SIB escape rule).
+    //   disp8 = 0 (required because r13 with mod=00 means "disp32, no base")
     e.u8(0x41); e.u8(0x8B); e.u8(0x44); e.u8(0x85); e.u8(0x00);
 
     // [+20] movsxd rax, eax
@@ -121,8 +157,7 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
 
     // [+23] add rax, r13
     //
-    //   REX.W|R (0x4C, r13 as source reg-field) + 0x01 +
-    //   ModRM(mod=11 reg=r13&7=101 rm=rax=000) = 0xE8
+    //   REX.W|R (0x4C) + 0x01 + ModRM(11 101 000 = 0xE8)
     e.u8(0x4C); e.u8(0x01); e.u8(0xE8);
 
     // [+26] jmp rax
@@ -133,86 +168,130 @@ size_t emit_inner_vm_runtime(RawEmitter& e) {
     assert(e.size() - blob_base == kOffDispatcherEnd);
 
     // ------------------------------------------------------------------
-    // [+28] H_iload_src:  mov r14, [rdi];  jmp .loop
+    // [+28] H_iload_src: mov r15, [rdi]; jmp .loop
     //
-    //   mov r64, r/m64:   REX.W|R + 0x8B + ModRM
-    //   For `mov r14, [rdi]`: REX = W|R = 0x4C, opcode = 0x8B,
-    //   ModRM = 00 (mod) 110 (reg=r14&7=6) 111 (rm=rdi=7) = 0x37
+    // r15 is the "rhs operand" register — the source value is the
+    // right-hand side of non-commutative ops like `sub r14, r15`
+    // (= dst - src, which is the outer VM's sub_rr semantics). For
+    // commutative ops (add/xor/and/or) the order is irrelevant.
     //
-    //   Body = 3 bytes, jmp .loop = 2 bytes, total = 5.
-    //
-    //   r14 is used as the "inner src register" to avoid clobbering
-    //   rax — which the dispatcher loop uses as its opcode / table-
-    //   index / handler-address scratch. If we kept the src value in
-    //   rax, the very next dispatcher iteration's `movzx eax, byte
-    //   [r12]` would overwrite it, and the terminal handler would
-    //   add the handler address to the destination slot. (That was
-    //   the first-pass bug — 48-bit pointer results everywhere.)
+    //   REX.W|R (0x4C) + 0x8B + ModRM(00 111 111 = 0x3F)
     // ------------------------------------------------------------------
     assert(e.size() - blob_base == kOffHIloadSrc);
-    e.u8(0x4C); e.u8(0x8B); e.u8(0x37);
-    {
-        constexpr int8_t rel8 =
-            static_cast<int8_t>(static_cast<int32_t>(kOffLoopStart) -
-                                static_cast<int32_t>(kOffHIloadSrc + 5));
-        static_assert(rel8 == -26, "iload_src jmp distance");
-        e.u8(0xEB); e.u8(static_cast<uint8_t>(rel8));
-    }
+    e.u8(0x4C); e.u8(0x8B); e.u8(0x3F);
+    emit_jmp_loop_rel8(e, kOffHIloadSrc + 5);
 
     // ------------------------------------------------------------------
-    // [+33] H_iadd_exit:  add [rsi], r14;  ret
+    // [+33] H_iload_dst: mov r14, [rsi]; jmp .loop
     //
-    //   `add r/m64, r64`:  REX.W|R + 0x01 + ModRM
-    //   For `add [rsi], r14`: REX = W|R = 0x4C, opcode = 0x01,
-    //   ModRM = 00 (mod) 110 (reg=r14&7=6) 110 (rm=rsi=6) = 0x36
+    // r14 is the "accumulator" — holds the dst value before the ALU,
+    // then the result after. istore_dst writes r14 back to [rsi].
     //
-    //   rflags after the add reflects the guest ALU result. `ret`
-    //   preserves them, and the outer handler's tail dispatch saves
-    //   them straight into the VM `vflags` slot — downstream
-    //   `vjcc` handlers see the correct guest ZF/SF/CF/OF/PF.
+    //   REX.W|R (0x4C) + 0x8B + ModRM(00 110 110 = 0x36)
     // ------------------------------------------------------------------
-    assert(e.size() - blob_base == kOffHIaddExit);
-    e.u8(0x4C); e.u8(0x01); e.u8(0x36);
-    e.u8(0xC3);
+    assert(e.size() - blob_base == kOffHIloadDst);
+    e.u8(0x4C); e.u8(0x8B); e.u8(0x36);
+    emit_jmp_loop_rel8(e, kOffHIloadDst + 5);
 
     // ------------------------------------------------------------------
-    // [+37] H_isub_exit:  sub [rsi], r14;  ret
-    //   `sub r/m64, r64`: 4C 29 36
+    // [+38] H_istore_dst: mov [rsi], r14; jmp .loop
+    //
+    //   mov r/m64, r64: REX.W|R (0x4C) + 0x89 + ModRM(00 110 110 = 0x36)
     // ------------------------------------------------------------------
-    assert(e.size() - blob_base == kOffHIsubExit);
-    e.u8(0x4C); e.u8(0x29); e.u8(0x36);
-    e.u8(0xC3);
+    assert(e.size() - blob_base == kOffHIstoreDst);
+    e.u8(0x4C); e.u8(0x89); e.u8(0x36);
+    emit_jmp_loop_rel8(e, kOffHIstoreDst + 5);
 
     // ------------------------------------------------------------------
-    // [+41] H_ixor_exit:  xor [rsi], r14;  ret
-    //   `xor r/m64, r64`: 4C 31 36
+    // ALU r-r handlers. Each is:
+    //   <3 bytes ALU `op r14, r15`>     REX.W|R|B=0x4D + opcode + ModRM=0xFE
+    //   <1 byte pushfq>                 0x9C
+    //   <1 byte pop rcx>                0x59   (pop r64 = 58+rq, rcx rq=1)
+    //   <2 bytes jmp .loop>             0xEB rel8
+    // = 7 bytes total.
+    //
+    // ModRM 0xFE = 11 111 110: mod=11 (reg-direct), reg=r15&7=111,
+    // rm=r14&7=110 → destination r14, source r15. Opcode differs per op:
+    //   add 0x01   sub 0x29   xor 0x31   and 0x21   or 0x09
+    //
+    // The `pop rcx` is a plain opcode (0x59) with no REX prefix —
+    // rcx is a low register, so it encodes into the opcode byte
+    // directly (pop r64 = 58 + reg_num, rcx=1, → 0x59).
     // ------------------------------------------------------------------
-    assert(e.size() - blob_base == kOffHIxorExit);
-    e.u8(0x4C); e.u8(0x31); e.u8(0x36);
-    e.u8(0xC3);
+
+    auto emit_alu_tail = [&](size_t handler_offset) {
+        e.u8(0x9C);  // pushfq
+        e.u8(0x59);  // pop rcx
+        // jmp .loop, body_end = handler_offset + 3 (alu) + 1 (pushfq) + 1 (pop rcx) + 2 (jmp)
+        emit_jmp_loop_rel8(e, handler_offset + 7);
+    };
+
+    // [+43] H_iadd_rr: add r14, r15; save→rcx; jmp .loop
+    assert(e.size() - blob_base == kOffHIaddRr);
+    e.u8(0x4D); e.u8(0x01); e.u8(0xFE);
+    emit_alu_tail(kOffHIaddRr);
+
+    // [+50] H_isub_rr: sub r14, r15; save→rcx; jmp .loop
+    assert(e.size() - blob_base == kOffHIsubRr);
+    e.u8(0x4D); e.u8(0x29); e.u8(0xFE);
+    emit_alu_tail(kOffHIsubRr);
+
+    // [+57] H_ixor_rr: xor r14, r15; save→rcx; jmp .loop
+    assert(e.size() - blob_base == kOffHIxorRr);
+    e.u8(0x4D); e.u8(0x31); e.u8(0xFE);
+    emit_alu_tail(kOffHIxorRr);
+
+    // [+64] H_iand_rr: and r14, r15; save→rcx; jmp .loop
+    assert(e.size() - blob_base == kOffHIandRr);
+    e.u8(0x4D); e.u8(0x21); e.u8(0xFE);
+    emit_alu_tail(kOffHIandRr);
+
+    // [+71] H_ior_rr: or r14, r15; save→rcx; jmp .loop
+    assert(e.size() - blob_base == kOffHIorRr);
+    e.u8(0x4D); e.u8(0x09); e.u8(0xFE);
+    emit_alu_tail(kOffHIorRr);
+
+    // ------------------------------------------------------------------
+    // [+78] H_iret: push rcx; popfq; ret
+    //
+    //   push rcx = 0x51 (push r64 = 50+rq, rcx rq=1)
+    //   popfq    = 0x9D
+    //   ret      = 0xC3
+    //
+    // `ret` preserves rflags, so the flags we just loaded from rcx
+    // carry straight through to the outer handler's tail dispatch,
+    // which saves them to `vflags`.
+    // ------------------------------------------------------------------
+    assert(e.size() - blob_base == kOffHIret);
+    e.u8(0x51); e.u8(0x9D); e.u8(0xC3);
 
     assert(e.size() - blob_base == kOffHandlersEnd);
 
     // ------------------------------------------------------------------
-    // [+45] 3-byte padding so the int32 handler table lands 4-aligned.
+    // [+81] 3 bytes padding so the int32 handler table lands 4-aligned.
     // ------------------------------------------------------------------
     e.u8(0xCC); e.u8(0xCC); e.u8(0xCC);
     assert(e.size() - blob_base == kOffPaddingEnd);
 
     // ------------------------------------------------------------------
-    // [+48] Handler table: 4 × signed int32 offsets, each stored as
+    // [+84] Handler table: 9 × signed int32 offsets, each stored as
     // `handler_offset - kOffHandlerTable`, so the dispatcher's
     // `movsxd rax, eax; add rax, r13` yields the absolute handler
     // address.
     // ------------------------------------------------------------------
-    constexpr int32_t kTableEntries[4] = {
-        static_cast<int32_t>(kOffHIloadSrc) - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIaddExit) - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIsubExit) - static_cast<int32_t>(kOffHandlerTable),
-        static_cast<int32_t>(kOffHIxorExit) - static_cast<int32_t>(kOffHandlerTable),
+    constexpr int32_t kTableEntries[9] = {
+        static_cast<int32_t>(kOffHIloadSrc)  - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIloadDst)  - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIstoreDst) - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIaddRr)    - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIsubRr)    - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIxorRr)    - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIandRr)    - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIorRr)     - static_cast<int32_t>(kOffHandlerTable),
+        static_cast<int32_t>(kOffHIret)      - static_cast<int32_t>(kOffHandlerTable),
     };
-    static_assert(kTableEntries[0] == -20);
-    static_assert(kTableEntries[3] == -7);
+    static_assert(kTableEntries[0] == -56, "iload_src table entry");
+    static_assert(kTableEntries[8] == -6,  "iret table entry");
     for (int32_t entry : kTableEntries) {
         e.u32(static_cast<uint32_t>(entry));
     }

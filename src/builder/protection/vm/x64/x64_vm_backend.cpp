@@ -52,11 +52,11 @@ constexpr uint8_t variant_count_for(VmOp op) {
         case VmOp::add_rr:
         case VmOp::sub_rr:
         case VmOp::xor_rr:
+        case VmOp::and_rr:   // V0 direct, V1 De Morgan, V2 nested
+        case VmOp::or_rr:    // V0 direct, V1 De Morgan, V2 nested
             return 3;
         // Canonical body + MBA / alternative x64 sequence (G4 only).
         case VmOp::mov_rr:   // V0 mov/mov        V1 push/pop
-        case VmOp::and_rr:   // V0 and direct     V1 De Morgan
-        case VmOp::or_rr:    // V0 or direct      V1 De Morgan
         case VmOp::not_r:    // V0 not r/m64      V1 xor r/m64, -1
         case VmOp::neg_r:    // V0 neg r/m64      V1 not + inc
             return 2;
@@ -736,10 +736,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 } else if (variant == 1) {
                     emit_handler_add_rr_mba(rt, rolling_key_disp, rolling);
                 } else {
-                    // V2 — nested VM. Inner terminal opcode 0x01 = iadd_exit.
+                    // V2 — nested VM. Inner ALU opcode 0x03 = iadd_rr.
                     size_t patch = 0;
                     emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                                /*alu_inner_opcode=*/0x01, patch);
+                                                /*alu_inner_opcode=*/0x03, patch);
                     inner_vm_call_patches.push_back(patch);
                 }
                 return true;
@@ -750,10 +750,10 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 } else if (variant == 1) {
                     emit_handler_sub_rr_neg(rt, rolling_key_disp, rolling);
                 } else {
-                    // V2 — nested VM. Inner terminal opcode 0x02 = isub_exit.
+                    // V2 — nested VM. Inner ALU opcode 0x04 = isub_rr.
                     size_t patch = 0;
                     emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                                /*alu_inner_opcode=*/0x02, patch);
+                                                /*alu_inner_opcode=*/0x04, patch);
                     inner_vm_call_patches.push_back(patch);
                 }
                 return true;
@@ -764,22 +764,40 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 } else if (variant == 1) {
                     emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
                 } else {
-                    // V2 — nested VM. Inner terminal opcode 0x03 = ixor_exit.
+                    // V2 — nested VM. Inner ALU opcode 0x05 = ixor_rr.
                     size_t patch = 0;
                     emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                                /*alu_inner_opcode=*/0x03, patch);
+                                                /*alu_inner_opcode=*/0x05, patch);
                     inner_vm_call_patches.push_back(patch);
                 }
                 return true;
 
             case VmOp::and_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);
-                else              emit_handler_and_rr_demorgan(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);
+                } else if (variant == 1) {
+                    emit_handler_and_rr_demorgan(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner ALU opcode 0x06 = iand_rr.
+                    size_t patch = 0;
+                    emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
+                                                /*alu_inner_opcode=*/0x06, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::or_rr:
-                if (variant == 0) emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);
-                else              emit_handler_or_rr_demorgan(rt, rolling_key_disp, rolling);
+                if (variant == 0) {
+                    emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);
+                } else if (variant == 1) {
+                    emit_handler_or_rr_demorgan(rt, rolling_key_disp, rolling);
+                } else {
+                    // V2 — nested VM. Inner ALU opcode 0x07 = ior_rr.
+                    size_t patch = 0;
+                    emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
+                                                /*alu_inner_opcode=*/0x07, patch);
+                    inner_vm_call_patches.push_back(patch);
+                }
                 return true;
 
             case VmOp::imul_rr:  emit_handler_imul_rr(rt, rolling_key_disp, rolling);            return true;

@@ -296,12 +296,19 @@ reverser один раз разбирает наш runtime и дальше ви�
 - [x] Backend wiring (`variant_count_for`, `emit_op_variant`,
   `inner_vm_call_patches`, patch loop).
 - [x] Stress coverage для initial scope (90/90 strong).
-- [ ] Расширенная ISA (10–12 opcode'ов) в `x64_inner_vm.hpp/cpp`.
-- [ ] Multi-step dispatch с scratch vflags slot (схема 2).
-- [ ] `emit_handler_{mov_rr,alu_rr,unary_r}_nested` для and/or/mov/not/neg.
-- [ ] `emit_handler_alu_ri32_nested` (после решения по inline imm).
+- [x] Расширенная ISA (9 opcode'ов) в `x64_inner_vm.hpp/cpp` — 120-byte
+  runtime, multi-step threaded dispatcher.
+- [x] Multi-step dispatch через **rcx-live flag carrier** (scheme 2
+  variant). Scratch flag slot в памяти runtime оказался недоступен
+  (.mxvm секция R+X, без W) — переиграно на host-register carrier.
+- [x] V2 variant для `and_rr`/`or_rr` (вдобавок к add/sub/xor). 5 из 5
+  r-r ALU хэндлеров теперь лифтятся в nested VM. Stress 90/90 strong.
+- [ ] V2 variant для `mov_rr`.
+- [ ] V2 variant для `not_r` / `neg_r` (unary).
+- [ ] `emit_handler_alu_ri32_nested` (после решения по inline imm8/imm32
+  в inner bytecode).
 - [ ] Per-build inner-ISA randomization hook.
-- [ ] vjcc-лифт через `ibranch`.
+- [ ] vjcc-лифт через `ibranch` + scratch flag carrier.
 - [ ] Unit test `x64_inner_vm_runtime_test.cpp` — byte-level stability
   check (hash runtime'а на fixed seed).
 
