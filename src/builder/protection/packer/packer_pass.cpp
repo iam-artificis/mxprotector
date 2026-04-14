@@ -823,6 +823,44 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
     std::memcpy(buf.data() + offset, &value, sizeof(value));
 }
 
+/// Patches produced by `build_stub_bytes_dll_forwarding`. Tiny on purpose —
+/// the first DLL-path iteration does not encrypt, so there is nothing to
+/// keystream, nothing to reprotect, and no IAT to wipe. Only the jmp back
+/// to the real DllMain (after any stolen prologue bytes) needs a rel32.
+struct DllForwardingPatches {
+    uint32_t stolen_bytes_offset;   ///< offset of the first byte of the embedded stolen payload
+    uint32_t rel_to_dllmain_at;     ///< patch offset (rel32 from end-of-jmp to DllMain + stolen_size)
+};
+
+/// Minimal DLL stub: inline any safely-stolen DllMain prologue bytes, then
+/// `jmp rel32` back into the real DllMain body. No register saves, no
+/// anti-debug, no decryption. The Windows loader enters with the standard
+/// x64 DllMain ABI (rcx=HINSTANCE, rdx=reason, r8=lpReserved) and the stub
+/// leaves those untouched, so the real DllMain sees them as if it had been
+/// entered directly. Its `ret` returns to the loader with the DllMain BOOL
+/// in eax.
+[[nodiscard]] std::pair<ByteBuffer, DllForwardingPatches>
+build_stub_bytes_dll_forwarding(ByteView stolen_bytes) {
+    ByteBuffer buf;
+    buf.reserve(stolen_bytes.size() + 5);
+
+    DllForwardingPatches p{};
+
+    // (1) Stolen DllMain prologue bytes run inline (may be empty).
+    p.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
+    for (auto b : stolen_bytes) buf.push_back(b);
+
+    // (2) jmp rel32 → DllMain + stolen_size
+    buf.push_back(0xE9);
+    p.rel_to_dllmain_at = static_cast<uint32_t>(buf.size());
+    buf.push_back(0);
+    buf.push_back(0);
+    buf.push_back(0);
+    buf.push_back(0);
+
+    return {std::move(buf), p};
+}
+
 /// Strip base relocations: clear the directory entry, set the file header's
 /// IMAGE_FILE_RELOCS_STRIPPED bit, clear DYNAMIC_BASE in DllCharacteristics,
 /// and blank out in-memory .reloc contents so PeBuilder doesn't re-emit them.
@@ -880,6 +918,126 @@ std::vector<size_t> collect_target_sections(const PeImage& image,
     return indices;
 }
 
+/// DLL path — forwarding-only stub, no encryption.
+///
+/// Strips base relocations (so the stub's rel32s survive to runtime
+/// without loader fix-ups), steals whatever safe prologue bytes we can
+/// from DllMain, emits a `.mxpack` section holding the stolen bytes
+/// followed by `jmp rel32 → DllMain + stolen_size`, and redirects
+/// `AddressOfEntryPoint` to the stub. The stub leaves rcx/rdx/r8
+/// untouched so the real DllMain sees the standard ABI, and its `ret`
+/// returns to the loader with the BOOL result in eax.
+///
+/// This first iteration deliberately skips the cipher/reprotect/IAT
+/// wipe pipeline. The next follow-up wraps those around the forwarding
+/// path, gated on `reason == DLL_PROCESS_ATTACH` so THREAD_ATTACH and
+/// DETACH fall straight through.
+MxStatus execute_dll_forwarding(ProtectionContext& ctx) {
+    ctx.log("PackerPass: DLL forwarding path (plumbing only, no encryption)");
+
+    disable_relocations(ctx.pe_image());
+    ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+
+    const Rva oep_rva_initial = ctx.pe_image().entry_point_rva();
+    if (oep_rva_initial == 0) {
+        ctx.log("PackerPass: DLL без DllMain, пропуск");
+        return {};
+    }
+
+    auto& sections = ctx.pe_image().sections();
+    size_t oep_sec_idx = sections.size();
+    for (size_t i = 0; i < sections.size(); ++i) {
+        const auto& s = sections[i];
+        if (oep_rva_initial >= s.virtual_address &&
+            oep_rva_initial < s.virtual_address + s.virtual_size) {
+            oep_sec_idx = i;
+            break;
+        }
+    }
+    if (oep_sec_idx == sections.size()) {
+        ctx.log("PackerPass: DllMain RVA вне секций, пропуск");
+        return {};
+    }
+    auto& oep_target = sections[oep_sec_idx];
+
+    StolenPlan stolen_plan;
+    ByteBuffer stolen_bytes;
+    const uint32_t oep_off = oep_rva_initial - oep_target.virtual_address;
+    stolen_plan = plan_stolen_bytes(
+        ByteView{oep_target.data.data(), oep_target.data.size()},
+        oep_off, oep_rva_initial);
+    if (stolen_plan.size > 0) {
+        stolen_bytes.assign(
+            oep_target.data.begin() + oep_off,
+            oep_target.data.begin() + oep_off + stolen_plan.size);
+        std::fill(oep_target.data.begin() + oep_off,
+                  oep_target.data.begin() + oep_off + stolen_plan.size,
+                  static_cast<uint8_t>(0xCC));
+        ctx.log_fmt("PackerPass: DLL — украдено {} байт DllMain (0x{:08X}), {} CALL-fixup",
+            stolen_plan.size, oep_rva_initial,
+            static_cast<uint32_t>(stolen_plan.relocs.size()));
+    } else {
+        ctx.log("PackerPass: DllMain небезопасен для stolen bytes — пропуск");
+    }
+    const uint32_t stolen_size = stolen_plan.size;
+
+    auto [stub_buf, patches] = build_stub_bytes_dll_forwarding(
+        ByteView{stolen_bytes.data(), stolen_bytes.size()});
+
+    constexpr uint32_t pack_characteristics =
+        pe::IMAGE_SCN_CNT_CODE |
+        pe::IMAGE_SCN_MEM_EXECUTE |
+        pe::IMAGE_SCN_MEM_READ;
+
+    SectionManager sec_mgr(ctx.pe_image());
+    const std::string& packer_section_name = ctx.section_names().packer;
+    auto add_res = sec_mgr.add_section(
+        packer_section_name,
+        ByteView{stub_buf.data(), stub_buf.size()},
+        pack_characteristics);
+    if (!add_res) {
+        return std::unexpected(add_res.error());
+    }
+
+    const uint32_t pack_idx = *add_res;
+    auto& pack_sec = ctx.pe_image().sections()[pack_idx];
+    const Rva stub_rva = pack_sec.virtual_address;
+
+    ctx.log_fmt("PackerPass: секция '{}' добавлена: RVA=0x{:08X}, размер={} байт",
+        packer_section_name, stub_rva, static_cast<uint32_t>(pack_sec.data.size()));
+
+    // jmp rel32 → DllMain + stolen_size
+    {
+        const Rva dllmain_resume_rva = oep_rva_initial + stolen_size;
+        const Rva jmp_end_rva = stub_rva + patches.rel_to_dllmain_at + 4;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(dllmain_resume_rva) -
+            static_cast<int64_t>(jmp_end_rva));
+        write_i32(pack_sec.data, patches.rel_to_dllmain_at, rel);
+    }
+
+    // Fix up CALL rel32 inside the stolen bytes.
+    for (const auto& r : stolen_plan.relocs) {
+        const uint32_t rel_abs_offset = patches.stolen_bytes_offset + r.offset_in_stolen;
+        const uint32_t instr_end_abs  = patches.stolen_bytes_offset + r.instr_end_in_stolen;
+        const Rva new_instr_end_rva   = stub_rva + instr_end_abs;
+        const int32_t new_rel = static_cast<int32_t>(
+            static_cast<int64_t>(r.original_target_rva) -
+            static_cast<int64_t>(new_instr_end_rva));
+        write_i32(pack_sec.data, rel_abs_offset, new_rel);
+    }
+
+    ctx.pe_image().set_entry_point_rva(stub_rva);
+    std::visit([&](auto& nt) {
+        nt.OptionalHeader.AddressOfEntryPoint = stub_rva;
+    }, ctx.pe_image().nt_headers());
+
+    ctx.log_fmt("PackerPass: DllMain перенаправлен 0x{:08X} -> 0x{:08X}",
+        oep_rva_initial, stub_rva);
+    ctx.log("PackerPass: DLL forwarding stub готов");
+    return {};
+}
+
 } // anonymous namespace
 
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
@@ -888,22 +1046,26 @@ bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     if (!ctx.config().enable_packer)      return false;
     if (!ctx.target().is_windows_pe_x64()) return false;
 
-    // The stub assumes executable entry-point semantics: a single
-    // thread enters at OEP with no arguments and runs the unpack
-    // loop before jumping to the real OEP. DLLs enter via DllMain
-    // with a (HINSTANCE, DWORD reason, LPVOID) ABI; kernel drivers
-    // via DriverEntry with (PDRIVER_OBJECT, PUNICODE_STRING).
-    // Dropping the exe-shaped stub on either of those produces a
-    // binary that crashes on load. Auto-skip until the packer grows
-    // a DLL/SYS-aware variant.
+    // Kernel drivers enter via DriverEntry (PDRIVER_OBJECT, PUNICODE_STRING)
+    // and still need their own stub variant — auto-skip them.
+    // DLLs enter via DllMain (HINSTANCE, DWORD reason, LPVOID). The DLL
+    // path below emits a forwarding-only stub for now (no encryption yet);
+    // full DLL packing will layer on top of that in a follow-up.
     const auto pe_type = ctx.pe_image().pe_type();
-    if (pe_type != PeType::executable) return false;
+    if (pe_type != PeType::executable &&
+        pe_type != PeType::dynamic_library) {
+        return false;
+    }
 
     return true;
 }
 
 MxStatus PackerPass::execute(ProtectionContext& ctx) {
     ctx.log("PackerPass: начало самораспаковывающейся защиты");
+
+    if (ctx.pe_image().pe_type() == PeType::dynamic_library) {
+        return execute_dll_forwarding(ctx);
+    }
 
     auto target_indices = collect_target_sections(ctx.pe_image(),
                                                    ctx.section_names());
