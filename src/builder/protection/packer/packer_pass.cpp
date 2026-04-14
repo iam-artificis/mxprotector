@@ -216,13 +216,38 @@ struct CipherBodyPatches {
     uint32_t rel_to_reprotect_table_at = 0;
     uint32_t reprotect_table_offset    = 0;
     uint32_t reprotect_entry_count     = 0;
+
+    // --- ImageBase rip-relative computation ---
+    // The reprotect block needs to know the runtime image base of
+    // **our own module** so it can compute `base = ImageBase + rva`
+    // for each section entry. Reading `PEB.ImageBaseAddress` gives
+    // the host EXE's base — correct for executables (where the host
+    // IS the packed module) but wrong for DLLs (the stub would
+    // reprotect pages inside the host EXE's image instead of our
+    // own, intermittently crashing the host depending on ASLR).
+    //
+    // Instead the stub computes the base rip-relative:
+    //
+    //   lea rbx, [rip + 0]          ; rbx = runtime address of next insn
+    //   sub rbx, <imm32>            ; imm32 = stub_section_rva +
+    //                                         imagebase_lea_anchor_offset
+    //                                 → rbx = our own image base
+    //
+    // `imagebase_lea_anchor_offset` is the stub-relative offset of
+    // the byte right after the lea (also the "rip" value the lea
+    // produces, because the lea is `[rip + 0]`). The caller fills
+    // `imagebase_sub_imm32_at` after the stub section is injected.
+    uint32_t imagebase_lea_anchor_offset = 0;
+    uint32_t imagebase_sub_imm32_at      = 0;
 };
 
 struct ExeStubPatches : CommonStubPatches, CipherBodyPatches {};
 
-/// Patches produced by the forwarding DLL stub. The first iteration has
-/// nothing to add beyond the common fields.
-struct DllForwardingPatches : CommonStubPatches {};
+/// Patches produced by the full DLL stub — same cipher body as the EXE
+/// shape, just wrapped in a DllMain-ABI save/restore shell and a
+/// `reason == DLL_PROCESS_ATTACH` gate (the gate's rel32 is back-patched
+/// inside the emitter itself, so the caller sees nothing new).
+struct DllFullStubPatches : CommonStubPatches, CipherBodyPatches {};
 
 /// A StubEmitter is a stateless (or cheaply copyable) policy type that
 /// turns `(rng, stolen_bytes_view)` into a concrete stub buffer + an
@@ -693,14 +718,24 @@ void emit_decrypt_body(ByteBuffer& buf,
 
     // --- One-time setup outside the loop: ImageBase, arg5, table ---
 
-    // mov rax, gs:[0x60]                     65 48 8B 04 25 60 00 00 00
-    u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
-    u8(0x60); u8(0x00); u8(0x00); u8(0x00);
-    // mov rbx, [rax + 0x10]                  48 8B 58 10
-    //   rbx = PEB.ImageBase. rbx is nonvolatile across the CALL, so
-    //   we cache it once and reuse it for every iteration's base
-    //   computation.
-    u8(0x48); u8(0x8B); u8(0x58); u8(0x10);
+    // rbx = our own module's runtime image base, computed rip-relative.
+    // PEB.ImageBaseAddress would give the host EXE's base, which is
+    // correct for executables but wrong for DLLs (we'd reprotect pages
+    // inside the host's image instead of our own). The rip-relative
+    // path works for both.
+    //
+    //   lea rbx, [rip + 0]                   48 8D 1D 00 00 00 00
+    //     rbx = runtime address of the next instruction = ImageBase
+    //           + stub_section_rva + `imagebase_lea_anchor_offset`.
+    //   sub rbx, <imm32>                     48 81 EB imm32
+    //     imm32 = stub_section_rva + imagebase_lea_anchor_offset
+    //     → rbx = ImageBase (always, EXE or DLL).
+    u8(0x48); u8(0x8D); u8(0x1D);
+    u8(0x00); u8(0x00); u8(0x00); u8(0x00);
+    patches.imagebase_lea_anchor_offset = static_cast<uint32_t>(buf.size());
+    u8(0x48); u8(0x81); u8(0xEB);
+    patches.imagebase_sub_imm32_at = static_cast<uint32_t>(buf.size());
+    u32(0);
 
     // lea rax, [rsp + 0x40]                  48 8D 44 24 40
     // mov [rsp + 0x20], rax                  48 89 44 24 20
@@ -891,33 +926,113 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
     std::memcpy(buf.data() + offset, &value, sizeof(value));
 }
 
-/// Minimal DLL stub: inline any safely-stolen DllMain prologue bytes, then
-/// `jmp rel32` back into the real DllMain body. No register saves, no
-/// anti-debug, no decryption. The Windows loader enters with the standard
-/// x64 DllMain ABI (rcx=HINSTANCE, rdx=reason, r8=lpReserved) and the stub
-/// leaves those untouched, so the real DllMain sees them as if it had been
-/// entered directly. Its `ret` returns to the loader with the DllMain BOOL
-/// in eax.
-[[nodiscard]] std::pair<ByteBuffer, DllForwardingPatches>
-build_dll_forwarding_stub_bytes(ByteView stolen_bytes) {
+/// Build the full DLL stub code bytes (without patching rel32s yet).
+///
+/// Layout:
+///   1. Save all nonvolatile GPRs the cipher body can clobber
+///      (rbx, rbp, rsi, rdi, r12-r15) plus the three DllMain arg
+///      registers (rcx = HINSTANCE, rdx = reason, r8 = lpReserved).
+///      That is 11 pushes total — odd count, so rsp moves from the
+///      call-site mod16 == 8 to mod16 == 0, which is what the
+///      reprotect block inside `emit_decrypt_body` expects before
+///      its own `and rsp, -16; sub rsp, 0x50` frame.
+///   2. `cmp edx, 1; jne .forward` — only run the decrypt pipeline
+///      on `DLL_PROCESS_ATTACH`. THREAD_ATTACH (2), THREAD_DETACH (3)
+///      and PROCESS_DETACH (0) fall straight through to the forward
+///      block so the real DllMain sees them untouched.
+///   3. Shared decrypt body — anti-debug, KSA, PRGA per section,
+///      reprotect, IAT wipe — via `emit_decrypt_body`.
+///   4. `.forward:` — back-patch site for the `jne` above.
+///   5. Pop everything in reverse LIFO order. Nonvolatiles restored
+///      so the loader's caller state is intact; DllMain args
+///      restored so the real entry sees its ABI unchanged.
+///   6. Stolen DllMain prologue bytes inline.
+///   7. `jmp rel32` → DllMain + stolen_size. The real DllMain's `ret`
+///      then returns to the loader with the BOOL in eax.
+///
+/// Note on r12: the reprotect block inside the cipher body uses r12
+/// as scratch for its own rsp save/restore. That clobbers the value
+/// we pushed in step 1, but the push-to-stack copy is what counts —
+/// the `pop r12` in step 5 reloads the caller's original r12 from
+/// the stack, untouched.
+[[nodiscard]] std::pair<ByteBuffer, DllFullStubPatches> build_dll_full_stub_bytes(
+    Randomizer& rng,
+    ByteView stolen_bytes,
+    uint32_t section_count)
+{
     ByteBuffer buf;
-    buf.reserve(stolen_bytes.size() + 5);
+    buf.reserve(192 + 32 * section_count + stolen_bytes.size() + kKeySize);
 
-    DllForwardingPatches p{};
+    auto u8 = [&](uint8_t v) { buf.push_back(v); };
+    auto u32 = [&](uint32_t v) {
+        buf.push_back(static_cast<uint8_t>(v));
+        buf.push_back(static_cast<uint8_t>(v >> 8));
+        buf.push_back(static_cast<uint8_t>(v >> 16));
+        buf.push_back(static_cast<uint8_t>(v >> 24));
+    };
 
-    // (1) Stolen DllMain prologue bytes run inline (may be empty).
-    p.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
-    for (auto b : stolen_bytes) buf.push_back(b);
+    DllFullStubPatches patches{};
 
-    // (2) jmp rel32 → DllMain + stolen_size
-    buf.push_back(0xE9);
-    p.rel_to_oep_at = static_cast<uint32_t>(buf.size());
-    buf.push_back(0);
-    buf.push_back(0);
-    buf.push_back(0);
-    buf.push_back(0);
+    // (1) Save nonvolatiles + DllMain args. Fixed order — polymorphism
+    //     comes from the anti-debug probe and KSA variance. 11 pushes
+    //     → rsp mod 16 = 0 before the cipher body starts.
+    u8(0x53);                    // push rbx
+    u8(0x55);                    // push rbp
+    u8(0x56);                    // push rsi
+    u8(0x57);                    // push rdi
+    u8(0x41); u8(0x54);          // push r12
+    u8(0x41); u8(0x55);          // push r13
+    u8(0x41); u8(0x56);          // push r14
+    u8(0x41); u8(0x57);          // push r15
+    u8(0x51);                    // push rcx  (HINSTANCE)
+    u8(0x52);                    // push rdx  (reason — also consumed by KSA bias seed)
+    u8(0x41); u8(0x50);          // push r8   (lpReserved)
 
-    return {std::move(buf), p};
+    // (2) Gate on reason == DLL_PROCESS_ATTACH (1). rdx still holds
+    //     the original reason at this point (the cmp is 32-bit safe
+    //     because the reason argument is a DWORD).
+    //
+    //   cmp edx, 1                        83 FA 01
+    u8(0x83); u8(0xFA); u8(0x01);
+    //   jne .forward (rel32, back-patched below)  0F 85 rel32
+    u8(0x0F); u8(0x85);
+    const uint32_t reason_jne_rel32_at = static_cast<uint32_t>(buf.size());
+    u32(0);
+
+    // (3) Shared decrypt body.
+    emit_decrypt_body(buf, patches, rng, section_count);
+
+    // (4) .forward: — back-patch the jne target.
+    {
+        const uint32_t forward_label = static_cast<uint32_t>(buf.size());
+        const int32_t rel32 = static_cast<int32_t>(forward_label) -
+            static_cast<int32_t>(reason_jne_rel32_at + 4);
+        std::memcpy(buf.data() + reason_jne_rel32_at, &rel32, sizeof(rel32));
+    }
+
+    // (5) Pop nonvolatiles + DllMain args in reverse push order.
+    u8(0x41); u8(0x58);          // pop r8
+    u8(0x5A);                    // pop rdx
+    u8(0x59);                    // pop rcx
+    u8(0x41); u8(0x5F);          // pop r15
+    u8(0x41); u8(0x5E);          // pop r14
+    u8(0x41); u8(0x5D);          // pop r13
+    u8(0x41); u8(0x5C);          // pop r12
+    u8(0x5F);                    // pop rdi
+    u8(0x5E);                    // pop rsi
+    u8(0x5D);                    // pop rbp
+    u8(0x5B);                    // pop rbx
+
+    // (6) Stolen DllMain prologue bytes inline (may be empty).
+    patches.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
+    for (auto b : stolen_bytes) u8(b);
+
+    // (7) jmp rel32 → DllMain + stolen_size
+    u8(0xE9);
+    patches.rel_to_oep_at = static_cast<uint32_t>(buf.size());
+    u32(0);
+
+    return {std::move(buf), patches};
 }
 
 // ---------------------------------------------------------------------------
@@ -946,20 +1061,26 @@ private:
     uint32_t section_count_;
 };
 
-class DllForwardingStubEmitter {
+class DllFullStubEmitter {
 public:
-    using patches_type = DllForwardingPatches;
+    using patches_type = DllFullStubPatches;
 
-    [[nodiscard]] std::pair<ByteBuffer, DllForwardingPatches> emit(
-        Randomizer& /*rng*/, ByteView stolen_bytes) {
-        return build_dll_forwarding_stub_bytes(stolen_bytes);
+    explicit DllFullStubEmitter(uint32_t section_count) noexcept
+        : section_count_(section_count) {}
+
+    [[nodiscard]] std::pair<ByteBuffer, DllFullStubPatches> emit(
+        Randomizer& rng, ByteView stolen_bytes) {
+        return build_dll_full_stub_bytes(rng, stolen_bytes, section_count_);
     }
+
+private:
+    uint32_t section_count_;
 };
 
 static_assert(StubEmitter<ExeStubEmitter>,
     "ExeStubEmitter must satisfy the StubEmitter concept");
-static_assert(StubEmitter<DllForwardingStubEmitter>,
-    "DllForwardingStubEmitter must satisfy the StubEmitter concept");
+static_assert(StubEmitter<DllFullStubEmitter>,
+    "DllFullStubEmitter must satisfy the StubEmitter concept");
 
 /// Strip base relocations: clear the directory entry, set the file header's
 /// IMAGE_FILE_RELOCS_STRIPPED bit, clear DYNAMIC_BASE in DllCharacteristics,
@@ -1168,74 +1289,38 @@ struct PackerStubInjection {
     return PackerStubInjection{pack_idx, stub_rva};
 }
 
-/// DLL path — forwarding-only stub, no encryption.
+/// Shared encrypted-packer pipeline. Parameterised on `Emitter` so EXE
+/// and DLL both flow through the same steps, differing only in the
+/// policy type's save/restore shell (and, for DLL, its PROCESS_ATTACH
+/// gate). The emitter's `patches_type` must inherit from both
+/// `CommonStubPatches` and `CipherBodyPatches`, which the concept +
+/// multi-inheritance of the concrete patch types statically guarantee.
 ///
-/// Strips base relocations (so the stub's rel32s survive to runtime
-/// without loader fix-ups), steals whatever safe prologue bytes we can
-/// from DllMain, emits a `.mxpack` section holding the stolen bytes
-/// followed by `jmp rel32 → DllMain + stolen_size`, and redirects
-/// `AddressOfEntryPoint` to the stub. The stub leaves rcx/rdx/r8
-/// untouched so the real DllMain sees the standard ABI, and its `ret`
-/// returns to the loader with the BOOL result in eax.
-///
-/// This first iteration deliberately skips the cipher/reprotect/IAT
-/// wipe pipeline. The next follow-up wraps those around the forwarding
-/// path, gated on `reason == DLL_PROCESS_ATTACH` so THREAD_ATTACH and
-/// DETACH fall straight through.
-MxStatus execute_dll_forwarding(ProtectionContext& ctx) {
-    ctx.log("PackerPass: DLL forwarding path (plumbing only, no encryption)");
-
-    auto steal_opt = prepare_oep_steal(ctx, "DllMain");
-    if (!steal_opt) return {};
-
-    Randomizer rng;
-    DllForwardingStubEmitter emitter{};
-    auto [stub_buf, patches] = emitter.emit(
-        rng, ByteView{steal_opt->stolen_bytes.data(),
-                      steal_opt->stolen_bytes.size()});
-
-    constexpr uint32_t pack_characteristics =
-        pe::IMAGE_SCN_CNT_CODE |
-        pe::IMAGE_SCN_MEM_EXECUTE |
-        pe::IMAGE_SCN_MEM_READ;
-
-    auto inject = finalize_packer_stub(
-        ctx, std::move(stub_buf), pack_characteristics, *steal_opt, patches);
-    if (!inject) return std::unexpected(inject.error());
-
-    ctx.log("PackerPass: DLL forwarding stub готов");
-    return {};
-}
-
-} // anonymous namespace
-
-bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    // The self-unpacking stub is assembled in x64 PE form; other targets
-    // need their own packer implementations.
-    if (!ctx.config().enable_packer)      return false;
-    if (!ctx.target().is_windows_pe_x64()) return false;
-
-    // Kernel drivers enter via DriverEntry (PDRIVER_OBJECT, PUNICODE_STRING)
-    // and still need their own stub variant — auto-skip them.
-    // DLLs enter via DllMain (HINSTANCE, DWORD reason, LPVOID). The DLL
-    // path below emits a forwarding-only stub for now (no encryption yet);
-    // full DLL packing will layer on top of that in a follow-up.
-    const auto pe_type = ctx.pe_image().pe_type();
-    if (pe_type != PeType::executable &&
-        pe_type != PeType::dynamic_library) {
-        return false;
-    }
-
-    return true;
-}
-
-MxStatus PackerPass::execute(ProtectionContext& ctx) {
-    ctx.log("PackerPass: начало самораспаковывающейся защиты");
-
-    if (ctx.pe_image().pe_type() == PeType::dynamic_library) {
-        return execute_dll_forwarding(ctx);
-    }
-
+/// Pipeline:
+///   1. Collect target sections (`.text`, vm blob, cff blob).
+///   2. `prepare_oep_steal` — strip relocations, locate entry, steal
+///      safe prologue bytes, 0xCC the stolen range in place.
+///   3. Make `.rdata` writable so the stub can wipe the Import
+///      Directory at runtime.
+///   4. Generate the per-build random 32-byte RC4 key and encrypt
+///      every target section in place (KSA seeded with j = 0 at
+///      build time — see the anti-debug bias comment in Rc4State).
+///   5. Ask the emitter for the stub bytes.
+///   6. Append key, S-box scratch, optional P3 VM KSA blob, reprotect
+///      section table, all into the same stub buffer so everything
+///      lives inside one `.mxpack` section.
+///   7. `finalize_packer_stub` — inject section, patch common rel32
+///      slots (jmp → real entry, stolen CALL fix-ups), retarget
+///      AddressOfEntryPoint.
+///   8. Patch cipher-body rel32s (per-section LEA/ECX, key, S-box,
+///      reprotect table, IAT wipe). Optionally overwrite the KSA
+///      range with a `call rel32 <vm_entry>` if the VM lift
+///      succeeded in step 6.
+template <StubEmitter Emitter>
+    requires std::constructible_from<Emitter, uint32_t>
+[[nodiscard]] MxStatus execute_encrypted_stub(ProtectionContext& ctx,
+                                              std::string_view   steal_label)
+{
     auto target_indices = collect_target_sections(ctx.pe_image(),
                                                    ctx.section_names());
     if (target_indices.empty()) {
@@ -1243,12 +1328,7 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         return {};
     }
 
-    // Shared pre-stub work: strip relocations, locate the section that
-    // holds the OEP, steal a safe prologue range. The first entry in
-    // `target_indices` is required to be the OEP-bearing section (only
-    // `.text` qualifies under current policy); the helper redundantly
-    // rediscovers it by RVA and the two agree by construction.
-    auto steal_opt = prepare_oep_steal(ctx, "OEP");
+    auto steal_opt = prepare_oep_steal(ctx, steal_label);
     if (!steal_opt) return {};
     auto& steal = *steal_opt;
 
@@ -1259,26 +1339,19 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // (3) Generate the per-build random 32-byte RC4 key.
+    // Per-build random 32-byte RC4 key.
     Randomizer rng;
     ByteBuffer key(kKeySize);
     for (auto& b : key) b = rng.next_u8();
 
-    // (4) Encrypt every target section with RC4. The S-box and
-    //     (i, j) state are carried across sections so the cipher
-    //     streams through every protected section end-to-end — the
-    //     runtime stub rebuilds the same stream once via KSA and
-    //     consumes it in the same order.
-    //
-    //     We seed the KSA with `j = 0` at build time because the
-    //     builder is not running under a debugger. The stub starts
-    //     its KSA with `j = edx`, where edx is 0 under normal
-    //     execution and 1 if the anti-debug probe fires. If a
-    //     debugger is present the stub's S-box diverges on the very
-    //     first KSA iteration and the PRGA keystream is incompatible
-    //     with the build-time one — every protected section decrypts
-    //     to garbage and the process crashes before the reverser
-    //     reaches the real OEP.
+    // Encrypt every target section with a single streaming RC4 state.
+    // The S-box and (i, j) state are carried across sections so the
+    // runtime stub rebuilds the same stream via one KSA pass and
+    // consumes it in the same order. We seed KSA with j = 0 at build
+    // time (no debugger); the stub starts its KSA with j = edx
+    // (anti-debug probe result), so under a debugger the S-box
+    // diverges on the very first iteration and every protected
+    // section decrypts to garbage.
     Rc4State rc4{};
     rc4_init(rc4, ByteView{key.data(), key.size()}, /*anti_debug_bias=*/0);
 
@@ -1310,50 +1383,29 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         return {};
     }
 
-    // (5) Build the stub code (includes stolen OEP bytes) + append the
-    //     32-byte RC4 key, the 256-byte S-box scratch area, and the
-    //     reprotect section table. Size is not fixed because the stub
-    //     is polymorphic.
-    ExeStubEmitter exe_emitter{static_cast<uint32_t>(encrypted.size())};
-    auto [stub_buf, patches] = exe_emitter.emit(
+    // Emit the stub via the policy-specified emitter.
+    Emitter emitter{static_cast<uint32_t>(encrypted.size())};
+    auto [stub_buf, patches] = emitter.emit(
         rng, ByteView{steal.stolen_bytes.data(), steal.stolen_bytes.size()});
+
+    // Append the 32-byte RC4 key.
     const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), key.begin(), key.end());
 
-    // S-box scratch: 256 bytes of zeros. At runtime the KSA overwrites
-    // the whole region — the build-time content doesn't matter, we
-    // just need the space inside the section so `lea r8, sbox` points
-    // at valid memory. Putting the scratch inside `.mxpack` keeps
-    // everything rip-relative and avoids per-process stack frames.
+    // S-box scratch: 256 bytes. At runtime the KSA overwrites the
+    // whole region — the build-time content doesn't matter, we just
+    // need the space inside the section so `lea r8, sbox` points at
+    // valid memory.
     const uint32_t sbox_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), kSboxSize, uint8_t{0});
 
-    // (5a) P3 — VM-protected entry stub.
-    //
-    // If a disassembler is available, lift the RC4 KSA block (init
-    // loop + mix loop + PRGA state reset — see `ksa_block_*_offset`
-    // recorded by `build_stub_bytes`) through the existing VM engine
-    // and append the runtime blob to the stub buffer. The original
-    // KSA bytes inside the stub are later overwritten with
-    // `call rel32 <vm_entry>` + NOP padding (step 7a below) so the
-    // entry stub dispatches the key derivation through a VM region
-    // instead of executing it as plaintext x64.
-    //
-    // Two things the lifted block deliberately includes:
-    //   * The `xor r9, r9; xor r10, r10` PRGA state reset, so the
-    //     PRGA loops that run AFTER the VM exits see a consistent
-    //     initial (i=0, j=0). The VM's exit writes these back to
-    //     the real registers.
-    //   * No rip-relative operands. `r8` and `rsi` are loaded BEFORE
-    //     the KSA block via plaintext `lea` pairs; the VM just uses
-    //     the values the caller handed it.
-    //
-    // Anti-tamper checks are skipped for this VM: `.mxpack` is
-    // R+W+X on purpose (the KSA writes the S-box in place) and the
-    // page-protection probe would trip on that.
-    size_t   packer_vm_blob_offset       = 0;
-    uint32_t packer_vm_entry_offset      = 0;
-    bool     packer_vm_lift_succeeded    = false;
+    // P3 — VM-protected KSA. If a disassembler is available, lift
+    // the RC4 KSA range through the existing VM engine and append
+    // the runtime blob to the stub buffer; the original plaintext
+    // KSA bytes are later overwritten with `call rel32 <vm_entry>`.
+    size_t   packer_vm_blob_offset    = 0;
+    uint32_t packer_vm_entry_offset   = 0;
+    bool     packer_vm_lift_succeeded = false;
     if (ctx.disassembler() != nullptr &&
         patches.ksa_block_end_offset > patches.ksa_block_start_offset)
     {
@@ -1364,9 +1416,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
             ksa_size};
 
         vm::VmLifter lifter(*ctx.disassembler());
-        // Fake base VA — the lift only uses it for intra-region
-        // branch resolution, and the KSA block has no external
-        // branches.
         constexpr Va kFakeKsaBase = 0x0000000140000000ULL;
         auto lift_result = lifter.lift(ksa_view, kFakeKsaBase);
         if (!lift_result) {
@@ -1378,15 +1427,23 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
                 report.total_insns, report.generic_ops, report.native_ops);
 
             vm::VmRuntimeGenerator gen;
+            // `use_imagebase_key` reads `PEB.ImageBaseAddress` at VM
+            // runtime and folds it into the handler-table key via a
+            // build-time MBA chain anchored on `preferred_image_base`.
+            // For an EXE, PEB.ImageBase == the exe's own preferred
+            // base (we strip relocations), so the chain agrees. For
+            // a DLL, PEB.ImageBase is the HOST exe's base regardless
+            // of which module is running — a DLL VM using this key
+            // would compute the wrong table_xor_key and dispatch
+            // every handler into garbage. `VirtualizationPass` has
+            // the same gate for the same reason.
+            const bool is_exe =
+                ctx.pe_image().pe_type() == PeType::executable;
             const vm::VmGenOptions opts{
                 .emit_exit_as_jmp        = false,
-                // Packer strips ASLR so runtime ImageBase matches
-                // preferred — same condition VirtualizationPass uses.
-                .use_imagebase_key       = true,
+                .use_imagebase_key       = is_exe,
                 .preferred_image_base    =
                     static_cast<uint64_t>(ctx.pe_image().image_base()),
-                // `.mxpack` stays R+W+X for the S-box — the
-                // page-protection probe would misfire.
                 .skip_anti_tamper_checks = true,
             };
             auto runtime = gen.generate(vm_insns, rng, opts);
@@ -1394,8 +1451,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
                 ctx.log_fmt("PackerPass: P3 VM-lift generate failed ({}), keeping plaintext",
                     runtime.error().message());
             } else {
-                // Align the blob to 16 bytes so handler loads land
-                // on naturally aligned addresses.
                 while (stub_buf.size() % 16 != 0) {
                     stub_buf.push_back(0xCC);
                 }
@@ -1412,25 +1467,15 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // Embed the reprotect section table right after the VM blob (or
-    // right after the S-box if no blob was appended): one
-    // {rva: u32, size: u32} entry per encrypted section. The content
-    // is zero-filled here and patched in step (7) once section RVAs
-    // are final.
+    // Embed the reprotect section table right after the VM blob.
     const uint32_t reprotect_table_offset_in_stub =
         static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), encrypted.size() * 8, uint8_t{0});
 
-    // (6) Inject the .mxpack section and apply common runtime patches
-    //     (jmp → OEP + stolen_size, stolen CALL fix-ups, entry retarget).
-    //     Characteristics include MEM_WRITE because the RC4 KSA rebuilds
-    //     the S-box scratch area at runtime (and the scratch lives inside
-    //     the stub section itself). The reprotect loop at the tail of
-    //     the stub only revokes WRITE from sections in `encrypted` — it
-    //     never touches `.mxpack` — so the section stays R+W+X for the
-    //     lifetime of the process. That's tolerable here because the
-    //     stub is only used once at startup and the page is a single
-    //     4KB region no anti-tamper probe targets.
+    // Inject the .mxpack section + apply the common rel32 patches.
+    // Characteristics include MEM_WRITE because the RC4 KSA rebuilds
+    // the S-box scratch area at runtime and the scratch lives inside
+    // the stub section itself.
     constexpr uint32_t pack_characteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
@@ -1444,12 +1489,7 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     auto& pack_sec = ctx.pe_image().sections()[inject->pack_section_index];
     const Rva stub_rva = inject->stub_rva;
 
-    // (7) Patch EXE-specific rel32 placeholders. For each
-    //     `lea reg, [rip + rel32]` and each `jmp rel32`, rel32 is
-    //     computed from the instruction's END (= patch_offset + 4) to
-    //     the target RVA.
-
-    // Per-section: lea rdi → section base, mov ecx → section size
+    // Per-section: lea rdi → section base, mov ecx → section size.
     for (size_t i = 0; i < encrypted.size(); ++i) {
         const auto& ds  = patches.sections[i];
         const auto& tgt = encrypted[i];
@@ -1461,7 +1501,7 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         write_i32(pack_sec.data, ds.patch_size_at, static_cast<int32_t>(tgt.size));
     }
 
-    // lea rsi, [rip + rel] → embedded 32-byte RC4 key
+    // lea rsi, [rip + rel] → embedded 32-byte RC4 key.
     {
         const Rva lea_end_rva = stub_rva + patches.rel_to_key_at + 4;
         const Rva key_rva     = stub_rva + key_offset_in_stub;
@@ -1470,7 +1510,7 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         write_i32(pack_sec.data, patches.rel_to_key_at, rel);
     }
 
-    // lea r8, [rip + rel] → 256-byte S-box scratch area
+    // lea r8, [rip + rel] → 256-byte S-box scratch area.
     {
         const Rva lea_end_rva = stub_rva + patches.rel_to_sbox_at + 4;
         const Rva sbox_rva    = stub_rva + sbox_offset_in_stub;
@@ -1481,23 +1521,6 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
 
     // P3 — if the KSA block was successfully lifted, overwrite the
     // plaintext KSA bytes with `call rel32 <vm_entry>` + NOP pad.
-    // Runtime flow becomes:
-    //
-    //   save regs
-    //   anti-debug → edx
-    //   lea rsi, key; lea r8, sbox
-    //   call vm_entry                   ; [NEW] KSA dispatched through VM
-    //   <NOPs filling the rest of the old KSA range>
-    //   per-section PRGA loop           ; unchanged, reads r8/r9/r10 state
-    //   reprotect block
-    //   ...
-    //
-    // When the VM exits, guest r8 / rsi are still the same pointers
-    // (the KSA only writes the S-box through r8, doesn't overwrite
-    // the pointer itself), and guest r9 / r10 are zero (the PRGA
-    // state reset at the end of the lifted block). The PRGA loops
-    // read those values unchanged, so the post-VM state is
-    // bit-for-bit identical to the old plaintext path.
     if (packer_vm_lift_succeeded) {
         const Rva vm_entry_rva =
             stub_rva +
@@ -1522,10 +1545,20 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
             vm_entry_rva);
     }
 
-    // lea r14, [rip + rel] → reprotect section table (one {rva,size} per
-    // encrypted section). The table itself lives right after the key in
-    // the stub buffer; each entry is filled with the final section RVA
-    // and byte count.
+    // ImageBase rip-relative computation. The `lea rbx, [rip + 0];
+    // sub rbx, imm32` pair in the reprotect block needs `imm32 =
+    // stub_section_rva + imagebase_lea_anchor_offset` so that at
+    // runtime `rbx = current_rip - imm32 = module_base`. This works
+    // for both EXE (host == packed module) and DLL (host != packed
+    // module) — we never read PEB.ImageBaseAddress.
+    {
+        const uint32_t imm32 =
+            stub_rva + patches.imagebase_lea_anchor_offset;
+        write_i32(pack_sec.data, patches.imagebase_sub_imm32_at,
+                  static_cast<int32_t>(imm32));
+    }
+
+    // lea r14, [rip + rel] → reprotect section table + fill data.
     {
         const Rva lea_end_rva = stub_rva + patches.rel_to_reprotect_table_at + 4;
         const Rva table_rva   = stub_rva + reprotect_table_offset_in_stub;
@@ -1543,8 +1576,7 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    // IAT destruction: patch the lea rdi → Import Directory and size.
-    // Read Import Directory RVA/size from the NT headers.
+    // IAT destruction: patch lea rdi → Import Directory + the size.
     {
         Rva impdir_rva = 0;
         uint32_t impdir_size = 0;
@@ -1556,20 +1588,16 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
         }, ctx.pe_image().nt_headers());
 
         if (impdir_rva != 0 && impdir_size >= 4) {
-            // lea rdi → Import Directory
             const Rva lea_end_rva = stub_rva + patches.rel_to_impdir_at + 4;
             const int32_t rel = static_cast<int32_t>(
                 static_cast<int64_t>(impdir_rva) - static_cast<int64_t>(lea_end_rva));
             write_i32(pack_sec.data, patches.rel_to_impdir_at, rel);
-            // mov ecx, size / 4 (dword count for rep stosd)
             write_i32(pack_sec.data, patches.impdir_size_at,
                       static_cast<int32_t>(impdir_size / 4));
-
             ctx.log_fmt("PackerPass: IAT destruction — Import Directory 0x{:08X} ({} байт) "
                         "будет обнулён при запуске",
                 impdir_rva, impdir_size);
         } else {
-            // No imports — zero the size so rep stosd is a no-op
             write_i32(pack_sec.data, patches.impdir_size_at, 0);
         }
     }
@@ -1577,5 +1605,41 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     ctx.log("PackerPass: упаковка завершена");
     return {};
 }
+
+} // anonymous namespace
+
+bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
+    // The self-unpacking stub is assembled in x64 PE form; other targets
+    // need their own packer implementations.
+    if (!ctx.config().enable_packer)      return false;
+    if (!ctx.target().is_windows_pe_x64()) return false;
+
+    // Kernel drivers enter via DriverEntry (PDRIVER_OBJECT, PUNICODE_STRING)
+    // and still need their own stub variant — auto-skip them.
+    // DLLs enter via DllMain (HINSTANCE, DWORD reason, LPVOID). The DLL
+    // path below emits a forwarding-only stub for now (no encryption yet);
+    // full DLL packing will layer on top of that in a follow-up.
+    const auto pe_type = ctx.pe_image().pe_type();
+    if (pe_type != PeType::executable &&
+        pe_type != PeType::dynamic_library) {
+        return false;
+    }
+
+    return true;
+}
+
+MxStatus PackerPass::execute(ProtectionContext& ctx) {
+    ctx.log("PackerPass: начало самораспаковывающейся защиты");
+
+    const auto pe_type = ctx.pe_image().pe_type();
+    if (pe_type == PeType::executable) {
+        return execute_encrypted_stub<ExeStubEmitter>(ctx, "OEP");
+    }
+    if (pe_type == PeType::dynamic_library) {
+        return execute_encrypted_stub<DllFullStubEmitter>(ctx, "DllMain");
+    }
+    return {};
+}
+
 
 } // namespace mx

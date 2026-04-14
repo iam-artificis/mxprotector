@@ -18,10 +18,14 @@
 using mx_compute_fn = uint64_t(*)(uint64_t);
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     const char* dll_path = (argc > 1) ? argv[1] : "test_dll_basic.dll";
     std::printf("[loader] LoadLibraryA(\"%s\")\n", dll_path);
+    std::fflush(stdout);
 
     HMODULE h = LoadLibraryA(dll_path);
+    std::printf("[loader] LoadLibraryA returned h=%p\n", (void*)h);
+    std::fflush(stdout);
     if (!h) {
         std::printf("[loader] LoadLibrary FAILED, GetLastError=%lu\n",
                     GetLastError());
