@@ -18,6 +18,7 @@ set(TEST_SOURCES
     anti_emulation_check_test.cpp
     mx_string_test.cpp
     x64_specialized_handlers_test.cpp
+    x64_inner_vm_runtime_test.cpp
     anti_tamper_test.cpp
     string_scanner_test.cpp
     string_xref_finder_test.cpp
