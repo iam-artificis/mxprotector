@@ -67,12 +67,21 @@ enum class VmOp : uint8_t {
     // to defeat static bytecode analysis (static recovery now has
     // to distinguish "live" from "dead" opcode bytes without running
     // the VM). The handler is flag-transparent by construction —
-    // the body is empty, and the standard tail dispatch saves
-    // whatever rflags entered the handler (= previous real
-    // handler's output) straight back to vflags. See the G4
-    // "dead opcodes" note in ROADMAP.md for the failure mode the
-    // first-attempt "reuse ALU with identity imm" approach hit.
+    // the body is empty, and the tail dispatch is emitted inline
+    // with save_rflags=false so it never touches vflags.
     dead,
+
+    // G4 opaque branch. 4-byte rel32-shaped operand, no actual
+    // branching. Handler fetches the 4 bytes (advancing r11) and
+    // falls through without ever adding the rel32 to r11. Looks
+    // like a `vjmp` at the byte level — a reverser parsing the
+    // encrypted bytecode linearly sees a handler_id followed by
+    // 4 operand bytes and has to trace into the handler body to
+    // discover that the rel32 is never added to the VPC. Paired
+    // with encoder-side insertion of "dead bytecode" past the fake
+    // target, it makes static recovery of the real control flow
+    // significantly harder.
+    opq_branch,
 
     count_        ///< sentinel
 };
@@ -125,6 +134,9 @@ constexpr uint32_t kVmOpCount = static_cast<uint32_t>(VmOp::count_);
         case VmOp::exit:
         case VmOp::dead:
             return 0;
+
+        case VmOp::opq_branch:
+            return 4;           // rel32-shaped operand (never actually added to r11)
 
         case VmOp::count_:
             return 0;

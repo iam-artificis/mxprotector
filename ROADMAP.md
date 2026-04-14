@@ -362,9 +362,18 @@ reverser один раз разбирает наш runtime и дальше ви�
   bytecode ~2x on average and defeats static "byte = real opcode"
   recovery. 90/90 stress green with dead inserts on.
 
-- 📋 **Opaque branches inside bytecode**: `VJCC` с всегда-ложным
-  условием, уводящая на мертвую ветку handlers (которая сама
-  корректно завершается).
+- ✅ **Opaque branches inside bytecode** — shipped. New
+  `VmOp::opq_branch` with a 4-byte rel32-shaped operand and a
+  handler body that fetches the 4 bytes (advancing r11 past them)
+  but NEVER adds the rel32 to the outer VPC. Byte-level shape is
+  identical to a `vjmp` — a reverser parsing the encrypted
+  bytecode linearly sees a handler_id followed by 4 operand bytes
+  and has to trace into the handler body to discover the rel32
+  is never applied. Encoder inserts one opq_branch per slot with
+  30% probability (same branch-safe masking as dead opcodes —
+  never inserted right after a real vjmp/vjcc). Tail dispatch
+  uses save_rflags=false, same as dead opcodes, so the 4-byte
+  fetch's flag clobbers don't contaminate vflags.
 
 - 📋 **Bytecode encryption с rolling key per-handler**: каждый
   handler XOR'ит следующий opcode byte ключом зависящим от своего
