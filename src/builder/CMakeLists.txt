@@ -76,6 +76,7 @@ set(BUILDER_SOURCES
 
     # Phase 5: Self-unpacking packer (multi-section XOR + anti-debug + IAT wipe)
     protection/packer/packer_pass.cpp
+    protection/packer/cipher_body.cpp
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
     protection/packer/tls_callback.cpp

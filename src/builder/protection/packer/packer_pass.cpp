@@ -31,6 +31,7 @@
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
+#include "mxprotector/protection/packer/cipher_body.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/tls_callback.hpp"
@@ -83,21 +84,10 @@ using mx::packer::ExistingTlsDirectory;
 using mx::packer::read_existing_tls_directory;
 using mx::packer::emit_tls_callback_body;
 
-/// A single section the packer stub decrypts at runtime.
-///
-/// For each target section, the stub receives a (rva, size) pair and runs
-/// a standalone XOR loop over that range. The key pointer (`rsi`) is set
-/// once before the first loop; the key index (`dl`) wraps at 256 and is
-/// simply carried from one section to the next, so each section uses a
-/// unique slice of the key stream — good enough against known-plaintext
-/// since one section won't reveal another's offset without guessing the
-/// dl value at the section boundary.
-struct DecryptSection {
-    Rva      rva;            ///< RVA of the section to decrypt
-    uint32_t size;           ///< Size in bytes
-    uint32_t patch_lea_at;   ///< Stub-relative offset of the rel32 inside `lea rdi, [rip+rel]`
-    uint32_t patch_size_at;  ///< Stub-relative offset of the `mov ecx, imm32` immediate
-};
+using mx::packer::DecryptSection;
+using mx::packer::LayerPatches;
+using mx::packer::CipherBodyPatches;
+using mx::packer::emit_decrypt_body;
 
 /// Patch offsets every stub emitter is required to produce, regardless of
 /// shape. The shared packer runtime (`finalize_packer_stub`) consumes these
@@ -113,93 +103,6 @@ struct DecryptSection {
 struct CommonStubPatches {
     uint32_t stolen_bytes_offset = 0;
     uint32_t rel_to_oep_at       = 0;
-};
-
-/// Patch offsets for ONE cipher layer inside a multi-layer stub.
-///
-/// Each layer has its own RC4 key (baked as 32 bytes elsewhere in the
-/// stub buffer) and its own per-section decrypt loop. The runtime walks
-/// layers from `N-1` down to `0`, so layer 0 is the innermost layer —
-/// it's the last one undone at runtime and the one whose KSA is seeded
-/// with the anti-debug bias. See `emit_decrypt_body` for the full layer
-/// ordering rationale.
-///
-/// Both fields are stub-relative byte offsets:
-///   * `rel_to_key_at`  — rel32 inside `lea rsi, [rip + key_rel32]`
-///                       that selects this layer's key pointer.
-///   * `sections`       — per-target-section decrypt-loop patch sites
-///                       (one per encrypted section, filled by the
-///                       caller with section RVA and byte count).
-struct LayerPatches {
-    uint32_t                    rel_to_key_at = 0;
-    std::vector<DecryptSection> sections;
-};
-
-/// Patch offsets produced by the shared decrypt-body emitter
-/// (`emit_decrypt_body`). Every stub that embeds the cipher pipeline —
-/// EXE today, full DLL next — exposes these through multi-inheritance
-/// so the caller code that patches them stays emitter-agnostic.
-struct CipherBodyPatches {
-    // One entry per cipher layer (see P2 multi-layer comment in
-    // `emit_decrypt_body`). Layer 0 is the innermost (bias-seeded
-    // layer, runtime: LAST) and layer N-1 is the outermost (runtime:
-    // first). Each layer has its own 32-byte RC4 key and its own
-    // per-section decrypt loop; the S-box scratch area below is
-    // shared because every layer's KSA rebuilds it from scratch.
-    std::vector<LayerPatches> layers;
-
-    uint32_t rel_to_sbox_at      = 0;  ///< rel32 from end-of-lea to 256-byte scratch S-box
-
-    // P3 — VM-protected entry stub. The range
-    // `[ksa_block_start_offset, ksa_block_end_offset)` inside the emitted
-    // stub holds the RC4 KSA (init loop + mix loop + PRGA state reset).
-    // If the caller succeeds in lifting those bytes through the VM engine
-    // they overwrite the range with `call rel32 <vm_entry>` + NOP padding
-    // and append the runtime blob elsewhere in the stub buffer. On lift
-    // failure the range stays as plaintext — the packer still runs
-    // correctly, it just isn't VM-wrapped.
-    uint32_t ksa_block_start_offset = 0;
-    uint32_t ksa_block_end_offset   = 0;
-
-    uint32_t rel_to_impdir_at    = 0;  ///< rel32 from end-of-lea to Import Directory
-    uint32_t impdir_size_at      = 0;  ///< offset of the import dir size imm32
-
-    // --- Reprotect block patches ---
-    // The reprotect block emits a Hell's Gate resolver + loop over an
-    // embedded section table so the stub can revoke WRITE from every
-    // decrypted section via `NtProtectVirtualMemory`. The table contains
-    // `reprotect_entry_count` entries of {rva: u32, size: u32} and the
-    // caller fills it with the actual RVAs/sizes right after stub assembly.
-    //
-    // `rel_to_reprotect_table_at` is the rel32 offset inside the
-    // `lea r14, [rip + table]` that points at the table. Filled in by
-    // the caller once the stub's section RVA is known.
-    uint32_t rel_to_reprotect_table_at = 0;
-    uint32_t reprotect_table_offset    = 0;
-    uint32_t reprotect_entry_count     = 0;
-
-    // --- ImageBase rip-relative computation ---
-    // The reprotect block needs to know the runtime image base of
-    // **our own module** so it can compute `base = ImageBase + rva`
-    // for each section entry. Reading `PEB.ImageBaseAddress` gives
-    // the host EXE's base — correct for executables (where the host
-    // IS the packed module) but wrong for DLLs (the stub would
-    // reprotect pages inside the host EXE's image instead of our
-    // own, intermittently crashing the host depending on ASLR).
-    //
-    // Instead the stub computes the base rip-relative:
-    //
-    //   lea rbx, [rip + 0]          ; rbx = runtime address of next insn
-    //   sub rbx, <imm32>            ; imm32 = stub_section_rva +
-    //                                         imagebase_lea_anchor_offset
-    //                                 → rbx = our own image base
-    //
-    // `imagebase_lea_anchor_offset` is the stub-relative offset of
-    // the byte right after the lea (also the "rip" value the lea
-    // produces, because the lea is `[rip + 0]`). The caller fills
-    // `imagebase_sub_imm32_at` after the stub section is injected.
-    uint32_t imagebase_lea_anchor_offset = 0;
-    uint32_t imagebase_sub_imm32_at      = 0;
 };
 
 struct ExeStubPatches : CommonStubPatches, CipherBodyPatches {};
@@ -223,596 +126,6 @@ concept StubEmitter = requires(T& t, Randomizer& rng, ByteView stolen) {
         std::same_as<std::pair<ByteBuffer, typename T::patches_type>>;
 };
 
-/// Append the shared decrypt body to `buf`:
-///   anti-debug probe → edx ∈ {0, 1}
-///   mov r15d, edx                 ; save bias across layer boundaries
-///   lea r8 = sbox                 ; shared scratch (every layer rebuilds it)
-///   for k = layer_count-1 down to 0:
-///     lea rsi = key[k]
-///     RC4 KSA phase 1 / 2 / 3     ; phase 2 seeds j=r15d only for layer 0
-///     per-section RC4 PRGA decrypt loop (state carried across sections)
-///   reprotect loop (Hell's Gate → NtProtectVirtualMemory per section)
-///   Import Directory wipe
-///
-/// P2 — Multi-layer unpack: the runtime applies `layer_count` cipher
-/// rounds, each with its own embedded key. Build-time encryption runs
-/// the layers in REVERSE order (layer 0 first, layer N-1 last) so that
-/// runtime decryption — which walks layers from N-1 down to 0 — undoes
-/// them in the correct order. XOR is self-inverse, so the cascade
-/// reduces to applying the per-layer keystream in symmetric order.
-///
-/// Anti-debug bias is woven ONLY into layer 0 (the innermost, runtime-
-/// last layer). Under a debugger, layer 0's KSA seeds `j = 1` instead
-/// of `j = 0`, produces a divergent S-box, and its PRGA XORs with a
-/// wrong keystream — the final bytes are garbage before the stub
-/// reaches the OEP, regardless of how many outer layers decrypted
-/// cleanly. The bias itself is captured into `r15d` right after the
-/// probe (`mov r15d, edx`) and stays there across every outer layer's
-/// KSA, because r15 is nonvolatile-enough for this block: it's free
-/// from the start of the body until the reprotect loop reloads it
-/// with its iteration count, which happens AFTER all layers finish.
-///
-/// Only layer 0's KSA is exposed to the P3 VM lifter via
-/// `ksa_block_start/end_offset`. Outer layers' KSAs stay as plaintext
-/// x64 — they would need their own ksa range tracking, and the MVP
-/// keeps the lift surface minimal to avoid multiplying VM-blob size.
-///
-/// This body is emitter-agnostic: EXE and full-DLL stubs both wrap it in
-/// their own register save/restore (and, for DLL, a `reason != ATTACH`
-/// gate) and inherit `CipherBodyPatches` so their patch descriptors are
-/// fillable by the same post-emit patching code.
-///
-/// Registers clobbered by the body: rax, rbx, rcx, rdx, rsi, rdi,
-/// r8, r9, r10, r12, r13, r14, r15. (r11 is the only volatile GPR
-/// left untouched.) Callers must save any of these that they need
-/// preserved across the body.
-///
-/// On entry, the body assumes it owns rsp and can freely add a
-/// 16-aligned scratch frame for the reprotect block's syscall args.
-/// rsp at entry must be 16-aligned after any caller-side saves so the
-/// reprotect block's `and rsp, -16` is a no-op.
-void emit_decrypt_body(ByteBuffer& buf,
-                       CipherBodyPatches& patches,
-                       Randomizer& rng,
-                       uint32_t section_count,
-                       uint32_t layer_count)
-{
-    auto u8 = [&](uint8_t v) { buf.push_back(v); };
-    auto u32 = [&](uint32_t v) {
-        buf.push_back(static_cast<uint8_t>(v));
-        buf.push_back(static_cast<uint8_t>(v >> 8));
-        buf.push_back(static_cast<uint8_t>(v >> 16));
-        buf.push_back(static_cast<uint8_t>(v >> 24));
-    };
-
-    // P2 — allocate per-layer patch storage up front. The emission loop
-    // below fills entries in runtime-decrypt order (N-1 first, 0 last);
-    // the caller addresses each layer by its logical index and the
-    // in-memory position of the per-layer LEAs is irrelevant to patching.
-    patches.layers.resize(layer_count);
-    for (auto& lp : patches.layers) lp.sections.reserve(section_count);
-
-    // (2) Anti-debug — polymorphic. Each variant reads a different Windows
-    //     "debugger present" indicator and normalizes the result to `edx`
-    //     ∈ {0, 1}. The downstream decrypt loop uses `edx` as the key-stream
-    //     start index, so a non-zero value silently garbles the entire
-    //     decrypted output. No explicit jump to patch: the check is baked
-    //     into the cipher.
-    //
-    // All variants leave edx ∈ {0, 1} and clobber rax. Callers that need
-    // a preserved rax must restore it after the stub.
-    //
-    // Variant 0: PEB.BeingDebugged (byte at PEB+0x02) — classic.
-    //    mov rax, gs:[0x60]         ; PEB
-    //    movzx eax, byte [rax+2]    ; 0 or 1
-    //    mov edx, eax
-    //
-    // Variant 1: PEB.NtGlobalFlag (dword at PEB+0xBC). Under a debugger the
-    //    loader sets FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK
-    //    | FLG_HEAP_VALIDATE_PARAMETERS (mask 0x70). We reduce to {0, 1}
-    //    via `(val & 0x70) ? 1 : 0`.
-    //    mov rax, gs:[0x60]              ; PEB
-    //    mov eax, [rax + 0xBC]           ; NtGlobalFlag
-    //    and eax, 0x70                   ; mask heap flags
-    //    xor edx, edx
-    //    test eax, eax
-    //    setnz dl                         ; edx = (masked != 0)
-    //
-    // Variant 2: KUSER_SHARED_DATA.KdDebuggerEnabled at 0x7FFE02D4.
-    //    User-mode readable page mapped at fixed VA 0x7FFE0000. Byte at
-    //    +0x2D4 has bit 0x01 set when a kernel debugger is present AND
-    //    attached. bit 0x02 set when user-mode code runs under a debugger
-    //    in many Windows versions, but less reliable — we use bit 0x01
-    //    OR bit 0x02 for broader coverage.
-    //    mov rax, 0x7FFE02D4
-    //    movzx eax, byte [rax]
-    //    and eax, 0x03
-    //    xor edx, edx
-    //    test eax, eax
-    //    setnz dl
-    const uint32_t adv = rng.next_range(0, 2);
-    switch (adv) {
-        case 0: {
-            // PEB.BeingDebugged
-            u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
-            u8(0x60); u8(0x00); u8(0x00); u8(0x00);     // mov rax, gs:[0x60]
-            u8(0x0F); u8(0xB6); u8(0x40); u8(0x02);     // movzx eax, byte [rax+2]
-            u8(0x89); u8(0xC2);                          // mov edx, eax
-            break;
-        }
-        case 1: {
-            // PEB.NtGlobalFlag
-            u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
-            u8(0x60); u8(0x00); u8(0x00); u8(0x00);     // mov rax, gs:[0x60]
-            u8(0x8B); u8(0x80); u8(0xBC); u8(0x00); u8(0x00); u8(0x00);
-                                                          // mov eax, [rax + 0xBC]
-            u8(0x83); u8(0xE0); u8(0x70);                // and eax, 0x70
-            u8(0x31); u8(0xD2);                          // xor edx, edx
-            u8(0x85); u8(0xC0);                          // test eax, eax
-            u8(0x0F); u8(0x95); u8(0xC2);                // setnz dl
-            break;
-        }
-        default: {
-            // KUSER_SHARED_DATA.KdDebuggerEnabled at 0x7FFE02D4.
-            // `mov rax, imm64` is 10 bytes; we need the full 64-bit addr.
-            u8(0x48); u8(0xB8);                          // mov rax, imm64
-            u8(0xD4); u8(0x02); u8(0xFE); u8(0x7F);
-            u8(0x00); u8(0x00); u8(0x00); u8(0x00);      // 0x7FFE02D4
-            u8(0x0F); u8(0xB6); u8(0x00);                // movzx eax, byte [rax]
-            u8(0x83); u8(0xE0); u8(0x03);                // and eax, 0x03
-            u8(0x31); u8(0xD2);                          // xor edx, edx
-            u8(0x85); u8(0xC0);                          // test eax, eax
-            u8(0x0F); u8(0x95); u8(0xC2);                // setnz dl
-            break;
-        }
-    }
-
-    // P2 — Bias carrier. `edx` holds the anti-debug bias right after
-    // the probe, but we're about to clobber edx inside each layer's KSA
-    // phase 2 (it's used as scratch for `mov dl, cl; and dl, 0x1F`).
-    // Copy the bias into `r15d` so it survives every KSA call until
-    // layer 0's phase 2 reads it back. r15 is free from here until the
-    // reprotect loop reloads it with its iteration counter, which runs
-    // AFTER all layers finish.
-    //
-    //   mov r15d, edx                           41 89 D7
-    u8(0x41); u8(0x89); u8(0xD7);
-
-    // (3) RC4 setup — load the shared S-box pointer.
-    //
-    // `r8` holds the 256-byte S-box scratch area. Every layer's KSA
-    // rebuilds the full S-box from S[k]=k, so layers can share one
-    // scratch region. The per-layer `lea rsi, key_K` load happens
-    // inside the layer emission loop below.
-    //
-    //   lea r8,  [rip + sbox_rel32]  4C 8D 05 rel32
-    u8(0x4C); u8(0x8D); u8(0x05);
-    patches.rel_to_sbox_at = static_cast<uint32_t>(buf.size());
-    u32(0);
-
-    // (3a) RC4 Key Scheduling Algorithm (KSA).
-    //
-    //   Phase 1 — initialise S[k] = k for k ∈ [0, 256):
-    //     xor  ecx, ecx               ; k = 0
-    //   .init:
-    //     mov  [r8 + rcx], cl         ; S[k] = k (low byte)
-    //     inc  cl                     ; k++
-    //     jnz  .init                  ; wraps at 256 → exit
-    //
-    //   Phase 2 — mix with the key, seeded by the anti-debug bias
-    //             (only on layer 0; other layers start with j = 0):
-    //     xor  ecx, ecx               ; k = 0
-    //     mov  ebx, r15d              ; j = bias    (layer 0 only)
-    //       or  xor  ebx, ebx         ; j = 0       (outer layers)
-    //   .ksa:
-    //     movzx eax, byte [r8 + rcx]  ; al = S[k]
-    //     mov  dl, cl                 ; dl = k
-    //     and  dl, 0x1F               ; dl = k mod 32 (key length)
-    //     add  bl, al                 ; j += S[k]
-    //     add  bl, [rsi + rdx]        ; j += key[k mod 32]
-    //     movzx edx, byte [r8 + rbx]  ; dl = S[j]
-    //     mov  [r8 + rbx], al         ; S[j] = S[k]
-    //     mov  [r8 + rcx], dl         ; S[k] = S[j]   (old S[j])
-    //     inc  cl                     ; k++
-    //     jnz  .ksa                   ; wraps at 256
-    //
-    //   Phase 3 — reset PRGA state:
-    //     xor  r9,  r9                ; i = 0
-    //     xor  r10, r10               ; j = 0
-
-    // P2 — Emit `layer_count` cipher rounds in RUNTIME DECRYPT order
-    // (N-1 first, 0 last). Layer 0 is the innermost; build-time
-    // encryption applies layers in the reverse order (0, 1, ..., N-1)
-    // so that runtime decryption undoes them correctly. Only layer 0's
-    // KSA is exposed to the P3 VM lifter — the `ksa_block_start/end`
-    // fields are filled in only when the inner iteration hits
-    // `layer_idx == 0`.
-    for (int32_t layer_idx = static_cast<int32_t>(layer_count) - 1;
-         layer_idx >= 0; --layer_idx)
-    {
-        const bool is_bias_layer = (layer_idx == 0);
-        LayerPatches& lp = patches.layers[layer_idx];
-
-        // Per-layer: load this layer's RC4 key pointer. Placed BEFORE
-        // the `ksa_block_start_offset` mark for layer 0 so the P3 VM
-        // lift region stays register-only (no rip-relative memory).
-        //
-        //   lea rsi, [rip + key_K_rel32]   48 8D 35 rel32
-        u8(0x48); u8(0x8D); u8(0x35);
-        lp.rel_to_key_at = static_cast<uint32_t>(buf.size());
-        u32(0);
-
-        // Mark the start of the VM-liftable KSA block for layer 0.
-        // Everything from here through `xor r10, r10` (PRGA state reset)
-        // is pure register / r8-or-rsi-relative code — no rip-relative
-        // memory operands, no syscalls, no external branches. Safe for
-        // the VmLifter.
-        if (is_bias_layer) {
-            patches.ksa_block_start_offset = static_cast<uint32_t>(buf.size());
-        }
-
-        // Phase 1: init S[k] = k.
-        u8(0x31); u8(0xC9);                          // xor ecx, ecx
-        const uint32_t init_loop_start = static_cast<uint32_t>(buf.size());
-        u8(0x41); u8(0x88); u8(0x0C); u8(0x08);      // mov [r8+rcx], cl
-        u8(0xFE); u8(0xC1);                          // inc cl
-        {
-            const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-            const int32_t  rel8    = static_cast<int32_t>(init_loop_start) -
-                                     static_cast<int32_t>(jnz_end);
-            u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-        }
-
-        // Phase 2: KSA mix. Seed j from the bias on layer 0, else 0.
-        u8(0x31); u8(0xC9);                          // xor ecx, ecx    (k = 0)
-        if (is_bias_layer) {
-            // mov ebx, r15d                          44 89 FB
-            //   j = saved anti-debug bias (0 normally, 1 under debugger)
-            u8(0x44); u8(0x89); u8(0xFB);
-        } else {
-            // xor ebx, ebx                           31 DB
-            //   j = 0 — outer layers don't care about bias, they just
-            //   rebuild a deterministic S-box from their own key.
-            u8(0x31); u8(0xDB);
-        }
-        const uint32_t ksa_loop_start = static_cast<uint32_t>(buf.size());
-        u8(0x41); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08); // movzx eax, byte [r8+rcx]
-        u8(0x88); u8(0xCA);                          // mov dl, cl
-        u8(0x80); u8(0xE2); u8(0x1F);                // and dl, 0x1F
-        u8(0x00); u8(0xC3);                          // add bl, al        (j += S[k])
-        u8(0x02); u8(0x1C); u8(0x16);                // add bl, [rsi+rdx] (j += key[k mod 32])
-        u8(0x41); u8(0x0F); u8(0xB6); u8(0x14); u8(0x18); // movzx edx, byte [r8+rbx] (dl = S[j])
-        u8(0x41); u8(0x88); u8(0x04); u8(0x18);      // mov [r8+rbx], al  (S[j] = S[k])
-        u8(0x41); u8(0x88); u8(0x14); u8(0x08);      // mov [r8+rcx], dl  (S[k] = old S[j])
-        u8(0xFE); u8(0xC1);                          // inc cl
-        {
-            const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-            const int32_t  rel8    = static_cast<int32_t>(ksa_loop_start) -
-                                     static_cast<int32_t>(jnz_end);
-            u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-        }
-
-        // Phase 3: zero the PRGA (i, j) state. Each layer restarts
-        // PRGA from (0, 0) — cross-layer state sharing would require
-        // matching build-time encryption to use a different initial
-        // state on every layer, which gains nothing.
-        u8(0x4D); u8(0x31); u8(0xC9);                // xor r9, r9     (i  = 0)
-        u8(0x4D); u8(0x31); u8(0xD2);                // xor r10, r10   (j  = 0)
-
-        // End of the VM-liftable KSA block for layer 0. The caller may
-        // replace the range `[ksa_block_start_offset, ksa_block_end_offset)`
-        // with a `call rel32 <vm_entry>` + NOP pad, hiding the RC4 setup
-        // inside a VM region.
-        if (is_bias_layer) {
-            patches.ksa_block_end_offset = static_cast<uint32_t>(buf.size());
-        }
-
-        // (4) Per-section decrypt loop — RC4 PRGA.
-        //
-        // State at entry: r8 = S-box ptr, r9b = PRGA i, r10b = PRGA j,
-        //                 rdi/ecx = per-section dest ptr and length.
-        //
-        //   .loop:
-        //     inc   r9b                           ; i++
-        //     movzx eax, byte [r8 + r9]           ; al = S[i]
-        //     add   r10b, al                      ; j += S[i]
-        //     movzx edx, byte [r8 + r10]          ; dl = S[j]
-        //     mov   [r8 + r10], al                ; S[j] = S[i]
-        //     mov   [r8 + r9],  dl                ; S[i] = S[j] (swap)
-        //     add   al, dl                        ; al = (S[i]+S[j]) mod 256
-        //     movzx eax, al                       ; zero-extend sum
-        //     mov   al, [r8 + rax]                ; K = S[sum]
-        //     xor   [rdi], al                     ; decrypt one byte
-        //     inc   rdi                           ; advance dst
-        //     dec   ecx                           ; length--
-        //     jnz   .loop
-        for (uint32_t s = 0; s < section_count; ++s) {
-            DecryptSection ds{};
-
-            //   lea rdi, [rip + section_rel32]    48 8D 3D rel32
-            u8(0x48); u8(0x8D); u8(0x3D);
-            ds.patch_lea_at = static_cast<uint32_t>(buf.size());
-            u32(0);
-
-            //   mov ecx, imm32                    B9 imm32
-            u8(0xB9);
-            ds.patch_size_at = static_cast<uint32_t>(buf.size());
-            u32(0);
-
-            lp.sections.push_back(ds);
-
-            const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
-
-            u8(0x41); u8(0xFE); u8(0xC1);                      // inc r9b
-            u8(0x43); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08);  // movzx eax, [r8+r9]
-            u8(0x41); u8(0x00); u8(0xC2);                      // add r10b, al
-            u8(0x43); u8(0x0F); u8(0xB6); u8(0x14); u8(0x10);  // movzx edx, [r8+r10]
-            u8(0x43); u8(0x88); u8(0x04); u8(0x10);            // mov [r8+r10], al
-            u8(0x43); u8(0x88); u8(0x14); u8(0x08);            // mov [r8+r9],  dl
-            u8(0x00); u8(0xD0);                                // add al, dl
-            u8(0x0F); u8(0xB6); u8(0xC0);                      // movzx eax, al
-            u8(0x41); u8(0x8A); u8(0x04); u8(0x00);            // mov al, [r8+rax]
-            u8(0x30); u8(0x07);                                // xor [rdi], al
-            u8(0x48); u8(0xFF); u8(0xC7);                      // inc rdi
-            u8(0xFF); u8(0xC9);                                // dec ecx
-            {
-                const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-                const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
-                                         static_cast<int32_t>(jnz_end);
-                u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-            }
-        }
-    }
-
-    // (4.5) Reprotect decrypted sections to PAGE_EXECUTE_READ.
-    //
-    // The decrypt loop above wrote through each section, which means
-    // those sections had IMAGE_SCN_MEM_WRITE in the loader's eyes and
-    // were mapped PAGE_EXECUTE_READWRITE. Leaving them RWX at runtime
-    // is a security hazard — it means (a) a reverser's in-memory
-    // patch doesn't need to call VirtualProtect first (no detection
-    // opportunity), and (b) the anti-tamper `page_protection_sweep`
-    // check can't meaningfully probe our own VM blob section because
-    // a legitimate state of RWX is indistinguishable from a tampered
-    // one. Both problems disappear if we revoke WRITE after the
-    // decrypt loop finishes.
-    //
-    // The reprotect block does:
-    //
-    //   1. Save rsp to r12 and allocate a 16-byte-aligned 0x50-byte
-    //      scratch frame for the syscall args and output buffer.
-    //
-    //   2. Emit the Hell's Gate SSN resolver targeting
-    //      `NtProtectVirtualMemory`. It walks
-    //      `PEB.Ldr.InMemoryOrderModuleList` → ntdll (2nd entry) →
-    //      PE export table → DJB2 scan → prologue validation → SSN
-    //      into r13d. ~155 bytes of emitted code.
-    //
-    //   3. Skip the reprotect loop entirely if r13 came back 0
-    //      (resolver failure). The decrypted sections stay RWX,
-    //      which is the pre-fix state — safe, just not hardened.
-    //
-    //   4. Load one-time constants that survive across syscalls:
-    //      rbx = PEB.ImageBase, rdx = &base_var, r8 = &size_var,
-    //      r9d = PAGE_EXECUTE_READ, [rsp+0x28] = &old_protect_var,
-    //      r14 = section table pointer, r15 = N section count.
-    //
-    //   5. Loop over each {rva, size} entry in the table:
-    //        compute base = ImageBase + rva
-    //        write base into base_var
-    //        write size into size_var
-    //        mov rcx, -1 (NtCurrentProcess)
-    //        mov r10, rcx (syscall ABI)
-    //        mov eax, r13d (SSN)
-    //        syscall
-    //
-    //   6. Restore rsp from r12.
-    //
-    // All clobbered registers (rax, rbx, rcx, rdx, rdi, rsi, r8–r15)
-    // are either already dirty from the decrypt loop, or are loader-
-    // initialised values that the original OEP code doesn't depend
-    // on. r12 is new state we introduce specifically for the rsp
-    // save, and we restore it before returning control.
-
-    const uint32_t reprotect_entry_count = section_count;
-    patches.reprotect_entry_count = reprotect_entry_count;
-
-    // Save rsp, align, and allocate our scratch+call frame.
-    //
-    //   mov r12, rsp                 49 89 E4
-    //   and rsp, -16                 48 83 E4 F0
-    //   sub rsp, 0x50                48 81 EC 50 00 00 00
-    //
-    // After sub the frame looks like:
-    //   [rsp+0x00..0x1F]  shadow space for the callee's arg1..4 homes
-    //   [rsp+0x20]        arg5 slot = &old_protect_var (set once)
-    //   [rsp+0x28]        pad / unused
-    //   [rsp+0x30]        base_var  (rdx target, rewritten per iter)
-    //   [rsp+0x38]        size_var  (r8 target, rewritten per iter)
-    //   [rsp+0x40]        old_protect_var (PULONG output)
-    //   [rsp+0x48..0x4F]  pad
-    //
-    // `and rsp, -16` ensures rsp is 16-aligned BEFORE the `call r13`
-    // below — the CALL push will then leave rsp at mod16==8 inside
-    // ntdll's stub, which is what the Windows x64 ABI expects.
-    u8(0x49); u8(0x89); u8(0xE4);
-    u8(0x48); u8(0x83); u8(0xE4); u8(0xF0);
-    u8(0x48); u8(0x81); u8(0xEC);
-    u32(0x00000050u);
-
-    // Hell's Gate address resolver → r13 = NtProtectVirtualMemory
-    // function body address. The resolver walks the PEB, finds
-    // ntdll, and looks up the export by salted DJB2 hash. On
-    // failure r13 is left at 0 and we skip the reprotect loop
-    // entirely — pre-fix behaviour.
-    //
-    // The per-build random salt is what kills the "djb2_hash →
-    // ntdll API" reverse-lookup dictionary: every build folds a
-    // different 32-bit constant into the hash seed, so both the
-    // `cmp eax, target_hash` slot and the scan-loop initial seed
-    // slot change from build to build even though the target API
-    // name is the same. Reversers reading the stub can still
-    // extract both constants, but no longer via a static table.
-    {
-        mx::RawEmitter tmp{};
-        const uint32_t salt = rng.next_u32();
-        const uint32_t ntprotect_hash =
-            anti_tamper::djb2_ascii_hash_salted(
-                "NtProtectVirtualMemory", salt);
-        anti_tamper::emit_hells_gate_address_resolver(
-            tmp, ntprotect_hash, salt);
-        for (uint8_t b : tmp.buf) u8(b);
-    }
-
-    // test r13, r13                          4D 85 ED
-    u8(0x4D); u8(0x85); u8(0xED);
-    // jz short .reprotect_done               74 rel8 (patched below)
-    u8(0x74);
-    const uint32_t patch_jz_reprotect_done = static_cast<uint32_t>(buf.size());
-    u8(0x00);
-
-    // --- One-time setup outside the loop: ImageBase, arg5, table ---
-
-    // rbx = our own module's runtime image base, computed rip-relative.
-    // PEB.ImageBaseAddress would give the host EXE's base, which is
-    // correct for executables but wrong for DLLs (we'd reprotect pages
-    // inside the host's image instead of our own). The rip-relative
-    // path works for both.
-    //
-    //   lea rbx, [rip + 0]                   48 8D 1D 00 00 00 00
-    //     rbx = runtime address of the next instruction = ImageBase
-    //           + stub_section_rva + `imagebase_lea_anchor_offset`.
-    //   sub rbx, <imm32>                     48 81 EB imm32
-    //     imm32 = stub_section_rva + imagebase_lea_anchor_offset
-    //     → rbx = ImageBase (always, EXE or DLL).
-    u8(0x48); u8(0x8D); u8(0x1D);
-    u8(0x00); u8(0x00); u8(0x00); u8(0x00);
-    patches.imagebase_lea_anchor_offset = static_cast<uint32_t>(buf.size());
-    u8(0x48); u8(0x81); u8(0xEB);
-    patches.imagebase_sub_imm32_at = static_cast<uint32_t>(buf.size());
-    u32(0);
-
-    // lea rax, [rsp + 0x40]                  48 8D 44 24 40
-    // mov [rsp + 0x20], rax                  48 89 44 24 20
-    //   arg5 slot (pointer to old_protect_var) — constant, set once.
-    u8(0x48); u8(0x8D); u8(0x44); u8(0x24); u8(0x40);
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x20);
-
-    // lea r14, [rip + reprotect_table_rel32]  4C 8D 35 rel32
-    //   r14 = pointer to the embedded section table. The rel32 is
-    //   patched in `execute()` once the stub's section RVA and the
-    //   table's offset inside the stub are final. r14 is also
-    //   nonvolatile so it survives the CALL.
-    u8(0x4C); u8(0x8D); u8(0x35);
-    patches.rel_to_reprotect_table_at = static_cast<uint32_t>(buf.size());
-    u32(0);
-
-    // mov r15d, <reprotect_entry_count>      41 BF imm32
-    //   r15 = loop countdown. Nonvolatile, so the CALL won't stomp it.
-    u8(0x41); u8(0xBF);
-    u32(reprotect_entry_count);
-
-    // --- Loop body ---
-
-    const uint32_t loop_start = static_cast<uint32_t>(buf.size());
-
-    // test r15, r15                          4D 85 FF
-    u8(0x4D); u8(0x85); u8(0xFF);
-    // jz short .reprotect_done               74 rel8 (patched below)
-    u8(0x74);
-    const uint32_t patch_jz_loop_done = static_cast<uint32_t>(buf.size());
-    u8(0x00);
-
-    // mov eax, [r14]                         41 8B 06
-    //   rva (zero-extends to 64-bit in rax)
-    u8(0x41); u8(0x8B); u8(0x06);
-    // lea rax, [rbx + rax*1]                 48 8D 04 03
-    //   rax = ImageBase + rva
-    u8(0x48); u8(0x8D); u8(0x04); u8(0x03);
-    // mov [rsp + 0x30], rax                  48 89 44 24 30
-    //   store base_var
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x30);
-
-    // mov eax, [r14 + 4]                     41 8B 46 04
-    //   size (zero-extends)
-    u8(0x41); u8(0x8B); u8(0x46); u8(0x04);
-    // mov [rsp + 0x38], rax                  48 89 44 24 38
-    //   store size_var
-    u8(0x48); u8(0x89); u8(0x44); u8(0x24); u8(0x38);
-
-    // Prepare call registers (volatile — re-set every iteration
-    // because the previous CALL clobbered them).
-    //
-    //   rcx = -1              (NtCurrentProcess pseudo-handle)
-    //   rdx = &base_var       ([rsp + 0x30])
-    //   r8  = &size_var       ([rsp + 0x38])
-    //   r9d = PAGE_EXECUTE_READ (0x20)
-
-    // mov rcx, -1                            48 C7 C1 FF FF FF FF
-    u8(0x48); u8(0xC7); u8(0xC1);
-    u32(0xFFFFFFFFu);
-    // lea rdx, [rsp + 0x30]                  48 8D 54 24 30
-    u8(0x48); u8(0x8D); u8(0x54); u8(0x24); u8(0x30);
-    // lea r8, [rsp + 0x38]                   4C 8D 44 24 38
-    u8(0x4C); u8(0x8D); u8(0x44); u8(0x24); u8(0x38);
-    // mov r9d, 0x20                          41 B9 20 00 00 00
-    u8(0x41); u8(0xB9);
-    u32(0x00000020u);
-
-    // call r13                               41 FF D5
-    //   Invoke ntdll!NtProtectVirtualMemory. Going through the real
-    //   stub means ntdll handles the Windows x64 ABI for the stack
-    //   argument at [rsp+0x20] → [rsp+0x28] inside the stub, which
-    //   a hand-rolled direct `syscall` from a 16-aligned rsp does
-    //   not replicate correctly on Win11 with CET / shadow stack.
-    u8(0x41); u8(0xFF); u8(0xD5);
-
-    // add r14, 8                             49 83 C6 08
-    u8(0x49); u8(0x83); u8(0xC6); u8(0x08);
-    // dec r15                                49 FF CF
-    u8(0x49); u8(0xFF); u8(0xCF);
-    // jmp short .loop_start                  EB rel8
-    u8(0xEB);
-    {
-        const uint32_t jmp_end = static_cast<uint32_t>(buf.size()) + 1;
-        const int32_t rel8 = static_cast<int32_t>(loop_start) -
-                             static_cast<int32_t>(jmp_end);
-        u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-    }
-
-    // .reprotect_done:
-    {
-        const uint32_t done_at = static_cast<uint32_t>(buf.size());
-        buf[patch_jz_reprotect_done] = static_cast<uint8_t>(
-            static_cast<int8_t>(static_cast<int32_t>(done_at) -
-                                static_cast<int32_t>(patch_jz_reprotect_done + 1)));
-        buf[patch_jz_loop_done] = static_cast<uint8_t>(
-            static_cast<int8_t>(static_cast<int32_t>(done_at) -
-                                static_cast<int32_t>(patch_jz_loop_done + 1)));
-    }
-
-    // Restore rsp from r12.
-    // mov rsp, r12                           4C 89 E4
-    u8(0x4C); u8(0x89); u8(0xE4);
-
-    // (5) IAT destruction: zero the Import Directory region in memory.
-    // After decryption, the loader has already resolved all imports into the
-    // IAT. Zeroing the Import Directory + ILT makes the resolved addresses
-    // un-labelable by dump/reconstruction tools (Scylla, IDA imports tab).
-    //
-    //   lea rdi, [rip + import_dir_rel32]
-    //   xor eax, eax
-    //   mov ecx, import_dir_size / 4
-    //   rep stosd
-    u8(0x48); u8(0x8D); u8(0x3D);            // lea rdi, [rip + rel32]
-    patches.rel_to_impdir_at = static_cast<uint32_t>(buf.size());
-    u32(0);                                   // placeholder rel32
-    u8(0x31); u8(0xC0);                       // xor eax, eax
-    u8(0xB9);                                  // mov ecx, imm32
-    patches.impdir_size_at = static_cast<uint32_t>(buf.size());
-    u32(0);                                   // placeholder size/4
-    u8(0xF3); u8(0xAB);                       // rep stosd
-}
 
 /// Build the EXE stub code bytes (without patching rel32s yet) and
 /// report where the placeholders need to be filled in. The stub layout:
@@ -834,17 +147,9 @@ void emit_decrypt_body(ByteBuffer& buf,
     uint32_t section_count,
     uint32_t layer_count)
 {
-    ByteBuffer buf;
-    buf.reserve(128 + (32 + 32 * section_count) * layer_count +
-                stolen_bytes.size() + kKeySize * layer_count);
-
-    auto u8 = [&](uint8_t v) { buf.push_back(v); };
-    auto u32 = [&](uint32_t v) {
-        buf.push_back(static_cast<uint8_t>(v));
-        buf.push_back(static_cast<uint8_t>(v >> 8));
-        buf.push_back(static_cast<uint8_t>(v >> 16));
-        buf.push_back(static_cast<uint8_t>(v >> 24));
-    };
+    RawEmitter e;
+    e.buf.reserve(128 + (32 + 32 * section_count) * layer_count +
+                  stolen_bytes.size() + kKeySize * layer_count);
 
     ExeStubPatches patches{};
 
@@ -853,29 +158,29 @@ void emit_decrypt_body(ByteBuffer& buf,
     std::array<uint8_t, 5> save_order{0x50 /*rax*/, 0x51 /*rcx*/, 0x52 /*rdx*/,
                                        0x56 /*rsi*/, 0x57 /*rdi*/};
     std::shuffle(save_order.begin(), save_order.end(), rng.engine());
-    for (uint8_t op : save_order) u8(op);
+    for (uint8_t op : save_order) e.u8(op);
 
     // (2) Shared decrypt body — anti-debug, KSA, PRGA per section,
     //     reprotect, IAT wipe. Populates the CipherBodyPatches slots
     //     of `patches` via the multi-inheritance base.
-    emit_decrypt_body(buf, patches, rng, section_count, layer_count);
+    emit_decrypt_body(e, patches, rng, section_count, layer_count);
 
     // (3) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
-        u8(static_cast<uint8_t>(*it + 0x08));
+        e.u8(static_cast<uint8_t>(*it + 0x08));
     }
 
     // (4) Stolen OEP bytes run inline — rsp is now back to what the OEP
     //     would have seen at entry. If none were stolen this is empty.
-    patches.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
-    for (auto b : stolen_bytes) u8(b);
+    patches.stolen_bytes_offset = static_cast<uint32_t>(e.size());
+    e.bytes(stolen_bytes);
 
     // (5) jmp rel32 → OEP + stolen_size
-    u8(0xE9);
-    patches.rel_to_oep_at = static_cast<uint32_t>(buf.size());
-    u32(0);
+    e.u8(0xE9);
+    patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
+    e.u32(0);
 
-    return {std::move(buf), patches};
+    return {std::move(e.buf), patches};
 }
 
 /// Build the full DLL stub code bytes (without patching rel32s yet).
@@ -913,80 +218,72 @@ void emit_decrypt_body(ByteBuffer& buf,
     uint32_t section_count,
     uint32_t layer_count)
 {
-    ByteBuffer buf;
-    buf.reserve(192 + (32 + 32 * section_count) * layer_count +
-                stolen_bytes.size() + kKeySize * layer_count);
-
-    auto u8 = [&](uint8_t v) { buf.push_back(v); };
-    auto u32 = [&](uint32_t v) {
-        buf.push_back(static_cast<uint8_t>(v));
-        buf.push_back(static_cast<uint8_t>(v >> 8));
-        buf.push_back(static_cast<uint8_t>(v >> 16));
-        buf.push_back(static_cast<uint8_t>(v >> 24));
-    };
+    RawEmitter e;
+    e.buf.reserve(192 + (32 + 32 * section_count) * layer_count +
+                  stolen_bytes.size() + kKeySize * layer_count);
 
     DllFullStubPatches patches{};
 
     // (1) Save nonvolatiles + DllMain args. Fixed order — polymorphism
     //     comes from the anti-debug probe and KSA variance. 11 pushes
     //     → rsp mod 16 = 0 before the cipher body starts.
-    u8(0x53);                    // push rbx
-    u8(0x55);                    // push rbp
-    u8(0x56);                    // push rsi
-    u8(0x57);                    // push rdi
-    u8(0x41); u8(0x54);          // push r12
-    u8(0x41); u8(0x55);          // push r13
-    u8(0x41); u8(0x56);          // push r14
-    u8(0x41); u8(0x57);          // push r15
-    u8(0x51);                    // push rcx  (HINSTANCE)
-    u8(0x52);                    // push rdx  (reason — also consumed by KSA bias seed)
-    u8(0x41); u8(0x50);          // push r8   (lpReserved)
+    e.u8(0x53);                    // push rbx
+    e.u8(0x55);                    // push rbp
+    e.u8(0x56);                    // push rsi
+    e.u8(0x57);                    // push rdi
+    e.u8(0x41); e.u8(0x54);        // push r12
+    e.u8(0x41); e.u8(0x55);        // push r13
+    e.u8(0x41); e.u8(0x56);        // push r14
+    e.u8(0x41); e.u8(0x57);        // push r15
+    e.u8(0x51);                    // push rcx  (HINSTANCE)
+    e.u8(0x52);                    // push rdx  (reason — also consumed by KSA bias seed)
+    e.u8(0x41); e.u8(0x50);        // push r8   (lpReserved)
 
     // (2) Gate on reason == DLL_PROCESS_ATTACH (1). rdx still holds
     //     the original reason at this point (the cmp is 32-bit safe
     //     because the reason argument is a DWORD).
     //
     //   cmp edx, 1                        83 FA 01
-    u8(0x83); u8(0xFA); u8(0x01);
+    e.u8(0x83); e.u8(0xFA); e.u8(0x01);
     //   jne .forward (rel32, back-patched below)  0F 85 rel32
-    u8(0x0F); u8(0x85);
-    const uint32_t reason_jne_rel32_at = static_cast<uint32_t>(buf.size());
-    u32(0);
+    e.u8(0x0F); e.u8(0x85);
+    const uint32_t reason_jne_rel32_at = static_cast<uint32_t>(e.size());
+    e.u32(0);
 
     // (3) Shared decrypt body.
-    emit_decrypt_body(buf, patches, rng, section_count, layer_count);
+    emit_decrypt_body(e, patches, rng, section_count, layer_count);
 
     // (4) .forward: — back-patch the jne target.
     {
-        const uint32_t forward_label = static_cast<uint32_t>(buf.size());
+        const uint32_t forward_label = static_cast<uint32_t>(e.size());
         const int32_t rel32 = static_cast<int32_t>(forward_label) -
             static_cast<int32_t>(reason_jne_rel32_at + 4);
-        std::memcpy(buf.data() + reason_jne_rel32_at, &rel32, sizeof(rel32));
+        std::memcpy(e.buf.data() + reason_jne_rel32_at, &rel32, sizeof(rel32));
     }
 
     // (5) Pop nonvolatiles + DllMain args in reverse push order.
-    u8(0x41); u8(0x58);          // pop r8
-    u8(0x5A);                    // pop rdx
-    u8(0x59);                    // pop rcx
-    u8(0x41); u8(0x5F);          // pop r15
-    u8(0x41); u8(0x5E);          // pop r14
-    u8(0x41); u8(0x5D);          // pop r13
-    u8(0x41); u8(0x5C);          // pop r12
-    u8(0x5F);                    // pop rdi
-    u8(0x5E);                    // pop rsi
-    u8(0x5D);                    // pop rbp
-    u8(0x5B);                    // pop rbx
+    e.u8(0x41); e.u8(0x58);        // pop r8
+    e.u8(0x5A);                    // pop rdx
+    e.u8(0x59);                    // pop rcx
+    e.u8(0x41); e.u8(0x5F);        // pop r15
+    e.u8(0x41); e.u8(0x5E);        // pop r14
+    e.u8(0x41); e.u8(0x5D);        // pop r13
+    e.u8(0x41); e.u8(0x5C);        // pop r12
+    e.u8(0x5F);                    // pop rdi
+    e.u8(0x5E);                    // pop rsi
+    e.u8(0x5D);                    // pop rbp
+    e.u8(0x5B);                    // pop rbx
 
     // (6) Stolen DllMain prologue bytes inline (may be empty).
-    patches.stolen_bytes_offset = static_cast<uint32_t>(buf.size());
-    for (auto b : stolen_bytes) u8(b);
+    patches.stolen_bytes_offset = static_cast<uint32_t>(e.size());
+    e.bytes(stolen_bytes);
 
     // (7) jmp rel32 → DllMain + stolen_size
-    u8(0xE9);
-    patches.rel_to_oep_at = static_cast<uint32_t>(buf.size());
-    u32(0);
+    e.u8(0xE9);
+    patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
+    e.u32(0);
 
-    return {std::move(buf), patches};
+    return {std::move(e.buf), patches};
 }
 
 // ---------------------------------------------------------------------------
