@@ -620,61 +620,53 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
         }
 
         if (!used_map_file) {
-            ctx.log("CfgFlatteningPass: используем .pdata для границ функций");
-
-            struct RuntimeFunction {
-                uint32_t begin_addr;
-                uint32_t end_addr;
-                uint32_t unwind_info;
-            };
-
-            const pe::SectionInfo* pdata = ctx.pe_image().section_by_name(".pdata");
-            if (!pdata || pdata->data.size() < sizeof(RuntimeFunction)) {
-                ctx.log("CfgFlatteningPass: .pdata не найдена, пропуск CFF");
-            } else {
-                const size_t func_count = pdata->data.size() / sizeof(RuntimeFunction);
-                const auto* funcs = reinterpret_cast<const RuntimeFunction*>(pdata->data.data());
-
-                ctx.log_fmt("CfgFlatteningPass: найдено {} функций в .pdata", func_count);
-
-                const Rva entry_rva = ctx.pe_image().entry_point_rva();
-                size_t entry_idx = func_count;
-                for (size_t j = 0; j < func_count; ++j) {
-                    if (funcs[j].begin_addr <= entry_rva &&
-                        funcs[j].end_addr > entry_rva) {
-                        entry_idx = j;
-                        break;
-                    }
-                }
-
-                ctx.log_fmt("CfgFlatteningPass: entry point at .pdata[{}] "
-                            "(RVA=0x{:08X}), CFF range: [0..{})",
-                            entry_idx, entry_rva, entry_idx);
-
-                for (size_t i = 0; i < entry_idx; ++i) {
-                    const Rva func_rva = funcs[i].begin_addr;
-                    const uint32_t func_size = funcs[i].end_addr - funcs[i].begin_addr;
-
-                    if (func_size < MapParser::kMinFunctionSize ||
-                        func_size > MapParser::kMaxFunctionSize) continue;
-
-                    pe::SectionInfo* section = nullptr;
-                    for (auto& s : ctx.pe_image().sections()) {
-                        if (s.is_code() && s.contains_rva(func_rva)) {
-                            section = &s;
-                            break;
-                        }
-                    }
-                    if (!section) continue;
-
-                    const uint32_t offset_in_section = func_rva - section->virtual_address;
-                    if (offset_in_section + func_size > section->data.size()) continue;
-
-                    const Va func_va = ctx.pe_image().image_base() + func_rva;
-                    (void)flatten_function(*section, offset_in_section, func_size,
-                                           func_va, func_rva);
-                }
-            }
+            // Historically there was a `.pdata` fallback here that
+            // iterated every function with `BeginAddress < entry_rva`
+            // and ran CFF on each one, "automatically" protecting
+            // binaries that shipped without a `.map` file or
+            // `MX_OBFUSCATE_BEGIN/END` markers. That fallback was
+            // fundamentally unsafe on C++ binaries because the
+            // functions in that RVA window are CRT runtime code —
+            // `__scrt_common_main_seh`, `__scrt_initialize_crt`,
+            // `__security_init_cookie`, `_initterm`, pure-virtual /
+            // new-handler / locale init, etc. CFF's block-based
+            // flattening produces semantically correct code for
+            // most user functions, but the CRT helpers contain
+            // patterns the current flattener subtly breaks.
+            //
+            // Symptom: `test_exception.cpp` (a minimal C++ try/catch
+            // smoke test) exited 127 with empty stdout under
+            // `-l standard`/`-l strong` without `--no-cfg-flattening`.
+            // A bisect-and-skip pass through the `.pdata` fallback's
+            // function list confirmed the crash is caused by CFF
+            // miscompiling a specific non-handler-bearing CRT
+            // function (RVA 0x184C in the test binary). The same
+            // class of bug likely affects several other CRT helpers
+            // — CFF just happens to tolerate most of them on C-only
+            // code like `test_vm_basic.exe` that doesn't exercise
+            // the same CRT paths.
+            //
+            // The only principled fix is to stop blindly scanning
+            // `.pdata`. CFF coverage now comes from two explicit,
+            // user-scoped inputs:
+            //
+            //   1. `MX_OBFUSCATE_BEGIN/END` markers in user source —
+            //      picked up via `ctx.markers()` and processed in the
+            //      `regions`-based path above this `else` branch.
+            //   2. A `.map` file (`--map-file=<path>`) listing the
+            //      symbol names the user opts into flattening.
+            //
+            // Both sources identify user code the developer has
+            // explicitly chosen to flatten, so CFF can no longer
+            // accidentally touch CRT code. Follow-up work can
+            // investigate the specific flattener bug that breaks
+            // CRT functions and re-enable the automatic path once
+            // it's safe.
+            ctx.log("CfgFlatteningPass: нет .map файла и нет "
+                    "MX_OBFUSCATE_BEGIN/END маркеров — CFF не применён "
+                    "(авто-выбор из .pdata отключён как небезопасный "
+                    "для C++ exception handling — см. комментарий в "
+                    "источнике)");
         }
     }
 
@@ -762,48 +754,59 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
         }
 
         // ==================================================================
-        // Patch .pdata: zero out RUNTIME_FUNCTION entries for CFF'd functions
-        // so the OS doesn't try to unwind through stale unwind info.
-        // The trampoline (JMP) is a leaf instruction — no unwind needed.
-        // ==================================================================
-        struct RuntimeFunction {
-            uint32_t begin_addr;
-            uint32_t end_addr;
-            uint32_t unwind_info;
-        };
-
-        pe::SectionInfo* pdata_sec = nullptr;
-        for (auto& s : ctx.pe_image().sections()) {
-            if (s.name == ".pdata") {
-                pdata_sec = &s;
-                break;
-            }
-        }
-
-        if (pdata_sec && pdata_sec->data.size() >= sizeof(RuntimeFunction)) {
-            const size_t entry_count = pdata_sec->data.size() / sizeof(RuntimeFunction);
-            auto* rt_funcs = reinterpret_cast<RuntimeFunction*>(pdata_sec->data.data());
-
-            std::unordered_set<Rva> trampolined_rvas;
-            trampolined_rvas.reserve(trampolines.size());
-            for (const auto& t : trampolines) {
-                trampolined_rvas.insert(t.original_func_rva);
-            }
-
-            uint32_t patched = 0;
-            for (size_t i = 0; i < entry_count; ++i) {
-                if (trampolined_rvas.contains(rt_funcs[i].begin_addr)) {
-                    rt_funcs[i].begin_addr = 0;
-                    rt_funcs[i].end_addr = 0;
-                    rt_funcs[i].unwind_info = 0;
-                    ++patched;
-                }
-            }
-
-            if (patched > 0) {
-                ctx.log_fmt("CfgFlatteningPass: обнулено {} записей .pdata "
-                            "для трамплинированных функций", patched);
-            }
+        // .pdata handling for trampolined functions.
+        //
+        // Historical bug: this block used to zero out `begin_addr`,
+        // `end_addr`, and `unwind_info` for every trampolined function,
+        // reasoning that "the trampoline (JMP) is a leaf instruction —
+        // no unwind needed." That reasoning is wrong for C++ exception
+        // handling:
+        //
+        //   * The .pdata section is a sorted array of
+        //     `RUNTIME_FUNCTION` entries. The SEH dispatcher
+        //     binary-searches it by `Rip` to find unwind info for
+        //     EVERY frame on the stack, not just the frame an
+        //     exception is thrown from.
+        //
+        //   * When a protected C++ binary throws (even an internal
+        //     CRT exception during startup), the unwinder walks UP
+        //     the stack looking for a handler. If it ever hits a
+        //     frame whose `Rip` resolves to a zeroed .pdata entry,
+        //     `RtlLookupFunctionEntry` returns NULL, the walk fails,
+        //     and the process terminates — usually with exit code
+        //     127, no stdout, because the crash happens inside
+        //     `RtlRaiseException` before user code has a chance to
+        //     print anything.
+        //
+        //   * `test_exception.cpp` reproduces this: before the fix
+        //     it exits 127 with empty output under `-l strong`;
+        //     with `--no-cfg-flattening` it runs to completion.
+        //
+        // Fix: leave .pdata entries intact. The original entry still
+        // points at the original `.xdata` blob, which describes the
+        // function's prologue in RVA-independent terms. For in-place
+        // flattening that's exactly what the runtime still has at
+        // the original RVA (the flattener preserves prologue bytes).
+        // For trampoline mode the original RVA is now a 5-byte
+        // `jmp rel32` + `0xCC` pad, which is:
+        //
+        //   1. Almost never reached with Rip mid-jmp (a single
+        //      instruction), and
+        //   2. Describes a "leaf" function the unwinder can still
+        //      trivially pass through: the original xdata codes
+        //      tell it how to reverse the prologue, and since the
+        //      actual stack state WAS correctly set up by the
+        //      flattened trampoline target before `ret` fires, the
+        //      unwind math agrees.
+        //
+        // This fix preserves CFF's original-RVA-range semantics for
+        // the unwinder without introducing any new .pdata
+        // resizing, reallocation, or header surgery.
+        if (!trampolines.empty()) {
+            ctx.log_fmt("CfgFlatteningPass: .pdata оставлен без изменений "
+                        "({} трамплин. функций) для совместимости с "
+                        "C++ exception unwinder",
+                static_cast<uint32_t>(trampolines.size()));
         }
     }
 
