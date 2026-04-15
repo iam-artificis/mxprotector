@@ -7,6 +7,7 @@
 
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/obfuscation/hash_opaque_predicate.hpp"
+#include "mxprotector/protection/packer/stub_self_hash.hpp"
 #include "mxprotector/protection/packer/veh_int3_trap.hpp"
 
 #include <cstdint>
@@ -165,6 +166,32 @@ void emit_decrypt_body(RawEmitter&        e,
     //   mov r15d, edx                           41 89 D7
     e.u8(0x41); e.u8(0x89); e.u8(0xD7);
 
+    // ----------------------------------------------------------------
+    // P6 — Stub-self-integrity hash.
+    //
+    // Emit the FNV-1a loop that walks the stub's own code bytes
+    // `[stub_start, stub_start + hash_range_end_offset)` and leaves
+    // the resulting 32-bit hash in `r14d`. Every per-layer
+    // `emit_key_derivation_loop` below reads `r14d` as input to the
+    // base→effective key transformation, so any tamper with the
+    // hashed range (debugger INT3, anti-debug NOP patch, reprotect
+    // loop hook, IAT wipe bypass, etc.) propagates through the
+    // derivation into every layer's effective key and the KSA+PRGA
+    // produces a diverged S-box → garbage plaintext.
+    //
+    // Placement rationale: the self-hash sits AFTER the VEH trap
+    // (which clobbers r14 as part of the Hell's Gate resolver's
+    // register budget) and AFTER `mov r15d, edx` (bias save), but
+    // BEFORE `lea r8, sbox`. The self-hash inner loop loads the FNV
+    // prime into `r8d` and would stomp the S-box pointer if we ran
+    // it AFTER the sbox lea — by emitting it first, the subsequent
+    // `lea r8, sbox` reinitialises r8 cleanly and every downstream
+    // KSA read of `[r8 + ...]` is correct. Nothing between this
+    // point and the first derivation loop touches r14, so the hash
+    // survives every layer's setup until consumed.
+    // ----------------------------------------------------------------
+    patches.self_hash = emit_stub_self_hash(e);
+
     // (3) RC4 setup — load the shared S-box pointer.
     //
     // `r8` holds the 256-byte S-box scratch area. Every layer's KSA
@@ -228,6 +255,32 @@ void emit_decrypt_body(RawEmitter&        e,
         e.u8(0x48); e.u8(0x8D); e.u8(0x35);
         lp.rel_to_key_at = static_cast<uint32_t>(e.size());
         e.u32(0);
+
+        // P6 — Per-layer effective-key derivation.
+        //
+        // `rsi` now points at this layer's 32-byte base key embedded
+        // in the `.mxpack` data tail. The derivation loop reads the
+        // stub integrity hash from `r14d` (set by the self-hash loop
+        // above), chains it through every base-key byte with the
+        // FNV-1a multiplicative step, and writes the effective key
+        // back IN PLACE. After the loop `rsi` still points at the
+        // key base — the emitter preserves `rsi` by iterating
+        // through `rcx` — so the downstream KSA phase 2 read of
+        // `[rsi + rdx]` sees the effective bytes with no extra
+        // plumbing.
+        //
+        // Emitted OUTSIDE the `ksa_block_start/end` bracket so that
+        // P3's VM lifter, which only lifts layer 0's KSA body, never
+        // has to deal with the derivation code (which has no
+        // corresponding VM semantics yet — it's pure native x64).
+        //
+        // Clobbers: eax, rcx, rdx, r9d, RFLAGS. All of those are
+        // either dead at this point or about to be rewritten by
+        // the following KSA phase 1/2/3 (phase 1 starts with
+        // `xor ecx, ecx`, phase 3 resets `r9` to 0). `r8` (S-box
+        // pointer) and `r14d` (hash carrier) are explicitly
+        // preserved — see `stub_self_hash.hpp` for the contract.
+        emit_key_derivation_loop(e);
 
         // Mark the start of the VM-liftable KSA block for layer 0.
         // Everything from here through `xor r10, r10` (PRGA state reset)
@@ -571,6 +624,20 @@ void emit_decrypt_body(RawEmitter&        e,
     patches.impdir_size_at = static_cast<uint32_t>(e.size());
     e.u32(0);                             // placeholder size/4
     e.u8(0xF3); e.u8(0xAB);               // rep stosd
+
+    // ----------------------------------------------------------------
+    // P6 — Hash range end.
+    //
+    // The cipher body is complete. Record the end of the hashed
+    // range here so the build-time driver can compute FNV-1a over
+    // `[stub_start, stub_start + hash_range_end_offset)` once every
+    // rel32 inside the body has been finalised and the hash count
+    // imm32 has been patched. Anything the outer stub emitter
+    // appends after this point — pops, stolen bytes, `jmp OEP`,
+    // key blobs, sbox scratch, VM blob, reprotect table, TLS
+    // callback plumbing — lives OUTSIDE the hashed range.
+    // ----------------------------------------------------------------
+    patches.hash_range_end_offset = static_cast<uint32_t>(e.size());
 }
 
 } // namespace mx::packer

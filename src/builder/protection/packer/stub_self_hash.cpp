@@ -141,21 +141,26 @@ void emit_key_derivation_loop(RawEmitter& e) {
     e.u32(32);
 
     // ----------------------------------------------------------------
-    // mov r8d, 0x01000193                41 B8 imm32 (6 bytes)
-    //   FNV-1a prime — same constant as the self-hash loop. r8 is
-    //   loaded fresh per derivation rather than carried across
-    //   because nothing in the layer loop between the self-hash
-    //   exit and the first derivation guarantees r8 is preserved
-    //   (the anti-debug probe + mov r15d, edx + lea r8, sbox all
-    //   run between).
+    // mov r9d, 0x01000193                41 B9 imm32 (6 bytes)
+    //   FNV-1a prime — same constant as the self-hash loop. The
+    //   derivation loop CANNOT use r8 for the prime because by the
+    //   time it runs r8 already holds the live S-box scratch pointer
+    //   (`lea r8, [rip + sbox]` is emitted once at the top of the
+    //   layer loop and the KSA that follows every derivation reads
+    //   `[r8 + ...]` to build / mix the S-box). We use r9d instead
+    //   because r9 is dead at this point: on the first layer it
+    //   holds ABI-scrambled host state, on subsequent layers it
+    //   holds the prior layer's final PRGA `i` value — either way
+    //   the very next `xor r9, r9` in KSA phase 3 resets it, so
+    //   clobbering r9d here is invisible to every downstream user.
     // ----------------------------------------------------------------
-    e.u8(0x41); e.u8(0xB8);
+    e.u8(0x41); e.u8(0xB9);
     e.u32(kFnv1aPrime);
 
     // ----------------------------------------------------------------
     // .derive_loop:
     //   xor   al, byte [rcx]             32 01       (2 bytes)
-    //   imul  eax, r8d                   41 0F AF C0 (4 bytes)
+    //   imul  eax, r9d                   41 0F AF C1 (4 bytes)
     //   mov   [rcx], al                  88 01       (2 bytes)
     //   inc   rcx                        48 FF C1    (3 bytes)
     //   dec   edx                        FF CA       (2 bytes)
@@ -166,8 +171,8 @@ void emit_key_derivation_loop(RawEmitter& e) {
     const size_t loop_start = e.size();
     // xor al, byte ptr [rcx]
     e.u8(0x32); e.u8(0x01);
-    // imul eax, r8d
-    e.u8(0x41); e.u8(0x0F); e.u8(0xAF); e.u8(0xC0);
+    // imul eax, r9d
+    e.u8(0x41); e.u8(0x0F); e.u8(0xAF); e.u8(0xC1);
     // mov [rcx], al
     e.u8(0x88); e.u8(0x01);
     // inc rcx

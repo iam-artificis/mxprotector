@@ -236,21 +236,24 @@ struct StubSelfHashEmit {
  *     replacement is transparent.
  *
  * Clobbers:
- *   * `eax`, `rcx`, `rdx`, `r8d`, RFLAGS.
+ *   * `eax`, `rcx`, `rdx`, `r9d`, RFLAGS.
  *
  * Preserves:
  *   * `rsi` (iterator uses a local `rcx` copy).
  *   * `r14d` (hash is only read, never written).
+ *   * `r8`   (S-box pointer — the caller's `lea r8, sbox` remains
+ *             valid across the derivation loop because the prime is
+ *             loaded into `r9d` instead of `r8d`).
  *
  * Emission layout (32 bytes):
  *
  *     mov   eax, r14d        ; state = hash
  *     mov   rcx, rsi         ; rcx = rsi (iterator copy)
  *     mov   edx, 32          ; counter
- *     mov   r8d, 0x01000193  ; prime
+ *     mov   r9d, 0x01000193  ; prime
  *   .derive_loop:
  *     xor   al, byte [rcx]   ; state_lo ^= base_key[i]
- *     imul  eax, r8d         ; state *= prime
+ *     imul  eax, r9d         ; state *= prime
  *     mov   [rcx], al        ; effective_key[i] = state_lo
  *     inc   rcx              ; advance
  *     dec   edx              ; --count

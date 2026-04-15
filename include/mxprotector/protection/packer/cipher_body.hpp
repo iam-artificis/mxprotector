@@ -37,6 +37,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/protection/packer/stub_self_hash.hpp"
 
 namespace mx::packer {
 
@@ -98,6 +99,34 @@ struct CipherBodyPatches {
 
     uint32_t imagebase_lea_anchor_offset = 0;
     uint32_t imagebase_sub_imm32_at      = 0;
+
+    /**
+     * P6 — stub-self-integrity slots.
+     *
+     * `self_hash` holds the `mov ecx, <count>` imm32 patch offset (and
+     * the emit-time-baked `lea rsi` disp32 and `hash_range_start`) that
+     * the runtime FNV-1a loop at the head of the body uses. The caller
+     * patches `count_imm32_offset` with the total byte count of the
+     * hashed range once the full stub has been emitted.
+     *
+     * `hash_range_end_offset` is set at the END of `emit_decrypt_body`
+     * and points one past the last byte of the cipher body. Combined
+     * with `hash_range_start = 0`, it defines the byte range
+     * `[0, hash_range_end_offset)` that both the build-time hash
+     * computation and the runtime self-hash loop walk. The range
+     * deliberately stops at the end of the decrypt body — pops,
+     * stolen bytes, `jmp OEP`, key blobs, sbox scratch, VM blob,
+     * reprotect table, and the TLS callback plumbing all live
+     * AFTER this point and are OUTSIDE the hashed region. Including
+     * the key blobs would break the clean-run path: the TLS callback
+     * is a no-op on clean hosts so the bytes match build-time at
+     * runtime, but any future mutation of the data tail (e.g., an
+     * on-disk layout change) would risk silent hash drift — keeping
+     * the hash range code-only makes the invariant easy to reason
+     * about.
+     */
+    StubSelfHashEmit self_hash{};
+    uint32_t         hash_range_end_offset = 0;
 };
 
 /**

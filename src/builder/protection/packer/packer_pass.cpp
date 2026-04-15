@@ -35,6 +35,7 @@
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
+#include "mxprotector/protection/packer/stub_self_hash.hpp"
 #include "mxprotector/protection/packer/tls_callback.hpp"
 #include "mxprotector/protection/vm/vm_lifter.hpp"
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
@@ -97,6 +98,9 @@ using mx::packer::StubEmitter;
 using mx::packer::StubEmissionParams;
 using mx::packer::ExeStubEmitter;
 using mx::packer::DllFullStubEmitter;
+
+using mx::packer::fnv1a_32;
+using mx::packer::derive_effective_key_in_place;
 
 
 /// Strip base relocations: clear the directory entry, set the file header's
@@ -401,36 +405,17 @@ template <StubEmitter Emitter>
         return {};
     }
 
-    // Apply N RC4 rounds in BUILD order (0 first, N-1 last). The
-    // runtime decrypts in the opposite order (N-1 first, 0 last),
-    // and since each RC4 round is self-inverse the nested cascade
-    // unwinds to plaintext. Within a single layer we carry one
-    // `Rc4State` across all target sections so the build-time PRGA
-    // stream matches the runtime stream — the runtime's layer PRGA
-    // loops reset `(i, j)` to (0, 0) at the start of each layer but
-    // carry them across sections inside the layer.
-    //
-    // Build-time bias is 0 for every layer: there's no debugger at
-    // build time. Runtime's layer 0 seeds `j` from the anti-debug
-    // probe, which matches the build-time 0 on a clean host and
-    // diverges on a debugged one.
-    for (uint32_t layer = 0; layer < layer_count; ++layer) {
-        Rc4State rc4{};
-        rc4_init(rc4,
-                 ByteView{layer_keys[layer].data(), layer_keys[layer].size()},
-                 /*anti_debug_bias=*/0);
-        for (const auto& tgt : encrypted) {
-            auto& sec = ctx.pe_image().sections()[tgt.image_index];
-            rc4_process(rc4,
-                        MutableByteView{sec.data.data(), sec.data.size()});
-        }
-    }
-
-    for (const auto& tgt : encrypted) {
-        const auto& sec = ctx.pe_image().sections()[tgt.image_index];
-        ctx.log_fmt("PackerPass: зашифрована (RC4 ×{}) '{}' (RVA=0x{:08X}, {} байт)",
-            layer_count, sec.name, sec.virtual_address, tgt.size);
-    }
+    // P6 — section encryption is DEFERRED until after the stub is
+    // fully assembled and patched. The effective cipher keys that
+    // encrypt each section are a function of the stub's FNV-1a self
+    // integrity hash, which can only be computed once every rel32
+    // inside the stub and the hash count imm32 have been finalised.
+    // The sections stay plaintext in `pe_image` until the final
+    // "hash + derive + encrypt" block at the end of this function,
+    // which runs after TLS callback finalisation. Nothing between
+    // here and that block reads section contents — every downstream
+    // step only needs section RVAs and sizes, which are already
+    // captured in `encrypted`.
 
     // G3 Phase 2 VEH INT3 trap gate: opt-in AND EXE-only. DLL stubs
     // cannot safely install a VEH — it would outlive the DLL's
@@ -859,6 +844,105 @@ template <StubEmitter Emitter>
             tls_cb.key_layer_index,
             tls_cb.key_byte_offset_in_key);
         (void)tls_dir_va;  // reserved for future use (direct self-reference)
+    }
+
+    // ----------------------------------------------------------
+    // P6 — stub-self-integrity hash + effective-key derivation.
+    //
+    // Every rel32 inside the cipher body has been patched (layer
+    // keys, sections, sbox, ImageBase, reprotect table, IAT wipe,
+    // optional VM-lift call, TLS plumbing outside the hash range).
+    // We now:
+    //
+    //   1. Patch the runtime self-hash loop's `count imm32` slot
+    //      with the finalised `hash_range_end_offset`. The count
+    //      is INSIDE the hashed range, so this write must happen
+    //      before we compute the build-time hash.
+    //
+    //   2. Compute `fnv1a_32` over `pack_sec.data[0 ..
+    //      hash_range_end_offset)`. Bit-exact against what the
+    //      runtime self-hash loop will produce on a clean host.
+    //      Any tamper that changes any byte in this range at
+    //      runtime — debugger INT3, hotpatch, NOP'd anti-debug
+    //      probe, hooked reprotect syscall, etc. — will cascade
+    //      through the per-layer key derivation and produce a
+    //      diverged effective key.
+    //
+    //   3. For each cipher layer, copy the base key into a
+    //      scratch `effective` buffer and apply
+    //      `derive_effective_key_in_place(hash, effective)`. The
+    //      stub's runtime derivation loop produces the same
+    //      32 bytes per layer, so encrypting the target sections
+    //      with `effective` here gives the runtime a cascade that
+    //      unwinds to plaintext on a clean host.
+    //
+    //   4. Encrypt every target section by running RC4 with the
+    //      per-layer effective key in BUILD order (0 → N-1). The
+    //      runtime decrypts in reverse order (N-1 → 0) and each
+    //      RC4 round is self-inverse, so the cascade unwinds.
+    //      Build-time anti-debug bias is 0 (clean host), matching
+    //      layer 0's runtime seed when no debugger is attached.
+    //
+    // Base keys remain unmodified inside the stub's data tail —
+    // the runtime re-derives effective keys from `base + hash`
+    // every time the process starts. An attacker who statically
+    // reads the keys out of `.mxpack` no longer has enough
+    // information to decrypt the sections offline; they must
+    // also simulate the exact FNV-1a hash over the stub code
+    // AND the FNV-1a-chain derivation. That's a real bump in
+    // reverser effort for mass-protected samples.
+    {
+        const uint32_t hash_range_end = patches.hash_range_end_offset;
+        if (hash_range_end == 0 ||
+            hash_range_end > pack_sec.data.size())
+        {
+            ctx.log("PackerPass: P6 — некорректный hash_range_end, пропуск");
+            return std::unexpected(
+                MxError{ProtectionErrorCode::pass_failed,
+                        "P6: hash_range_end_offset out of bounds"});
+        }
+
+        // (1) Patch the runtime count imm32 with the finalised byte count.
+        write_i32(pack_sec.data,
+                  patches.self_hash.count_imm32_offset,
+                  static_cast<int32_t>(hash_range_end));
+
+        // (2) Compute FNV-1a over the now-finalised hashed range.
+        const uint32_t stub_hash = fnv1a_32(
+            ByteView{pack_sec.data.data(), hash_range_end});
+
+        ctx.log_fmt("PackerPass: P6 stub self-hash = 0x{:08X} over [0, 0x{:X})",
+            stub_hash, hash_range_end);
+
+        // (3) + (4) Derive effective keys and encrypt every target
+        //           section with them. We reuse the base key buffers
+        //           already written into the stub at build time — the
+        //           derivation is applied to a local COPY so the stub's
+        //           in-section bytes stay as base keys (which is what
+        //           the runtime derivation loop consumes).
+        for (uint32_t layer = 0; layer < layer_count; ++layer) {
+            ByteBuffer effective = layer_keys[layer];
+            derive_effective_key_in_place(
+                stub_hash,
+                MutableByteView{effective.data(), effective.size()});
+
+            Rc4State rc4{};
+            rc4_init(rc4,
+                     ByteView{effective.data(), effective.size()},
+                     /*anti_debug_bias=*/0);
+            for (const auto& tgt : encrypted) {
+                auto& sec = ctx.pe_image().sections()[tgt.image_index];
+                rc4_process(rc4,
+                            MutableByteView{sec.data.data(), sec.data.size()});
+            }
+        }
+
+        for (const auto& tgt : encrypted) {
+            const auto& sec = ctx.pe_image().sections()[tgt.image_index];
+            ctx.log_fmt("PackerPass: зашифрована (RC4 ×{}, P6) '{}' "
+                        "(RVA=0x{:08X}, {} байт)",
+                layer_count, sec.name, sec.virtual_address, tgt.size);
+        }
     }
 
     ctx.log("PackerPass: упаковка завершена");

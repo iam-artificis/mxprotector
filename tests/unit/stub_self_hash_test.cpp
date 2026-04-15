@@ -286,7 +286,7 @@ TEST(StubSelfHash, EmitDerivationLoopHasExpectedLayout) {
     //   [03-05] 48 89 F1        (mov rcx, rsi)
     //   [06]    BA              (mov edx, imm32)
     //   [07-10] imm32 = 32
-    //   [11-12] 41 B8           (mov r8d, imm32)
+    //   [11-12] 41 B9           (mov r9d, imm32)
     //   [13-16] imm32 = FNV prime
     EXPECT_EQ(e.buf[0],  0x44u);
     EXPECT_EQ(e.buf[1],  0x89u);
@@ -300,7 +300,7 @@ TEST(StubSelfHash, EmitDerivationLoopHasExpectedLayout) {
     EXPECT_EQ(read_u32_le(e.buf, 7), 32u);
 
     EXPECT_EQ(e.buf[11], 0x41u);
-    EXPECT_EQ(e.buf[12], 0xB8u);
+    EXPECT_EQ(e.buf[12], 0xB9u);
     EXPECT_EQ(read_u32_le(e.buf, 13), kFnv1aPrime);
 }
 
@@ -310,14 +310,14 @@ TEST(StubSelfHash, EmitDerivationLoopBodyHasXorAlAndImul) {
 
     // Loop body at offsets 17..31:
     //   xor al, [rcx]    32 01       (2)
-    //   imul eax, r8d    41 0F AF C0 (4)
+    //   imul eax, r9d    41 0F AF C1 (4)
     //   mov [rcx], al    88 01       (2)
     //   inc rcx          48 FF C1    (3)
     //   dec edx          FF CA       (2)
     //   jnz rel8         75 rel8     (2)
     EXPECT_EQ(e.buf[17], 0x32u); EXPECT_EQ(e.buf[18], 0x01u);
     EXPECT_EQ(e.buf[19], 0x41u); EXPECT_EQ(e.buf[20], 0x0Fu);
-    EXPECT_EQ(e.buf[21], 0xAFu); EXPECT_EQ(e.buf[22], 0xC0u);
+    EXPECT_EQ(e.buf[21], 0xAFu); EXPECT_EQ(e.buf[22], 0xC1u);
     EXPECT_EQ(e.buf[23], 0x88u); EXPECT_EQ(e.buf[24], 0x01u);
     EXPECT_EQ(e.buf[25], 0x48u); EXPECT_EQ(e.buf[26], 0xFFu);
     EXPECT_EQ(e.buf[27], 0xC1u);
