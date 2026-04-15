@@ -14,9 +14,6 @@
 5. 📋 **P2 — Multi-layer unpack:** Multiple cipher rounds in packer stub, each layer with its own key. Defeats single-pass dumping.
 6. 📋 **G3 Phase 2 — VEH-based INT3 trap (gated):** Plant INT3 + chained VEH that strictly handles only own addresses (returns `CONTINUE_SEARCH` for others, preserving C++ try/catch). EXE-only, behind `--anti-tamper-veh` flag. Needs C++ exception test EXE before merge.
 
-### Tier B — in-progress
-- 📋 **P6 — Stub-self-integrity-bound cipher keys:** Each RC4 layer's effective key is `derive(base_key, stub_self_hash)` where `stub_self_hash` is an FNV-1a over the packer's own code range. Build-time and runtime compute the same hash; effective keys stored as base keys. Any stub tampering (debugger breakpoint, patched anti-debug, inline hook) changes the runtime hash → wrong effective keys → decryption produces garbage. Does NOT protect against full memory dumping AFTER successful execution — that needs P7. Honestly positioned as "static extraction + stub tampering protection".
-
 ### Tier C — defer / skip
 - **P7 — Per-function runtime decryption:** True anti-dumping via VEH page-fault handlers. Each function stays encrypted at rest; accessing a page triggers a VEH that decrypts on demand and re-encrypts after execution. Very complex (requires whole-program function boundary tracking, VEH chain management, page-granular re-encryption scheduling). Multi-commit milestone, dedicated effort. **Prerequisite**: P6 (key derivation plumbing reused).
 - **`--guarded-regions` flag (P6 follow-up, short-term):** Encrypt sections that aren't part of normal execution (`.rdata` string tables, `.data` globals that are immutable after init, unreached `.text` cold paths). Defends against static dumping where an attacker extracts ciphertext from an on-disk binary. One-pass encryption at build + runtime decrypt in the packer stub similar to existing `.text` handling. Estimated ~1 commit after P6.
