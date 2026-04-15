@@ -89,17 +89,23 @@ concept StubEmitter = requires(T& t, Randomizer& rng, ByteView stolen) {
  * @brief Per-stub emission parameters shared by EXE and full-DLL
  *        stubs.
  *
- *   * `section_count` — number of target sections the decrypt loops
- *                      iterate over.
- *   * `layer_count`   — number of cipher rounds (P2). Each round
- *                      owns its own RC4 key and its own per-section
- *                      PRGA loop; the runtime decrypts layers
- *                      `N-1 → 0`, and build-time encryption applies
- *                      them in the reverse order.
+ *   * `section_count`   — number of target sections the decrypt loops
+ *                        iterate over.
+ *   * `layer_count`     — number of cipher rounds (P2). Each round
+ *                        owns its own RC4 key and its own per-section
+ *                        PRGA loop; the runtime decrypts layers
+ *                        `N-1 → 0`, and build-time encryption applies
+ *                        them in the reverse order.
+ *   * `enable_veh_trap` — G3 Phase 2 Vectored Exception Handler INT3
+ *                        trap. Opt-in (`--anti-tamper-veh`) and
+ *                        EXE-only. The DLL stub constructor forces
+ *                        this to false because a DLL-installed VEH
+ *                        outlives the DLL's unload.
  */
 struct StubEmissionParams {
     uint32_t section_count;
     uint32_t layer_count;
+    bool     enable_veh_trap;
 };
 
 /**
@@ -122,7 +128,8 @@ struct StubEmissionParams {
 build_exe_stub_bytes(Randomizer& rng,
                      ByteView    stolen_bytes,
                      uint32_t    section_count,
-                     uint32_t    layer_count);
+                     uint32_t    layer_count,
+                     bool        enable_veh_trap);
 
 /**
  * @brief Build the full-DLL stub code bytes (pre-patch).
@@ -158,6 +165,9 @@ build_dll_full_stub_bytes(Randomizer& rng,
                           ByteView    stolen_bytes,
                           uint32_t    section_count,
                           uint32_t    layer_count);
+// Note: no `enable_veh_trap` parameter — DLLs cannot safely install
+// Vectored Exception Handlers (the VEH would outlive the DLL's
+// unload). The full-DLL stub always passes false to the cipher body.
 
 /**
  * @brief StubEmitter policy for the EXE shape.
@@ -177,7 +187,8 @@ public:
     emit(Randomizer& rng, ByteView stolen_bytes) {
         return build_exe_stub_bytes(rng, stolen_bytes,
                                     params_.section_count,
-                                    params_.layer_count);
+                                    params_.layer_count,
+                                    params_.enable_veh_trap);
     }
 
 private:

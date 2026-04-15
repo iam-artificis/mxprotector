@@ -157,8 +157,20 @@ void emit_hells_gate_resolver(RawEmitter& e,
 /// On success r13 holds the full 64-bit function address. On failure
 /// r13 is left at 0, same contract as the SSN variant. `salt`
 /// follows the same rules as for `emit_hells_gate_resolver`.
+///
+/// `validate_syscall_prologue` controls whether the emitted code
+/// compares the matched function's prologue against the canonical
+/// syscall stub pattern `4C 8B D1 B8` (`mov r10, rcx; mov eax, ...`)
+/// before accepting the address. Every Nt* syscall stub has that
+/// prologue, so the default `true` is correct for syscall-based
+/// callers (e.g., the packer's NtProtectVirtualMemory reprotect
+/// loop). Non-syscall exports like `RtlAddVectoredExceptionHandler`
+/// have a different prologue and MUST pass `false` — otherwise the
+/// prologue check fails and the resolver returns 0 on every call,
+/// defeating the whole point of the lookup.
 void emit_hells_gate_address_resolver(RawEmitter& e,
                                       uint32_t    target_name_hash,
-                                      uint32_t    salt = 0);
+                                      uint32_t    salt = 0,
+                                      bool        validate_syscall_prologue = true);
 
 } // namespace mx::anti_tamper

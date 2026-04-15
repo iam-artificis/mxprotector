@@ -7,6 +7,7 @@
 
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/obfuscation/hash_opaque_predicate.hpp"
+#include "mxprotector/protection/packer/veh_int3_trap.hpp"
 
 #include <cstdint>
 
@@ -16,7 +17,8 @@ void emit_decrypt_body(RawEmitter&        e,
                        CipherBodyPatches& patches,
                        Randomizer&        rng,
                        uint32_t           section_count,
-                       uint32_t           layer_count)
+                       uint32_t           layer_count,
+                       bool               enable_veh_trap)
 {
     // P2 — allocate per-layer patch storage up front. The emission loop
     // below fills entries in runtime-decrypt order (N-1 first, 0 last);
@@ -62,6 +64,37 @@ void emit_decrypt_body(RawEmitter&        e,
         const obf::HashOpaqueParams hp =
             obf::randomize_hash_opaque_params(rng);
         obf::emit_hash_opaque_predicate(e, hp, rng);
+    }
+
+    // ----------------------------------------------------------------
+    // G3 Phase 2 — VEH INT3 trap (opt-in, EXE-only).
+    //
+    // When the caller sets `enable_veh_trap`, install a Vectored
+    // Exception Handler and plant an `int3 + 6 junk bytes` region
+    // here. The handler's filter is strict: it only acts on an
+    // exception whose code is STATUS_BREAKPOINT AND whose address
+    // is the exact runtime VA of the planted int3. Every other
+    // exception — including C++ `throw` — gets
+    // EXCEPTION_CONTINUE_SEARCH so the protected binary's own
+    // try/catch machinery is unaffected. See `veh_int3_trap.cpp`
+    // for the full encoding and `test_exception.cpp` for the
+    // compatibility smoke test.
+    //
+    // The trap is emitted BEFORE the anti-debug probe because the
+    // Hell's Gate resolver inside the trap clobbers r15 (loop
+    // counter), and the probe's bias capture into r15d happens
+    // AFTER the probe — so ordering the trap first means the VEH
+    // install has no register-state conflict with the downstream
+    // bias save.
+    //
+    // Gating is the caller's responsibility: `enable_veh_trap` must
+    // only be true when `pe_type == executable` AND the user passed
+    // `--anti-tamper-veh`. DLL stubs MUST NOT enable this because a
+    // DLL-installed VEH outlives the DLL's unload and would leave a
+    // dangling handler pointing at freed memory in the host process.
+    // ----------------------------------------------------------------
+    if (enable_veh_trap) {
+        emit_veh_int3_trap(e, rng);
     }
 
     // (2) Anti-debug — polymorphic. Each variant reads a different Windows

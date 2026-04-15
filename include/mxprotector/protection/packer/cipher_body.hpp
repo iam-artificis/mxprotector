@@ -122,16 +122,28 @@ struct CipherBodyPatches {
  * entry must be 16-aligned after any caller-side saves so the
  * reprotect block's `and rsp, -16` is a no-op.
  *
- * @param e              Emitter to append bytes to.
- * @param patches        Patch descriptor — filled in during emission.
- * @param rng            Randomiser for the anti-debug probe variant.
- * @param section_count  Number of target sections each layer decrypts.
- * @param layer_count    Number of cipher layers (≥ 1).
+ * When `enable_veh_trap` is true, the body plants the G3 Phase 2
+ * Vectored Exception Handler + INT3 trap at the very top, BEFORE
+ * the anti-debug probe. The trap is opt-in and EXE-only; callers
+ * are responsible for gating on `pe_type == executable` and the
+ * config flag before setting the parameter to true. See
+ * `veh_int3_trap.hpp` for the rationale.
+ *
+ * @param e               Emitter to append bytes to.
+ * @param patches         Patch descriptor — filled in during emission.
+ * @param rng             Randomiser for the anti-debug probe variant,
+ *                        the G6 opaque predicate, and (optionally)
+ *                        the VEH trap salt and junk tail.
+ * @param section_count   Number of target sections each layer decrypts.
+ * @param layer_count     Number of cipher layers (≥ 1).
+ * @param enable_veh_trap Opt-in flag for the G3 Phase 2 VEH INT3
+ *                        trap. Must be false for DLL stubs.
  */
 void emit_decrypt_body(RawEmitter&        e,
                        CipherBodyPatches& patches,
                        Randomizer&        rng,
                        uint32_t           section_count,
-                       uint32_t           layer_count);
+                       uint32_t           layer_count,
+                       bool               enable_veh_trap);
 
 } // namespace mx::packer

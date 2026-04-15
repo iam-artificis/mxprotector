@@ -432,10 +432,29 @@ template <StubEmitter Emitter>
             layer_count, sec.name, sec.virtual_address, tgt.size);
     }
 
+    // G3 Phase 2 VEH INT3 trap gate: opt-in AND EXE-only. DLL stubs
+    // cannot safely install a VEH — it would outlive the DLL's
+    // unload and leave a dangling handler in the host process. The
+    // DllFullStubEmitter forces `enable_veh_trap=false` inside its
+    // emit() regardless of what we pass here, but we still clear
+    // the flag at this level so the log / params reflect reality.
+    const bool pe_is_exe =
+        ctx.pe_image().pe_type() == PeType::executable;
+    const bool enable_veh_trap =
+        ctx.config().enable_veh_anti_tamper && pe_is_exe;
+
+    if (ctx.config().enable_veh_anti_tamper && !pe_is_exe) {
+        ctx.log("PackerPass: --anti-tamper-veh проигнорирован для DLL "
+                "(VEH переживёт unload — unsafe)");
+    } else if (enable_veh_trap) {
+        ctx.log("PackerPass: G3 Phase 2 VEH INT3 trap включён");
+    }
+
     // Emit the stub via the policy-specified emitter.
     Emitter emitter{StubEmissionParams{
-        .section_count = static_cast<uint32_t>(encrypted.size()),
-        .layer_count   = layer_count,
+        .section_count   = static_cast<uint32_t>(encrypted.size()),
+        .layer_count     = layer_count,
+        .enable_veh_trap = enable_veh_trap,
     }};
     auto [stub_buf, patches] = emitter.emit(
         rng, ByteView{steal.stolen_bytes.data(), steal.stolen_bytes.size()});

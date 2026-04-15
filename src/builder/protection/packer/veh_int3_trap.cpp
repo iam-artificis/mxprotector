@@ -189,13 +189,18 @@ void emit_veh_int3_trap(RawEmitter& e, Randomizer& rng) {
     e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x28);
 
     // Hell's Gate address resolver → r13 = RtlAddVectoredExceptionHandler.
+    // `validate_syscall_prologue=false` because this target is a
+    // plain user-mode function, not an Nt* syscall stub — its
+    // prologue doesn't start with `4C 8B D1 B8` and the default
+    // validation would reject every lookup.
     {
         const uint32_t salt = rng.next_u32();
         const uint32_t target_hash = anti_tamper::djb2_ascii_hash_salted(
             "RtlAddVectoredExceptionHandler", salt);
         RawEmitter tmp{};
         anti_tamper::emit_hells_gate_address_resolver(
-            tmp, target_hash, salt);
+            tmp, target_hash, salt,
+            /*validate_syscall_prologue=*/false);
         e.bytes(ByteView{tmp.buf.data(), tmp.buf.size()});
     }
 

@@ -16,7 +16,8 @@ std::pair<ByteBuffer, ExeStubPatches>
 build_exe_stub_bytes(Randomizer& rng,
                      ByteView    stolen_bytes,
                      uint32_t    section_count,
-                     uint32_t    layer_count)
+                     uint32_t    layer_count,
+                     bool        enable_veh_trap)
 {
     RawEmitter e;
     e.buf.reserve(128 + (32 + 32 * section_count) * layer_count +
@@ -36,7 +37,8 @@ build_exe_stub_bytes(Randomizer& rng,
     // (2) Shared decrypt body — anti-debug, KSA, PRGA per section,
     //     reprotect, IAT wipe. Populates the CipherBodyPatches slots
     //     of `patches` via the multi-inheritance base.
-    emit_decrypt_body(e, patches, rng, section_count, layer_count);
+    emit_decrypt_body(e, patches, rng, section_count, layer_count,
+                      enable_veh_trap);
 
     // (3) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
@@ -95,8 +97,11 @@ build_dll_full_stub_bytes(Randomizer& rng,
     const uint32_t reason_jne_rel32_at = static_cast<uint32_t>(e.size());
     e.u32(0);
 
-    // (3) Shared decrypt body.
-    emit_decrypt_body(e, patches, rng, section_count, layer_count);
+    // (3) Shared decrypt body. DLLs never enable the VEH trap —
+    //     a DLL-installed VEH survives the DLL's unload and would
+    //     leave a dangling handler in the host process.
+    emit_decrypt_body(e, patches, rng, section_count, layer_count,
+                      /*enable_veh_trap=*/false);
 
     // (4) .forward: — back-patch the jne target.
     {

