@@ -176,17 +176,39 @@ struct CommonStubPatches {
     uint32_t rel_to_oep_at       = 0;
 };
 
+/// Patch offsets for ONE cipher layer inside a multi-layer stub.
+///
+/// Each layer has its own RC4 key (baked as 32 bytes elsewhere in the
+/// stub buffer) and its own per-section decrypt loop. The runtime walks
+/// layers from `N-1` down to `0`, so layer 0 is the innermost layer —
+/// it's the last one undone at runtime and the one whose KSA is seeded
+/// with the anti-debug bias. See `emit_decrypt_body` for the full layer
+/// ordering rationale.
+///
+/// Both fields are stub-relative byte offsets:
+///   * `rel_to_key_at`  — rel32 inside `lea rsi, [rip + key_rel32]`
+///                       that selects this layer's key pointer.
+///   * `sections`       — per-target-section decrypt-loop patch sites
+///                       (one per encrypted section, filled by the
+///                       caller with section RVA and byte count).
+struct LayerPatches {
+    uint32_t                    rel_to_key_at = 0;
+    std::vector<DecryptSection> sections;
+};
+
 /// Patch offsets produced by the shared decrypt-body emitter
 /// (`emit_decrypt_body`). Every stub that embeds the cipher pipeline —
 /// EXE today, full DLL next — exposes these through multi-inheritance
 /// so the caller code that patches them stays emitter-agnostic.
 struct CipherBodyPatches {
-    // Per-section patch sites (see DecryptSection above). Populated in
-    // stub-emission order; the caller patches each one to its section RVA
-    // and byte count.
-    std::vector<DecryptSection> sections;
+    // One entry per cipher layer (see P2 multi-layer comment in
+    // `emit_decrypt_body`). Layer 0 is the innermost (bias-seeded
+    // layer, runtime: LAST) and layer N-1 is the outermost (runtime:
+    // first). Each layer has its own 32-byte RC4 key and its own
+    // per-section decrypt loop; the S-box scratch area below is
+    // shared because every layer's KSA rebuilds it from scratch.
+    std::vector<LayerPatches> layers;
 
-    uint32_t rel_to_key_at       = 0;  ///< rel32 from end-of-lea to embedded 32-byte RC4 key
     uint32_t rel_to_sbox_at      = 0;  ///< rel32 from end-of-lea to 256-byte scratch S-box
 
     // P3 — VM-protected entry stub. The range
@@ -359,11 +381,37 @@ struct StolenPlan {
 
 /// Append the shared decrypt body to `buf`:
 ///   anti-debug probe → edx ∈ {0, 1}
-///   lea rsi = key; lea r8 = sbox
-///   RC4 KSA (init + mix + PRGA state reset, VM-liftable range)
-///   per-section RC4 PRGA decrypt loop (state carried across sections)
+///   mov r15d, edx                 ; save bias across layer boundaries
+///   lea r8 = sbox                 ; shared scratch (every layer rebuilds it)
+///   for k = layer_count-1 down to 0:
+///     lea rsi = key[k]
+///     RC4 KSA phase 1 / 2 / 3     ; phase 2 seeds j=r15d only for layer 0
+///     per-section RC4 PRGA decrypt loop (state carried across sections)
 ///   reprotect loop (Hell's Gate → NtProtectVirtualMemory per section)
 ///   Import Directory wipe
+///
+/// P2 — Multi-layer unpack: the runtime applies `layer_count` cipher
+/// rounds, each with its own embedded key. Build-time encryption runs
+/// the layers in REVERSE order (layer 0 first, layer N-1 last) so that
+/// runtime decryption — which walks layers from N-1 down to 0 — undoes
+/// them in the correct order. XOR is self-inverse, so the cascade
+/// reduces to applying the per-layer keystream in symmetric order.
+///
+/// Anti-debug bias is woven ONLY into layer 0 (the innermost, runtime-
+/// last layer). Under a debugger, layer 0's KSA seeds `j = 1` instead
+/// of `j = 0`, produces a divergent S-box, and its PRGA XORs with a
+/// wrong keystream — the final bytes are garbage before the stub
+/// reaches the OEP, regardless of how many outer layers decrypted
+/// cleanly. The bias itself is captured into `r15d` right after the
+/// probe (`mov r15d, edx`) and stays there across every outer layer's
+/// KSA, because r15 is nonvolatile-enough for this block: it's free
+/// from the start of the body until the reprotect loop reloads it
+/// with its iteration count, which happens AFTER all layers finish.
+///
+/// Only layer 0's KSA is exposed to the P3 VM lifter via
+/// `ksa_block_start/end_offset`. Outer layers' KSAs stay as plaintext
+/// x64 — they would need their own ksa range tracking, and the MVP
+/// keeps the lift surface minimal to avoid multiplying VM-blob size.
 ///
 /// This body is emitter-agnostic: EXE and full-DLL stubs both wrap it in
 /// their own register save/restore (and, for DLL, a `reason != ATTACH`
@@ -382,7 +430,8 @@ struct StolenPlan {
 void emit_decrypt_body(ByteBuffer& buf,
                        CipherBodyPatches& patches,
                        Randomizer& rng,
-                       uint32_t section_count)
+                       uint32_t section_count,
+                       uint32_t layer_count)
 {
     auto u8 = [&](uint8_t v) { buf.push_back(v); };
     auto u32 = [&](uint32_t v) {
@@ -392,7 +441,12 @@ void emit_decrypt_body(ByteBuffer& buf,
         buf.push_back(static_cast<uint8_t>(v >> 24));
     };
 
-    patches.sections.reserve(section_count);
+    // P2 — allocate per-layer patch storage up front. The emission loop
+    // below fills entries in runtime-decrypt order (N-1 first, 0 last);
+    // the caller addresses each layer by its logical index and the
+    // in-memory position of the per-layer LEAs is irrelevant to patching.
+    patches.layers.resize(layer_count);
+    for (auto& lp : patches.layers) lp.sections.reserve(section_count);
 
     // (2) Anti-debug — polymorphic. Each variant reads a different Windows
     //     "debugger present" indicator and normalizes the result to `edx`
@@ -469,16 +523,24 @@ void emit_decrypt_body(ByteBuffer& buf,
         }
     }
 
-    // (3) RC4 setup — load the key and scratch S-box pointers.
+    // P2 — Bias carrier. `edx` holds the anti-debug bias right after
+    // the probe, but we're about to clobber edx inside each layer's KSA
+    // phase 2 (it's used as scratch for `mov dl, cl; and dl, 0x1F`).
+    // Copy the bias into `r15d` so it survives every KSA call until
+    // layer 0's phase 2 reads it back. r15 is free from here until the
+    // reprotect loop reloads it with its iteration counter, which runs
+    // AFTER all layers finish.
     //
-    // `rsi` holds the 32-byte key. `r8` holds the 256-byte S-box
-    // scratch area. Both are `lea rip+disp32` loads whose disp32
-    // slots the caller patches after the stub section RVA is known.
+    //   mov r15d, edx                           41 89 D7
+    u8(0x41); u8(0x89); u8(0xD7);
+
+    // (3) RC4 setup — load the shared S-box pointer.
     //
-    //   lea rsi, [rip + key_rel32]   48 8D 35 rel32
-    u8(0x48); u8(0x8D); u8(0x35);
-    patches.rel_to_key_at = static_cast<uint32_t>(buf.size());
-    u32(0);
+    // `r8` holds the 256-byte S-box scratch area. Every layer's KSA
+    // rebuilds the full S-box from S[k]=k, so layers can share one
+    // scratch region. The per-layer `lea rsi, key_K` load happens
+    // inside the layer emission loop below.
+    //
     //   lea r8,  [rip + sbox_rel32]  4C 8D 05 rel32
     u8(0x4C); u8(0x8D); u8(0x05);
     patches.rel_to_sbox_at = static_cast<uint32_t>(buf.size());
@@ -493,9 +555,11 @@ void emit_decrypt_body(ByteBuffer& buf,
     //     inc  cl                     ; k++
     //     jnz  .init                  ; wraps at 256 → exit
     //
-    //   Phase 2 — mix with the key, seeded by the anti-debug bias:
+    //   Phase 2 — mix with the key, seeded by the anti-debug bias
+    //             (only on layer 0; other layers start with j = 0):
     //     xor  ecx, ecx               ; k = 0
-    //     mov  ebx, edx               ; j  = edx (0 normally, 1 under a debugger)
+    //     mov  ebx, r15d              ; j = bias    (layer 0 only)
+    //       or  xor  ebx, ebx         ; j = 0       (outer layers)
     //   .ksa:
     //     movzx eax, byte [r8 + rcx]  ; al = S[k]
     //     mov  dl, cl                 ; dl = k
@@ -512,111 +576,147 @@ void emit_decrypt_body(ByteBuffer& buf,
     //     xor  r9,  r9                ; i = 0
     //     xor  r10, r10               ; j = 0
 
-    // Mark the start of the VM-liftable KSA block. Everything from
-    // here through `xor r10, r10` (PRGA state reset) is pure
-    // register / r8-or-rsi-relative code — no rip-relative memory
-    // operands, no syscalls, no external branches. Safe for the
-    // VmLifter.
-    patches.ksa_block_start_offset = static_cast<uint32_t>(buf.size());
-
-    // Phase 1: init S[k] = k.
-    u8(0x31); u8(0xC9);                          // xor ecx, ecx
-    const uint32_t init_loop_start = static_cast<uint32_t>(buf.size());
-    u8(0x41); u8(0x88); u8(0x0C); u8(0x08);      // mov [r8+rcx], cl
-    u8(0xFE); u8(0xC1);                          // inc cl
+    // P2 — Emit `layer_count` cipher rounds in RUNTIME DECRYPT order
+    // (N-1 first, 0 last). Layer 0 is the innermost; build-time
+    // encryption applies layers in the reverse order (0, 1, ..., N-1)
+    // so that runtime decryption undoes them correctly. Only layer 0's
+    // KSA is exposed to the P3 VM lifter — the `ksa_block_start/end`
+    // fields are filled in only when the inner iteration hits
+    // `layer_idx == 0`.
+    for (int32_t layer_idx = static_cast<int32_t>(layer_count) - 1;
+         layer_idx >= 0; --layer_idx)
     {
-        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-        const int32_t  rel8    = static_cast<int32_t>(init_loop_start) -
-                                 static_cast<int32_t>(jnz_end);
-        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-    }
+        const bool is_bias_layer = (layer_idx == 0);
+        LayerPatches& lp = patches.layers[layer_idx];
 
-    // Phase 2: KSA mix.
-    u8(0x31); u8(0xC9);                          // xor ecx, ecx    (k = 0)
-    u8(0x89); u8(0xD3);                          // mov ebx, edx    (j = anti-debug bias)
-    const uint32_t ksa_loop_start = static_cast<uint32_t>(buf.size());
-    u8(0x41); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08); // movzx eax, byte [r8+rcx]
-    u8(0x88); u8(0xCA);                          // mov dl, cl
-    u8(0x80); u8(0xE2); u8(0x1F);                // and dl, 0x1F
-    u8(0x00); u8(0xC3);                          // add bl, al        (j += S[k])
-    u8(0x02); u8(0x1C); u8(0x16);                // add bl, [rsi+rdx] (j += key[k mod 32])
-    u8(0x41); u8(0x0F); u8(0xB6); u8(0x14); u8(0x18); // movzx edx, byte [r8+rbx] (dl = S[j])
-    u8(0x41); u8(0x88); u8(0x04); u8(0x18);      // mov [r8+rbx], al  (S[j] = S[k])
-    u8(0x41); u8(0x88); u8(0x14); u8(0x08);      // mov [r8+rcx], dl  (S[k] = old S[j])
-    u8(0xFE); u8(0xC1);                          // inc cl
-    {
-        const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-        const int32_t  rel8    = static_cast<int32_t>(ksa_loop_start) -
-                                 static_cast<int32_t>(jnz_end);
-        u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-    }
-
-    // Phase 3: zero the PRGA (i, j) state. These are carried across all
-    // per-section decrypt loops so the cipher streams through every
-    // protected section end-to-end — the same way the old XOR carried
-    // `dl` across sections.
-    u8(0x4D); u8(0x31); u8(0xC9);                // xor r9, r9     (i  = 0)
-    u8(0x4D); u8(0x31); u8(0xD2);                // xor r10, r10   (j  = 0)
-
-    // End of the VM-liftable KSA block. The caller may replace the
-    // range `[ksa_block_start_offset, ksa_block_end_offset)` with a
-    // `call rel32 <vm_entry>` + NOP pad, hiding the RC4 setup inside
-    // a VM region.
-    patches.ksa_block_end_offset = static_cast<uint32_t>(buf.size());
-
-    // (4) Per-section decrypt loop — RC4 PRGA.
-    //
-    // State at entry: r8 = S-box ptr, r9b = PRGA i, r10b = PRGA j,
-    //                 rdi/ecx = per-section dest ptr and length.
-    //
-    //   .loop:
-    //     inc   r9b                           ; i++
-    //     movzx eax, byte [r8 + r9]           ; al = S[i]
-    //     add   r10b, al                      ; j += S[i]
-    //     movzx edx, byte [r8 + r10]          ; dl = S[j]
-    //     mov   [r8 + r10], al                ; S[j] = S[i]
-    //     mov   [r8 + r9],  dl                ; S[i] = S[j] (swap)
-    //     add   al, dl                        ; al = (S[i]+S[j]) mod 256
-    //     movzx eax, al                       ; zero-extend sum
-    //     mov   al, [r8 + rax]                ; K = S[sum]
-    //     xor   [rdi], al                     ; decrypt one byte
-    //     inc   rdi                           ; advance dst
-    //     dec   ecx                           ; length--
-    //     jnz   .loop
-    for (uint32_t s = 0; s < section_count; ++s) {
-        DecryptSection ds{};
-
-        //   lea rdi, [rip + section_rel32]    48 8D 3D rel32
-        u8(0x48); u8(0x8D); u8(0x3D);
-        ds.patch_lea_at = static_cast<uint32_t>(buf.size());
+        // Per-layer: load this layer's RC4 key pointer. Placed BEFORE
+        // the `ksa_block_start_offset` mark for layer 0 so the P3 VM
+        // lift region stays register-only (no rip-relative memory).
+        //
+        //   lea rsi, [rip + key_K_rel32]   48 8D 35 rel32
+        u8(0x48); u8(0x8D); u8(0x35);
+        lp.rel_to_key_at = static_cast<uint32_t>(buf.size());
         u32(0);
 
-        //   mov ecx, imm32                    B9 imm32
-        u8(0xB9);
-        ds.patch_size_at = static_cast<uint32_t>(buf.size());
-        u32(0);
+        // Mark the start of the VM-liftable KSA block for layer 0.
+        // Everything from here through `xor r10, r10` (PRGA state reset)
+        // is pure register / r8-or-rsi-relative code — no rip-relative
+        // memory operands, no syscalls, no external branches. Safe for
+        // the VmLifter.
+        if (is_bias_layer) {
+            patches.ksa_block_start_offset = static_cast<uint32_t>(buf.size());
+        }
 
-        patches.sections.push_back(ds);
-
-        const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
-
-        u8(0x41); u8(0xFE); u8(0xC1);                      // inc r9b
-        u8(0x43); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08);  // movzx eax, [r8+r9]
-        u8(0x41); u8(0x00); u8(0xC2);                      // add r10b, al
-        u8(0x43); u8(0x0F); u8(0xB6); u8(0x14); u8(0x10);  // movzx edx, [r8+r10]
-        u8(0x43); u8(0x88); u8(0x04); u8(0x10);            // mov [r8+r10], al
-        u8(0x43); u8(0x88); u8(0x14); u8(0x08);            // mov [r8+r9],  dl
-        u8(0x00); u8(0xD0);                                // add al, dl
-        u8(0x0F); u8(0xB6); u8(0xC0);                      // movzx eax, al
-        u8(0x41); u8(0x8A); u8(0x04); u8(0x00);            // mov al, [r8+rax]
-        u8(0x30); u8(0x07);                                // xor [rdi], al
-        u8(0x48); u8(0xFF); u8(0xC7);                      // inc rdi
-        u8(0xFF); u8(0xC9);                                // dec ecx
+        // Phase 1: init S[k] = k.
+        u8(0x31); u8(0xC9);                          // xor ecx, ecx
+        const uint32_t init_loop_start = static_cast<uint32_t>(buf.size());
+        u8(0x41); u8(0x88); u8(0x0C); u8(0x08);      // mov [r8+rcx], cl
+        u8(0xFE); u8(0xC1);                          // inc cl
         {
             const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
-            const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
+            const int32_t  rel8    = static_cast<int32_t>(init_loop_start) -
                                      static_cast<int32_t>(jnz_end);
             u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+        }
+
+        // Phase 2: KSA mix. Seed j from the bias on layer 0, else 0.
+        u8(0x31); u8(0xC9);                          // xor ecx, ecx    (k = 0)
+        if (is_bias_layer) {
+            // mov ebx, r15d                          44 89 FB
+            //   j = saved anti-debug bias (0 normally, 1 under debugger)
+            u8(0x44); u8(0x89); u8(0xFB);
+        } else {
+            // xor ebx, ebx                           31 DB
+            //   j = 0 — outer layers don't care about bias, they just
+            //   rebuild a deterministic S-box from their own key.
+            u8(0x31); u8(0xDB);
+        }
+        const uint32_t ksa_loop_start = static_cast<uint32_t>(buf.size());
+        u8(0x41); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08); // movzx eax, byte [r8+rcx]
+        u8(0x88); u8(0xCA);                          // mov dl, cl
+        u8(0x80); u8(0xE2); u8(0x1F);                // and dl, 0x1F
+        u8(0x00); u8(0xC3);                          // add bl, al        (j += S[k])
+        u8(0x02); u8(0x1C); u8(0x16);                // add bl, [rsi+rdx] (j += key[k mod 32])
+        u8(0x41); u8(0x0F); u8(0xB6); u8(0x14); u8(0x18); // movzx edx, byte [r8+rbx] (dl = S[j])
+        u8(0x41); u8(0x88); u8(0x04); u8(0x18);      // mov [r8+rbx], al  (S[j] = S[k])
+        u8(0x41); u8(0x88); u8(0x14); u8(0x08);      // mov [r8+rcx], dl  (S[k] = old S[j])
+        u8(0xFE); u8(0xC1);                          // inc cl
+        {
+            const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+            const int32_t  rel8    = static_cast<int32_t>(ksa_loop_start) -
+                                     static_cast<int32_t>(jnz_end);
+            u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+        }
+
+        // Phase 3: zero the PRGA (i, j) state. Each layer restarts
+        // PRGA from (0, 0) — cross-layer state sharing would require
+        // matching build-time encryption to use a different initial
+        // state on every layer, which gains nothing.
+        u8(0x4D); u8(0x31); u8(0xC9);                // xor r9, r9     (i  = 0)
+        u8(0x4D); u8(0x31); u8(0xD2);                // xor r10, r10   (j  = 0)
+
+        // End of the VM-liftable KSA block for layer 0. The caller may
+        // replace the range `[ksa_block_start_offset, ksa_block_end_offset)`
+        // with a `call rel32 <vm_entry>` + NOP pad, hiding the RC4 setup
+        // inside a VM region.
+        if (is_bias_layer) {
+            patches.ksa_block_end_offset = static_cast<uint32_t>(buf.size());
+        }
+
+        // (4) Per-section decrypt loop — RC4 PRGA.
+        //
+        // State at entry: r8 = S-box ptr, r9b = PRGA i, r10b = PRGA j,
+        //                 rdi/ecx = per-section dest ptr and length.
+        //
+        //   .loop:
+        //     inc   r9b                           ; i++
+        //     movzx eax, byte [r8 + r9]           ; al = S[i]
+        //     add   r10b, al                      ; j += S[i]
+        //     movzx edx, byte [r8 + r10]          ; dl = S[j]
+        //     mov   [r8 + r10], al                ; S[j] = S[i]
+        //     mov   [r8 + r9],  dl                ; S[i] = S[j] (swap)
+        //     add   al, dl                        ; al = (S[i]+S[j]) mod 256
+        //     movzx eax, al                       ; zero-extend sum
+        //     mov   al, [r8 + rax]                ; K = S[sum]
+        //     xor   [rdi], al                     ; decrypt one byte
+        //     inc   rdi                           ; advance dst
+        //     dec   ecx                           ; length--
+        //     jnz   .loop
+        for (uint32_t s = 0; s < section_count; ++s) {
+            DecryptSection ds{};
+
+            //   lea rdi, [rip + section_rel32]    48 8D 3D rel32
+            u8(0x48); u8(0x8D); u8(0x3D);
+            ds.patch_lea_at = static_cast<uint32_t>(buf.size());
+            u32(0);
+
+            //   mov ecx, imm32                    B9 imm32
+            u8(0xB9);
+            ds.patch_size_at = static_cast<uint32_t>(buf.size());
+            u32(0);
+
+            lp.sections.push_back(ds);
+
+            const uint32_t loop_body_start = static_cast<uint32_t>(buf.size());
+
+            u8(0x41); u8(0xFE); u8(0xC1);                      // inc r9b
+            u8(0x43); u8(0x0F); u8(0xB6); u8(0x04); u8(0x08);  // movzx eax, [r8+r9]
+            u8(0x41); u8(0x00); u8(0xC2);                      // add r10b, al
+            u8(0x43); u8(0x0F); u8(0xB6); u8(0x14); u8(0x10);  // movzx edx, [r8+r10]
+            u8(0x43); u8(0x88); u8(0x04); u8(0x10);            // mov [r8+r10], al
+            u8(0x43); u8(0x88); u8(0x14); u8(0x08);            // mov [r8+r9],  dl
+            u8(0x00); u8(0xD0);                                // add al, dl
+            u8(0x0F); u8(0xB6); u8(0xC0);                      // movzx eax, al
+            u8(0x41); u8(0x8A); u8(0x04); u8(0x00);            // mov al, [r8+rax]
+            u8(0x30); u8(0x07);                                // xor [rdi], al
+            u8(0x48); u8(0xFF); u8(0xC7);                      // inc rdi
+            u8(0xFF); u8(0xC9);                                // dec ecx
+            {
+                const uint32_t jnz_end = static_cast<uint32_t>(buf.size()) + 2;
+                const int32_t  rel8    = static_cast<int32_t>(loop_body_start) -
+                                         static_cast<int32_t>(jnz_end);
+                u8(0x75); u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+            }
         }
     }
 
@@ -887,10 +987,12 @@ void emit_decrypt_body(ByteBuffer& buf,
 [[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> build_exe_stub_bytes(
     Randomizer& rng,
     ByteView stolen_bytes,
-    uint32_t section_count)
+    uint32_t section_count,
+    uint32_t layer_count)
 {
     ByteBuffer buf;
-    buf.reserve(128 + 32 * section_count + stolen_bytes.size() + kKeySize);
+    buf.reserve(128 + (32 + 32 * section_count) * layer_count +
+                stolen_bytes.size() + kKeySize * layer_count);
 
     auto u8 = [&](uint8_t v) { buf.push_back(v); };
     auto u32 = [&](uint32_t v) {
@@ -912,7 +1014,7 @@ void emit_decrypt_body(ByteBuffer& buf,
     // (2) Shared decrypt body — anti-debug, KSA, PRGA per section,
     //     reprotect, IAT wipe. Populates the CipherBodyPatches slots
     //     of `patches` via the multi-inheritance base.
-    emit_decrypt_body(buf, patches, rng, section_count);
+    emit_decrypt_body(buf, patches, rng, section_count, layer_count);
 
     // (3) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
@@ -969,10 +1071,12 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
 [[nodiscard]] std::pair<ByteBuffer, DllFullStubPatches> build_dll_full_stub_bytes(
     Randomizer& rng,
     ByteView stolen_bytes,
-    uint32_t section_count)
+    uint32_t section_count,
+    uint32_t layer_count)
 {
     ByteBuffer buf;
-    buf.reserve(192 + 32 * section_count + stolen_bytes.size() + kKeySize);
+    buf.reserve(192 + (32 + 32 * section_count) * layer_count +
+                stolen_bytes.size() + kKeySize * layer_count);
 
     auto u8 = [&](uint8_t v) { buf.push_back(v); };
     auto u32 = [&](uint32_t v) {
@@ -1011,7 +1115,7 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
     u32(0);
 
     // (3) Shared decrypt body.
-    emit_decrypt_body(buf, patches, rng, section_count);
+    emit_decrypt_body(buf, patches, rng, section_count, layer_count);
 
     // (4) .forward: — back-patch the jne target.
     {
@@ -1052,40 +1156,52 @@ void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
 // runtime can patch the common rel32 slots uniformly.
 // ---------------------------------------------------------------------------
 
+/// Per-stub emission parameters shared by EXE and full-DLL stubs.
+///
+/// `section_count` — number of target sections the decrypt loops walk.
+/// `layer_count`   — number of cipher rounds (P2). Each round owns its
+///                   own RC4 key and its own per-section PRGA loop; the
+///                   runtime decrypts layers N-1 → 0, and build-time
+///                   encryption applies them in the reverse order.
+struct StubEmissionParams {
+    uint32_t section_count;
+    uint32_t layer_count;
+};
+
 class ExeStubEmitter {
 public:
     using patches_type = ExeStubPatches;
 
-    /// `section_count` is the number of encrypted sections the stub will
-    /// iterate over. The decrypt loops are unrolled at build time —
-    /// `ExeStubPatches::sections` ends up with one entry per loop the
-    /// caller needs to patch with (rva, size).
-    explicit ExeStubEmitter(uint32_t section_count) noexcept
-        : section_count_(section_count) {}
+    explicit ExeStubEmitter(StubEmissionParams params) noexcept
+        : params_(params) {}
 
     [[nodiscard]] std::pair<ByteBuffer, ExeStubPatches> emit(
         Randomizer& rng, ByteView stolen_bytes) {
-        return build_exe_stub_bytes(rng, stolen_bytes, section_count_);
+        return build_exe_stub_bytes(rng, stolen_bytes,
+                                    params_.section_count,
+                                    params_.layer_count);
     }
 
 private:
-    uint32_t section_count_;
+    StubEmissionParams params_;
 };
 
 class DllFullStubEmitter {
 public:
     using patches_type = DllFullStubPatches;
 
-    explicit DllFullStubEmitter(uint32_t section_count) noexcept
-        : section_count_(section_count) {}
+    explicit DllFullStubEmitter(StubEmissionParams params) noexcept
+        : params_(params) {}
 
     [[nodiscard]] std::pair<ByteBuffer, DllFullStubPatches> emit(
         Randomizer& rng, ByteView stolen_bytes) {
-        return build_dll_full_stub_bytes(rng, stolen_bytes, section_count_);
+        return build_dll_full_stub_bytes(rng, stolen_bytes,
+                                         params_.section_count,
+                                         params_.layer_count);
     }
 
 private:
-    uint32_t section_count_;
+    StubEmissionParams params_;
 };
 
 static_assert(StubEmitter<ExeStubEmitter>,
@@ -1559,7 +1675,7 @@ struct PackerStubInjection {
 ///      range with a `call rel32 <vm_entry>` if the VM lift
 ///      succeeded in step 6.
 template <StubEmitter Emitter>
-    requires std::constructible_from<Emitter, uint32_t>
+    requires std::constructible_from<Emitter, StubEmissionParams>
 [[nodiscard]] MxStatus execute_encrypted_stub(ProtectionContext& ctx,
                                               std::string_view   steal_label)
 {
@@ -1581,21 +1697,22 @@ template <StubEmitter Emitter>
         }
     }
 
-    // Per-build random 32-byte RC4 key.
-    Randomizer rng;
-    ByteBuffer key(kKeySize);
-    for (auto& b : key) b = rng.next_u8();
+    // P2 — Multi-layer cipher rounds. Each round has its own RC4 key
+    // and its own PRGA decrypt loop. Layer 0 is the innermost (runtime
+    // decrypted LAST, anti-debug bias woven into its KSA); build-time
+    // encryption applies layers in the reverse of runtime order, i.e.
+    // `layer 0 first, then 1, ..., then N-1`. `layer_count` is clamped
+    // to at least 1 — a config value of 0 is promoted to 1 so the
+    // decrypt body still emits one cipher round.
+    const uint32_t layer_count =
+        std::max<uint32_t>(1, ctx.config().packer_cipher_layers);
 
-    // Encrypt every target section with a single streaming RC4 state.
-    // The S-box and (i, j) state are carried across sections so the
-    // runtime stub rebuilds the same stream via one KSA pass and
-    // consumes it in the same order. We seed KSA with j = 0 at build
-    // time (no debugger); the stub starts its KSA with j = edx
-    // (anti-debug probe result), so under a debugger the S-box
-    // diverges on the very first iteration and every protected
-    // section decrypts to garbage.
-    Rc4State rc4{};
-    rc4_init(rc4, ByteView{key.data(), key.size()}, /*anti_debug_bias=*/0);
+    Randomizer rng;
+    std::vector<ByteBuffer> layer_keys(layer_count);
+    for (auto& k : layer_keys) {
+        k.resize(kKeySize);
+        for (auto& b : k) b = rng.next_u8();
+    }
 
     struct EncryptedTarget {
         size_t   image_index;
@@ -1605,19 +1722,19 @@ template <StubEmitter Emitter>
     std::vector<EncryptedTarget> encrypted;
     encrypted.reserve(target_indices.size());
 
+    // Walk the target sections once to skip empty ones and mark them
+    // writable. The layer-encryption loop below re-walks the resulting
+    // `encrypted` vector so every layer sees the same section order
+    // that the runtime stub's PRGA loops will walk.
     for (const size_t idx : target_indices) {
         auto& sec = ctx.pe_image().sections()[idx];
         const uint32_t sec_size = static_cast<uint32_t>(sec.data.size());
         if (sec_size == 0) continue;
 
-        rc4_process(rc4, MutableByteView{sec.data.data(), sec.data.size()});
-
         // Allow the stub to decrypt in place.
         sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
 
         encrypted.push_back({idx, sec.virtual_address, sec_size});
-        ctx.log_fmt("PackerPass: зашифрована (RC4) '{}' (RVA=0x{:08X}, {} байт)",
-            sec.name, sec.virtual_address, sec_size);
     }
 
     if (encrypted.empty()) {
@@ -1625,14 +1742,55 @@ template <StubEmitter Emitter>
         return {};
     }
 
+    // Apply N RC4 rounds in BUILD order (0 first, N-1 last). The
+    // runtime decrypts in the opposite order (N-1 first, 0 last),
+    // and since each RC4 round is self-inverse the nested cascade
+    // unwinds to plaintext. Within a single layer we carry one
+    // `Rc4State` across all target sections so the build-time PRGA
+    // stream matches the runtime stream — the runtime's layer PRGA
+    // loops reset `(i, j)` to (0, 0) at the start of each layer but
+    // carry them across sections inside the layer.
+    //
+    // Build-time bias is 0 for every layer: there's no debugger at
+    // build time. Runtime's layer 0 seeds `j` from the anti-debug
+    // probe, which matches the build-time 0 on a clean host and
+    // diverges on a debugged one.
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        Rc4State rc4{};
+        rc4_init(rc4,
+                 ByteView{layer_keys[layer].data(), layer_keys[layer].size()},
+                 /*anti_debug_bias=*/0);
+        for (const auto& tgt : encrypted) {
+            auto& sec = ctx.pe_image().sections()[tgt.image_index];
+            rc4_process(rc4,
+                        MutableByteView{sec.data.data(), sec.data.size()});
+        }
+    }
+
+    for (const auto& tgt : encrypted) {
+        const auto& sec = ctx.pe_image().sections()[tgt.image_index];
+        ctx.log_fmt("PackerPass: зашифрована (RC4 ×{}) '{}' (RVA=0x{:08X}, {} байт)",
+            layer_count, sec.name, sec.virtual_address, tgt.size);
+    }
+
     // Emit the stub via the policy-specified emitter.
-    Emitter emitter{static_cast<uint32_t>(encrypted.size())};
+    Emitter emitter{StubEmissionParams{
+        .section_count = static_cast<uint32_t>(encrypted.size()),
+        .layer_count   = layer_count,
+    }};
     auto [stub_buf, patches] = emitter.emit(
         rng, ByteView{steal.stolen_bytes.data(), steal.stolen_bytes.size()});
 
-    // Append the 32-byte RC4 key.
-    const uint32_t key_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
-    stub_buf.insert(stub_buf.end(), key.begin(), key.end());
+    // Append each layer's 32-byte RC4 key to the stub buffer and
+    // record the stub-relative offsets so each layer's `lea rsi, key_K`
+    // rel32 can be patched after the stub section is injected.
+    std::vector<uint32_t> key_offsets_in_stub(layer_count);
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        key_offsets_in_stub[layer] = static_cast<uint32_t>(stub_buf.size());
+        stub_buf.insert(stub_buf.end(),
+                        layer_keys[layer].begin(),
+                        layer_keys[layer].end());
+    }
 
     // S-box scratch: 256 bytes. At runtime the KSA overwrites the
     // whole region — the build-time content doesn't matter, we just
@@ -1794,25 +1952,32 @@ template <StubEmitter Emitter>
     auto& pack_sec = ctx.pe_image().sections()[inject->pack_section_index];
     const Rva stub_rva = inject->stub_rva;
 
-    // Per-section: lea rdi → section base, mov ecx → section size.
-    for (size_t i = 0; i < encrypted.size(); ++i) {
-        const auto& ds  = patches.sections[i];
-        const auto& tgt = encrypted[i];
+    // Per-layer patching: every layer has its own `lea rsi, key_K`
+    // and its own per-section `lea rdi / mov ecx` pair.
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        const auto& lp = patches.layers[layer];
 
-        const Rva lea_end_rva = stub_rva + ds.patch_lea_at + 4;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
-        write_i32(pack_sec.data, ds.patch_lea_at, rel);
-        write_i32(pack_sec.data, ds.patch_size_at, static_cast<int32_t>(tgt.size));
-    }
+        // lea rsi, [rip + rel] → this layer's 32-byte RC4 key.
+        {
+            const Rva lea_end_rva = stub_rva + lp.rel_to_key_at + 4;
+            const Rva key_rva     = stub_rva + key_offsets_in_stub[layer];
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(pack_sec.data, lp.rel_to_key_at, rel);
+        }
 
-    // lea rsi, [rip + rel] → embedded 32-byte RC4 key.
-    {
-        const Rva lea_end_rva = stub_rva + patches.rel_to_key_at + 4;
-        const Rva key_rva     = stub_rva + key_offset_in_stub;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_key_at, rel);
+        // Per-section: lea rdi → section base, mov ecx → section size.
+        for (size_t i = 0; i < encrypted.size(); ++i) {
+            const auto& ds  = lp.sections[i];
+            const auto& tgt = encrypted[i];
+
+            const Rva lea_end_rva = stub_rva + ds.patch_lea_at + 4;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(pack_sec.data, ds.patch_lea_at, rel);
+            write_i32(pack_sec.data, ds.patch_size_at,
+                      static_cast<int32_t>(tgt.size));
+        }
     }
 
     // lea r8, [rip + rel] → 256-byte S-box scratch area.
@@ -1933,12 +2098,16 @@ template <StubEmitter Emitter>
             image_base + stub_rva + tls_cb_array_offset_in_stub;
 
         // 1. Patch the `xor byte [rip + rel32], imm8` inside the
-        //    callback body to point at `key[key_byte_offset_in_key]`
-        //    in the embedded RC4 key. The rel32 is computed from
-        //    the end of the instruction (`xor_instruction_end`)
-        //    to the target byte.
+        //    callback body to point at one byte of layer 0's RC4
+        //    key. Layer 0 is the innermost (bias-seeded) layer, so
+        //    corrupting its key under a debugger produces a wrong
+        //    KSA → wrong S-box → wrong PRGA output for the final
+        //    layer → every preceding outer layer's intermediate
+        //    cleartext is XORed back to garbage. The rel32 is
+        //    computed from the end of the xor instruction
+        //    (`xor_instruction_end`) to the target byte.
         const uint32_t key_target_offset_in_stub =
-            key_offset_in_stub + tls_cb.key_byte_offset_in_key;
+            key_offsets_in_stub[0] + tls_cb.key_byte_offset_in_key;
         const int32_t xor_rel32 = static_cast<int32_t>(
             static_cast<int64_t>(key_target_offset_in_stub) -
             static_cast<int64_t>(tls_cb.xor_instruction_end));
