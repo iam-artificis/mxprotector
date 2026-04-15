@@ -97,6 +97,7 @@ set(BUILDER_SOURCES
     protection/anti_tamper/import_hook_check.cpp
     protection/anti_tamper/self_crc_check.cpp
     protection/anti_tamper/page_protection_check.cpp
+    protection/anti_tamper/debug_object_handle_check.cpp
 )
 
 # ==============================================================================

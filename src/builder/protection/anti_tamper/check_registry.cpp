@@ -23,12 +23,14 @@ std::unique_ptr<ICheck> make_hw_breakpoint_sweep_check();
 std::unique_ptr<ICheck> make_import_hook_detect_check();
 std::unique_ptr<ICheck> make_self_crc_check();
 std::unique_ptr<ICheck> make_page_protection_check();
+std::unique_ptr<ICheck> make_debug_object_handle_check();
 
 CheckRegistry::CheckRegistry() {
     checks_.push_back(make_hw_breakpoint_sweep_check());
     checks_.push_back(make_import_hook_detect_check());
     checks_.push_back(make_self_crc_check());
     checks_.push_back(make_page_protection_check());
+    checks_.push_back(make_debug_object_handle_check());
 }
 
 std::vector<const ICheck*>
