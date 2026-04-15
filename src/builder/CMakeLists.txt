@@ -76,6 +76,8 @@ set(BUILDER_SOURCES
 
     # Phase 5: Self-unpacking packer (multi-section XOR + anti-debug + IAT wipe)
     protection/packer/packer_pass.cpp
+    protection/packer/rc4.cpp
+    protection/packer/stolen_bytes.cpp
 
     # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
     protection/string/string_scanner.cpp

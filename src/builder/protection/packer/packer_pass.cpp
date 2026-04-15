@@ -30,6 +30,8 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/packer/rc4.hpp"
+#include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/vm/vm_lifter.hpp"
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
@@ -48,101 +50,25 @@ namespace mx {
 
 namespace {
 
-/// RC4 key size in bytes. 32 bytes = 256 bits — matches the roadmap's
-/// P1 target ("key 256 бит") and is the length the KSA modular index
-/// `i mod kKeySize` is hard-coded to in the emitted stub.
-///
-/// Historically this was 256 bytes for the vanilla-XOR stream cipher;
-/// the number and the name have been kept so the existing patch-site
-/// plumbing ("embedded key" → "lea rsi, key") reads the same, but the
-/// semantics are now "KSA input key" rather than "XOR key stream".
-constexpr uint32_t kKeySize = 32;
+// Pull the packer helpers into this TU's anonymous namespace so the
+// existing unqualified references to `kKeySize`, `kSboxSize`,
+// `Rc4State`, `rc4_init`, `rc4_process`, `kMinStolenBytes`,
+// `kMaxStolenBytes`, `StolenReloc`, `StolenPlan`, and
+// `plan_stolen_bytes` keep compiling after the extraction. Future
+// commits that split the stub emitter / cipher body / TLS callback
+// out of this file will move their call sites to the fully-qualified
+// `packer::` form.
+using mx::packer::kKeySize;
+using mx::packer::kSboxSize;
+using mx::packer::Rc4State;
+using mx::packer::rc4_init;
+using mx::packer::rc4_process;
 
-/// S-box size for RC4 (fixed by the algorithm).
-constexpr uint32_t kSboxSize = 256;
-
-// ---------------------------------------------------------------------------
-// Build-time RC4 stream cipher — mirrors the runtime stub byte-for-byte.
-//
-// The decryptor emitted by `build_stub_bytes` below implements standard
-// RC4 (KSA + PRGA). This helper runs the same algorithm at build time
-// so the encrypted output matches what the stub will decrypt.
-//
-// The state deliberately starts with `j = anti_debug_bias`, which is
-// the build's prediction of what `edx` will hold at stub entry —
-// normally 0 (no debugger). At runtime, if a debugger is present and
-// the anti-debug probe flips `edx` to 1, the KSA starts with a
-// different `j`, produces an entirely different S-box, and the PRGA
-// stream decrypts the sections into garbage. There is no explicit
-// "if debugger then die" branch; the cipher itself silently fails.
-// ---------------------------------------------------------------------------
-
-struct Rc4State {
-    std::array<uint8_t, kSboxSize> sbox{};
-    uint8_t i = 0;
-    uint8_t j = 0;
-};
-
-void rc4_init(Rc4State& s, ByteView key, uint8_t anti_debug_bias) noexcept {
-    for (uint32_t k = 0; k < kSboxSize; ++k) {
-        s.sbox[k] = static_cast<uint8_t>(k);
-    }
-    uint8_t j = anti_debug_bias;
-    for (uint32_t k = 0; k < kSboxSize; ++k) {
-        j = static_cast<uint8_t>(
-            j + s.sbox[k] + key[k % key.size()]);
-        std::swap(s.sbox[k], s.sbox[j]);
-    }
-    s.i = 0;
-    s.j = 0;
-}
-
-/// Encrypt (or decrypt — RC4 is self-inverse through XOR) `data` in
-/// place. State carries over across calls so the cipher can stream
-/// through several sections with one KSA.
-void rc4_process(Rc4State& s, MutableByteView data) noexcept {
-    for (auto& b : data) {
-        s.i = static_cast<uint8_t>(s.i + 1);
-        s.j = static_cast<uint8_t>(s.j + s.sbox[s.i]);
-        std::swap(s.sbox[s.i], s.sbox[s.j]);
-        const uint8_t k = s.sbox[
-            static_cast<uint8_t>(s.sbox[s.i] + s.sbox[s.j])];
-        b = static_cast<uint8_t>(b ^ k);
-    }
-}
-
-/// Approximate size of the stub code (before the key). The actual size varies
-/// a little across builds because the push/pop and setup order is randomised,
-/// but the patch offsets are tracked dynamically so this is only a sanity
-/// reference for documentation.
-///
-/// Layout (approximate — the stub is polymorphic and grew in P1 from
-/// a 256-byte XOR keystream to full RC4 KSA + PRGA):
-///   push rdi/rsi/rcx/rdx/rax          = 5
-///   anti-debug probe (variant 0/1/2) = 10..20
-///   lea  rsi, [rip + rel32]           = 7    — 32-byte RC4 key
-///   lea  r8,  [rip + rel32]           = 7    — 256-byte S-box scratch
-///   KSA phase 1 (init S[k]=k loop)   ~10
-///   KSA phase 2 (mix with key loop)  ~34
-///   PRGA state reset (xor r9/r10)     = 6
-///   per section:
-///     lea  rdi, [rip + rel32]         = 7
-///     mov  ecx, imm32                 = 5
-///     PRGA loop body                 ~42
-///   reprotect block                 ~250
-///   pop rax/rdx/rcx/rsi/rdi           = 5
-///   jmp  rel32                        = 5
-///
-/// The anti-debug is woven *into* the cipher: the probe writes `edx`
-/// ∈ {0, 1}, the KSA seeds its `j` register from `edx`. On a clean
-/// run both build-time and runtime KSAs see j=0 and produce the same
-/// S-box. Under a debugger the runtime j starts at 1 — the very first
-/// KSA iteration swaps different entries than the build, the S-box
-/// diverges, and the PRGA keystream is unrelated to the build-time
-/// one. Every protected section decrypts to garbage before the stub
-/// even reaches its reprotect block, and the process crashes before
-/// the debugger can inspect anything meaningful.
-constexpr uint32_t kStubCodeSize = 0; // polymorphic; see comment above
+using mx::packer::kMinStolenBytes;
+using mx::packer::kMaxStolenBytes;
+using mx::packer::StolenReloc;
+using mx::packer::StolenPlan;
+using mx::packer::plan_stolen_bytes;
 
 /// A single section the packer stub decrypts at runtime.
 ///
@@ -283,101 +209,6 @@ concept StubEmitter = requires(T& t, Randomizer& rng, ByteView stolen) {
     { t.emit(rng, stolen) } ->
         std::same_as<std::pair<ByteBuffer, typename T::patches_type>>;
 };
-
-/// Minimum number of bytes we want to steal from the OEP. We walk whole
-/// instructions so the actual stolen size may be larger.
-constexpr uint32_t kMinStolenBytes = 10;
-/// Upper bound on stolen bytes — prevents extracting so much code that the
-/// stub grows unreasonably or the check for safe instructions becomes fragile.
-constexpr uint32_t kMaxStolenBytes = 64;
-
-/// One rel32 fix-up inside the stolen-bytes payload: the rel32 target was
-/// originally `original_target_rva`; after the bytes move into the stub the
-/// rel32 at `offset_in_stolen` (4 bytes) must be rewritten to keep pointing
-/// at that RVA. Currently only CALL rel32 patches are produced.
-struct StolenReloc {
-    uint32_t offset_in_stolen;    ///< offset of rel32 within stolen_bytes
-    uint32_t instr_end_in_stolen; ///< byte just after the full instruction
-    Rva      original_target_rva; ///< absolute target RVA (stays constant)
-};
-
-struct StolenPlan {
-    uint32_t                 size = 0;
-    std::vector<StolenReloc> relocs;
-};
-
-/// Scan OEP for instructions that can be safely lifted into the stub.
-/// Allows:
-///   - plain GPR/ALU instructions
-///   - CALL rel32 (will be rewritten after move)
-/// Rejects:
-///   - JMP/JCC (stubs don't loop — a taken branch would escape unresolved)
-///   - RET (ends the OEP sequence)
-///   - RIP-relative memory operands (cannot be fixed up generically)
-[[nodiscard]] StolenPlan plan_stolen_bytes(ByteView text_bytes,
-                                           uint32_t oep_offset_in_text,
-                                           Rva oep_rva)
-{
-    StolenPlan result;
-    if (oep_offset_in_text >= text_bytes.size()) return result;
-
-    ZydisDecoder decoder;
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-
-    size_t pos = oep_offset_in_text;
-    while (result.size < kMinStolenBytes) {
-        if (pos >= text_bytes.size()) { result.size = 0; result.relocs.clear(); return result; }
-        const size_t remain = text_bytes.size() - pos;
-
-        ZydisDecodedInstruction insn{};
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-                &decoder, text_bytes.data() + pos, remain, &insn, operands))) {
-            return {};
-        }
-
-        // Reject branches/ret outright — they leave the stolen sequence.
-        if (insn.meta.category == ZYDIS_CATEGORY_COND_BR ||
-            insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
-            insn.meta.category == ZYDIS_CATEGORY_RET) {
-            return {};
-        }
-
-        // RIP-relative memory references break when we move the bytes.
-        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
-            const auto& op = operands[i];
-            if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                op.mem.base == ZYDIS_REGISTER_RIP) {
-                return {};
-            }
-        }
-
-        // CALL rel32 — record a fix-up so the absolute target survives.
-        if (insn.meta.category == ZYDIS_CATEGORY_CALL) {
-            // Only the rel32 form (E8 rel32) is supported here. Indirect calls
-            // (FF /2) would need a different encoding change.
-            if (insn.length != 5 || text_bytes[pos] != 0xE8) return {};
-
-            int32_t rel32 = 0;
-            std::memcpy(&rel32, text_bytes.data() + pos + 1, 4);
-            const Rva target_rva = static_cast<Rva>(
-                static_cast<int64_t>(oep_rva) +
-                static_cast<int64_t>(pos - oep_offset_in_text) +
-                5 + rel32);
-
-            StolenReloc r{};
-            r.offset_in_stolen    = result.size + 1;
-            r.instr_end_in_stolen = result.size + 5;
-            r.original_target_rva = target_rva;
-            result.relocs.push_back(r);
-        }
-
-        pos += insn.length;
-        result.size += insn.length;
-        if (result.size > kMaxStolenBytes) return {};
-    }
-    return result;
-}
 
 /// Append the shared decrypt body to `buf`:
 ///   anti-debug probe → edx ∈ {0, 1}
