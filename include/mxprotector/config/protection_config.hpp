@@ -199,6 +199,7 @@ struct ProtectionConfig {
                 cfg.strip_debug_info       = true;
                 cfg.string_protection      = StringProtectionMode::virtualized;
                 cfg.vm_nesting_depth       = 2;
+                cfg.packer_cipher_layers   = 3;
                 break;
         }
 

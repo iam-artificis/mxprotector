@@ -1362,6 +1362,7 @@ struct TlsCallbackEmit {
     uint32_t xor_instruction_end    = 0;  // byte right after the xor imm8
     uint32_t body_end_offset        = 0;  // one past the last byte (for padding)
     uint32_t key_byte_offset_in_key = 0;  // 0..31 — which byte of the RC4 key to corrupt
+    uint32_t key_layer_index        = 0;  // 0..layer_count-1 — which layer's key to corrupt
 };
 
 /// Emit the 32-byte TLS callback body and record its patch sites.
@@ -1384,7 +1385,8 @@ struct TlsCallbackEmit {
 /// ignored. `rcx`, `r8` (hModule, lpReserved) are not touched, which
 /// lets us coexist with any existing callback that reads them.
 [[nodiscard]] TlsCallbackEmit emit_tls_callback_body(ByteBuffer& buf,
-                                                     Randomizer& rng)
+                                                     Randomizer& rng,
+                                                     uint32_t layer_count)
 {
     TlsCallbackEmit out{};
     out.body_offset = static_cast<uint32_t>(buf.size());
@@ -1437,6 +1439,12 @@ struct TlsCallbackEmit {
 
     out.body_end_offset         = static_cast<uint32_t>(buf.size());
     out.key_byte_offset_in_key  = rng.next_range(0, kKeySize - 1);
+    // P2 — randomise which cipher layer's key gets corrupted. Every
+    // build picks a different target, so a reverser who extracts the
+    // target offset from one binary cannot predict it on the next.
+    // `layer_count` is clamped to ≥1 before this call, so the upper
+    // bound is always valid.
+    out.key_layer_index         = rng.next_range(0, layer_count - 1);
     return out;
 }
 
@@ -1908,7 +1916,7 @@ template <StubEmitter Emitter>
     // 8-byte field lands at a naturally-aligned offset.
     while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
 
-    const TlsCallbackEmit tls_cb = emit_tls_callback_body(stub_buf, rng);
+    const TlsCallbackEmit tls_cb = emit_tls_callback_body(stub_buf, rng, layer_count);
 
     while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
     const uint32_t tls_dir_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
@@ -2098,16 +2106,20 @@ template <StubEmitter Emitter>
             image_base + stub_rva + tls_cb_array_offset_in_stub;
 
         // 1. Patch the `xor byte [rip + rel32], imm8` inside the
-        //    callback body to point at one byte of layer 0's RC4
-        //    key. Layer 0 is the innermost (bias-seeded) layer, so
-        //    corrupting its key under a debugger produces a wrong
-        //    KSA → wrong S-box → wrong PRGA output for the final
-        //    layer → every preceding outer layer's intermediate
-        //    cleartext is XORed back to garbage. The rel32 is
-        //    computed from the end of the xor instruction
-        //    (`xor_instruction_end`) to the target byte.
+        //    callback body to point at one byte of a per-build
+        //    random cipher layer's RC4 key. Corrupting ANY layer's
+        //    key is sufficient to cascade: a wrong S-box for one
+        //    layer produces a wrong PRGA output which means the
+        //    other layers decrypt the intermediate bytes into
+        //    garbage. Randomising the target layer per build
+        //    denies reversers a stable pivot — extracting the
+        //    corruption site from one binary tells them nothing
+        //    about the next. The rel32 is computed from the end
+        //    of the xor instruction (`xor_instruction_end`) to
+        //    the target byte.
         const uint32_t key_target_offset_in_stub =
-            key_offsets_in_stub[0] + tls_cb.key_byte_offset_in_key;
+            key_offsets_in_stub[tls_cb.key_layer_index] +
+            tls_cb.key_byte_offset_in_key;
         const int32_t xor_rel32 = static_cast<int32_t>(
             static_cast<int64_t>(key_target_offset_in_stub) -
             static_cast<int64_t>(tls_cb.xor_instruction_end));
@@ -2167,12 +2179,15 @@ template <StubEmitter Emitter>
         }, ctx.pe_image().nt_headers());
 
         ctx.log_fmt("PackerPass: P4 TLS callback planted @ RVA=0x{:08X}, "
-                    "chain length {} (existing={}, ours=1)",
+                    "chain length {} (existing={}, ours=1), "
+                    "corrupts key[layer={}, byte={}]",
             stub_rva + tls_cb.body_offset,
             static_cast<uint32_t>(tls_cb_array_entries - 1),
             existing_tls_opt.has_value()
                 ? static_cast<uint32_t>(existing_tls_opt->callbacks.size())
-                : 0u);
+                : 0u,
+            tls_cb.key_layer_index,
+            tls_cb.key_byte_offset_in_key);
         (void)tls_dir_va;  // reserved for future use (direct self-reference)
     }
 
