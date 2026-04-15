@@ -29,6 +29,7 @@ set(TEST_SOURCES
     veh_int3_trap_test.cpp
     stub_self_hash_test.cpp
     marker_scanner_test.cpp
+    guard_page_layout_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -117,6 +118,13 @@ set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
 )
 
+# Runtime-guards module sources needed for guard_page_layout_test.
+# guard_pass.cpp is NOT needed here because the page layout is a pure
+# function with no ProtectionContext dependency.
+set(GUARD_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_page_layout.cpp
+)
+
 # ==============================================================================
 # Цель: mxprotector_tests
 # ==============================================================================
@@ -130,7 +138,8 @@ add_executable(mxprotector_tests
     ${ANTI_TAMPER_SOURCES}
     ${STRING_PROTECT_SOURCES}
     ${PACKER_SOURCES}
-    ${ANALYSIS_SOURCES})
+    ${ANALYSIS_SOURCES}
+    ${GUARD_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

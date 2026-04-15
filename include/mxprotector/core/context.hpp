@@ -46,6 +46,7 @@ struct SectionNameMap {
     std::string cff;      ///< CFG-flattening trampoline section
     std::string packer;   ///< Self-unpacking stub section
     std::string str;      ///< S2 string-protection section (mx_str_get + trampolines + desc table + ciphertext)
+    std::string guard;    ///< Runtime-guards page table (MX_GUARD_BEGIN/END relocated bodies)
 };
 
 /**

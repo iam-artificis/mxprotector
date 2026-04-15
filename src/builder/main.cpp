@@ -39,6 +39,7 @@
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/vm/virtualization_pass.hpp"
+#include "mxprotector/protection/guard/guard_pass.hpp"
 #include "mxprotector/protection/packer/packer_pass.hpp"
 #include "mxprotector/protection/string/string_protection_pass.hpp"
 
@@ -191,11 +192,12 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
             .cff    = ".mxprot1",
             .packer = ".mxpack",
             .str    = ".mxstr",
+            .guard  = ".mxguard",
         };
     }
 
     auto pool = stealth_section_pool();
-    // Fisher-Yates shuffle so we can just take the first 4.
+    // Fisher-Yates shuffle so we can just take the first 5.
     for (size_t i = pool.size() - 1; i > 0; --i) {
         const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
         std::swap(pool[i], pool[j]);
@@ -205,6 +207,7 @@ mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
         .cff    = pool[1],
         .packer = pool[2],
         .str    = pool[3],
+        .guard  = pool[4],
     };
 }
 
@@ -297,8 +300,8 @@ int main(int argc, char** argv) {
         mx::Randomizer name_rng;
         auto names = generate_section_names(ctx.config(), name_rng);
         std::cout << std::format(
-            "[*] Секции: vm='{}' cff='{}' pack='{}'\n",
-            names.vm, names.cff, names.packer);
+            "[*] Секции: vm='{}' cff='{}' pack='{}' guard='{}'\n",
+            names.vm, names.cff, names.packer, names.guard);
         ctx.set_section_names(std::move(names));
     }
 
@@ -333,6 +336,7 @@ int main(int argc, char** argv) {
     pass_manager.register_pass(std::make_unique<mx::MutationPass>());
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
     pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
+    pass_manager.register_pass(std::make_unique<mx::GuardPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());
     pass_manager.register_pass(std::make_unique<mx::StringProtectionPass>());
     pass_manager.register_pass(std::make_unique<mx::PackerPass>());

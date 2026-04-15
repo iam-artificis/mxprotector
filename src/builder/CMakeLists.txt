@@ -67,6 +67,10 @@ set(BUILDER_SOURCES
     protection/vm/vm_runtime_gen.cpp
     protection/vm/virtualization_pass.cpp
 
+    # Runtime guards — MX_GUARD_BEGIN/END relocation + VEH dispatcher
+    protection/guard/guard_pass.cpp
+    protection/guard/guard_page_layout.cpp
+
     # Phase 4: x64 VM backend (split out of vm_runtime_gen.cpp)
     protection/vm/x64/x64_emitters.cpp
     protection/vm/x64/x64_vflags.cpp
