@@ -110,6 +110,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--code-interleaving")   { config.enable_code_interleaving = true; continue; }
         if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
+        if (arg == "--anti-tamper-veh")     { config.enable_veh_anti_tamper = true; continue; }
 
         if (arg.starts_with("--strings=") && arg.size() > 10) {
             const auto mode_str = arg.substr(10);
@@ -216,6 +217,7 @@ void CliHandler::print_usage() {
         "  --code-interleaving         Включить перемешивание кода\n"
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
+        "  --anti-tamper-veh           Install VEH INT3 trap in packer stub (EXE-only, G3 Phase 2)\n"
         "  --strings=<режим>           Защита строк в .rdata:\n"
         "                                off       — оставить plaintext\n"
         "                                stub      — decryptor как обычный x64 asm\n"

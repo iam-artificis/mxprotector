@@ -127,6 +127,41 @@ struct ProtectionConfig {
     uint32_t packer_cipher_layers = 1;
 
     /**
+     * @brief G3 Phase 2 — VEH-based INT3 trap (EXE-only, opt-in).
+     *
+     * When enabled, the packer entry stub:
+     *   1. Registers a Vectored Exception Handler via a Hell's Gate
+     *      resolution of `ntdll!RtlAddVectoredExceptionHandler`.
+     *   2. Plants an `int3` followed by 6 bytes of per-build random
+     *      junk, and relies on the VEH to advance `CONTEXT.Rip` past
+     *      the whole 7-byte block at runtime.
+     *
+     * The junk bytes are never executed on a clean host but are still
+     * reachable in the binary, so linear disassemblers decode them
+     * and produce bogus instructions that confuse their control-flow
+     * recovery. A debugger that swallows first-chance exceptions
+     * disrupts the reverser's workflow when the int3 fires.
+     *
+     * The VEH's address filter is strict: it only acts on an
+     * exception whose `ExceptionRecord->ExceptionAddress` matches
+     * the exact runtime VA of our planted int3. Every other
+     * exception — including C++ `throw` (code `0xE06D7363`) — gets
+     * `EXCEPTION_CONTINUE_SEARCH` so try/catch and SEH still work
+     * unchanged. A C++ exception smoke test (`test_exception.cpp`)
+     * guards this property.
+     *
+     * **EXE-only** — a DLL-installed VEH outlives the DLL's unload
+     * (there is no cleanup hook in our DllMain forwarding stub), so
+     * any subsequent exception in the host process would reach a
+     * freed handler body and crash the host. The packer's EXE path
+     * enables this check only when `pe_type == executable` **and**
+     * this flag is true; the DLL path ignores the flag entirely.
+     *
+     * Default: false. Set via `--anti-tamper-veh` on the command line.
+     */
+    bool enable_veh_anti_tamper = false;
+
+    /**
      * @brief Фабричный метод: создаёт конфигурацию по уровню защиты.
      *
      * Раскладка уровней:
