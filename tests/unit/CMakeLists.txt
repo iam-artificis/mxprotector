@@ -26,6 +26,7 @@ set(TEST_SOURCES
     string_decryptor_codegen_test.cpp
     string_protection_pass_test.cpp
     hash_opaque_predicate_test.cpp
+    veh_int3_trap_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -73,6 +74,13 @@ set(STRING_PROTECT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_protection_pass.cpp
 )
 
+# Packer sub-module sources needed by individual packer unit tests
+# (currently just the G3 Phase 2 VEH INT3 trap emitter; depends on
+# the Hell's Gate resolver from ANTI_TAMPER_SOURCES).
+set(PACKER_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/veh_int3_trap.cpp
+)
+
 # ==============================================================================
 # Исходные файлы мутации/обфускации (нужны для линковки)
 # ==============================================================================
@@ -111,7 +119,8 @@ add_executable(mxprotector_tests
     ${VM_SOURCES}
     ${ANTI_EMU_SOURCES}
     ${ANTI_TAMPER_SOURCES}
-    ${STRING_PROTECT_SOURCES})
+    ${STRING_PROTECT_SOURCES}
+    ${PACKER_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

@@ -82,6 +82,7 @@ set(BUILDER_SOURCES
     protection/packer/stolen_bytes.cpp
     protection/packer/stub_emitter.cpp
     protection/packer/tls_callback.cpp
+    protection/packer/veh_int3_trap.cpp
 
     # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
     protection/string/string_scanner.cpp
