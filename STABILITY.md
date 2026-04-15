@@ -25,9 +25,10 @@ Everything in `src/builder/` is mutable:
 ## 3. Supported Targets & Known Gaps
 | Target | Status | Notes |
 |---|---|---|
-| `.exe` x64 | Full Support | All passes run. Must pass 240/240 stress test. |
-| `.dll` x64 | Partial | Packer auto-skipped (requires DllMain stub logic). VM/Mutate/CFF work. |
-| `.sys` x64 | Untested | Packer auto-skipped. Requires test-signing infra. |
+| `.exe` x64 | Full Support | All passes run. Validated via 15/15 stress on test_vm_basic, branch, loop, multi, showcase, stress, string + 268/268 unit tests. |
+| `.dll` x64 | Full Support | DLL packer ships full decrypt pipeline through `DllFullStubEmitter` (push 11 nonvolatiles + DllMain args, gate on `reason == DLL_PROCESS_ATTACH`, decrypt + reprotect via rip-relative ImageBase). Validated 15/15 on test_dll_basic via test_dll_loader. |
+| `.sys` x64 | Untested | Packer auto-skipped. Requires test-signing infra. Anti-tamper checks and VM both depend on user-mode `gs:[0x60]` PEB reads, so kernel support requires a separate emission path. |
 
 **Known Logic Gaps:**
 - `--strings=stub/vm` CLI flag parses, but the final `.mxstr` assembler orchestrator pass is not written yet.
+- Anti-tamper VEH techniques (G3 Phase 2, planned) will be gated on `pe_type == executable` + explicit `--anti-tamper-veh` flag — DLLs cannot safely host VEH that outlives unload.
