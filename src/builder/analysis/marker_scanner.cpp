@@ -93,7 +93,11 @@ std::vector<MarkerScanner::RawMarker> MarkerScanner::scan_section(
         if ((rex != 0x48 && rex != 0x49) || op < 0xB8 || op > 0xBF) continue;
 
         const auto type_byte = static_cast<uint8_t>(candidate >> 56);
-        if (type_byte > static_cast<uint8_t>(MarkerType::obfuscate_end)) continue;
+        // Any type byte beyond the highest known MarkerType enumerant is a
+        // false match (the magic prefix is shared with user data that happens
+        // to start with the same 7 bytes). Update this bound whenever a new
+        // marker pair is added to `MarkerType`.
+        if (type_byte > static_cast<uint8_t>(MarkerType::guard_end)) continue;
 
         const size_t insn_start = offset - 2;
         uint32_t total = 10; // mov rax, imm64

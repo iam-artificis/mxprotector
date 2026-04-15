@@ -28,6 +28,7 @@ set(TEST_SOURCES
     hash_opaque_predicate_test.cpp
     veh_int3_trap_test.cpp
     stub_self_hash_test.cpp
+    marker_scanner_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -110,6 +111,12 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/mba_transition_gen.cpp
 )
 
+# Analysis module sources needed by analysis-level unit tests (currently
+# just the marker scanner — adding more if future tests require).
+set(ANALYSIS_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
+)
+
 # ==============================================================================
 # Цель: mxprotector_tests
 # ==============================================================================
@@ -122,7 +129,8 @@ add_executable(mxprotector_tests
     ${ANTI_EMU_SOURCES}
     ${ANTI_TAMPER_SOURCES}
     ${STRING_PROTECT_SOURCES}
-    ${PACKER_SOURCES})
+    ${PACKER_SOURCES}
+    ${ANALYSIS_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)
 

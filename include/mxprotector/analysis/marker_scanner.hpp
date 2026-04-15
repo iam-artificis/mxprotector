@@ -92,12 +92,13 @@ private:
     /**
      * @brief Проверяет, является ли тип маркера «begin».
      * @param type Тип маркера.
-     * @return true для vm_begin, mutate_begin, obfuscate_begin.
+     * @return true для любого *_begin маркера.
      */
     [[nodiscard]] static constexpr bool is_begin_marker(MarkerType type) noexcept {
         return type == MarkerType::vm_begin ||
                type == MarkerType::mutate_begin ||
-               type == MarkerType::obfuscate_begin;
+               type == MarkerType::obfuscate_begin ||
+               type == MarkerType::guard_begin;
     }
 
     /**
@@ -110,6 +111,7 @@ private:
             case MarkerType::vm_begin:        return MarkerType::vm_end;
             case MarkerType::mutate_begin:    return MarkerType::mutate_end;
             case MarkerType::obfuscate_begin: return MarkerType::obfuscate_end;
+            case MarkerType::guard_begin:     return MarkerType::guard_end;
             default:                          return begin_type;
         }
     }
@@ -127,6 +129,8 @@ private:
             case MarkerType::mutate_end:      return "MUTATE_END";
             case MarkerType::obfuscate_begin: return "OBFUSCATE_BEGIN";
             case MarkerType::obfuscate_end:   return "OBFUSCATE_END";
+            case MarkerType::guard_begin:     return "GUARD_BEGIN";
+            case MarkerType::guard_end:       return "GUARD_END";
             default:                          return "UNKNOWN";
         }
     }

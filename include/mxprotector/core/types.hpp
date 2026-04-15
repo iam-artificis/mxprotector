@@ -106,7 +106,9 @@ enum class MarkerType : uint8_t {
     mutate_begin    = 2,  ///< MX_MUTATE_BEGIN — начало мутируемого региона
     mutate_end      = 3,  ///< MX_MUTATE_END — конец мутируемого региона
     obfuscate_begin = 4,  ///< MX_OBFUSCATE_BEGIN — начало обфусцируемого региона
-    obfuscate_end   = 5   ///< MX_OBFUSCATE_END — конец обфусцируемого региона
+    obfuscate_end   = 5,  ///< MX_OBFUSCATE_END — конец обфусцируемого региона
+    guard_begin     = 6,  ///< MX_GUARD_BEGIN — начало runtime-guarded блока
+    guard_end       = 7   ///< MX_GUARD_END — конец runtime-guarded блока
 };
 
 // ============================================================================

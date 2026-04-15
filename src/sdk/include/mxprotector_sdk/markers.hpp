@@ -21,7 +21,9 @@ enum MarkerTypeId : uint8_t {
     MUTATE_BEGIN    = 2,
     MUTATE_END      = 3,
     OBFUSCATE_BEGIN = 4,
-    OBFUSCATE_END   = 5
+    OBFUSCATE_END   = 5,
+    GUARD_BEGIN     = 6,
+    GUARD_END       = 7
 };
 
 /// 7-байтовый префикс магии "MX_PROT" в little-endian: 0x??_54_4F_52_50_5F_58_4D
@@ -61,3 +63,22 @@ __attribute__((always_inline)) inline void emit_marker_t() {
 #define MX_MUTATE_END       ::mx::sdk::emit_marker_t<::mx::sdk::MUTATE_END>();
 #define MX_OBFUSCATE_BEGIN  ::mx::sdk::emit_marker_t<::mx::sdk::OBFUSCATE_BEGIN>();
 #define MX_OBFUSCATE_END    ::mx::sdk::emit_marker_t<::mx::sdk::OBFUSCATE_END>();
+
+/**
+ * @brief Runtime-guard блок: код между MX_GUARD_BEGIN и MX_GUARD_END
+ *        помещается builder'ом на выделенные 4K-страницы в отдельной
+ *        секции и шифруется at-rest. При первом вызове VEH на INT3
+ *        расшифровывает соответствующую страницу, исполняет тело
+ *        блока, затем шифрует её обратно.
+ *
+ * Ограничения (Commit 1 — только SDK-side, builder-side защита
+ * будет добавлена следующими коммитами):
+ *
+ *   * Тело блока должно быть структурным callable-подобным регионом:
+ *     никаких early-return, exception, goto через границу блока.
+ *   * Размер тела — порядка десятков-сотен байт (одна 4K страница).
+ *   * Тело не должно разделяться с другим кодом по страницам —
+ *     builder сам выносит его на свою выровненную страницу.
+ */
+#define MX_GUARD_BEGIN      ::mx::sdk::emit_marker_t<::mx::sdk::GUARD_BEGIN>();
+#define MX_GUARD_END        ::mx::sdk::emit_marker_t<::mx::sdk::GUARD_END>();

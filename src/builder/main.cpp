@@ -318,6 +318,7 @@ int main(int argc, char** argv) {
             case mx::MarkerType::vm_begin:        type_name = "VM"; break;
             case mx::MarkerType::mutate_begin:    type_name = "MUTATE"; break;
             case mx::MarkerType::obfuscate_begin: type_name = "OBFUSCATE"; break;
+            case mx::MarkerType::guard_begin:     type_name = "GUARD"; break;
             default: break;
         }
         std::cout << std::format("    {} : RVA [0x{:08X} - 0x{:08X}] ({} байт)\n",
