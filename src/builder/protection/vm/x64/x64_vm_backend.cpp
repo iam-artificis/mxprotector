@@ -1165,6 +1165,23 @@ MxResult<VmRuntime> X64VmBackend::generate(
         rt.u8(per_handler_key[handler_id]);
     };
 
+    // G5 invariant: every handler_id the backend begins via
+    // `begin_handler` MUST later get a trampoline chain queued
+    // via `queue_trampoline_chain`, otherwise the post-emit
+    // handler_table patch fires the "handler id N missing
+    // trampoline chain" error. The standard path goes through
+    // `end_handler_tail`, which emits the tail dispatch AND
+    // queues the chain in one shot. A handful of `VmOp` cases
+    // (dead / opq_branch / native) emit their own inline tail
+    // and `return false` from `emit_op_variant` to tell the
+    // surrounding loop "don't call end_handler_tail" — they must
+    // still call `finish_handler_chain` themselves so the
+    // invariant holds.
+    auto finish_handler_chain = [&]() {
+        queue_trampoline_chain(current_handler_id);
+        maybe_drain_trampolines();
+    };
+
     auto end_handler_tail = [&]() {
         emit_handler_key_fold_in(current_handler_id);
         const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
@@ -1173,8 +1190,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                           rflags_disp, &rng,
                                           imagebase_key_disp);
         table_patches.push_back({p.rel32_offset, p.instruction_end});
-        queue_trampoline_chain(current_handler_id);
-        maybe_drain_trampolines();
+        finish_handler_chain();
     };
 
     uint32_t exit_jmp_offset = 0;  // patched if emit_exit_as_jmp
@@ -1416,8 +1432,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
             case VmOp::native:
                 // Generic native slot is never invoked — each native insn gets
-                // its own handler. Trap with ud2 (no tail).
+                // its own handler. Trap with ud2 (no tail). Still needs a
+                // trampoline chain queued so the handler_table entry for this
+                // id has a valid target and the integrity-check XOR sum
+                // matches; the trampoline points at `ud2` and only fires if
+                // something dispatches through the generic native slot by
+                // mistake, in which case the process crashes immediately —
+                // which is exactly what we want.
                 emit_ud2(rt);
+                finish_handler_chain();
                 return false;
 
             case VmOp::dead: {
@@ -1458,7 +1481,8 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                                    rflags_disp, &rng,
                                                    imagebase_key_disp);
                 table_patches.push_back({p.rel32_offset, p.instruction_end});
-                return false;  // tail already emitted inline
+                finish_handler_chain();  // G5: inline-tail path still owes a chain
+                return false;
             }
 
             case VmOp::opq_branch: {
@@ -1488,6 +1512,7 @@ MxResult<VmRuntime> X64VmBackend::generate(
                                                    rflags_disp, &rng,
                                                    imagebase_key_disp);
                 table_patches.push_back({p.rel32_offset, p.instruction_end});
+                finish_handler_chain();  // G5: inline-tail path still owes a chain
                 return false;
             }
 
@@ -1523,6 +1548,15 @@ MxResult<VmRuntime> X64VmBackend::generate(
                 } else {
                     emit_ret(rt);
                 }
+                // G5: exit handler has no tail dispatch (it unwinds
+                // the VM state and returns), but it still needs a
+                // trampoline chain queued — the handler_table entry
+                // for exit must point at a valid trampoline so the
+                // integrity-check XOR sum stays consistent. The
+                // trampoline jmps into the exit body; on dispatch,
+                // the body pops registers and returns to the caller,
+                // exactly as a direct call would.
+                finish_handler_chain();
                 return false;
             }
             case VmOp::count_:
