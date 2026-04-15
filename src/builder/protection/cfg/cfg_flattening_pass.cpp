@@ -336,6 +336,112 @@ void apply_relocation_fixups(
     }
 }
 
+/// Check whether a function's prologue bytes indicate an MSVC
+/// "register-save-via-rsp-copy" pattern that the current flattener
+/// doesn't handle correctly:
+///
+///     mov rax, rsp              ; 48 8B C4 (load-form)
+///     mov [rax+8], rbx          ; SAVE_NONVOL via the rax alias
+///     mov [rax+0x10], rbp
+///     ...
+///     push r14                  ; THEN the "normal" push saves
+///     sub rsp, N
+///
+/// The ORIGINAL pre-mutation bytes start with `48 8B C4` (opcode 8B
+/// = MOV r64, r/m64). After `MutationPass` runs its instruction
+/// substitution rules, the same sequence may be re-encoded to the
+/// equivalent store-form `48 89 E0` (opcode 89 = MOV r/m64, r64);
+/// both encodings produce `mov rax, rsp` with identical semantics.
+/// The check below matches either form.
+///
+/// The failing pattern reproduces deterministically on
+/// `test_exception.exe`'s RVA 0x184C CRT helper — a function that
+/// saves rbx/rbp/rsi/rdi directly into the caller's shadow space
+/// via `mov [rax+N], reg` rather than pushing them. The flattener
+/// shuffles blocks and inserts its dispatcher jumps between the
+/// `mov rax, rsp` and the subsequent mov-based saves in a way that
+/// subtly breaks the function on some code paths. The root cause
+/// wasn't isolated in a reasonable time budget, and a bisect via
+/// `MX_CFF_SKIP_RVA=184C` confirmed this specific function is the
+/// only crash source in the CRT helper window. Skipping it keeps
+/// CFF coverage for every standard-prologue function while
+/// avoiding the one pattern the flattener gets wrong.
+[[nodiscard]] bool first_instruction_is_mov_rax_rsp(
+    ByteView func_bytes) noexcept
+{
+    if (func_bytes.size() < 3) return false;
+    // `48 8B C4` — MOV r64 rax, r/m64 rsp (load form)
+    // `48 89 E0` — MOV r/m64 rax, r64 rsp (store form, post-mutation)
+    if (func_bytes[0] == 0x48 && func_bytes[1] == 0x8B && func_bytes[2] == 0xC4) {
+        return true;
+    }
+    if (func_bytes[0] == 0x48 && func_bytes[1] == 0x89 && func_bytes[2] == 0xE0) {
+        return true;
+    }
+    return false;
+}
+
+/// Check whether a function's `.xdata` unwind record makes it unsafe
+/// for CFG flattening. Three conditions, any of which is a stop-sign:
+///
+///   * `UNW_FLAG_EHANDLER (0x01)` — function has a `__try/__except`
+///     or C++ catch scope directly attached. The SEH dispatcher
+///     reads a language-specific scope table inline after the
+///     unwind codes and matches current `Rip` against it to pick
+///     the right filter. If CFF rewrites the function body, every
+///     address in the scope table becomes stale and the match
+///     picks the wrong filter — typical outcome is a silent
+///     process abort during CRT startup.
+///
+///   * `UNW_FLAG_UHANDLER (0x02)` — termination handler
+///     (`__try/__finally`). Same staleness risk. MSVC's
+///     `__scrt_common_main_seh`, the CRT wrapper that runs
+///     `main()` inside a `__try/__except(seh_filter_exe(...))`,
+///     always has this flag set.
+///
+///   * `UNW_FLAG_CHAININFO (0x04)` — this record chains into
+///     another record's unwind codes. Chained records are NOT
+///     standalone functions: MSVC emits them when a single logical
+///     function has multiple prologue phases (e.g., register saves
+///     deferred past the main prologue because the saved register
+///     is live-in), and each phase needs its own unwind codes.
+///     The `begin/end` range of a chained entry covers a code
+///     SLICE inside a larger function, and linear execution
+///     typically falls out of the slice into the parent. CFF
+///     processing this as a standalone function produces code that
+///     emits `jmp exit` (= `int3` trap) where the original just
+///     continued linearly into the rest of the parent function,
+///     aborting the process the moment execution reaches that
+///     slice. The test_exception.exe crash under `-l standard` was
+///     this exact case at RVA 0x10C1, a chained entry whose parent
+///     starts at RVA 0x1070.
+///
+/// The `.xdata` bytes may live in `.xdata`, `.rdata`, or any other
+/// data section — MSVC typically emits unwind info into `.rdata`.
+/// We resolve the containing section by RVA rather than by name.
+[[nodiscard]] bool unwind_info_makes_function_unsafe_for_cff(
+    const PeImage& image,
+    uint32_t       unwind_info_rva) noexcept
+{
+    if (unwind_info_rva == 0) return false;
+
+    const pe::SectionInfo* sec = image.section_by_rva(unwind_info_rva);
+    if (sec == nullptr) return false;
+
+    const uint32_t offset = unwind_info_rva - sec->virtual_address;
+    if (offset >= sec->data.size()) return false;
+
+    // UNWIND_INFO first byte: Version(3 bits) | Flags(5 bits).
+    const uint8_t first_byte = sec->data[offset];
+    const uint8_t flags = static_cast<uint8_t>((first_byte >> 3) & 0x1F);
+
+    constexpr uint8_t kEhandler  = 0x01;
+    constexpr uint8_t kUhandler  = 0x02;
+    constexpr uint8_t kChainInfo = 0x04;
+
+    return (flags & (kEhandler | kUhandler | kChainInfo)) != 0;
+}
+
 void write_jmp_trampoline(
     pe::SectionInfo& section,
     uint32_t offset_in_section,
@@ -435,6 +541,18 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
         }
 
         if (cfg.block_count() < 3) return {};
+
+        // Skip the non-standard "mov rax, rsp; mov [rax+N], reg" prologue
+        // pattern — see the comment on `first_instruction_is_mov_rax_rsp`
+        // for the rationale.
+        if (first_instruction_is_mov_rax_rsp(
+                ByteView{code_snapshot.data(), code_snapshot.size()})) {
+            ctx.log_fmt("  CFF: RVA=0x{:08X} size={} — skipped "
+                        "(mov rax, rsp prologue pattern)",
+                func_rva, func_size);
+            ++functions_skipped;
+            return {};
+        }
 
         // ==================================================================
         // Safety: skip functions with patterns incompatible with CFF
@@ -620,53 +738,130 @@ MxStatus CfgFlatteningPass::execute(ProtectionContext& ctx) {
         }
 
         if (!used_map_file) {
-            // Historically there was a `.pdata` fallback here that
-            // iterated every function with `BeginAddress < entry_rva`
-            // and ran CFF on each one, "automatically" protecting
-            // binaries that shipped without a `.map` file or
-            // `MX_OBFUSCATE_BEGIN/END` markers. That fallback was
-            // fundamentally unsafe on C++ binaries because the
-            // functions in that RVA window are CRT runtime code —
-            // `__scrt_common_main_seh`, `__scrt_initialize_crt`,
-            // `__security_init_cookie`, `_initterm`, pure-virtual /
-            // new-handler / locale init, etc. CFF's block-based
-            // flattening produces semantically correct code for
-            // most user functions, but the CRT helpers contain
-            // patterns the current flattener subtly breaks.
+            // `.pdata` fallback: iterate every `RUNTIME_FUNCTION`
+            // whose begin address is before the entry point and
+            // try to flatten each one. This automatically covers
+            // binaries that ship without a `.map` file or
+            // `MX_OBFUSCATE_BEGIN/END` markers.
             //
-            // Symptom: `test_exception.cpp` (a minimal C++ try/catch
-            // smoke test) exited 127 with empty stdout under
-            // `-l standard`/`-l strong` without `--no-cfg-flattening`.
-            // A bisect-and-skip pass through the `.pdata` fallback's
-            // function list confirmed the crash is caused by CFF
-            // miscompiling a specific non-handler-bearing CRT
-            // function (RVA 0x184C in the test binary). The same
-            // class of bug likely affects several other CRT helpers
-            // — CFF just happens to tolerate most of them on C-only
-            // code like `test_vm_basic.exe` that doesn't exercise
-            // the same CRT paths.
+            // ## The old bug
             //
-            // The only principled fix is to stop blindly scanning
-            // `.pdata`. CFF coverage now comes from two explicit,
-            // user-scoped inputs:
+            // An earlier version of this loop flattened every
+            // entry in that window unconditionally, which broke
+            // C++ binaries on `-l standard`+ because a subset of
+            // `.pdata` entries describe CODE SLICES, not full
+            // functions:
             //
-            //   1. `MX_OBFUSCATE_BEGIN/END` markers in user source —
-            //      picked up via `ctx.markers()` and processed in the
-            //      `regions`-based path above this `else` branch.
-            //   2. A `.map` file (`--map-file=<path>`) listing the
-            //      symbol names the user opts into flattening.
+            //   * **`UNW_FLAG_CHAININFO`**: MSVC emits chained
+            //     unwind records whenever a function has multiple
+            //     prologue phases (e.g., registers saved lazily
+            //     after the main prologue). The chained entry's
+            //     `BeginAddress`/`EndAddress` cover a slice in the
+            //     middle of the parent function; linear execution
+            //     falls out of the slice into the parent function's
+            //     continuation, NOT to a `ret` inside the slice.
+            //     CFG flattening on that slice emits a dispatcher
+            //     with `jmp exit` for the last block (exit_label
+            //     is a one-byte `int3` trap). Runtime execution
+            //     hits the trap the moment it reaches the slice
+            //     through the parent flow → exit 127 with no
+            //     stdout during CRT startup.
             //
-            // Both sources identify user code the developer has
-            // explicitly chosen to flatten, so CFF can no longer
-            // accidentally touch CRT code. Follow-up work can
-            // investigate the specific flattener bug that breaks
-            // CRT functions and re-enable the automatic path once
-            // it's safe.
-            ctx.log("CfgFlatteningPass: нет .map файла и нет "
-                    "MX_OBFUSCATE_BEGIN/END маркеров — CFF не применён "
-                    "(авто-выбор из .pdata отключён как небезопасный "
-                    "для C++ exception handling — см. комментарий в "
-                    "источнике)");
+            //   * **`UNW_FLAG_EHANDLER`** / **`UNW_FLAG_UHANDLER`**:
+            //     functions with attached SEH/C++ handlers carry
+            //     a scope table after the unwind codes. Flattening
+            //     their body invalidates the address references
+            //     inside the scope table, so the runtime
+            //     dispatcher picks the wrong handler (or an
+            //     invalid one) and the process aborts.
+            //
+            // The `test_exception.exe` smoke test used to exit 127
+            // under `-l standard` without `--no-cfg-flattening`
+            // because `.pdata[2]` at RVA 0x10C1 was a chained
+            // entry (parent at 0x1070) that this loop flattened.
+            // `dumpbin /UNWINDINFO` confirmed the CHAININFO flag.
+            //
+            // ## The fix
+            //
+            // Skip any entry whose `UNWIND_INFO.Flags` contains
+            // any of EHANDLER / UHANDLER / CHAININFO. This leaves
+            // normal leaf functions and standard-prologue
+            // functions eligible for CFF while excluding the
+            // slice-style chained entries and the SEH-bearing
+            // functions that carry language-specific scope
+            // tables. The filter is cheap (one byte read per
+            // candidate) and has no runtime cost in the protected
+            // binary.
+            ctx.log("CfgFlatteningPass: используем .pdata для границ функций");
+
+            struct RuntimeFunction {
+                uint32_t begin_addr;
+                uint32_t end_addr;
+                uint32_t unwind_info;
+            };
+
+            const pe::SectionInfo* pdata = ctx.pe_image().section_by_name(".pdata");
+            if (!pdata || pdata->data.size() < sizeof(RuntimeFunction)) {
+                ctx.log("CfgFlatteningPass: .pdata не найдена, пропуск CFF");
+            } else {
+                const size_t func_count = pdata->data.size() / sizeof(RuntimeFunction);
+                const auto* funcs = reinterpret_cast<const RuntimeFunction*>(pdata->data.data());
+
+                ctx.log_fmt("CfgFlatteningPass: найдено {} функций в .pdata", func_count);
+
+                const Rva entry_rva = ctx.pe_image().entry_point_rva();
+                size_t entry_idx = func_count;
+                for (size_t j = 0; j < func_count; ++j) {
+                    if (funcs[j].begin_addr <= entry_rva &&
+                        funcs[j].end_addr > entry_rva) {
+                        entry_idx = j;
+                        break;
+                    }
+                }
+
+                ctx.log_fmt("CfgFlatteningPass: entry point at .pdata[{}] "
+                            "(RVA=0x{:08X}), CFF range: [0..{})",
+                            entry_idx, entry_rva, entry_idx);
+
+                uint32_t unsafe_skipped = 0;
+                for (size_t i = 0; i < entry_idx; ++i) {
+                    const Rva func_rva = funcs[i].begin_addr;
+                    const uint32_t func_size = funcs[i].end_addr - funcs[i].begin_addr;
+
+                    if (func_size < MapParser::kMinFunctionSize ||
+                        func_size > MapParser::kMaxFunctionSize) continue;
+
+                    if (unwind_info_makes_function_unsafe_for_cff(
+                            ctx.pe_image(), funcs[i].unwind_info)) {
+                        ++unsafe_skipped;
+                        continue;
+                    }
+
+                    pe::SectionInfo* section = nullptr;
+                    for (auto& s : ctx.pe_image().sections()) {
+                        if (s.is_code() && s.contains_rva(func_rva)) {
+                            section = &s;
+                            break;
+                        }
+                    }
+                    if (!section) continue;
+
+                    const uint32_t offset_in_section = func_rva - section->virtual_address;
+                    if (offset_in_section + func_size > section->data.size()) continue;
+
+                    const Va func_va = ctx.pe_image().image_base() + func_rva;
+                    (void)flatten_function(*section, offset_in_section, func_size,
+                                           func_va, func_rva);
+                }
+
+                if (unsafe_skipped > 0) {
+                    ctx.log_fmt("CfgFlatteningPass: пропущено {} функций с "
+                                "UNW_FLAG_EHANDLER/UHANDLER/CHAININFO "
+                                "(compat с C++ exception unwinder + "
+                                "chained-unwind slices)",
+                        unsafe_skipped);
+                }
+            }
         }
     }
 
