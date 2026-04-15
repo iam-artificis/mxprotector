@@ -79,6 +79,7 @@ set(BUILDER_SOURCES
     protection/packer/cipher_body.cpp
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
+    protection/packer/stub_emitter.cpp
     protection/packer/tls_callback.cpp
 
     # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
