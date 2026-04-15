@@ -46,6 +46,7 @@ set(BUILDER_SOURCES
     protection/obfuscation/opaque_predicates.cpp
     protection/obfuscation/constant_unfolding.cpp
     protection/obfuscation/mba_transform.cpp
+    protection/obfuscation/hash_opaque_predicate.cpp
 
     # Phase 3: Mutation Strengthening
     protection/mutation/instruction_splitter.cpp

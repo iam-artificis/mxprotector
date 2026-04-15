@@ -6,6 +6,7 @@
 #include "mxprotector/protection/packer/cipher_body.hpp"
 
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/obfuscation/hash_opaque_predicate.hpp"
 
 #include <cstdint>
 
@@ -23,6 +24,45 @@ void emit_decrypt_body(RawEmitter&        e,
     // in-memory position of the per-layer LEAs is irrelevant to patching.
     patches.layers.resize(layer_count);
     for (auto& lp : patches.layers) lp.sections.reserve(section_count);
+
+    // ----------------------------------------------------------------
+    // G6 — Hash-based opaque predicate gate.
+    //
+    // Plant one always-true hash predicate at the very head of the
+    // decrypt body, BEFORE the anti-debug probe. The predicate hashes
+    // a build-time random 4-byte input (loaded via a rip-relative
+    // mov from inline data) through three rounds of multiplication
+    // mixed with XOR and rotation, then compares the result against
+    // a build-time-baked target. The "true" path falls through to
+    // the anti-debug probe; the "false" path is reachable code (a
+    // tiny `mov eax, junk; ret` body) that's never executed at
+    // runtime but which static analysers must still decode and
+    // explore.
+    //
+    // Effect on reverse engineering:
+    //   * SAT/SMT-based symbolic engines that try to invert the hash
+    //     to find an input satisfying the false branch get stuck on
+    //     the multiplication chain. Most engines either time out or
+    //     skip the constraint, leaving both branches "reachable" in
+    //     their reachability set and inflating analysis cost.
+    //   * Linear disassemblers that follow the `jne short` happily
+    //     decode the false branch, see the `ret`, and assume the
+    //     enclosing function ended there — confusing their callgraph
+    //     view of the surrounding stub.
+    //   * Concrete-evaluation engines (the strongest case) evaluate
+    //     the hash forward and prune the false branch correctly.
+    //     They pay a small extra cost but recover ground truth.
+    //
+    // The predicate clobbers `eax` and `rflags`. That's safe here
+    // because the very next emission (the anti-debug probe) clobbers
+    // both anyway — the variants either do `mov rax, gs:[0x60]` or
+    // load `rax = imm64`, and they all rebuild `edx` from scratch
+    // afterwards.
+    {
+        const obf::HashOpaqueParams hp =
+            obf::randomize_hash_opaque_params(rng);
+        obf::emit_hash_opaque_predicate(e, hp, rng);
+    }
 
     // (2) Anti-debug — polymorphic. Each variant reads a different Windows
     //     "debugger present" indicator and normalizes the result to `edx`

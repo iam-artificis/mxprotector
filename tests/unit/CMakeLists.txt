@@ -25,6 +25,7 @@ set(TEST_SOURCES
     string_encryptor_test.cpp
     string_decryptor_codegen_test.cpp
     string_protection_pass_test.cpp
+    hash_opaque_predicate_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -84,6 +85,7 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/opaque_predicates.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/mba_transform.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/hash_opaque_predicate.cpp
 )
 
 # Phase 3: CFF + Assembler
