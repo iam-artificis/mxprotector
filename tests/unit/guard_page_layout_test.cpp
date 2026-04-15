@@ -4,26 +4,24 @@
  *
  * The page builder is a pure function — same inputs yield byte-for-byte
  * identical outputs — so the tests pin down the exact layout contract
- * that Commit 2 of the runtime-guards milestone relies on. Future
- * commits will reshape this layout (plaintext int3+tag windows,
- * encrypted tail), and the tests here are the tripwire that warns us
- * about an accidental change before downstream code notices the new
- * offsets.
+ * the runtime-guards VEH dispatcher relies on. The two 5-byte
+ * `int3 + tag` windows MUST remain at fixed offsets so Commit 3b's
+ * encryption skip-window mechanism can preserve them correctly.
  *
  * Covered behaviours:
- *   * Happy path for a tiny body: size, body placement, exit-jump
- *     placeholder, junk offset.
- *   * Determinism: identical body + identical seed → identical bytes.
- *   * Different seed: identical body + different seed → identical
- *     body prefix and exit jump, different junk tail.
- *   * Edge case: body exactly `page_size - 5` — zero junk bytes but
- *     still succeeds, all fields valid.
- *   * Edge case: body `page_size - 4` — fails with a clear error
- *     (body + exit jmp would overflow).
- *   * Edge case: empty body fails (nothing to relocate).
- *   * Configurable `page_size` override keeps all invariants intact
- *     on a non-standard small page (useful for tests without
- *     allocating 4 KiB).
+ *   * Happy path for a tiny body: size, entry int3+tag, body placement,
+ *     exit int3+tag, junk offset, guard_id baked into both tags.
+ *   * Determinism: identical body + same seed → identical bytes.
+ *   * Different seed: body and both int3+tag windows stable, junk tail
+ *     diverges.
+ *   * Edge case: body exactly `page_size - 10` fills the page — both
+ *     plaintext windows present, zero junk bytes, all fields valid.
+ *   * Edge case: body one byte too large → error.
+ *   * Edge case: empty body → error.
+ *   * Configurable `page_size` override keeps invariants on a small
+ *     64-byte page.
+ *   * Guard id is encoded as little-endian u32 in BOTH tag windows.
+ *   * Two different guard_ids produce distinct tag bytes, same body.
  */
 
 #include <gtest/gtest.h>
@@ -43,61 +41,62 @@ using mx::ByteView;
 using mx::Randomizer;
 using mx::guard::build_guard_page;
 using mx::guard::GuardPageLayout;
+using mx::guard::kGuardInt3TagSize;
 using mx::guard::kGuardPageSize;
 
-/// Single-byte helper: true iff `buf[offset .. offset+4]` is exactly
-/// `E9 00 00 00 00`, which is the placeholder `jmp rel32 0` emitted
-/// by `build_guard_page` before `GuardPass::apply_exit_jump` patches
-/// the rel32.
-[[nodiscard]] bool is_exit_jmp_placeholder(
-    const ByteBuffer& buf, uint32_t offset)
-{
-    if (offset + 5 > buf.size()) return false;
-    return buf[offset + 0] == 0xE9u &&
-           buf[offset + 1] == 0x00u &&
-           buf[offset + 2] == 0x00u &&
-           buf[offset + 3] == 0x00u &&
-           buf[offset + 4] == 0x00u;
+/// Read the 4-byte little-endian u32 stored at the tag slot right
+/// after an `0xCC` instruction byte.
+[[nodiscard]] uint32_t read_tag(const ByteBuffer& buf, uint32_t int3_offset) {
+    uint32_t tag = 0;
+    std::memcpy(&tag, buf.data() + int3_offset + 1, sizeof(tag));
+    return tag;
 }
 
 // ---------------------------------------------------------------------------
-// Happy-path: tiny body on a default 4 KiB page.
+// Happy path — tiny body on a default 4 KiB page.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, HappyPathTinyBody) {
     const std::vector<uint8_t> body = {
-        0x48, 0x89, 0xC1,        // mov rcx, rax
-        0x48, 0x01, 0xC8,        // add rax, rcx
-        0x48, 0x31, 0xD2,        // xor rdx, rdx
+        0x48, 0x89, 0xC1,   // mov rcx, rax
+        0x48, 0x01, 0xC8,   // add rax, rcx
+        0x48, 0x31, 0xD2,   // xor rdx, rdx
     };
+    const uint32_t guard_id = 0x12345678u;
 
     Randomizer rng;
     auto result = build_guard_page(
-        ByteView{body.data(), body.size()}, rng);
+        ByteView{body.data(), body.size()}, guard_id, rng);
     ASSERT_TRUE(result.has_value()) << result.error().format();
     const auto& layout = *result;
 
     EXPECT_EQ(layout.bytes.size(), kGuardPageSize);
-    EXPECT_EQ(layout.body_offset, 0u);
-    EXPECT_EQ(layout.body_size, body.size());
 
-    // Body is placed verbatim at the start of the page.
+    // Entry int3+tag at offset 0.
+    EXPECT_EQ(layout.entry_int3_offset, 0u);
+    EXPECT_EQ(layout.bytes[0], 0xCCu);
+    EXPECT_EQ(read_tag(layout.bytes, layout.entry_int3_offset), guard_id);
+
+    // Body starts right after the entry tag.
+    EXPECT_EQ(layout.body_offset, kGuardInt3TagSize);
+    EXPECT_EQ(layout.body_size, body.size());
     for (size_t i = 0; i < body.size(); ++i) {
-        EXPECT_EQ(layout.bytes[i], body[i])
+        EXPECT_EQ(layout.bytes[layout.body_offset + i], body[i])
             << "Body byte mismatch at offset " << i;
     }
 
-    // Exit jmp rel32 sits right after the body.
-    EXPECT_EQ(layout.exit_jmp_offset, body.size());
-    EXPECT_TRUE(is_exit_jmp_placeholder(layout.bytes, layout.exit_jmp_offset));
+    // Exit int3+tag right after the body.
+    EXPECT_EQ(layout.exit_int3_offset, layout.body_offset + layout.body_size);
+    EXPECT_EQ(layout.bytes[layout.exit_int3_offset], 0xCCu);
+    EXPECT_EQ(read_tag(layout.bytes, layout.exit_int3_offset), guard_id);
 
     // Junk fills the remainder.
-    EXPECT_EQ(layout.junk_offset, body.size() + 5);
+    EXPECT_EQ(layout.junk_offset, layout.exit_int3_offset + kGuardInt3TagSize);
     EXPECT_LT(layout.junk_offset, kGuardPageSize);
 }
 
 // ---------------------------------------------------------------------------
-// Determinism: same body + same seed → bit-identical pages.
+// Determinism — same body + same seed → bit-identical bytes.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, DeterministicForIdenticalSeeds) {
@@ -106,8 +105,8 @@ TEST(GuardPageLayout, DeterministicForIdenticalSeeds) {
     Randomizer rng_a(0xABCD1234u);
     Randomizer rng_b(0xABCD1234u);
 
-    auto a = build_guard_page(ByteView{body.data(), body.size()}, rng_a);
-    auto b = build_guard_page(ByteView{body.data(), body.size()}, rng_b);
+    auto a = build_guard_page(ByteView{body.data(), body.size()}, 7u, rng_a);
+    auto b = build_guard_page(ByteView{body.data(), body.size()}, 7u, rng_b);
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
 
@@ -115,35 +114,32 @@ TEST(GuardPageLayout, DeterministicForIdenticalSeeds) {
 }
 
 // ---------------------------------------------------------------------------
-// Different seed: body + exit jmp stay identical, junk tail diverges.
+// Different seed — body + both int3+tag windows stable, junk tail diverges.
 // ---------------------------------------------------------------------------
 
-TEST(GuardPageLayout, BodyAndExitStableAcrossSeedsButJunkDiffers) {
+TEST(GuardPageLayout, BodyAndTagsStableAcrossSeedsButJunkDiffers) {
     const std::vector<uint8_t> body = {
         0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
-        0xC3,                           // ret  (would-be fragment — irrelevant)
+        0xC3,                           // ret fragment — irrelevant bytes
     };
 
     Randomizer rng_a(0x11111111u);
     Randomizer rng_b(0x22222222u);
 
-    auto a = build_guard_page(ByteView{body.data(), body.size()}, rng_a);
-    auto b = build_guard_page(ByteView{body.data(), body.size()}, rng_b);
+    auto a = build_guard_page(ByteView{body.data(), body.size()}, 3u, rng_a);
+    auto b = build_guard_page(ByteView{body.data(), body.size()}, 3u, rng_b);
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
 
-    // Body and exit jmp slots must match regardless of RNG state.
+    // The int3+tag windows and the body are RNG-independent.
     const uint32_t prefix_len = a->junk_offset;
     for (uint32_t i = 0; i < prefix_len; ++i) {
         ASSERT_EQ(a->bytes[i], b->bytes[i])
-            << "Deterministic region mismatch at offset " << i;
+            << "Deterministic region byte mismatch at offset " << i;
     }
 
-    // At least a majority of the junk tail bytes should differ.
-    // A random draw of 4085 bytes with a 256-symbol alphabet has a
-    // ~0.4% collision per byte, so we expect well over 99% of bytes
-    // to differ. We require >= 80% to avoid flakiness on short tails
-    // while still detecting an accidental shared-state bug.
+    // Junk tail should mostly differ. With a 4085-byte tail and
+    // uniform random bytes we expect ~99% different; require >=80%.
     uint32_t differing = 0;
     for (uint32_t i = a->junk_offset; i < kGuardPageSize; ++i) {
         if (a->bytes[i] != b->bytes[i]) ++differing;
@@ -155,50 +151,55 @@ TEST(GuardPageLayout, BodyAndExitStableAcrossSeedsButJunkDiffers) {
 }
 
 // ---------------------------------------------------------------------------
-// Edge case: body fills the page exactly minus the 5-byte exit jump.
+// Edge — body exactly `page_size - 10` → zero junk, all fields valid.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, ExactFitBodyHasZeroJunkBytes) {
-    const uint32_t kMaxBody = kGuardPageSize - 5;
+    const uint32_t kMaxBody = kGuardPageSize - 2 * kGuardInt3TagSize;
     const std::vector<uint8_t> body(kMaxBody, 0xAA);
 
     Randomizer rng;
     auto result = build_guard_page(
-        ByteView{body.data(), body.size()}, rng);
+        ByteView{body.data(), body.size()}, 0xDEADBEEFu, rng);
     ASSERT_TRUE(result.has_value());
 
+    EXPECT_EQ(result->entry_int3_offset, 0u);
     EXPECT_EQ(result->body_size, kMaxBody);
-    EXPECT_EQ(result->exit_jmp_offset, kMaxBody);
+    EXPECT_EQ(result->exit_int3_offset, kGuardInt3TagSize + kMaxBody);
     EXPECT_EQ(result->junk_offset, kGuardPageSize);
-    EXPECT_TRUE(is_exit_jmp_placeholder(
-        result->bytes, result->exit_jmp_offset));
+
+    EXPECT_EQ(result->bytes[result->entry_int3_offset], 0xCCu);
+    EXPECT_EQ(result->bytes[result->exit_int3_offset],  0xCCu);
+    EXPECT_EQ(read_tag(result->bytes, result->entry_int3_offset), 0xDEADBEEFu);
+    EXPECT_EQ(read_tag(result->bytes, result->exit_int3_offset),  0xDEADBEEFu);
 }
 
 // ---------------------------------------------------------------------------
-// Edge case: body too large by one byte → error.
+// Edge — body one byte too large.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, BodyTooLargeFails) {
-    const std::vector<uint8_t> body(kGuardPageSize - 4, 0xAA);
+    const std::vector<uint8_t> body(
+        kGuardPageSize - 2 * kGuardInt3TagSize + 1, 0xAA);
 
     Randomizer rng;
     auto result = build_guard_page(
-        ByteView{body.data(), body.size()}, rng);
+        ByteView{body.data(), body.size()}, 0u, rng);
     ASSERT_FALSE(result.has_value());
 }
 
 // ---------------------------------------------------------------------------
-// Edge case: empty body rejected.
+// Edge — empty body rejected.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, EmptyBodyFails) {
     Randomizer rng;
-    auto result = build_guard_page(ByteView{}, rng);
+    auto result = build_guard_page(ByteView{}, 0u, rng);
     ASSERT_FALSE(result.has_value());
 }
 
 // ---------------------------------------------------------------------------
-// Configurable page size: same invariants on a small 64-byte page.
+// Configurable page size — same invariants on a small 64-byte page.
 // ---------------------------------------------------------------------------
 
 TEST(GuardPageLayout, CustomPageSizePreservesInvariants) {
@@ -207,19 +208,51 @@ TEST(GuardPageLayout, CustomPageSizePreservesInvariants) {
 
     Randomizer rng;
     auto result = build_guard_page(
-        ByteView{body.data(), body.size()}, rng, kSmallPage);
+        ByteView{body.data(), body.size()}, 0xCAFEu, rng, kSmallPage);
     ASSERT_TRUE(result.has_value());
 
     EXPECT_EQ(result->bytes.size(), kSmallPage);
-    EXPECT_EQ(result->body_offset, 0u);
+    EXPECT_EQ(result->entry_int3_offset, 0u);
+    EXPECT_EQ(result->body_offset, kGuardInt3TagSize);
     EXPECT_EQ(result->body_size, body.size());
+    EXPECT_EQ(result->exit_int3_offset, kGuardInt3TagSize + body.size());
+    EXPECT_EQ(result->junk_offset,
+              kGuardInt3TagSize + body.size() + kGuardInt3TagSize);
+
     for (size_t i = 0; i < body.size(); ++i) {
-        EXPECT_EQ(result->bytes[i], body[i]);
+        EXPECT_EQ(result->bytes[result->body_offset + i], body[i]);
     }
-    EXPECT_EQ(result->exit_jmp_offset, body.size());
-    EXPECT_TRUE(is_exit_jmp_placeholder(
-        result->bytes, result->exit_jmp_offset));
-    EXPECT_EQ(result->junk_offset, body.size() + 5);
+    EXPECT_EQ(result->bytes[result->entry_int3_offset], 0xCCu);
+    EXPECT_EQ(result->bytes[result->exit_int3_offset],  0xCCu);
+    EXPECT_EQ(read_tag(result->bytes, result->entry_int3_offset), 0xCAFEu);
+    EXPECT_EQ(read_tag(result->bytes, result->exit_int3_offset),  0xCAFEu);
+}
+
+// ---------------------------------------------------------------------------
+// Different guard_ids produce distinct tag bytes for identical bodies.
+// ---------------------------------------------------------------------------
+
+TEST(GuardPageLayout, DifferentGuardIdsYieldDifferentTags) {
+    const std::vector<uint8_t> body = {0x90, 0x90, 0x90};
+
+    Randomizer rng_a(0x42u);
+    Randomizer rng_b(0x42u);
+
+    auto a = build_guard_page(ByteView{body.data(), body.size()}, 1u, rng_a);
+    auto b = build_guard_page(ByteView{body.data(), body.size()}, 2u, rng_b);
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+
+    EXPECT_NE(read_tag(a->bytes, a->entry_int3_offset),
+              read_tag(b->bytes, b->entry_int3_offset));
+    EXPECT_NE(read_tag(a->bytes, a->exit_int3_offset),
+              read_tag(b->bytes, b->exit_int3_offset));
+
+    // Same guard_id within one page is consistent across entry and exit.
+    EXPECT_EQ(read_tag(a->bytes, a->entry_int3_offset),
+              read_tag(a->bytes, a->exit_int3_offset));
+    EXPECT_EQ(read_tag(b->bytes, b->entry_int3_offset),
+              read_tag(b->bytes, b->exit_int3_offset));
 }
 
 } // namespace

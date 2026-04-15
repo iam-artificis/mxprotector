@@ -580,10 +580,17 @@ template <StubEmitter Emitter>
     while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
     const uint32_t tls_cb_array_offset_in_stub =
         static_cast<uint32_t>(stub_buf.size());
+    // Callback array sizing: packer_cb + (optional guard installer) +
+    // existing user callbacks + NULL terminator. The guard installer
+    // slot is only reserved when an earlier pass (GuardPass) set
+    // `ctx.extra_tls_callback_va`; otherwise we keep the old layout.
+    const bool has_extra_tls_cb = ctx.extra_tls_callback_va() != 0;
     const size_t tls_cb_array_entries =
         (existing_tls_opt.has_value()
             ? existing_tls_opt->callbacks.size()
-            : 0) + 2;  // +1 for our callback, +1 for the NULL terminator
+            : 0)
+        + (has_extra_tls_cb ? 1u : 0u)
+        + 2u;  // +1 for our packer cb, +1 for the NULL terminator
     stub_buf.insert(stub_buf.end(), tls_cb_array_entries * 8, uint8_t{0});
 
     // Index slot — only needed when the input had no TLS directory
@@ -780,12 +787,28 @@ template <StubEmitter Emitter>
             static_cast<int64_t>(tls_cb.xor_instruction_end));
         write_i32(pack_sec.data, tls_cb.xor_key_rel32_offset, xor_rel32);
 
-        // 2. Fill the callback array: our callback first, then
-        //    every existing callback from the input TLS directory
-        //    in its original order, then a NULL terminator.
+        // 2. Fill the callback array: our packer callback first,
+        //    then (optional) the runtime-guards VEH installer from
+        //    `ctx.extra_tls_callback_va`, then every existing
+        //    callback from the input TLS directory in its original
+        //    order, then a NULL terminator.
+        //
+        // Ordering rationale: packer_cb MUST run first so the
+        // anti-debug key-corruption gag fires before any other
+        // callback has a chance to inspect the stub. The guard
+        // installer MUST run before any existing user callback
+        // because user callbacks may execute code that later
+        // triggers guarded paths — if the VEH isn't installed yet,
+        // those int3s crash the process. So:
+        //     [packer_cb][guard_install_cb?][user_cb_0][user_cb_1]...[NULL]
         uint32_t write_off = tls_cb_array_offset_in_stub;
         write_u64_le(pack_sec.data, write_off, cb_body_va);
         write_off += 8;
+        if (has_extra_tls_cb) {
+            write_u64_le(pack_sec.data, write_off,
+                         ctx.extra_tls_callback_va());
+            write_off += 8;
+        }
         if (existing_tls_opt.has_value()) {
             for (const uint64_t old_cb : existing_tls_opt->callbacks) {
                 write_u64_le(pack_sec.data, write_off, old_cb);

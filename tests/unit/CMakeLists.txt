@@ -30,6 +30,8 @@ set(TEST_SOURCES
     stub_self_hash_test.cpp
     marker_scanner_test.cpp
     guard_page_layout_test.cpp
+    guard_veh_emitter_test.cpp
+    guard_tls_installer_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -118,11 +120,15 @@ set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
 )
 
-# Runtime-guards module sources needed for guard_page_layout_test.
-# guard_pass.cpp is NOT needed here because the page layout is a pure
-# function with no ProtectionContext dependency.
+# Runtime-guards module sources needed for guard_* unit tests.
+# guard_pass.cpp itself is NOT needed because each test targets an
+# isolated pure-function emitter without a ProtectionContext.
+# The TLS installer pulls in the Hell's Gate resolver because its
+# body embeds the resolver bytes.
 set(GUARD_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_page_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_veh_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_tls_installer.cpp
 )
 
 # ==============================================================================

@@ -65,16 +65,27 @@ inline constexpr uint32_t kGuardPageSize = 4096;
  * the `.mxguard` section:
  *
  *   * `guard_id`      — 0-based, stable build-time identifier that
- *     Commit 3's entry/exit `int3 + tag` markers encode into their
- *     trailing 4-byte tag.
+ *     the entry/exit `int3 + tag` trailing 4-byte tags encode. The
+ *     VEH handler never needs the id for dispatch — it matches the
+ *     faulting Rip against the descriptor table directly — but the
+ *     id is embedded in the plaintext tags anyway so a reverser
+ *     cannot trivially tell entry markers from exit markers without
+ *     decoding the table.
  *   * `page_rva`      — runtime RVA of the guard's page (inside the
  *     protected image). Multiple of `kGuardPageSize`.
  *   * `body_offset`   — offset inside the page where the body bytes
- *     begin. In Commit 2 this is `0`; Commit 3 bumps it to `5` to
- *     leave room for the entry `int3 + tag` plaintext window.
+ *     begin (always `5` in Commit 3 — right after the entry int3+tag
+ *     plaintext window).
  *   * `body_size`     — number of body bytes copied from the source.
- *     Equals `source_body_end_rva - source_body_start_rva`, minus
- *     any rejected trailing bytes (none in Commit 2).
+ *     Equals `source_body_end_rva - source_body_start_rva`.
+ *   * `entry_int3_rva`— RVA of the single `0xCC` byte that triggers
+ *     the entry VEH event. Equals `page_rva + 0`.
+ *   * `exit_int3_rva` — RVA of the single `0xCC` byte that triggers
+ *     the exit VEH event. Equals `page_rva + body_offset + body_size`.
+ *   * `body_start_rva`— RVA of the first body byte. Equals
+ *     `page_rva + body_offset`. The VEH entry handler sets
+ *     `CONTEXT.Rip` to this value after advancing past the plaintext
+ *     entry tag, so that execution resumes inside the user's body.
  */
 struct GuardDescriptor {
     // --- Source side --------------------------------------------------
@@ -86,10 +97,13 @@ struct GuardDescriptor {
     Rva      return_rva            = 0;
 
     // --- Page side ----------------------------------------------------
-    uint32_t guard_id    = 0;
-    Rva      page_rva    = 0;
-    uint32_t body_offset = 0;
-    uint32_t body_size   = 0;
+    uint32_t guard_id       = 0;
+    Rva      page_rva       = 0;
+    uint32_t body_offset    = 0;
+    uint32_t body_size      = 0;
+    Rva      entry_int3_rva = 0;
+    Rva      exit_int3_rva  = 0;
+    Rva      body_start_rva = 0;
 };
 
 } // namespace mx::guard

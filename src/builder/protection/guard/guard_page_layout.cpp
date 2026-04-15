@@ -1,34 +1,39 @@
 /**
  * @file guard_page_layout.cpp
- * @brief Implementation of `build_guard_page` — see the header for
- *        the layout contract and rationale.
+ * @brief Implementation of `build_guard_page` — see header for the
+ *        layout contract and rationale.
  */
 
 #include "mxprotector/protection/guard/guard_page_layout.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <format>
 
 namespace mx::guard {
 
 namespace {
 
-/// Size of the trailing `jmp rel32` trampoline in Commit 2. The slot
-/// is always 5 bytes (`0xE9` + 4-byte rel32) regardless of where the
-/// page ultimately lands — the rel32 is a delta, not an absolute, and
-/// gets back-patched by `GuardPass::apply_exit_jump`.
-constexpr uint32_t kExitJmpSize = 5;
+/// Write a 5-byte `int3 + 4-byte guard_id` window at `buf[offset]`.
+/// `offset` must be a valid slot — the caller guarantees bounds via
+/// the page-size check earlier in `build_guard_page`.
+void write_int3_tag(ByteBuffer& buf, uint32_t offset, uint32_t guard_id) noexcept {
+    buf[offset] = 0xCC;  // int3
+    std::memcpy(buf.data() + offset + 1, &guard_id, sizeof(guard_id));
+}
 
 } // anonymous namespace
 
 MxResult<GuardPageLayout> build_guard_page(
     ByteView    body,
+    uint32_t    guard_id,
     Randomizer& rng,
     uint32_t    page_size)
 {
-    // The layout must hold the body AND the exit trampoline in a
-    // single page. We reject anything larger here so the caller can
-    // skip the offending guard with a clear log line instead of
-    // silently producing a corrupted page.
+    // The layout must hold: one 5-byte entry int3+tag + body +
+    // one 5-byte exit int3+tag, all in a single page. We reject
+    // oversized bodies here so `GuardPass` can log a clear "guard
+    // too big, skipping" line and move on.
     const uint64_t body_size = body.size();
     if (body_size == 0) {
         return std::unexpected(MxError{
@@ -36,48 +41,51 @@ MxResult<GuardPageLayout> build_guard_page(
             static_cast<uint16_t>(ProtectionErrorCode::region_too_small),
             "GuardPageLayout: тело пусто — нечего релоцировать"});
     }
-    if (body_size + kExitJmpSize > page_size) {
+    const uint64_t required = 2ULL * kGuardInt3TagSize + body_size;
+    if (required > page_size) {
         return std::unexpected(MxError{
             ErrorCategory::protection,
             static_cast<uint16_t>(ProtectionErrorCode::pass_failed),
-            std::format("GuardPageLayout: тело {} байт + {} байт exit jmp "
+            std::format("GuardPageLayout: тело {} байт + 2×{} байт int3+tag "
                         "не помещается в страницу {} байт",
-                body_size, kExitJmpSize, page_size)});
+                body_size, kGuardInt3TagSize, page_size)});
     }
 
     GuardPageLayout out{};
     out.bytes.resize(page_size);
 
-    // ----- Body ------------------------------------------------------
-    // Commit 2 places the body at offset 0 — the caller's `call` or
-    // `jmp` to `page_rva` lands directly on the first body byte.
-    // Commit 3 will bump body_offset to 5 to leave a plaintext window
-    // for the entry `int3 + tag` trigger.
-    out.body_offset = 0;
+    // ----- Entry int3+tag -------------------------------------------
+    // The source-side `jmp rel32 <page>` lands on offset 0 → CPU
+    // executes `int3` → `EXCEPTION_BREAKPOINT` → VEH advances Rip
+    // past the tag to `body_offset`.
+    out.entry_int3_offset = 0;
+    write_int3_tag(out.bytes, out.entry_int3_offset, guard_id);
+
+    // ----- Body -----------------------------------------------------
+    // Verbatim copy of the user's bytes. Commit 3b will encrypt this
+    // region at rest with the entry/exit int3+tag windows kept in
+    // plaintext as "skip windows".
+    out.body_offset = out.entry_int3_offset + kGuardInt3TagSize;
     out.body_size   = static_cast<uint32_t>(body_size);
     if (body_size > 0) {
         std::copy(body.begin(), body.end(), out.bytes.begin() + out.body_offset);
     }
 
-    // ----- Exit trampoline (placeholder rel32) -----------------------
-    // `GuardPass::apply_exit_jump` fills the 4-byte rel32 slot once
-    // the page's runtime RVA and the return RVA are both known. Until
-    // then we emit an explicit zero so a premature execution (e.g. a
-    // loader mis-jump during development) fails fast at the intended
-    // slot instead of silently branching into polymorphic junk.
-    out.exit_jmp_offset = out.body_offset + out.body_size;
-    out.bytes[out.exit_jmp_offset] = 0xE9;
-    out.bytes[out.exit_jmp_offset + 1] = 0x00;
-    out.bytes[out.exit_jmp_offset + 2] = 0x00;
-    out.bytes[out.exit_jmp_offset + 3] = 0x00;
-    out.bytes[out.exit_jmp_offset + 4] = 0x00;
+    // ----- Exit int3+tag --------------------------------------------
+    // The last real body instruction falls through into this int3.
+    // The exit VEH decodes the tag, re-encrypts the body (commit 3b),
+    // and sets Rip = descriptor.return_rva so control returns to the
+    // source section right past the `MX_GUARD_END` marker.
+    out.exit_int3_offset = out.body_offset + out.body_size;
+    write_int3_tag(out.bytes, out.exit_int3_offset, guard_id);
 
-    // ----- Polymorphic junk tail -------------------------------------
-    // Uniform random bytes fill the remainder of the page. Never
-    // executed at runtime (the exit jump leaves the page before
-    // reaching here), encrypted by Commit 3, so the distribution is
-    // intentionally indistinguishable from ciphertext.
-    out.junk_offset = out.exit_jmp_offset + kExitJmpSize;
+    // ----- Polymorphic junk tail ------------------------------------
+    // Random bytes — never executed at runtime (the exit VEH jumps
+    // away before reaching here) and encrypted as part of the
+    // body-range in Commit 3b, so any plausible byte distribution
+    // works. Uniform random avoids an "all zeros at rest" fingerprint
+    // for the unencrypted Commit 3a binaries.
+    out.junk_offset = out.exit_int3_offset + kGuardInt3TagSize;
     for (uint32_t i = out.junk_offset; i < page_size; ++i) {
         out.bytes[i] = rng.next_u8();
     }

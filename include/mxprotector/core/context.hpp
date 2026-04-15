@@ -182,6 +182,41 @@ public:
     void set_section_names(SectionNameMap names) { section_names_ = std::move(names); }
 
     // ====================================================================
+    // Extra TLS callbacks injected by upstream passes
+    // ====================================================================
+
+    /**
+     * @brief TLS callback absolute VA that an earlier pass registered
+     *        for the packer to inherit.
+     *
+     * Set by `GuardPass::execute` to the runtime VA of the
+     * `guard_tls_installer` thunk (which installs the runtime-guards
+     * VEH at `DLL_PROCESS_ATTACH`). `PackerPass::execute` reads this
+     * during its TLS callback array build-up and — if non-zero —
+     * appends the VA to the array right after its own anti-debug
+     * callback so every guarded binary gets the VEH installed before
+     * user code runs.
+     *
+     * A value of zero means "no extra callback" — normal pipeline
+     * path when no `MX_GUARD_BEGIN` markers exist.
+     *
+     * Only ONE extra callback slot exists on purpose — the
+     * runtime-guards design puts every late-binding initialisation
+     * behind a single installer thunk, which keeps the packer's
+     * TLS directory shape deterministic (exactly
+     * `1 + has_guard + existing_user_cbs + NULL` entries) and
+     * avoids the polymorphism / sizing churn that a variable-length
+     * callback list would add.
+     */
+    [[nodiscard]] uint64_t extra_tls_callback_va() const noexcept {
+        return extra_tls_callback_va_;
+    }
+
+    void set_extra_tls_callback_va(uint64_t va) noexcept {
+        extra_tls_callback_va_ = va;
+    }
+
+    // ====================================================================
     // Журнал сообщений
     // ====================================================================
 
@@ -218,6 +253,7 @@ private:
     target::TargetInfo                               target_ =
         target::TargetInfo::windows_pe_x64();                       ///< Target platform
     SectionNameMap                                   section_names_;///< Имена добавленных секций
+    uint64_t                                         extra_tls_callback_va_ = 0;  ///< GuardPass → PackerPass TLS callback hand-off
     std::vector<std::string>                         log_messages_; ///< Журнал
 };
 

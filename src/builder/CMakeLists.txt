@@ -70,6 +70,8 @@ set(BUILDER_SOURCES
     # Runtime guards — MX_GUARD_BEGIN/END relocation + VEH dispatcher
     protection/guard/guard_pass.cpp
     protection/guard/guard_page_layout.cpp
+    protection/guard/guard_veh_emitter.cpp
+    protection/guard/guard_tls_installer.cpp
 
     # Phase 4: x64 VM backend (split out of vm_runtime_gen.cpp)
     protection/vm/x64/x64_emitters.cpp
