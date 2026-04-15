@@ -30,8 +30,10 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/packer/byte_io.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
+#include "mxprotector/protection/packer/tls_callback.hpp"
 #include "mxprotector/protection/vm/vm_lifter.hpp"
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
@@ -69,6 +71,17 @@ using mx::packer::kMaxStolenBytes;
 using mx::packer::StolenReloc;
 using mx::packer::StolenPlan;
 using mx::packer::plan_stolen_bytes;
+
+using mx::packer::write_i32;
+using mx::packer::write_u32_le;
+using mx::packer::write_u64_le;
+using mx::packer::read_u32_le;
+using mx::packer::read_u64_le;
+
+using mx::packer::TlsCallbackEmit;
+using mx::packer::ExistingTlsDirectory;
+using mx::packer::read_existing_tls_directory;
+using mx::packer::emit_tls_callback_body;
 
 /// A single section the packer stub decrypts at runtime.
 ///
@@ -865,11 +878,6 @@ void emit_decrypt_body(ByteBuffer& buf,
     return {std::move(buf), patches};
 }
 
-/// Write an int32 little-endian into a buffer at `offset`.
-void write_i32(ByteBuffer& buf, uint32_t offset, int32_t value) {
-    std::memcpy(buf.data() + offset, &value, sizeof(value));
-}
-
 /// Build the full DLL stub code bytes (without patching rel32s yet).
 ///
 /// Layout:
@@ -1039,245 +1047,6 @@ static_assert(StubEmitter<ExeStubEmitter>,
     "ExeStubEmitter must satisfy the StubEmitter concept");
 static_assert(StubEmitter<DllFullStubEmitter>,
     "DllFullStubEmitter must satisfy the StubEmitter concept");
-
-// ---------------------------------------------------------------------------
-// Little-endian helpers for writing 64- and 32-bit values into a byte buffer.
-// The packer already has `write_i32` for signed rel32 slots; these
-// complementary helpers are used by the P4 TLS callback path which has to
-// emit 64-bit absolute VAs into the TLS directory and the callback array.
-// ---------------------------------------------------------------------------
-inline void write_u64_le(ByteBuffer& buf, size_t offset, uint64_t value) {
-    std::memcpy(buf.data() + offset, &value, sizeof(value));
-}
-
-inline void write_u32_le(ByteBuffer& buf, size_t offset, uint32_t value) {
-    std::memcpy(buf.data() + offset, &value, sizeof(value));
-}
-
-[[nodiscard]] inline uint64_t read_u64_le(const uint8_t* p) noexcept {
-    uint64_t v = 0;
-    std::memcpy(&v, p, sizeof(v));
-    return v;
-}
-
-[[nodiscard]] inline uint32_t read_u32_le(const uint8_t* p) noexcept {
-    uint32_t v = 0;
-    std::memcpy(&v, p, sizeof(v));
-    return v;
-}
-
-// ---------------------------------------------------------------------------
-// Find the section that contains a given RVA, or nullptr if none does.
-// Used by the P4 TLS callback path to locate the existing TLS directory's
-// in-memory bytes (if the input binary has one) and to walk its callback
-// array.
-// ---------------------------------------------------------------------------
-[[nodiscard]] const pe::SectionInfo* find_section_containing_rva(const PeImage& image,
-                                                                  Rva rva) noexcept
-{
-    for (const auto& sec : image.sections()) {
-        if (rva >= sec.virtual_address &&
-            rva <  sec.virtual_address + sec.virtual_size) {
-            return &sec;
-        }
-    }
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// P4 — TLS callback entry.
-//
-// We install an extra TLS callback at the head of the TLS callback array
-// so that an anti-debug probe runs BEFORE `AddressOfEntryPoint` (for EXEs)
-// or BEFORE `DllMain` (for DLLs). Windows' image loader walks the callback
-// array in order at PROCESS_ATTACH, THREAD_ATTACH, etc., so a callback at
-// position 0 fires earlier than any entry-point the protector redirected
-// to the packer stub. Breakpoints set on the classic "start" / "main" /
-// "DllMain" symbols do not intercept code run from a TLS callback, so a
-// reverser single-stepping from the debugger break lands AFTER the
-// anti-debug probe has already had its say.
-//
-// When the callback detects a debugger it XORs a per-build random mask
-// into one byte of the embedded RC4 key in `.mxpack`. The subsequent
-// packer stub (running from `AddressOfEntryPoint` or the DllMain
-// forwarding stub) then builds its KSA off the corrupted key, produces a
-// different S-box from the one `rc4_process` used at build time, and
-// every protected section decrypts to garbage. The process crashes with
-// a wild indirect branch before the real OEP is reached. This is the
-// same silent-kill pattern the existing packer anti-debug probe uses
-// (seeding j=edx in the KSA) — P4 layers an earlier detection point on
-// top of it.
-// ---------------------------------------------------------------------------
-
-/// Information read from the input PE's existing TLS directory, if any.
-/// We keep the non-callback-array fields verbatim so C++
-/// `__declspec(thread)` data that the CRT relies on keeps working, and
-/// we prepend our new callback to the existing callback list so every
-/// original callback still gets invoked in order.
-struct ExistingTlsDirectory {
-    uint64_t              start_va          = 0;
-    uint64_t              end_va            = 0;
-    uint64_t              index_va          = 0;
-    uint32_t              size_of_zero_fill = 0;
-    uint32_t              characteristics   = 0;
-    std::vector<uint64_t> callbacks;  // raw VAs, preserved order, NULL stripped
-};
-
-/// Parse the input's `IMAGE_TLS_DIRECTORY64` if `DataDirectory[TLS]` is
-/// populated. Returns `std::nullopt` for binaries that ship with no TLS
-/// directory at all (common for tiny MSVC EXEs that don't use thread-
-/// local statics). Any parsing failure after a TLS directory was found
-/// also returns nullopt — the packer logs it and proceeds without TLS
-/// protection rather than crashing the build.
-[[nodiscard]] std::optional<ExistingTlsDirectory>
-read_existing_tls_directory(const PeImage& image)
-{
-    Rva      tls_rva  = 0;
-    uint32_t tls_size = 0;
-    std::visit([&](const auto& nt) {
-        if (pe::IMAGE_DIRECTORY_ENTRY_TLS < nt.OptionalHeader.NumberOfRvaAndSizes) {
-            tls_rva  = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
-            tls_size = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].Size;
-        }
-    }, image.nt_headers());
-
-    if (tls_rva == 0 || tls_size < 40) return std::nullopt;
-
-    const auto* tls_sec = find_section_containing_rva(image, tls_rva);
-    if (tls_sec == nullptr) return std::nullopt;
-
-    const uint32_t off = tls_rva - tls_sec->virtual_address;
-    if (static_cast<size_t>(off) + 40 > tls_sec->data.size()) return std::nullopt;
-
-    const uint8_t* p = tls_sec->data.data() + off;
-    ExistingTlsDirectory out{};
-    out.start_va          = read_u64_le(p + 0x00);
-    out.end_va            = read_u64_le(p + 0x08);
-    out.index_va          = read_u64_le(p + 0x10);
-    const uint64_t cb_va  = read_u64_le(p + 0x18);
-    out.size_of_zero_fill = read_u32_le(p + 0x20);
-    out.characteristics   = read_u32_le(p + 0x24);
-
-    // Walk the existing callback array until the NULL terminator or the
-    // end of whatever section it lives in. We copy the raw VAs — they
-    // are correct for the preferred image base, which the packer stub
-    // keeps (it strips relocations so the loaded base matches the
-    // build-time preferred base).
-    if (cb_va == 0) return out;  // no callbacks, but directory kept
-
-    const auto image_base = static_cast<uint64_t>(image.image_base());
-    if (cb_va < image_base) return out;  // garbage pointer — leave callbacks empty
-
-    const auto cb_rva = static_cast<Rva>(cb_va - image_base);
-    const auto* cb_sec = find_section_containing_rva(image, cb_rva);
-    if (cb_sec == nullptr) return out;
-
-    uint32_t cb_off = cb_rva - cb_sec->virtual_address;
-    while (static_cast<size_t>(cb_off) + 8 <= cb_sec->data.size()) {
-        const uint64_t entry = read_u64_le(cb_sec->data.data() + cb_off);
-        if (entry == 0) break;
-        out.callbacks.push_back(entry);
-        cb_off += 8;
-    }
-    return out;
-}
-
-/// Offsets into `stub_buf` recorded while `emit_tls_callback_body`
-/// emits its 32 bytes. The single patch slot, `xor_key_rel32_offset`,
-/// is a rel32 that points at the embedded RC4 key byte to corrupt;
-/// the caller fills it in after the stub section's runtime RVA is
-/// known.
-struct TlsCallbackEmit {
-    uint32_t body_offset            = 0;  // offset of first byte of callback
-    uint32_t xor_key_rel32_offset   = 0;  // rel32 inside the xor-byte instruction
-    uint32_t xor_instruction_end    = 0;  // byte right after the xor imm8
-    uint32_t body_end_offset        = 0;  // one past the last byte (for padding)
-    uint32_t key_byte_offset_in_key = 0;  // 0..31 — which byte of the RC4 key to corrupt
-    uint32_t key_layer_index        = 0;  // 0..layer_count-1 — which layer's key to corrupt
-};
-
-/// Emit the 32-byte TLS callback body and record its patch sites.
-///
-/// Layout:
-///
-///   83 FA 01                   cmp   edx, 1                 ; reason == PROCESS_ATTACH?
-///   75 rel8                    jne   .done                  ; skip everything else
-///   65 48 8B 04 25 60 00 00 00 mov   rax, gs:[0x60]          ; PEB
-///   0F B6 40 02                movzx eax, byte [rax+2]     ; BeingDebugged
-///   85 C0                      test  eax, eax
-///   74 rel8                    je    .done                  ; clean host → skip XOR
-///   80 35 rel32 imm8           xor   byte [rip+rel32], mask ; corrupt RC4 key byte
-///   .done:
-///   31 C0                      xor   eax, eax                ; return 0 (VOID cast)
-///   C3                         ret
-///
-/// Registers used: `rax`, `edx` — both volatile in the Windows x64
-/// ABI, and the caller is a VOID NTAPI callback so return value is
-/// ignored. `rcx`, `r8` (hModule, lpReserved) are not touched, which
-/// lets us coexist with any existing callback that reads them.
-[[nodiscard]] TlsCallbackEmit emit_tls_callback_body(ByteBuffer& buf,
-                                                     Randomizer& rng,
-                                                     uint32_t layer_count)
-{
-    TlsCallbackEmit out{};
-    out.body_offset = static_cast<uint32_t>(buf.size());
-
-    auto u8 = [&](uint8_t v) { buf.push_back(v); };
-    auto patch_rel8 = [&](uint32_t at) {
-        const int32_t target = static_cast<int32_t>(buf.size());
-        const int32_t rel8   = target - (static_cast<int32_t>(at) + 1);
-        buf[at] = static_cast<uint8_t>(static_cast<int8_t>(rel8));
-    };
-
-    // cmp edx, 1
-    u8(0x83); u8(0xFA); u8(0x01);
-    // jne .done   — rel8 backpatched
-    u8(0x75);
-    const uint32_t jne_done_rel8_at = static_cast<uint32_t>(buf.size());
-    u8(0x00);
-
-    // mov rax, gs:[0x60]   ; PEB
-    u8(0x65); u8(0x48); u8(0x8B); u8(0x04); u8(0x25);
-    u8(0x60); u8(0x00); u8(0x00); u8(0x00);
-    // movzx eax, byte [rax+2]
-    u8(0x0F); u8(0xB6); u8(0x40); u8(0x02);
-    // test eax, eax
-    u8(0x85); u8(0xC0);
-    // je .done   — rel8 backpatched
-    u8(0x74);
-    const uint32_t je_done_rel8_at = static_cast<uint32_t>(buf.size());
-    u8(0x00);
-
-    // xor byte [rip + rel32], imm8
-    //   Opcode: 80 /6 ib (XOR r/m8, imm8).
-    //   ModRM: mod=00 reg=/6 rm=101 = 0x35 → rip-relative, no SIB.
-    u8(0x80); u8(0x35);
-    out.xor_key_rel32_offset = static_cast<uint32_t>(buf.size());
-    u8(0x00); u8(0x00); u8(0x00); u8(0x00);  // rel32 placeholder
-    const uint8_t mask = static_cast<uint8_t>(rng.next_range(1, 255));
-    u8(mask);
-    out.xor_instruction_end = static_cast<uint32_t>(buf.size());
-
-    // .done: — back-patch the two forward rel8 branches above.
-    patch_rel8(jne_done_rel8_at);
-    patch_rel8(je_done_rel8_at);
-
-    // xor eax, eax   — VOID NTAPI return, value is discarded but we
-    //                  leave rax in a deterministic state.
-    u8(0x31); u8(0xC0);
-    // ret
-    u8(0xC3);
-
-    out.body_end_offset         = static_cast<uint32_t>(buf.size());
-    out.key_byte_offset_in_key  = rng.next_range(0, kKeySize - 1);
-    // P2 — randomise which cipher layer's key gets corrupted. Every
-    // build picks a different target, so a reverser who extracts the
-    // target offset from one binary cannot predict it on the next.
-    // `layer_count` is clamped to ≥1 before this call, so the upper
-    // bound is always valid.
-    out.key_layer_index         = rng.next_range(0, layer_count - 1);
-    return out;
-}
 
 /// Strip base relocations: clear the directory entry, set the file header's
 /// IMAGE_FILE_RELOCS_STRIPPED bit, clear DYNAMIC_BASE in DllCharacteristics,

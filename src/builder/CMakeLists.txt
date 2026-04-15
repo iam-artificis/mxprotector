@@ -78,6 +78,7 @@ set(BUILDER_SOURCES
     protection/packer/packer_pass.cpp
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
+    protection/packer/tls_callback.cpp
 
     # S2: String protection — scanner / xref / encryptor / runtime emitter / pass
     protection/string/string_scanner.cpp
