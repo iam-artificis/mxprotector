@@ -27,6 +27,7 @@ set(TEST_SOURCES
     string_protection_pass_test.cpp
     hash_opaque_predicate_test.cpp
     veh_int3_trap_test.cpp
+    stub_self_hash_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -79,6 +80,7 @@ set(STRING_PROTECT_SOURCES
 # the Hell's Gate resolver from ANTI_TAMPER_SOURCES).
 set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/veh_int3_trap.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stub_self_hash.cpp
 )
 
 # ==============================================================================

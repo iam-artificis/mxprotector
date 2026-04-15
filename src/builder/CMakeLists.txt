@@ -81,6 +81,7 @@ set(BUILDER_SOURCES
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
     protection/packer/stub_emitter.cpp
+    protection/packer/stub_self_hash.cpp
     protection/packer/tls_callback.cpp
     protection/packer/veh_int3_trap.cpp
 
