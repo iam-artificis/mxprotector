@@ -742,7 +742,8 @@ MxResult<VmRuntime> X64VmBackend::generate(
     if (opts.use_imagebase_key) {
         //   65 48 8B 04 25 60 00 00 00   mov rax, gs:[0x60]    ; PEB
         //   48 8B 40 10                  mov rax, [rax + 0x10] ; ImageBase
-        //   <MBA chain>                  transforms eax IB_low32 -> table_xor_key
+        //   <G6 loop>                    iterated bit-mix: eax = f^N(IB_low32)
+        //   <MBA chain>                  transforms loop_output -> table_xor_key
         //   <integrity check>            xor'd into eax (zero on intact table)
         //   89 44 24 <disp8>             mov [rsp + key_disp], eax
         rt.u8(0x65); rt.u8(0x48); rt.u8(0x8B); rt.u8(0x04); rt.u8(0x25);
@@ -751,9 +752,119 @@ MxResult<VmRuntime> X64VmBackend::generate(
 
         const uint32_t ib_low32 =
             static_cast<uint32_t>(opts.preferred_image_base & 0xFFFFFFFFULL);
+
+        // ----------------------------------------------------------
+        // G6 — loop-based key schedule.
+        //
+        // Before feeding the ImageBase into the MBA chain, run a
+        // short iterated bit-mix `f(x) = g(x) op K` applied N times.
+        // A symbolic execution engine (angr, KLEE, Triton) that
+        // tries to express the full key derivation as a single
+        // constraint has to either unroll the loop N times (path
+        // explosion for N≥32) or infer a closed-form invariant for
+        // the iterated rotate-xor transform (no general technique
+        // does this at bit level). The loop adds ~17 emitted bytes
+        // and ~N ALU ops at runtime — microseconds for any
+        // sensible N, invisible next to the syscalls the tail
+        // anti-tamper checks already make.
+        //
+        // Three polymorphic shapes are chosen uniformly per build.
+        // Each is an 8-byte body encoded by hand; they all use
+        // eax as accumulator and no other register, so the loop
+        // counter sits in ecx without interference. ecx is freely
+        // clobberable here — the very next thing the entry stub
+        // emits after the MBA chain is a `mov ecx, total_handlers`
+        // for the integrity-check loop, so ecx is already dead at
+        // this point. Likewise for rflags: every instruction down
+        // to the anti-tamper checks clobbers them.
+        //
+        // Invariant: apply the runtime loop body N times to
+        // `ib_low32` at build time and feed the result into the
+        // MBA chain as its new input. The MBA chain still maps
+        // that input to `table_xor_key`, so the handler-table
+        // encryption, integrity-check expected sum, and every
+        // downstream consumer of the key see the same value they
+        // did pre-G6.
+        // ----------------------------------------------------------
+        constexpr uint32_t kLoopVariantCount = 3;
+        enum : uint32_t {
+            kVariantRolXor = 0,  // rol eax, rot; xor eax, K
+            kVariantRorAdd = 1,  // ror eax, rot; add eax, K
+            kVariantXorRol = 2,  // xor eax, K;   rol eax, rot
+        };
+
+        const uint32_t loop_variant = rng.next_range(0, kLoopVariantCount - 1);
+        const uint32_t loop_count   = rng.next_range(32, 128);
+        const uint8_t  loop_rot     = static_cast<uint8_t>(rng.next_range(1, 31));
+        const uint32_t loop_key     = rng.next_u32();
+
+        auto apply_loop_step = [&](uint32_t x) -> uint32_t {
+            switch (loop_variant) {
+                case kVariantRolXor: {
+                    const uint32_t r = (x << loop_rot) |
+                                       (x >> (32u - loop_rot));
+                    return r ^ loop_key;
+                }
+                case kVariantRorAdd: {
+                    const uint32_t r = (x >> loop_rot) |
+                                       (x << (32u - loop_rot));
+                    return r + loop_key;
+                }
+                case kVariantXorRol: {
+                    const uint32_t y = x ^ loop_key;
+                    return (y << loop_rot) | (y >> (32u - loop_rot));
+                }
+                default:
+                    return x;  // unreachable — next_range clamps.
+            }
+        };
+
+        uint32_t loop_output = ib_low32;
+        for (uint32_t i = 0; i < loop_count; ++i) {
+            loop_output = apply_loop_step(loop_output);
+        }
+
+        //   mov ecx, loop_count           B9 imm32
+        rt.u8(0xB9);
+        rt.u32(loop_count);
+        // .loop:
+        const size_t g6_loop_body_start = rt.size();
+        switch (loop_variant) {
+            case kVariantRolXor:
+                //   rol eax, rot          C1 C0 rot
+                rt.u8(0xC1); rt.u8(0xC0); rt.u8(loop_rot);
+                //   xor eax, K            35 imm32
+                rt.u8(0x35); rt.u32(loop_key);
+                break;
+            case kVariantRorAdd:
+                //   ror eax, rot          C1 C8 rot
+                rt.u8(0xC1); rt.u8(0xC8); rt.u8(loop_rot);
+                //   add eax, K            05 imm32
+                rt.u8(0x05); rt.u32(loop_key);
+                break;
+            case kVariantXorRol:
+                //   xor eax, K            35 imm32
+                rt.u8(0x35); rt.u32(loop_key);
+                //   rol eax, rot          C1 C0 rot
+                rt.u8(0xC1); rt.u8(0xC0); rt.u8(loop_rot);
+                break;
+            default:
+                break;
+        }
+        //   dec ecx                       FF C9
+        rt.u8(0xFF); rt.u8(0xC9);
+        //   jnz .loop                     75 rel8
+        {
+            const size_t jnz_end = rt.size() + 2;
+            const int32_t rel8 = static_cast<int32_t>(g6_loop_body_start) -
+                                 static_cast<int32_t>(jnz_end);
+            rt.u8(0x75);
+            rt.u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
+        }
+
         MbaTransitionGenerator mba_gen(Architecture::x64);
         auto chain = mba_gen.generate(
-            ib_low32, table_xor_key, mx::x86::Reg::rax, rng,
+            loop_output, table_xor_key, mx::x86::Reg::rax, rng,
             /*state_preserved=*/true);
         rt.bytes(ByteView{chain.data(), chain.size()});
 
