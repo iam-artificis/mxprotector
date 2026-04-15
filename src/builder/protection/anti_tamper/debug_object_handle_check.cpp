@@ -91,6 +91,7 @@
  */
 
 #include "mxprotector/protection/anti_tamper/check.hpp"
+#include "mxprotector/protection/anti_tamper/syscall_scaffold.hpp"
 
 #include <memory>
 
@@ -111,96 +112,56 @@ public:
         // another build.
         const uint32_t corruption = rng.next_u32() | 1;
 
-        // ---------- stack frame setup ----------
-        // mov r12, rsp                           49 89 E4
-        e.u8(0x49); e.u8(0x89); e.u8(0xE4);
-        // sub rsp, 0x40                          48 81 EC 40 00 00 00
-        // 0x40 bytes = 0x08 (fake ret slot) + 0x20 (shadow) + 0x08
-        //              (arg5 slot) + 0x08 (buf) + 0x08 (padding).
-        e.u8(0x48); e.u8(0x81); e.u8(0xEC);
-        e.u32(0x00000040u);
-        // and rsp, -16                           48 83 E4 F0
-        e.u8(0x48); e.u8(0x83); e.u8(0xE4); e.u8(0xF0);
+        // 0x40 bytes = 0x20 shadow + 0x08 arg5 slot + 0x08 out buffer
+        //            + 0x10 padding for the `and rsp, -16` alignment.
+        constexpr uint32_t kHandleFrameSize = 0x00000040u;
 
-        // Zero the output buffer so the detection branch is reliable
-        // even when the kernel leaves it untouched on failure (which
-        // is exactly what happens for STATUS_PORT_NOT_SET — the
-        // no-debugger return path).
-        //
-        // mov qword [rsp + 0x30], 0              48 C7 44 24 30 00 00 00 00
-        e.u8(0x48); e.u8(0xC7); e.u8(0x44); e.u8(0x24); e.u8(0x30);
-        e.u32(0);
-        // mov qword [rsp + 0x28], 0              48 C7 44 24 28 00 00 00 00
-        //   arg5 = PULONG ReturnLength = NULL.
-        e.u8(0x48); e.u8(0xC7); e.u8(0x44); e.u8(0x24); e.u8(0x28);
-        e.u32(0);
+        emit_syscall_check_scaffold(
+            e, kHandleFrameSize, key_slot_disp, corruption,
+            // ---- setup ----
+            [](RawEmitter& w) {
+                // Zero the output buffer so the detection branch is
+                // reliable even when the kernel leaves it untouched on
+                // failure (which is exactly what happens for
+                // STATUS_PORT_NOT_SET — the no-debugger return path).
+                //
+                // mov qword [rsp + 0x30], 0      48 C7 44 24 30 00 00 00 00
+                w.u8(0x48); w.u8(0xC7); w.u8(0x44); w.u8(0x24); w.u8(0x30);
+                w.u32(0);
+                // mov qword [rsp + 0x28], 0      48 C7 44 24 28 00 00 00 00
+                //   arg5 = PULONG ReturnLength = NULL.
+                w.u8(0x48); w.u8(0xC7); w.u8(0x44); w.u8(0x24); w.u8(0x28);
+                w.u32(0);
 
-        // ---------- argument setup ----------
-        // mov rcx, -1                            48 C7 C1 FF FF FF FF
-        //   ProcessHandle = NtCurrentProcess pseudo-handle (-1).
-        e.u8(0x48); e.u8(0xC7); e.u8(0xC1);
-        e.u32(0xFFFFFFFFu);
-        // mov edx, 0x1E                          BA 1E 00 00 00
-        //   PROCESS_INFORMATION_CLASS::ProcessDebugObjectHandle.
-        e.u8(0xBA);
-        e.u32(0x0000001Eu);
-        // lea r8, [rsp + 0x30]                   4C 8D 44 24 30
-        //   ProcessInformation → our 8-byte buffer.
-        e.u8(0x4C); e.u8(0x8D); e.u8(0x44); e.u8(0x24); e.u8(0x30);
-        // mov r9d, 8                             41 B9 08 00 00 00
-        //   ProcessInformationLength = sizeof(HANDLE) on x64.
-        e.u8(0x41); e.u8(0xB9);
-        e.u32(0x00000008u);
-
-        // ---------- direct syscall ----------
-        // mov r10, rcx                           49 89 CA
-        //   Windows x64 syscall ABI: the `syscall` instruction
-        //   itself clobbers rcx (loaded with saved RIP), so the
-        //   first arg moves to r10 before entering the kernel.
-        e.u8(0x49); e.u8(0x89); e.u8(0xCA);
-        // mov eax, r13d                          44 89 E8
-        //   SSN lives in r13d courtesy of the Hell's Gate resolver
-        //   emitted immediately before this check body.
-        e.u8(0x44); e.u8(0x89); e.u8(0xE8);
-        // syscall                                0F 05
-        e.u8(0x0F); e.u8(0x05);
-
-        // After return:
-        //   rax       = NTSTATUS (we ignore it — the buffer zero-init
-        //               guarantees the detection branch is reliable
-        //               regardless of STATUS_SUCCESS vs. STATUS_PORT_NOT_SET
-        //               vs. the graceful-degradation case).
-        //   rcx, r11  = clobbered by `syscall`.
-        //   r12       = preserved (still holds saved rsp).
-        //   [rsp+0x30..0x37] = either 0 (clean) or a non-zero HANDLE.
-
-        // ---------- detection ----------
-        // mov rax, [rsp + 0x30]                  48 8B 44 24 30
-        e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x30);
-        // neg rax                                48 F7 D8
-        //   CF set iff rax was non-zero (sign-aware negate).
-        e.u8(0x48); e.u8(0xF7); e.u8(0xD8);
-        // sbb eax, eax                           19 C0
-        //   eax = -CF = 0 (clean) or 0xFFFFFFFF (debugger present).
-        //   Zero-extends to rax.
-        e.u8(0x19); e.u8(0xC0);
-
-        // mov rsp, r12                           4C 89 E4
-        //   Restore the caller's rsp BEFORE the final XOR so the
-        //   `[rsp + key_slot_disp]` addressing is against the
-        //   original stack frame, matching what every subsequent
-        //   handler tail dispatch expects.
-        e.u8(0x4C); e.u8(0x89); e.u8(0xE4);
-
-        // and eax, <corruption_mask>             25 imm32
-        //   Project the 0 / -1 result onto 0 / mask.
-        e.u8(0x25); e.u32(corruption);
-        // xor [rsp + key_slot_disp], eax         31 44 24 disp8
-        //   Silent kill: clean host leaves the key unchanged, a
-        //   debugged host XORs the mask into the key and every
-        //   subsequent dispatch decrypts garbage.
-        e.u8(0x31); e.u8(0x44); e.u8(0x24);
-        e.u8(static_cast<uint8_t>(static_cast<int8_t>(key_slot_disp)));
+                // mov rcx, -1                    48 C7 C1 FF FF FF FF
+                //   ProcessHandle = NtCurrentProcess pseudo-handle (-1).
+                w.u8(0x48); w.u8(0xC7); w.u8(0xC1);
+                w.u32(0xFFFFFFFFu);
+                // mov edx, 0x1E                  BA 1E 00 00 00
+                //   PROCESS_INFORMATION_CLASS::ProcessDebugObjectHandle.
+                w.u8(0xBA);
+                w.u32(0x0000001Eu);
+                // lea r8, [rsp + 0x30]           4C 8D 44 24 30
+                //   ProcessInformation → our 8-byte buffer.
+                w.u8(0x4C); w.u8(0x8D); w.u8(0x44); w.u8(0x24); w.u8(0x30);
+                // mov r9d, 8                     41 B9 08 00 00 00
+                //   ProcessInformationLength = sizeof(HANDLE) on x64.
+                w.u8(0x41); w.u8(0xB9);
+                w.u32(0x00000008u);
+            },
+            // ---- detection ----
+            //
+            // After return [rsp + 0x30 .. 0x37] holds either 0 (clean)
+            // or a non-zero HANDLE (debugger attached). Normalise to
+            // 0 / -1 via the neg/sbb idiom. Zero-extends to rax.
+            [](RawEmitter& w) {
+                // mov rax, [rsp + 0x30]          48 8B 44 24 30
+                w.u8(0x48); w.u8(0x8B); w.u8(0x44); w.u8(0x24); w.u8(0x30);
+                // neg rax                        48 F7 D8  ; CF iff non-zero
+                w.u8(0x48); w.u8(0xF7); w.u8(0xD8);
+                // sbb eax, eax                   19 C0     ; 0 or -1
+                w.u8(0x19); w.u8(0xC0);
+            });
     }
 
     [[nodiscard]] const char* name() const noexcept override {

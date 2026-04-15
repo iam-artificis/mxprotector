@@ -87,6 +87,7 @@
 
 #include "mxprotector/protection/anti_tamper/check.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
+#include "mxprotector/protection/anti_tamper/syscall_scaffold.hpp"
 
 #include <memory>
 
@@ -103,86 +104,77 @@ public:
     {
         const uint32_t corruption = rng.next_u32() | 1;
 
-        // mov r12, rsp                         49 89 E4
-        e.u8(0x49); e.u8(0x89); e.u8(0xE4);
+        // Stack layout inside the aligned 0x80-byte frame:
+        //   [rsp+0x00..0x1F]  shadow / unused
+        //   [rsp+0x28..0x2F]  arg5 Length (0x30)
+        //   [rsp+0x30..0x37]  arg6 &ReturnLength
+        //   [rsp+0x40..0x6F]  MEMORY_BASIC_INFORMATION (0x30 bytes)
+        //     offset 0x24 inside MBI = [rsp+0x64]  ← Protect dword
+        //   [rsp+0x70..0x77]  ReturnLength scratch
+        //   [rsp+0x78..0x7F]  padding
+        constexpr uint32_t kMbiFrameSize = 0x00000080u;
 
-        // sub rsp, 0x80                        48 81 EC 80 00 00 00
-        e.u8(0x48); e.u8(0x81); e.u8(0xEC);
-        e.u32(0x00000080u);
+        emit_syscall_check_scaffold(
+            e, kMbiFrameSize, key_slot_disp, corruption,
+            // ---- setup ----
+            [](RawEmitter& w) {
+                // Zero MBI.Protect so a failed syscall leaves a benign
+                // value and the detection XOR collapses to a no-op.
+                // mov dword [rsp+0x64], 0          C7 44 24 64 00 00 00 00
+                w.u8(0xC7); w.u8(0x44); w.u8(0x24); w.u8(0x64);
+                w.u32(0x00000000u);
 
-        // and rsp, -16                         48 83 E4 F0
-        e.u8(0x48); e.u8(0x83); e.u8(0xE4); e.u8(0xF0);
+                // mov rcx, -1                      48 C7 C1 FF FF FF FF
+                // NtCurrentProcess pseudo-handle.
+                w.u8(0x48); w.u8(0xC7); w.u8(0xC1);
+                w.u32(0xFFFFFFFFu);
 
-        // Zero MBI.Protect so a failed syscall leaves a benign value:
-        // mov dword [rsp+0x64], 0              C7 44 24 64 00 00 00 00
-        e.u8(0xC7); e.u8(0x44); e.u8(0x24); e.u8(0x64);
-        e.u32(0x00000000u);
+                // lea rdx, [rip + 0]               48 8D 15 00 00 00 00
+                // Resolves to an address a few bytes forward inside this
+                // very check's emitted code, which is inside the VM
+                // entry stub, which lives in .mxvm.
+                w.u8(0x48); w.u8(0x8D); w.u8(0x15);
+                w.u32(0x00000000u);
 
-        // mov rcx, -1                          48 C7 C1 FF FF FF FF
-        e.u8(0x48); e.u8(0xC7); e.u8(0xC1);
-        e.u32(0xFFFFFFFFu);
+                // xor r8d, r8d                     45 31 C0
+                // MemoryInformationClass = MemoryBasicInformation = 0.
+                w.u8(0x45); w.u8(0x31); w.u8(0xC0);
 
-        // lea rdx, [rip + 0]                   48 8D 15 00 00 00 00
-        // Resolves to an address a few bytes forward inside this very
-        // check's emitted code, which is inside the VM entry stub,
-        // which lives in .mxvm.
-        e.u8(0x48); e.u8(0x8D); e.u8(0x15);
-        e.u32(0x00000000u);
+                // lea r9, [rsp + 0x40]             4C 8D 4C 24 40
+                //   arg4 = &MBI
+                w.u8(0x4C); w.u8(0x8D); w.u8(0x4C); w.u8(0x24); w.u8(0x40);
 
-        // xor r8d, r8d                         45 31 C0
-        // MemoryInformationClass = MemoryBasicInformation = 0
-        e.u8(0x45); e.u8(0x31); e.u8(0xC0);
+                // mov qword [rsp + 0x28], 0x30     48 C7 44 24 28 30 00 00 00
+                //   arg5 = sizeof(MEMORY_BASIC_INFORMATION) = 0x30
+                w.u8(0x48); w.u8(0xC7); w.u8(0x44); w.u8(0x24); w.u8(0x28);
+                w.u32(0x00000030u);
 
-        // lea r9, [rsp + 0x40]                 4C 8D 4C 24 40
-        e.u8(0x4C); e.u8(0x8D); e.u8(0x4C); e.u8(0x24); e.u8(0x40);
+                // lea rax, [rsp + 0x70]            48 8D 44 24 70
+                w.u8(0x48); w.u8(0x8D); w.u8(0x44); w.u8(0x24); w.u8(0x70);
+                // mov [rsp + 0x30], rax            48 89 44 24 30
+                //   arg6 = &ReturnLength
+                w.u8(0x48); w.u8(0x89); w.u8(0x44); w.u8(0x24); w.u8(0x30);
+            },
+            // ---- detection ----
+            //
+            // PAGE_READWRITE (0x04) | PAGE_WRITECOPY (0x08) |
+            // PAGE_EXECUTE_READWRITE (0x40) | PAGE_EXECUTE_WRITECOPY
+            // (0x80) — masking MBI.Protect with 0xCC keeps only the
+            // write-bits. Zero on a clean host, non-zero if any
+            // VirtualProtect added WRITE.
+            [](RawEmitter& w) {
+                // mov eax, [rsp + 0x64]            8B 44 24 64
+                //   MBI.Protect
+                w.u8(0x8B); w.u8(0x44); w.u8(0x24); w.u8(0x64);
 
-        // mov qword [rsp + 0x28], 0x30         48 C7 44 24 28 30 00 00 00
-        // Length parameter (5th arg); sizeof(MEMORY_BASIC_INFORMATION) = 0x30
-        e.u8(0x48); e.u8(0xC7); e.u8(0x44); e.u8(0x24); e.u8(0x28);
-        e.u32(0x00000030u);
+                // and eax, 0xCC                    25 CC 00 00 00
+                w.u8(0x25); w.u32(0x000000CCu);
 
-        // lea rax, [rsp + 0x70]                48 8D 44 24 70
-        e.u8(0x48); e.u8(0x8D); e.u8(0x44); e.u8(0x24); e.u8(0x70);
-        // mov [rsp + 0x30], rax                48 89 44 24 30
-        // ReturnLength pointer (6th arg)
-        e.u8(0x48); e.u8(0x89); e.u8(0x44); e.u8(0x24); e.u8(0x30);
-
-        // mov r10, rcx                         49 89 CA
-        e.u8(0x49); e.u8(0x89); e.u8(0xCA);
-
-        // mov eax, r13d                        44 89 E8
-        // SSN placed by the Hell's Gate resolver. On resolver failure
-        // r13 is 0, the syscall silently fails, MBI.Protect stays 0
-        // (we explicitly zeroed it above), and the final XOR is a no-op.
-        e.u8(0x44); e.u8(0x89); e.u8(0xE8);
-
-        // syscall                              0F 05
-        e.u8(0x0F); e.u8(0x05);
-
-        // mov eax, [rsp + 0x64]                8B 44 24 64
-        // MBI.Protect
-        e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x64);
-
-        // and eax, 0xCC                        25 CC 00 00 00
-        // PAGE_READWRITE (0x04) | PAGE_WRITECOPY (0x08)
-        //   | PAGE_EXECUTE_READWRITE (0x40) | PAGE_EXECUTE_WRITECOPY (0x80)
-        e.u8(0x25); e.u32(0x000000CCu);
-
-        // neg eax                              F7 D8
-        // CF set iff eax was non-zero (any write bit present).
-        e.u8(0xF7); e.u8(0xD8);
-        // sbb eax, eax                         19 C0
-        e.u8(0x19); e.u8(0xC0);
-
-        // mov rsp, r12                         4C 89 E4
-        e.u8(0x4C); e.u8(0x89); e.u8(0xE4);
-
-        // and eax, <mask32>                    25 imm32
-        e.u8(0x25); e.u32(corruption);
-
-        // xor [rsp + key_disp], eax            31 44 24 disp8
-        e.u8(0x31); e.u8(0x44); e.u8(0x24);
-        e.u8(static_cast<uint8_t>(static_cast<int8_t>(key_slot_disp)));
+                // neg eax                          F7 D8   ; CF iff non-zero
+                w.u8(0xF7); w.u8(0xD8);
+                // sbb eax, eax                     19 C0   ; 0 or -1
+                w.u8(0x19); w.u8(0xC0);
+            });
     }
 
     [[nodiscard]] const char* name() const noexcept override {
