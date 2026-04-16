@@ -98,9 +98,9 @@ TEST(GuardVehEmitter, TotalSizeInExpectedEnvelope) {
     RawEmitter e;
     Randomizer rng(kFixedSeed);
     (void)emit_guard_veh_handler(e, rng);
-    // Commit 3b base: 209 bytes. Commit 4 HW bp sweep: +21 → 230.
-    // Commit 7 polymorphic tail: +0..kGuardVehMaxTailJunk.
-    const size_t base = 288u;
+    // Commit 9a: decrypt_body (54 bytes) extracted to guard_decrypt_unit.
+    // Handler base: 288 - 54 = 234 bytes + 0..kGuardVehMaxTailJunk tail.
+    const size_t base = 234u;
     EXPECT_GE(e.size(), base);
     EXPECT_LE(e.size(), base + kGuardVehMaxTailJunk);
 }
@@ -160,17 +160,9 @@ TEST(GuardVehEmitter, LockXaddAppearsTwiceForRefCount) {
 }
 
 // ---------------------------------------------------------------------------
-// Decrypt body's defining per-guard key read instruction.
+// Commit 9a: decrypt body extracted to guard_decrypt_unit — the key read
+// pattern is no longer in the handler. Tested in guard_decrypt_unit_test.
 // ---------------------------------------------------------------------------
-
-TEST(GuardVehEmitter, DecryptBodyLoopContainsKeyReadPattern) {
-    RawEmitter e;
-    Randomizer rng(kFixedSeed);
-    (void)emit_guard_veh_handler(e, rng);
-    const size_t pos = find_pattern(
-        e.buf, {0x42, 0x0F, 0xB6, 0x44, 0x0E, 0x18});
-    EXPECT_NE(pos, std::string::npos);
-}
 
 // ---------------------------------------------------------------------------
 // Commit 4: HW breakpoint sweep in entry_match.
@@ -227,6 +219,13 @@ TEST(GuardVehEmitter, PatchSlotsPointAtZeroPlaceholders) {
     EXPECT_EQ(read_u32_le(e.buf, p.module_base_sub_imm32_offset), 0u);
     EXPECT_EQ(read_u32_le(e.buf, p.descriptor_table_rel32_offset), 0u);
     EXPECT_EQ(read_u32_le(e.buf, p.descriptor_count_imm32_offset), 0u);
+
+    // Commit 9a: call decrypt rel32 slots left as zero for external patching.
+    EXPECT_EQ(read_u32_le(e.buf, p.entry_call_decrypt_rel32_offset), 0u);
+    EXPECT_EQ(read_u32_le(e.buf, p.exit_call_decrypt_rel32_offset), 0u);
+    // The E8 opcode (call) must precede each slot.
+    EXPECT_EQ(e.buf[p.entry_call_decrypt_rel32_offset - 1], 0xE8u);
+    EXPECT_EQ(e.buf[p.exit_call_decrypt_rel32_offset - 1], 0xE8u);
 
     EXPECT_EQ(p.descriptor_table_rel32_end_offset,
               p.descriptor_table_rel32_offset + 4);
@@ -307,7 +306,7 @@ TEST(GuardVehEmitter, DeterministicCoreRegardlessOfSeed) {
     (void)emit_guard_veh_handler(a, rng_a);
     (void)emit_guard_veh_handler(b, rng_b);
 
-    const size_t core = 288u;
+    const size_t core = 234u;
     ASSERT_GE(a.size(), core);
     ASSERT_GE(b.size(), core);
     for (size_t i = 0; i < core; ++i) {
@@ -340,6 +339,10 @@ TEST(GuardVehEmitter, PatchOffsetsAreRelativeToHandlerStart) {
               pb.descriptor_table_rel32_end_offset);
     EXPECT_EQ(pa.descriptor_count_imm32_offset,
               pb.descriptor_count_imm32_offset);
+    EXPECT_EQ(pa.entry_call_decrypt_rel32_offset,
+              pb.entry_call_decrypt_rel32_offset);
+    EXPECT_EQ(pa.exit_call_decrypt_rel32_offset,
+              pb.exit_call_decrypt_rel32_offset);
 }
 
 } // namespace

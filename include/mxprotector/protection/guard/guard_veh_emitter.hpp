@@ -155,6 +155,20 @@ struct GuardVehEmit {
     uint32_t self_hash_lea_anchor_offset  = 0;
     uint32_t self_hash_sub_imm32_offset   = 0;
     uint32_t self_hash_size_imm32_offset  = 0;
+
+    /// Commit 9a — decrypt unit call sites.
+    ///
+    /// The decrypt subroutine is emitted as a separate blob by
+    /// `emit_guard_decrypt_unit` (guard_decrypt_unit.hpp). The VEH
+    /// handler calls it from two sites (entry_match and exit_match)
+    /// via `call rel32`. The rel32 slots are left as zero by the
+    /// emitter; the caller (GuardPass) patches them once the decrypt
+    /// unit's placement in the section is known.
+    ///
+    /// Each offset points at the 4-byte rel32 inside the `E8 rel32`
+    /// instruction, handler-relative.
+    uint32_t entry_call_decrypt_rel32_offset = 0;
+    uint32_t exit_call_decrypt_rel32_offset  = 0;
 };
 
 /// Size of one descriptor table entry in bytes. Must match the x64

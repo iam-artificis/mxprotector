@@ -71,6 +71,7 @@ set(BUILDER_SOURCES
     protection/guard/guard_pass.cpp
     protection/guard/guard_page_layout.cpp
     protection/guard/guard_veh_emitter.cpp
+    protection/guard/guard_decrypt_unit.cpp
     protection/guard/guard_tls_installer.cpp
 
     # Phase 4: x64 VM backend (split out of vm_runtime_gen.cpp)

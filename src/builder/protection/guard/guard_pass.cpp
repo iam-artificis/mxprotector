@@ -46,6 +46,7 @@
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/guard/guard_descriptor.hpp"
 #include "mxprotector/protection/guard/guard_page_layout.hpp"
+#include "mxprotector/protection/guard/guard_decrypt_unit.hpp"
 #include "mxprotector/protection/guard/guard_tls_installer.hpp"
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"  // fnv1a_32
@@ -60,11 +61,13 @@ namespace mx {
 
 namespace {
 
+using guard::GuardDecryptUnitEmit;
 using guard::GuardDescriptor;
 using guard::GuardPageLayout;
 using guard::GuardTlsInstallerEmit;
 using guard::GuardVehEmit;
 using guard::build_guard_page;
+using guard::emit_guard_decrypt_unit;
 using guard::emit_guard_tls_installer;
 using guard::emit_guard_veh_handler;
 using guard::kGuardDescriptorStride;
@@ -295,6 +298,16 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             tmp.buf.begin(), tmp.buf.end());
     }
 
+    const uint32_t decrypt_unit_offset =
+        static_cast<uint32_t>(section_data.size());
+    GuardDecryptUnitEmit decrypt_patches{};
+    {
+        RawEmitter tmp{};
+        decrypt_patches = emit_guard_decrypt_unit(tmp);
+        section_data.insert(section_data.end(),
+            tmp.buf.begin(), tmp.buf.end());
+    }
+
     const uint32_t tls_installer_offset =
         static_cast<uint32_t>(section_data.size());
     GuardTlsInstallerEmit tls_patches{};
@@ -339,19 +352,23 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
         ctx.pe_image().sections()[guard_section_index].virtual_address;
 
     ctx.log_fmt("GuardPass: секция '{}' добавлена: RVA=0x{:08X}, {} байт "
-                "(pages={}, descriptor_count={}, veh@0x{:X}, tls_install@0x{:X})",
+                "(pages={}, descriptor_count={}, veh@0x{:X}, "
+                "decrypt@0x{:X}, tls_install@0x{:X})",
         guard_section_name,
         guard_section_rva,
         section_data.size(),
         pendings.size(),
         descriptor_count,
         guard_section_rva + veh_handler_offset,
+        guard_section_rva + decrypt_unit_offset,
         guard_section_rva + tls_installer_offset);
 
     // Compute absolute section RVAs for downstream patching.
     const Rva descriptor_table_rva = guard_section_rva + descriptor_table_offset;
     const Rva veh_handler_rva      = guard_section_rva + veh_handler_offset;
+    const Rva decrypt_unit_rva     = guard_section_rva + decrypt_unit_offset;
     const Rva tls_installer_rva    = guard_section_rva + tls_installer_offset;
+    (void)decrypt_unit_rva;
 
     // ------------------------------------------------------------------
     // Phase 5 — per-guard: finalise descriptor, patch source section,
@@ -548,10 +565,31 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             tls_installer_offset + tls_patches.handler_rel32_offset,
             handler_rel32);
 
-        // Handler byte count — used by both Commit 8 self-hash and
-        // Commit 6 CRC. Declared here because both need it.
+        // Handler byte count — the handler proper, EXCLUDING the
+        // decrypt unit (which lives as a separate callable blob
+        // right after the handler). Used by both Commit 8 self-hash
+        // and Commit 6 CRC.
         const uint32_t veh_handler_size =
-            tls_installer_offset - veh_handler_offset;
+            decrypt_unit_offset - veh_handler_offset;
+
+        // Patch the two `call rel32` slots inside the handler to
+        // target the decrypt unit. Both calls jump to the same
+        // function but from different offsets, so the rel32 differs.
+        {
+            const uint32_t entry_slot_in_section =
+                veh_handler_offset + veh_patches.entry_call_decrypt_rel32_offset;
+            const int32_t entry_rel32 = static_cast<int32_t>(
+                static_cast<int64_t>(decrypt_unit_offset) -
+                static_cast<int64_t>(entry_slot_in_section + 4));
+            write_i32_le(guard_section.data, entry_slot_in_section, entry_rel32);
+
+            const uint32_t exit_slot_in_section =
+                veh_handler_offset + veh_patches.exit_call_decrypt_rel32_offset;
+            const int32_t exit_rel32 = static_cast<int32_t>(
+                static_cast<int64_t>(decrypt_unit_offset) -
+                static_cast<int64_t>(exit_slot_in_section + 4));
+            write_i32_le(guard_section.data, exit_slot_in_section, exit_rel32);
+        }
 
         // --- Commit 8: self-hash walk patch slots (BEFORE CRC!) ---
         //

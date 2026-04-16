@@ -31,6 +31,7 @@ set(TEST_SOURCES
     marker_scanner_test.cpp
     guard_page_layout_test.cpp
     guard_veh_emitter_test.cpp
+    guard_decrypt_unit_test.cpp
     guard_tls_installer_test.cpp
 )
 
@@ -128,6 +129,7 @@ set(ANALYSIS_SOURCES
 set(GUARD_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_page_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_veh_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_decrypt_unit.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_tls_installer.cpp
 )
 

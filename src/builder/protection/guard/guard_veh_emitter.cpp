@@ -1,68 +1,28 @@
 /**
  * @file guard_veh_emitter.cpp
  * @brief Byte-level x64 emission of the runtime-guards VEH handler.
- *        See guard_veh_emitter.hpp for the ABI and semantics.
  *
- * Commit 3b adds at-rest body encryption and concurrent-thread
- * reference counting to the Commit 3a scaffold. The handler body
- * is 209 bytes of position-independent code organised as:
+ * Commit 9a: the decrypt subroutine is extracted into a separate
+ * callable blob (`guard_decrypt_unit.hpp/cpp`). The handler emits
+ * two `call rel32` instructions whose rel32 slots are left as zero
+ * for `GuardPass` to patch once the decrypt unit's offset in the
+ * section is known.
  *
- *   * 0..21  — prologue + ExceptionCode filter + bailout tail.
- *     The fall-through after the filter IS the bailout path:
- *     `xor eax, eax` + pops + `ret`. The success path takes a
- *     forward `je` to skip over it.
+ * Handler structure (234 bytes base + 0..8 polymorphic tail):
  *
- *   * 22..59 — compute module base via rip-relative lea/sub,
- *     convert fault address to RVA, load descriptor table
- *     pointer + count.
- *
- *   * 60..82 — linear scan loop that matches the fault RVA
- *     against `[rsi + 0]` (entry) and `[rsi + 4]` (exit).
- *
- *   * 83..121 — entry_match: `LOCK XADD [rsi + 0x14], +1`; if
- *     the old count was 0 call `.decrypt_body`. Set
- *     `CONTEXT.Rip = body_start_va`, eax = -1, jmp forward
- *     into the shared success tail.
- *
- *   * 122..159 — exit_match: `LOCK XADD [rsi + 0x14], -1`; if
- *     the old count was 1 (new == 0) call `.decrypt_body` which
- *     re-encrypts the body because XOR is self-inverse. Set
- *     `CONTEXT.Rip = return_va`, eax = -1, fall through to the
- *     shared success tail.
- *
- *   * 160..164 — `.done_success`: pops + ret, reached from
- *     entry_match via forward jmp and from exit_match via
- *     fall-through.
- *
- *   * 165..208 — `.decrypt_body` subroutine. XORs the body range
- *     (at `[rbx + [rsi + 8]]`, length `[rsi + 0x10]`) with the
- *     32-byte key at `[rsi + 0x18]`, cycling every 32 bytes.
- *     Called from both entry_match and exit_match; because XOR
- *     is self-inverse, the same loop encrypts on the way in and
- *     decrypts on the way out (or vice versa).
- *
- * The ref-counter handles concurrent re-entry from multiple
- * threads: if thread A is already inside the guard, thread B's
- * entry sees count=1 and skips decryption (bytes are already
- * plaintext). Thread B's exit sees count=2→1 and skips
- * re-encryption. Only the LAST thread out re-encrypts.
+ *   * 0..21   — prologue + ExceptionCode filter + bailout tail
+ *   * 22..95  — module base, fault RVA, self-hash FNV walk
+ *   * 96..108 — descriptor table pointer + count
+ *   * 109..131 — linear scan loop
+ *   * 132..191 — entry_match (HW bp sweep + LOCK XADD + call decrypt)
+ *   * 192..228 — exit_match  (LOCK XADD + call decrypt)
+ *   * 229..233 — .done_success (pops + ret)
+ *   * 234..    — polymorphic tail (0..8 random bytes)
  *
  * ## ABI / register use
  *
  * Clobbered volatiles: rax, rcx, rdx, r8, r9, r10, r11.
  * Saved + restored nonvolatiles: rbx, rbp, rsi, rdi.
- *
- * `rbp` caches `PCONTEXT` across the whole body so entry_match
- * and exit_match can `mov [rbp + 0xF8], rax` without re-loading
- * from rcx each time. `rbx` caches the module base. `rsi` holds
- * the current descriptor pointer during the loop and is
- * preserved across the `.decrypt_body` call. `rdi` holds the
- * fault RVA (unused after the match but still live until the
- * loop terminates).
- *
- * The `.decrypt_body` subroutine clobbers rax/rcx/rdx/r9 and
- * preserves rsi/rbx/rbp/rdi/r8 — the caller only needs rsi and
- * rbx after the call, both of which survive.
  */
 
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
@@ -429,121 +389,15 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u8(0xC3);
 
     // =================================================================
-    // .decrypt_body — XOR-cipher pass over the guard body.
-    //
-    //   mov edx, [rsi + 8]            8B 56 08       body_start_rva
-    //   add rdx, rbx                  48 01 DA       body_va
-    //   mov ecx, [rsi + 0x10]         8B 4E 10       body_size
-    //   xor r9d, r9d                  45 31 C9       key index
-    //   test ecx, ecx                 85 C9
-    //   jz .decrypt_done              74 rel8
-    //   .decrypt_loop:
-    //     movzx eax, byte [rsi + r9 + 0x18]   42 0F B6 44 0E 18
-    //     xor [rdx], al                       30 02
-    //     inc rdx                             48 FF C2
-    //     inc r9d                             41 FF C1
-    //     cmp r9d, 32                         41 83 F9 20
-    //     jb .no_wrap                         72 rel8 (+3 to skip xor)
-    //     xor r9d, r9d                        45 31 C9
-    //   .no_wrap:
-    //     dec ecx                             FF C9
-    //     jnz .decrypt_loop                   75 rel8
-    //   .decrypt_done:
-    //     ret                                 C3
-    //
-    // Clobbers: rax, rcx, rdx, r9.
-    // Preserves: rsi, rbx, rbp, rdi, r8.
-    // =================================================================
-    // =================================================================
-    // .decrypt_body — XOR-cipher pass WITH hash-derived key unmask.
-    //
-    // Commit 8 change: r11d carries the handler self-hash computed
-    // at handler entry. Before XOR-ing the body byte, each stored
-    // key byte is first XOR-masked with the corresponding byte of
-    // the rolling r8d hash register (initialised from r11d). The
-    // rotation `ror r8d, 8` cycles through all 4 bytes of the hash,
-    // wrapping every 4 iterations. Since 32 (key length) is a
-    // multiple of 4, the alignment stays consistent across key-index
-    // wraps.
-    //
-    //   mov edx, [rsi + 8]                   body_start_rva
-    //   add rdx, rbx                         body_va
-    //   mov ecx, [rsi + 0x10]                body_size
-    //   xor r9d, r9d                         key index
-    //   mov r8d, r11d                        ← NEW: rolling mask init
-    //   test ecx, ecx
-    //   jz .decrypt_done
-    //   .decrypt_loop:
-    //     movzx eax, byte [rsi + r9 + 0x18]  stored_key[r9]
-    //     xor al, r8b                         ← NEW: unmask with hash byte
-    //     ror r8d, 8                          ← NEW: rotate to next hash byte
-    //     xor [rdx], al
-    //     inc rdx
-    //     inc r9d
-    //     cmp r9d, 32
-    //     jb .no_wrap
-    //     xor r9d, r9d
-    //   .no_wrap:
-    //     dec ecx
-    //     jnz .decrypt_loop
-    //   .decrypt_done:
-    //     ret
-    //
-    // Clobbers: rax, rcx, rdx, r8, r9.
-    // Preserves: rsi, rbx, rbp, rdi, r11 (hash is READ, not written).
-    // =================================================================
-    const uint32_t decrypt_body_label = static_cast<uint32_t>(e.size());
-
-    e.u8(0x8B); e.u8(0x56); e.u8(0x08);
-    e.u8(0x48); e.u8(0x01); e.u8(0xDA);
-    e.u8(0x8B); e.u8(0x4E); e.u8(0x10);
-    e.u8(0x45); e.u8(0x31); e.u8(0xC9);            // xor r9d, r9d
-    e.u8(0x45); e.u8(0x89); e.u8(0xD8);            // mov r8d, r11d  ← NEW
-    e.u8(0x85); e.u8(0xC9);
-    e.u8(0x74);
-    const uint32_t decrypt_done_rel8_slot = static_cast<uint32_t>(e.size());
-    e.u8(0x00);
-
-    const uint32_t decrypt_loop_label = static_cast<uint32_t>(e.size());
-    e.u8(0x42); e.u8(0x0F); e.u8(0xB6); e.u8(0x44); e.u8(0x0E); e.u8(0x18);
-    e.u8(0x44); e.u8(0x30); e.u8(0xC0);            // xor al, r8b   ← NEW
-    e.u8(0x41); e.u8(0xC1); e.u8(0xC8); e.u8(0x08); // ror r8d, 8   ← NEW
-    e.u8(0x30); e.u8(0x02);
-    e.u8(0x48); e.u8(0xFF); e.u8(0xC2);
-    e.u8(0x41); e.u8(0xFF); e.u8(0xC1);
-    e.u8(0x41); e.u8(0x83); e.u8(0xF9); e.u8(0x20);
-    // jb .no_wrap (skip the next 3-byte `xor r9d, r9d`)
-    e.u8(0x72); e.u8(0x03);
-    e.u8(0x45); e.u8(0x31); e.u8(0xC9);
-    // .no_wrap:
-    e.u8(0xFF); e.u8(0xC9);
-    e.u8(0x75);
-    const uint32_t decrypt_loop_rel8_slot = static_cast<uint32_t>(e.size());
-    e.u8(0x00);
-    {
-        const int32_t end = static_cast<int32_t>(decrypt_loop_rel8_slot + 1);
-        const int32_t rel8 =
-            static_cast<int32_t>(decrypt_loop_label) - end;
-        e.buf[decrypt_loop_rel8_slot] =
-            static_cast<uint8_t>(static_cast<int8_t>(rel8));
-    }
-
-    const uint32_t decrypt_done_label = static_cast<uint32_t>(e.size());
-    e.u8(0xC3);
-
-    // =================================================================
-    // Back-patch every forward rel8 and the two `call` rel32s.
+    // Back-patch forward rel8 jumps. The two `call decrypt_body`
+    // rel32 slots are LEFT AS ZERO — the caller (GuardPass) patches
+    // them once the separately-emitted decrypt unit's offset in the
+    // section is known (Commit 9a extraction).
     // =================================================================
     auto patch_rel8 = [&](uint32_t slot, uint32_t target) {
         const int32_t rel8 =
             static_cast<int32_t>(target) - static_cast<int32_t>(slot + 1);
         e.buf[slot] = static_cast<uint8_t>(static_cast<int8_t>(rel8));
-    };
-
-    auto patch_rel32 = [&](uint32_t slot, uint32_t target) {
-        const int32_t rel32 =
-            static_cast<int32_t>(target) - static_cast<int32_t>(slot + 4);
-        std::memcpy(e.buf.data() + slot, &rel32, sizeof(rel32));
     };
 
     patch_rel8(je_proceed_slot,          proceed_label);
@@ -554,39 +408,19 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     patch_rel8(entry_skip_rel8_slot,     entry_skip_label);
     patch_rel8(entry_done_rel8_slot,     done_success_label);
     patch_rel8(exit_skip_rel8_slot,      exit_skip_label);
-    patch_rel8(decrypt_done_rel8_slot,   decrypt_done_label);
-    patch_rel32(entry_call_rel32_slot,   decrypt_body_label);
-    patch_rel32(exit_call_rel32_slot,    decrypt_body_label);
+
+    out.entry_call_decrypt_rel32_offset =
+        entry_call_rel32_slot - handler_start;
+    out.exit_call_decrypt_rel32_offset =
+        exit_call_rel32_slot - handler_start;
 
     // =================================================================
     // Commit 7 — Per-build polymorphic random tail.
     //
-    // Append 0..kGuardVehMaxTailJunk random bytes AFTER the final
-    // `ret` inside `.decrypt_body`. These bytes are never executed
-    // (every control-flow path through the handler ends with a
-    // `ret`), but they:
-    //
-    //   * Change the handler's total byte length per build, which
-    //     shifts every downstream rel32 / imm32 patch in the
-    //     `.mxguard` section (descriptor table rel32 from the
-    //     handler, the TLS installer's handler_rel32 and
-    //     crc_walk_rel32, the installer's crc_size_imm32, and
-    //     the TLS callback VA computed by `GuardPass`).
-    //
-    //   * Change the CRC that the TLS installer's self-check
-    //     compares against (Commit 6 pins the expected value at
-    //     build time over the FULL handler byte range including
-    //     this tail, so runtime verification still matches).
-    //
-    //   * Break naive byte-signature matching across builds —
-    //     two builds of the same source binary will have
-    //     different handler hashes and different .mxguard byte
-    //     streams.
-    //
-    // The tail's bytes are drawn uniformly from `rng.next_u8()`.
-    // It is the ONLY randomness source inside the handler proper
-    // (other than what GuardPass already contributes via per-
-    // guard XOR keys and per-page junk tails).
+    // Append 0..kGuardVehMaxTailJunk random bytes AFTER the
+    // handler's final `ret` in `.done_success`. These bytes are
+    // never executed but change the handler's CRC and byte stream
+    // per build, breaking signature matching.
     // =================================================================
     const uint32_t tail_len = rng.next_range(0, kGuardVehMaxTailJunk);
     for (uint32_t i = 0; i < tail_len; ++i) {
