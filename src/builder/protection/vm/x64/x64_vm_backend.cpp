@@ -37,6 +37,7 @@
 #include "mxprotector/protection/anti_tamper/self_crc_check.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
+#include "mxprotector/protection/vm/x64/x64_bytecode_encoder.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_handlers.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
@@ -48,31 +49,11 @@ namespace mx::vm::x64 {
 
 namespace {
 
-// ----------------------------------------------------------------------------
-// G1 — Per-build handler specialisation (runtime side)
-// ----------------------------------------------------------------------------
-//
-// The compile-time metadata for specialisation — `kMaxSpecializations`,
-// `kSpecializableOps`, `is_specializable_op`, `alu_op_mr_for` and the
-// generic `variant_count_for` table — lives in `x64_vm_variants.hpp`.
-// What stays here is the runtime tuple that binds those tables to the
-// per-build handler-id allocator.
-//
-// A `Specialization` is a (op, dst_vreg, src_vreg) tuple for which the
-// backend will emit a dedicated handler with the destination and source
-// slot displacements baked in. Instructions that match a specialisation
-// emit only the specialised handler_id (1 byte of bytecode) instead of
-// the generic 3-byte form (handler_id + dst byte + src byte).
-//
-// Per-build random selection. Two builds of the same input get different
-// specialisations, with different handler_ids, in different positions in
-// the handler table.
-struct Specialization {
-    VmOp    op{};         // mov_rr / add_rr / sub_rr / xor_rr / and_rr / or_rr
-    uint8_t dst_vreg{};   // 0..15, ≠ junk_slot
-    uint8_t src_vreg{};   // 0..15, ≠ junk_slot
-    uint8_t handler_id{}; // assigned during slot allocation
-};
+// `Specialization` (the runtime (op, dst_vreg, src_vreg, handler_id)
+// tuple) is defined in `x64_bytecode_encoder.hpp`, which the encoder
+// and this file share. The compile-time metadata
+// (`kMaxSpecializations`, `kSpecializableOps`, `is_specializable_op`,
+// `alu_op_mr_for`, `variant_count_for`) lives in `x64_vm_variants.hpp`.
 
 // ----------------------------------------------------------------------------
 // GenerationSession — one run of the backend.
@@ -120,25 +101,14 @@ private:
     std::vector<uint8_t> native_handler_ids;
     std::vector<uint8_t> per_handler_key;
 
-    // ==== Step 2 — bytecode encoding state ==================================
-    ByteBuffer bytecode_plain;
-    uint32_t next_native_idx{};
+    // ==== Step 2 — bytecode encoding (only the fields that outlive the
+    //               encoder pass; everything else — spec_match, dead/opq
+    //               insertion counts, bc_offset, fold events — lives and
+    //               dies inside `encode_bytecode`).
+    ByteBuffer            bytecode_plain;
     std::vector<uint32_t> native_handler_of_insn;
-    std::vector<int> spec_match;
-    std::vector<uint8_t> dead_before;
-    std::vector<uint8_t> opq_before;
-    std::vector<uint32_t> bc_offset;
-    uint8_t dead_handler_id{};
-    uint8_t opq_branch_handler_id{};
-
-    // G4 per-handler-key fold-in events. Each entry marks the end of one
-    // handler's byte range in `bytecode_plain` and the handler_id that
-    // processed those bytes.
-    struct FoldInEvent { size_t end_offset; uint8_t handler_id; };
-    std::vector<FoldInEvent> fold_events;
-
-    bool has_branches{};
-    bool rolling{};
+    bool                  has_branches{};
+    bool                  rolling{};
 
     // ==== Step 3 — runtime blob state =======================================
     RawEmitter rt;
@@ -186,9 +156,7 @@ private:
     size_t bytecode_offset{};
 
     // Constants that were local `constexpr` in the original function.
-    static constexpr uint32_t kMaxDeadPerSlot       = 3;
-    static constexpr uint32_t kOpqBranchProbability = 30;   // /100
-    static constexpr uint32_t kMaxChainLen          = 3;
+    static constexpr uint32_t kMaxChainLen = 3;
 
     // ==== Step methods ======================================================
     [[nodiscard]] MxResult<void> step1_randomize();
@@ -203,11 +171,6 @@ private:
     [[nodiscard]] MxResult<void> step4_apply_patches();
 
     // ==== Shared helpers (were lambdas inside `generate`) ====================
-    uint8_t  remap_reg(uint8_t native_reg) const;
-    void     push32(int32_t v);
-    void     record_fold(uint8_t hid);
-    uint32_t insert_bytes_at(size_t i) const;
-    void     emit_g4_inserts(size_t i);
     uint32_t allocate_trampoline_slot();
     void     queue_trampoline_chain(uint8_t handler_id);
     void     emit_one_pending_trampoline();
@@ -416,304 +379,29 @@ MxResult<void> GenerationSession::step1_randomize() {
 //                          Step 2 — bytecode encoding
 // ============================================================================
 //
-// Build plain bytecode stream, then stream-encrypt with rolling key. The
-// encryption walks bytes in fetch order (opcode, operands, next opcode,
-// ...) so the runtime decryption order matches.
-//
-// Plumbing order:
-//   1. Define the operand remap helper (uses the per-region layout).
-//   2. Precompute spec_match[i]: whether each instruction matches one
-//      of the per-build specialisations. Drives BOTH the bytecode size
-//      table and the encoding loop.
-//   3. Compute bc_offset[] using the spec-aware sizes.
-//   4. Emit bytecode using the same spec_match decisions.
+// Delegated to `x64_bytecode_encoder.cpp`. The encoder is a pure
+// data-in / data-out pass: given the phase-1 outputs and the shared
+// `Randomizer`, it returns the encrypted bytecode, the per-instruction
+// native-handler map, and the `has_branches` / `rolling` flags that
+// downstream handler emission needs to pick the right cipher mode.
 // ============================================================================
 
 void GenerationSession::step2_emit_bytecode() {
-    bytecode_plain.reserve(instructions.size() * 4);
-
-    next_native_idx = 0;
-    native_handler_of_insn.assign(instructions.size(), UINT32_MAX);
-
-    // G1 — Precompute specialisation matches.
-    //
-    // spec_match[i] = index into `specializations[]`, or -1 for "no match,
-    // emit via the generic path". We do this BEFORE bc_offset[] because a
-    // matched instruction's bytecode size shrinks from 3 bytes (handler_id
-    // + 2 operand bytes) to 1 byte (handler_id only), and vjmp/vjcc rel32
-    // values depend on bc_offset[].
-    spec_match.assign(instructions.size(), -1);
-    if (!specializations.empty()) {
-        for (size_t i = 0; i < instructions.size(); ++i) {
-            const auto& vi = instructions[i];
-            if (!is_specializable_op(vi.op)) continue;
-            const uint8_t dst_v = remap_reg(vi.dst);
-            const uint8_t src_v = remap_reg(vi.src);
-            for (size_t s = 0; s < specializations.size(); ++s) {
-                const auto& spec = specializations[s];
-                if (spec.op == vi.op
-                 && spec.dst_vreg == dst_v
-                 && spec.src_vreg == src_v)
-                {
-                    spec_match[i] = static_cast<int>(s);
-                    break;  // first match wins
-                }
-            }
-        }
-    }
-
-    // G4 dead-opcode insertion. Pre-decide how many dead bytes to
-    // emit BEFORE each real instruction (position 0..N-1) and after
-    // the last one (position N, before the terminal `exit`). Both
-    // bc_offset computation and the phase-2 emit loop read from
-    // this array, so they stay in sync.
-    //
-    // Insertion density: 0..kMaxDeadPerSlot dead bytes per slot,
-    // uniform draw. With ~3-instruction average spacing the real
-    // bytecode grows by ~1.5x and every vjcc's vflags window gets
-    // mixed with dead-op fetches, making static opcode-table
-    // recovery have to disambiguate "live" vs "dead" bytes without
-    // actually running the VM.
-    //
-    // Regions with virtual branches fall back to static XOR
-    // encryption later on. Dead opcodes work under BOTH encryption
-    // modes — the encryption operates on bytes in fetch order and
-    // doesn't care whether a byte is live or dead.
-    // G4 obfuscation insertion. Two kinds of dummy bytes sprinkled
-    // between real instructions:
-    //
-    //   * `dead_before[i]` — number of zero-operand `VmOp::dead`
-    //     handler_id bytes to insert before real instruction `i`.
-    //     Each insert is 1 byte. Uniform draw [0..kMaxDeadPerSlot].
-    //
-    //   * `opq_before[i]` — whether to insert a single
-    //     `VmOp::opq_branch` at this slot. Each insert is 5 bytes
-    //     (handler_id + 4 random rel32-shaped bytes). Binary draw
-    //     with probability kOpqBranchProbability.
-    //
-    // Both arrays contribute to `bc_offset[]` so vjmp/vjcc rel32
-    // values land on the right target even with inserts in between.
-    //
-    // Branch constraint: neither insertion happens right after a
-    // vjmp/vjcc (index `i` such that `instructions[i-1]` is a
-    // branch). The branch's rel32 at runtime lands r11 at
-    // `bc_offset[i-1] + size(branch) = bc_offset[i] - inserts`, so
-    // any nonzero insert count at that slot would leave r11
-    // `inserts` bytes BEFORE the target. Zeroing the slot is the
-    // simplest correct fix: bytes after a branch are unreachable
-    // on the taken path anyway (and the fall-through path still
-    // walks through them via the normal dispatch chain).
-    dead_before.assign(instructions.size() + 1, 0);
-    opq_before.assign(instructions.size() + 1, 0);
-    for (size_t i = 0; i <= instructions.size(); ++i) {
-        const bool after_branch =
-            (i > 0) &&
-            (instructions[i - 1].op == VmOp::vjmp ||
-             instructions[i - 1].op == VmOp::vjcc);
-        if (after_branch) continue;
-        dead_before[i] =
-            static_cast<uint8_t>(rng.next_range(0, kMaxDeadPerSlot));
-        if (rng.next_range(0, 99) < kOpqBranchProbability) {
-            opq_before[i] = 1;
-        }
-    }
-
-    // Phase 1: compute bytecode offsets using spec-aware sizes +
-    // G4 obfuscation insertions. vjmp/vjcc rel32 depends on the
-    // target instruction's bytecode offset, so the counts of dead
-    // bytes and opaque branches inserted BEFORE the target are
-    // correctly reflected in the computed rel32.
-    //
-    // Insertion bytes per slot i:
-    //   dead_before[i]            (1 byte each)
-    // + opq_before[i] * 5         (handler_id + 4 operand bytes)
-    bc_offset.assign(instructions.size() + 1, 0);
-    bc_offset[0] = insert_bytes_at(0);
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        const uint32_t size = (spec_match[i] >= 0)
-            ? 1u   // specialised: just handler_id, no operand bytes
-            : (1u + vm_op_operand_size(instructions[i].op));
-        bc_offset[i + 1] = bc_offset[i] + size + insert_bytes_at(i + 1);
-    }
-
-    // Phase 2: encode bytecode.
-
-    // G4: cached handler ids for the phase-2 inserter below.
-    dead_handler_id =
-        variant_handler_ids[static_cast<uint32_t>(VmOp::dead)][0];
-    opq_branch_handler_id =
-        variant_handler_ids[static_cast<uint32_t>(VmOp::opq_branch)][0];
-
-    // G4 per-handler-key fold-in events. The rolling-cipher encryption
-    // pass below walks this list and applies `key ^= per_handler_key[id]`
-    // after each range, matching the `xor [rsp+key_disp], imm8` fold-in
-    // the handler body emits right before its tail dispatch.
-    //
-    // A trailing sentinel event for the terminal `exit` handler isn't
-    // needed: exit doesn't dispatch, so there's no "next fetch" to fold
-    // into.
-    fold_events.clear();
-    fold_events.reserve(instructions.size() * 2);
-
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        // G4: insert this slot's dummy bytes BEFORE the real
-        // instruction. bc_offset[i] already accounts for them.
-        emit_g4_inserts(i);
-
-        const auto& vi = instructions[i];
-
-        // G1 — Specialised path: emit only the handler_id, no operand bytes.
-        // The matched specialised handler has dst/src disps baked in, so the
-        // runtime decoder needs no operand fetch.
-        if (spec_match[i] >= 0) {
-            const uint8_t spec_hid =
-                specializations[static_cast<size_t>(spec_match[i])].handler_id;
-            bytecode_plain.push_back(spec_hid);
-            record_fold(spec_hid);
-            continue;
-        }
-
-        uint8_t handler_id;
-        if (vi.op == VmOp::native) {
-            handler_id = native_handler_ids[next_native_idx];
-            native_handler_of_insn[i] = next_native_idx;
-            ++next_native_idx;
-        } else if (vi.op == VmOp::vjcc) {
-            const auto& variants = variant_handler_ids[static_cast<uint32_t>(VmOp::vjcc)];
-            handler_id = variants[vi.branch_cc];
-        } else {
-            const auto& variants = variant_handler_ids[static_cast<uint32_t>(vi.op)];
-            const uint32_t v = (variants.size() > 1)
-                ? rng.next_range(0, static_cast<uint32_t>(variants.size() - 1))
-                : 0u;
-            handler_id = variants[v];
-        }
-
-        bytecode_plain.push_back(handler_id);
-
-        switch (vi.op) {
-            case VmOp::mov_rr:
-            case VmOp::add_rr:
-            case VmOp::sub_rr:
-            case VmOp::xor_rr:
-            case VmOp::and_rr:
-            case VmOp::or_rr:
-            case VmOp::imul_rr:
-                bytecode_plain.push_back(remap_reg(vi.dst));
-                bytecode_plain.push_back(remap_reg(vi.src));
-                break;
-
-            case VmOp::mov_ri32:
-            case VmOp::add_ri32:
-            case VmOp::sub_ri32:
-            case VmOp::xor_ri32:
-            case VmOp::and_ri32:
-            case VmOp::or_ri32:
-                bytecode_plain.push_back(remap_reg(vi.dst));
-                push32(vi.imm32);
-                break;
-
-            case VmOp::mov_ri64:
-                bytecode_plain.push_back(remap_reg(vi.dst));
-                for (int b = 0; b < 8; ++b)
-                    bytecode_plain.push_back(
-                        static_cast<uint8_t>((vi.imm64 >> (b * 8)) & 0xFF));
-                break;
-
-            case VmOp::not_r:
-            case VmOp::neg_r:
-                bytecode_plain.push_back(remap_reg(vi.dst));
-                break;
-
-            case VmOp::shl_ri:
-            case VmOp::shr_ri:
-            case VmOp::sar_ri:
-            case VmOp::rol_ri:
-            case VmOp::ror_ri:
-                bytecode_plain.push_back(remap_reg(vi.dst));
-                bytecode_plain.push_back(vi.shift_count);
-                break;
-
-            case VmOp::vjmp:
-            case VmOp::vjcc: {
-                const auto target_off = bc_offset[vi.branch_target_insn];
-                const auto next_off   = bc_offset[i + 1];
-                push32(static_cast<int32_t>(target_off) -
-                       static_cast<int32_t>(next_off));
-                break;
-            }
-
-            case VmOp::native:
-            case VmOp::exit:
-            case VmOp::dead:          // never in instructions[], -Wswitch
-            case VmOp::opq_branch:    // never in instructions[], -Wswitch
-            case VmOp::count_:
-                break;
-        }
-
-        // G4: record fold-in boundary after this instruction's
-        // handler_id + operand bytes. `exit` doesn't dispatch
-        // anywhere afterwards, so its fold would be unused — the
-        // runtime handler emits no fold-in either. Skip it.
-        if (vi.op != VmOp::exit) {
-            record_fold(handler_id);
-        }
-    }
-
-    // G4: last batch of dummy bytes between the final real
-    // instruction and the terminal `exit` opcode.
-    emit_g4_inserts(instructions.size());
-
-    // Terminal exit opcode.
-    bytecode_plain.push_back(
-        variant_handler_ids[static_cast<uint32_t>(VmOp::exit)][0]);
-
-    // Detect whether the instruction list contains any virtual branches.
-    // If it does, fall back to static XOR encryption (all bytes XOR'd with
-    // the same key) because branch targets would need key-state checkpoints
-    // that complicate the first-pass design. Straight-line regions keep the
-    // stronger rolling-key cipher.
-    has_branches = std::any_of(
-        instructions.begin(), instructions.end(),
-        [](const VmInstruction& v) {
-            return v.op == VmOp::vjmp || v.op == VmOp::vjcc;
-        });
-    rolling = !has_branches;
-
-    // Bytecode encryption: rolling-key (+ G4 per-handler fold-in)
-    // or static XOR.
-    if (rolling) {
-        uint8_t key = initial_key;
-        size_t byte_pos = 0;
-        size_t event_idx = 0;
-        while (byte_pos < bytecode_plain.size()) {
-            const size_t next_boundary =
-                (event_idx < fold_events.size())
-                ? fold_events[event_idx].end_offset
-                : bytecode_plain.size();
-
-            // Roll through bytes up to the next handler boundary.
-            while (byte_pos < next_boundary) {
-                const uint8_t plain = bytecode_plain[byte_pos];
-                bytecode_plain[byte_pos] =
-                    static_cast<uint8_t>(plain ^ key);
-                key ^= plain;
-                ++byte_pos;
-            }
-
-            // Apply this handler's fold-in (mirrors the
-            // `xor [rsp+key_disp], imm8` that the handler body
-            // emits right before its tail dispatch).
-            if (event_idx < fold_events.size()) {
-                key ^= per_handler_key[fold_events[event_idx].handler_id];
-                ++event_idx;
-            }
-        }
-    } else {
-        for (auto& b : bytecode_plain) {
-            b ^= initial_key;
-        }
-    }
+    const BytecodeEncoderInputs encoder_in{
+        instructions,
+        specializations,
+        variant_handler_ids,
+        native_handler_ids,
+        per_handler_key,
+        initial_key,
+        layout,
+        rng,
+    };
+    BytecodeEncoderOutputs encoder_out = encode_bytecode(encoder_in);
+    bytecode_plain         = std::move(encoder_out.bytecode);
+    native_handler_of_insn = std::move(encoder_out.native_handler_of_insn);
+    has_branches           = encoder_out.has_branches;
+    rolling                = encoder_out.rolling;
 }
 
 // ============================================================================
@@ -1428,50 +1116,6 @@ MxResult<void> GenerationSession::step4_apply_patches() {
 // ============================================================================
 //                 Shared helpers (were lambdas inside `generate`)
 // ============================================================================
-
-// Translate a native-reg operand (as emitted by the lifter) to its
-// per-build virtual slot. The lifter refuses to emit RSP operands for
-// generic ops, so native_to_slot[n] must be valid here.
-uint8_t GenerationSession::remap_reg(uint8_t native_reg) const {
-    const uint8_t slot = layout.native_to_slot[native_reg];
-    return (slot == VmStackLayout::kJunkMarker) ? layout.junk_slot : slot;
-}
-
-void GenerationSession::push32(int32_t v) {
-    const auto u = static_cast<uint32_t>(v);
-    bytecode_plain.push_back(static_cast<uint8_t>(u & 0xFF));
-    bytecode_plain.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
-    bytecode_plain.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
-    bytecode_plain.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
-}
-
-void GenerationSession::record_fold(uint8_t hid) {
-    fold_events.push_back({bytecode_plain.size(), hid});
-}
-
-uint32_t GenerationSession::insert_bytes_at(size_t i) const {
-    return static_cast<uint32_t>(dead_before[i]) +
-           static_cast<uint32_t>(opq_before[i]) * 5u;
-}
-
-void GenerationSession::emit_g4_inserts(size_t i) {
-    for (uint8_t k = 0; k < dead_before[i]; ++k) {
-        bytecode_plain.push_back(dead_handler_id);
-        record_fold(dead_handler_id);
-    }
-    if (opq_before[i]) {
-        bytecode_plain.push_back(opq_branch_handler_id);
-        // 4 rel32-shaped bytes — random-looking to make the
-        // fake target point "somewhere" in the bytecode. The
-        // handler never adds them to r11, so the value is
-        // purely for appearance.
-        for (int b = 0; b < 4; ++b) {
-            bytecode_plain.push_back(
-                static_cast<uint8_t>(rng.next_range(0, 255)));
-        }
-        record_fold(opq_branch_handler_id);
-    }
-}
 
 uint32_t GenerationSession::allocate_trampoline_slot() {
     const uint32_t slot = static_cast<uint32_t>(trampoline_offset_by_slot.size());
