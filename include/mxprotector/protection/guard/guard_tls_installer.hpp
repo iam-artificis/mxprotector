@@ -71,23 +71,52 @@ namespace mx::guard {
 /**
  * @brief Patch sites produced by `emit_guard_tls_installer`.
  *
- * `handler_rel32_offset` is the offset inside the installer's own
- * bytes of the 4-byte rel32 slot in `lea rdx, [rip + rel32]`.
+ * Two groups of offsets:
  *
- * `handler_rel32_end_offset` is the offset of the byte right after
- * the rel32 slot. The rel32 resolves to `rip_after_lea + disp`,
- * which must equal the VEH handler's RVA, so the caller computes:
+ * ### Handler pointer for `AddVectoredExceptionHandler`
+ *
+ * `handler_rel32_offset` / `handler_rel32_end_offset` form the
+ * rip-relative target of `lea rdx, [rip + rel32]` which passes the
+ * VEH handler's address to `RtlAddVectoredExceptionHandler`. The
+ * caller fills this in the same way as any other in-section rel32:
  *
  * ```
  * rel32 = handler_offset_in_section
  *       - (installer_offset_in_section + handler_rel32_end_offset);
  * ```
  *
- * and writes it into `data[installer_offset + handler_rel32_offset]`.
+ * ### Commit 6 self-CRC
+ *
+ * Before actually installing the handler, the installer walks the
+ * handler byte stream and computes `fnv1a_32` over it, then compares
+ * against a build-time-baked expected value. On mismatch the install
+ * is silently skipped — the first `int3` on a guard page then
+ * propagates as an unhandled breakpoint and terminates the process.
+ * This catches any tampering that modifies the handler between
+ * build time and the moment the loader runs our TLS callback.
+ *
+ *   * `crc_walk_rel32_offset` / `crc_walk_rel32_end_offset` — the
+ *     rel32 slot inside `lea r11, [rip + rel32]` which sets the
+ *     walk cursor to the first byte of the VEH handler. Patched
+ *     exactly like `handler_rel32_offset` but to the same target
+ *     from a different lea.
+ *
+ *   * `crc_size_imm32_offset` — the 4-byte imm32 inside
+ *     `mov ecx, imm32` that loads the handler byte count.
+ *     The caller writes `handler_size`.
+ *
+ *   * `crc_expected_imm32_offset` — the 4-byte imm32 inside
+ *     `cmp r10d, imm32` that holds the build-time
+ *     `fnv1a_32(handler_bytes, handler_size)`.
  */
 struct GuardTlsInstallerEmit {
     uint32_t handler_rel32_offset     = 0;
     uint32_t handler_rel32_end_offset = 0;
+
+    uint32_t crc_walk_rel32_offset     = 0;
+    uint32_t crc_walk_rel32_end_offset = 0;
+    uint32_t crc_size_imm32_offset     = 0;
+    uint32_t crc_expected_imm32_offset = 0;
 };
 
 /**

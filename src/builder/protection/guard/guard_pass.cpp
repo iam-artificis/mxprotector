@@ -48,6 +48,7 @@
 #include "mxprotector/protection/guard/guard_page_layout.hpp"
 #include "mxprotector/protection/guard/guard_tls_installer.hpp"
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
+#include "mxprotector/protection/packer/stub_self_hash.hpp"  // fnv1a_32
 
 #include <algorithm>
 #include <array>
@@ -546,6 +547,68 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             guard_section.data,
             tls_installer_offset + tls_patches.handler_rel32_offset,
             handler_rel32);
+
+        // --- Commit 6: self-CRC over the VEH handler bytes ---
+        //
+        // The TLS installer walks the handler byte-range at runtime
+        // and computes fnv1a_32 over it, comparing against a
+        // build-time-baked expected value. The expected value is
+        // fnv1a_32(handler_bytes, handler_size) computed RIGHT HERE
+        // (after all VEH patches have been applied: module_base
+        // imm32, descriptor table rel32, descriptor count imm32).
+        // Any runtime patch applied between PE mapping and TLS
+        // callback execution shifts the hash and causes the
+        // installer to silently skip AVEH, leaving the VEH
+        // unregistered — the first guard int3 then terminates the
+        // process.
+        //
+        // The handler size is fixed per build (emitter output
+        // length), so we compute it from `veh_handler_offset` and
+        // `tls_installer_offset`. Not perfectly tight if future
+        // commits append bytes between handler and installer, but
+        // good enough here because emission is dense.
+        const uint32_t veh_handler_size =
+            tls_installer_offset - veh_handler_offset;
+
+        const uint32_t handler_crc = packer::fnv1a_32(
+            ByteView{
+                guard_section.data.data() + veh_handler_offset,
+                veh_handler_size});
+
+        // crc_walk_rel32: same target as handler_rel32 but from a
+        // different lea, so the delta is different.
+        const uint32_t crc_walk_rel32_end_in_section =
+            tls_installer_offset + tls_patches.crc_walk_rel32_end_offset;
+        const int32_t crc_walk_rel32 = static_cast<int32_t>(
+            static_cast<int64_t>(veh_handler_offset) -
+            static_cast<int64_t>(crc_walk_rel32_end_in_section));
+        write_i32_le(
+            guard_section.data,
+            tls_installer_offset + tls_patches.crc_walk_rel32_offset,
+            crc_walk_rel32);
+
+        // crc_size_imm32: total byte count to walk.
+        write_u32_le(
+            guard_section.data,
+            tls_installer_offset + tls_patches.crc_size_imm32_offset,
+            veh_handler_size);
+
+        // crc_expected_imm32: fnv1a_32 of the handler bytes as they
+        // exist RIGHT NOW. Any future write to the handler range
+        // must happen BEFORE this point or the stored value will be
+        // stale. Commits 4-5 and this one are the final writes;
+        // commit 7's polymorphism adds a random tail AFTER this
+        // point in the emission phase, which is why the tail lives
+        // at a higher file offset than veh_handler_offset +
+        // veh_handler_size and is excluded from the CRC walk.
+        write_u32_le(
+            guard_section.data,
+            tls_installer_offset + tls_patches.crc_expected_imm32_offset,
+            handler_crc);
+
+        ctx.log_fmt("GuardPass: VEH handler CRC = 0x{:08X} "
+                    "over {} bytes @ 0x{:X}",
+            handler_crc, veh_handler_size, veh_handler_rva);
     }
 
     // ------------------------------------------------------------------
