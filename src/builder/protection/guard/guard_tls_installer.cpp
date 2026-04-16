@@ -6,6 +6,8 @@
 
 #include "mxprotector/protection/guard/guard_tls_installer.hpp"
 
+#include <cstring>
+
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 namespace mx::guard {
@@ -21,7 +23,21 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
     // Reason filter: only DLL_PROCESS_ATTACH (1) triggers the install.
     //
     //   cmp edx, 1                       83 FA 01
-    //   jne .done                        75 rel8  (patched below)
+    //   jne .done (near, rel32)          0F 85 rel32  (patched below)
+    //
+    // NOTE: this MUST be a near jne (rel32), not a short one.
+    // The `.done` label lives at the far end of the installer
+    // (past the 155-byte Hell's Gate resolver + the 51-byte CRC
+    // block + the ~15 bytes of AVEH call setup), which is well
+    // beyond the ±127-byte rel8 range. An earlier commit shipped
+    // this as a rel8 by mistake; the truncated byte wrapped to
+    // `-32` and jumped BACKWARD into the VEH handler, producing
+    // crashes on any TLS callback invocation where `reason != 1`
+    // (DLL_THREAD_ATTACH, etc.). Single-threaded tests never hit
+    // that branch, so the bug lay dormant until Commit 7's
+    // polymorphic handler tail shifted the crash landing byte
+    // into a truly invalid instruction. See that commit's message
+    // for the full diagnosis.
     //
     // THREAD_ATTACH / THREAD_DETACH / PROCESS_DETACH are ignored —
     // the VEH only needs to be registered once per process lifetime,
@@ -29,9 +45,9 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
     // per thread which is wasteful and noisy in EDR telemetry.
     // =================================================================
     e.u8(0x83); e.u8(0xFA); e.u8(0x01);
-    e.u8(0x75);
-    const uint32_t done_rel8_slot = static_cast<uint32_t>(e.size());
-    e.u8(0x00);
+    e.u8(0x0F); e.u8(0x85);
+    const uint32_t done_rel32_slot = static_cast<uint32_t>(e.size());
+    e.u32(0);
 
     // =================================================================
     // Reserve shadow space + alignment for the upcoming `call r13`.
@@ -208,8 +224,12 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
     e.u8(0xC3);
 
     // =================================================================
-    // Back-patch the forward rel8 branches now that the labels are
-    // known.
+    // Back-patch forward branches now that every label is known.
+    //
+    // `done_rel32_slot` is a 4-byte slot (near jne) — it needs
+    // rel32 arithmetic. The rel8 slots (`skip_rel8_slot` and
+    // `crc_fail_rel8_slot`) target `restore_label` which is at most
+    // ~20 bytes after them, well within int8 range.
     // =================================================================
     auto patch_rel8 = [&](uint32_t slot, uint32_t target) {
         const int32_t rel8 =
@@ -217,9 +237,15 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
         e.buf[slot] = static_cast<uint8_t>(static_cast<int8_t>(rel8));
     };
 
-    patch_rel8(done_rel8_slot,     done_label);
-    patch_rel8(skip_rel8_slot,     restore_label);
-    patch_rel8(crc_fail_rel8_slot, restore_label);
+    auto patch_rel32 = [&](uint32_t slot, uint32_t target) {
+        const int32_t rel32 =
+            static_cast<int32_t>(target) - static_cast<int32_t>(slot + 4);
+        std::memcpy(e.buf.data() + slot, &rel32, sizeof(rel32));
+    };
+
+    patch_rel32(done_rel32_slot,    done_label);
+    patch_rel8 (skip_rel8_slot,     restore_label);
+    patch_rel8 (crc_fail_rel8_slot, restore_label);
 
     return out;
 }

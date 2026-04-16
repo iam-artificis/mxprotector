@@ -290,7 +290,7 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
     GuardVehEmit veh_patches{};
     {
         RawEmitter tmp{};
-        veh_patches = emit_guard_veh_handler(tmp);
+        veh_patches = emit_guard_veh_handler(tmp, rng);
         section_data.insert(section_data.end(),
             tmp.buf.begin(), tmp.buf.end());
     }

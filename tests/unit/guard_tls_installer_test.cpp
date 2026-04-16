@@ -55,14 +55,18 @@ TEST(GuardTlsInstaller, PrefixMatchesReasonCheckAndFrameSetup) {
     EXPECT_EQ(e.buf[1], 0xFAu);
     EXPECT_EQ(e.buf[2], 0x01u);
 
-    // jne rel8               75 ??           @3..4
-    EXPECT_EQ(e.buf[3], 0x75u);
+    // jne NEAR (rel32)       0F 85 rel32     @3..8
+    // The near form is mandatory because `.done` sits past the
+    // Hell's Gate resolver + CRC block + AVEH call setup (>200
+    // bytes forward), well outside rel8 range.
+    EXPECT_EQ(e.buf[3], 0x0Fu);
+    EXPECT_EQ(e.buf[4], 0x85u);
 
-    // sub rsp, 0x28          48 83 EC 28     @5..8
-    EXPECT_EQ(e.buf[5], 0x48u);
-    EXPECT_EQ(e.buf[6], 0x83u);
-    EXPECT_EQ(e.buf[7], 0xECu);
-    EXPECT_EQ(e.buf[8], 0x28u);
+    // sub rsp, 0x28          48 83 EC 28     @9..12
+    EXPECT_EQ(e.buf[9],  0x48u);
+    EXPECT_EQ(e.buf[10], 0x83u);
+    EXPECT_EQ(e.buf[11], 0xECu);
+    EXPECT_EQ(e.buf[12], 0x28u);
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +102,9 @@ TEST(GuardTlsInstaller, DifferentSeedsDivergeInResolverOnly) {
         << "The same static prefix/suffix around the Hell's Gate "
            "block keeps the total size seed-independent";
 
-    // Prefix bytes must match.
-    for (size_t i = 0; i < 9; ++i) {
+    // Prefix bytes (cmp edx, 1 + jne NEAR + sub rsp, 0x28) match —
+    // 13 bytes (3 + 6 + 4).
+    for (size_t i = 0; i < 13; ++i) {
         EXPECT_EQ(a.buf[i], b.buf[i])
             << "Prefix byte mismatch at offset " << i;
     }
@@ -108,7 +113,7 @@ TEST(GuardTlsInstaller, DifferentSeedsDivergeInResolverOnly) {
     // differs — otherwise the salted hash isn't actually influencing
     // emission.
     bool found_difference = false;
-    for (size_t i = 9; i + 20 < a.size(); ++i) {
+    for (size_t i = 13; i + 20 < a.size(); ++i) {
         if (a.buf[i] != b.buf[i]) {
             found_difference = true;
             break;

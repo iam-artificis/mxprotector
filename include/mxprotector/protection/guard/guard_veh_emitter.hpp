@@ -84,6 +84,7 @@
 
 #include <cstdint>
 
+#include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 
 namespace mx::guard {
@@ -145,23 +146,43 @@ inline constexpr uint32_t kGuardDescriptorStride    = 64;
 inline constexpr uint32_t kGuardDescriptorKeyOffset = 0x18;
 inline constexpr uint32_t kGuardDescriptorKeySize   = 32;
 
+/// Maximum number of random tail bytes `emit_guard_veh_handler`
+/// appends AFTER the final `ret`. Range `[0..kGuardVehMaxTailJunk]`
+/// inclusive — a single build may pick anywhere in that window.
+/// The upper bound is kept small so the handler stays in its
+/// documented ~230-240 byte envelope.
+inline constexpr uint32_t kGuardVehMaxTailJunk = 8;
+
 /**
  * @brief Append the full VEH handler body to `e`.
  *
- * The emitter is byte-deterministic — identical `RawEmitter` state
- * plus identical inputs produce identical output. Patch sites are
- * returned via `GuardVehEmit` and must be finalised by the caller
- * before the binary is written.
+ * The emitter is deterministic given `e`'s state and the `rng`
+ * state — two runs with identical Randomizer seeds produce
+ * byte-identical output. Across DIFFERENT seeds, the handler
+ * remains semantically identical but its byte stream varies:
+ *
+ *   * `kGuardVehMaxTailJunk + 1` possible tail lengths (0..8).
+ *   * Per-byte random values in the tail.
+ *
+ * The tail lives AFTER the handler's final `ret`, so it is never
+ * executed at runtime. Its only role is to break byte-signature
+ * matching across builds of the same source binary.
+ *
+ * The tail IS included in the self-CRC walked by the TLS
+ * installer (Commit 6) so runtime tampering of the tail bytes is
+ * still detected.
  *
  * Post-conditions:
- *   * `e.size()` has grown by the fixed handler body size.
- *   * The handler body is position-independent code — no baked
+ *   * `e.size()` has grown by the fixed handler body size plus
+ *     0..`kGuardVehMaxTailJunk` random tail bytes.
+ *   * The handler body is position-independent — no baked
  *     absolute addresses, only rip-relative `lea`s and imm32
  *     placeholders the caller patches.
- *   * Nonvolatile `rbx`/`rsi`/`rdi` that the handler uses are
- *     saved with `push` at entry and restored with `pop` at exit,
- *     so the handler obeys the Windows x64 ABI.
+ *   * Nonvolatile `rbx`/`rbp`/`rsi`/`rdi` that the handler uses
+ *     are saved with `push` at entry and restored with `pop` at
+ *     exit, so the handler obeys the Windows x64 ABI.
  */
-[[nodiscard]] GuardVehEmit emit_guard_veh_handler(RawEmitter& e);
+[[nodiscard]] GuardVehEmit emit_guard_veh_handler(
+    RawEmitter& e, Randomizer& rng);
 
 } // namespace mx::guard

@@ -1,28 +1,27 @@
 /**
  * @file guard_veh_emitter_test.cpp
- * @brief [TESTS] Unit tests for `mx::guard::emit_guard_veh_handler`
- *        in its Commit 3b shape (with LOCK XADD ref-counting and
- *        an embedded `.decrypt_body` XOR-cipher subroutine).
+ * @brief [TESTS] Unit tests for `mx::guard::emit_guard_veh_handler`.
  *
- * The handler is 209 bytes of deterministic x64. Rather than pin
- * every single byte (which would be a high-churn test), the tests
- * below verify a few structural invariants that the runtime
- * depends on:
+ * Commit 7 adds a per-build random tail of 0..`kGuardVehMaxTailJunk`
+ * bytes after the handler's final `ret`, so the handler is no longer
+ * byte-identical across emitter invocations with different RNG
+ * seeds. The tests still pin down structural invariants — the body
+ * is deterministic given a fixed seed, only the tail varies.
  *
- *   * Total handler size matches the documented envelope.
- *   * Prologue saves exactly rbx/rbp/rsi/rdi.
- *   * The bailout tail is reachable by a fall-through after the
- *     `cmp dword [rax], 0x80000003; je .proceed` filter.
- *   * `LOCK XADD` bytes appear twice (entry + exit refcount
- *     operations).
- *   * The `movzx eax, byte [rsi + r9 + 0x18]` opcode appears
- *     inside the handler (the per-guard key read is the defining
- *     shape of the decrypt loop).
- *   * Patch slots returned by the emitter point at zero-init
- *     placeholders.
- *   * Determinism: two emissions are byte-identical.
- *   * Offset-independence: placing the handler at a non-zero
- *     starting offset does not change the reported patch offsets.
+ * Covered invariants:
+ *   * Size envelope (230 core + 0..8 random tail).
+ *   * Prologue pushes rbx/rbp/rsi/rdi.
+ *   * ExceptionCode fall-through bailout tail.
+ *   * `LOCK XADD` appears twice (entry/exit refcount).
+ *   * Decrypt loop's `movzx eax, byte [rsi + r9 + 0x18]` key read.
+ *   * HW breakpoint sweep (Dr0 read + Dr1/Dr2/Dr3 ORs + test/jnz).
+ *   * 64-byte descriptor stride.
+ *   * Patch-slot offsets point at zero placeholders.
+ *   * Module-base lea + sub shape.
+ *   * Determinism: same seed → bit-identical.
+ *   * Polymorphism: two different seeds produce either different
+ *     lengths or different trailing bytes.
+ *   * Patch offsets are handler-local (not emitter-global).
  */
 
 #include <gtest/gtest.h>
@@ -31,15 +30,22 @@
 #include <cstring>
 #include <vector>
 
+#include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 
 namespace {
 
 using mx::ByteBuffer;
+using mx::Randomizer;
 using mx::RawEmitter;
 using mx::guard::emit_guard_veh_handler;
 using mx::guard::GuardVehEmit;
+using mx::guard::kGuardVehMaxTailJunk;
+
+/// Default seed used everywhere the test only cares about the
+/// handler body shape (not its tail polymorphism).
+constexpr uint32_t kFixedSeed = 0xC0DEBABEu;
 
 [[nodiscard]] uint32_t read_u32_le(const ByteBuffer& buf, size_t off) {
     uint32_t v = 0;
@@ -47,8 +53,6 @@ using mx::guard::GuardVehEmit;
     return v;
 }
 
-/// Search for a multi-byte pattern in the handler body. Returns
-/// `string::npos` if not found.
 [[nodiscard]] size_t find_pattern(
     const ByteBuffer& buf,
     std::initializer_list<uint8_t> pattern)
@@ -68,7 +72,6 @@ using mx::guard::GuardVehEmit;
     return std::string::npos;
 }
 
-/// Count the number of distinct occurrences of a multi-byte pattern.
 [[nodiscard]] int count_pattern(
     const ByteBuffer& buf,
     std::initializer_list<uint8_t> pattern)
@@ -88,19 +91,18 @@ using mx::guard::GuardVehEmit;
 }
 
 // ---------------------------------------------------------------------------
-// Total size envelope.
+// Total size envelope (230 core + 0..8 polymorphic tail).
 // ---------------------------------------------------------------------------
 
 TEST(GuardVehEmitter, TotalSizeInExpectedEnvelope) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
-    // Commit 3b base handler: 209 bytes.
-    // Commit 4 adds 21 bytes of HW breakpoint sweep in entry_match
-    // (mov+3×or+test+jnz) → 230 bytes.
-    // Any resize outside this window triggers a re-audit — this
-    // test is the tripwire for accidental size drift.
-    EXPECT_GE(e.size(), 200u);
-    EXPECT_LE(e.size(), 260u);
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
+    // Commit 3b base: 209 bytes. Commit 4 HW bp sweep: +21 → 230.
+    // Commit 7 polymorphic tail: +0..kGuardVehMaxTailJunk.
+    const size_t base = 230u;
+    EXPECT_GE(e.size(), base);
+    EXPECT_LE(e.size(), base + kGuardVehMaxTailJunk);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +111,8 @@ TEST(GuardVehEmitter, TotalSizeInExpectedEnvelope) {
 
 TEST(GuardVehEmitter, PrologueSavesFourNonvolatiles) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
     EXPECT_EQ(e.buf[0], 0x53u);  // push rbx
     EXPECT_EQ(e.buf[1], 0x55u);  // push rbp
     EXPECT_EQ(e.buf[2], 0x56u);  // push rsi
@@ -122,22 +125,18 @@ TEST(GuardVehEmitter, PrologueSavesFourNonvolatiles) {
 
 TEST(GuardVehEmitter, ExceptionCodeFilterFallsThroughToBailout) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
-    // mov rax, [rcx]                          48 8B 01  @4..6
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
     EXPECT_EQ(e.buf[4], 0x48u);
     EXPECT_EQ(e.buf[5], 0x8Bu);
     EXPECT_EQ(e.buf[6], 0x01u);
-    // cmp dword [rax], 0x80000003             81 38 03 00 00 80  @7..12
     EXPECT_EQ(e.buf[7],  0x81u);
     EXPECT_EQ(e.buf[8],  0x38u);
     EXPECT_EQ(e.buf[9],  0x03u);
     EXPECT_EQ(e.buf[10], 0x00u);
     EXPECT_EQ(e.buf[11], 0x00u);
     EXPECT_EQ(e.buf[12], 0x80u);
-    // je .proceed (rel8)                      74 ??              @13..14
     EXPECT_EQ(e.buf[13], 0x74u);
-    // Fall-through bailout: xor eax, eax; pop rdi; pop rsi;
-    // pop rbp; pop rbx; ret                    31 C0 5F 5E 5D 5B C3  @15..21
     EXPECT_EQ(e.buf[15], 0x31u);
     EXPECT_EQ(e.buf[16], 0xC0u);
     EXPECT_EQ(e.buf[17], 0x5Fu);
@@ -153,34 +152,25 @@ TEST(GuardVehEmitter, ExceptionCodeFilterFallsThroughToBailout) {
 
 TEST(GuardVehEmitter, LockXaddAppearsTwiceForRefCount) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
-    // lock xadd [rsi + 0x14], eax  =  F0 0F C1 46 14
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
     const int count = count_pattern(
         e.buf, {0xF0, 0x0F, 0xC1, 0x46, 0x14});
-    EXPECT_EQ(count, 2)
-        << "Entry and exit must both emit LOCK XADD on the same count slot";
+    EXPECT_EQ(count, 2);
 }
 
 // ---------------------------------------------------------------------------
-// The `.decrypt_body` subroutine's defining instruction is the per-
-// guard key read.
+// Decrypt body's defining per-guard key read instruction.
 // ---------------------------------------------------------------------------
 
 TEST(GuardVehEmitter, DecryptBodyLoopContainsKeyReadPattern) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
-    // movzx eax, byte [rsi + r9 + 0x18]  =  42 0F B6 44 0E 18
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
     const size_t pos = find_pattern(
         e.buf, {0x42, 0x0F, 0xB6, 0x44, 0x0E, 0x18});
-    EXPECT_NE(pos, std::string::npos)
-        << "Decrypt loop's per-guard key read must be present";
+    EXPECT_NE(pos, std::string::npos);
 }
-
-// ---------------------------------------------------------------------------
-// Descriptor stride was bumped from 16 to 64 in Commit 3b — the
-// `add rsi, 64` instruction must be present (16 would be `48 83 C6 10`,
-// 64 is `48 83 C6 40`).
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Commit 4: HW breakpoint sweep in entry_match.
@@ -188,73 +178,56 @@ TEST(GuardVehEmitter, DecryptBodyLoopContainsKeyReadPattern) {
 
 TEST(GuardVehEmitter, HardwareBreakpointSweepReadsDr0ThroughDr3) {
     RawEmitter e;
-    (void)emit_guard_veh_handler(e);
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
 
-    // The sweep reads CONTEXT.Dr0 (offset 0x48) via
-    // `mov rax, [rbp + 0x48]` = `48 8B 45 48`. That's the defining
-    // instruction — look for it.
     const size_t dr0_read = find_pattern(
         e.buf, {0x48, 0x8B, 0x45, 0x48});
-    ASSERT_NE(dr0_read, std::string::npos)
-        << "Expected `mov rax, [rbp + 0x48]` (Dr0 read) somewhere in the "
-           "handler";
+    ASSERT_NE(dr0_read, std::string::npos);
 
-    // Each subsequent `or rax, [rbp + disp]` is 4 bytes.
-    // Dr1 at 0x50, Dr2 at 0x58, Dr3 at 0x60.
     EXPECT_EQ(e.buf[dr0_read + 4],  0x48u);
-    EXPECT_EQ(e.buf[dr0_read + 5],  0x0Bu);  // or
+    EXPECT_EQ(e.buf[dr0_read + 5],  0x0Bu);
     EXPECT_EQ(e.buf[dr0_read + 6],  0x45u);
-    EXPECT_EQ(e.buf[dr0_read + 7],  0x50u);  // Dr1
+    EXPECT_EQ(e.buf[dr0_read + 7],  0x50u);
     EXPECT_EQ(e.buf[dr0_read + 8],  0x48u);
     EXPECT_EQ(e.buf[dr0_read + 9],  0x0Bu);
     EXPECT_EQ(e.buf[dr0_read + 10], 0x45u);
-    EXPECT_EQ(e.buf[dr0_read + 11], 0x58u);  // Dr2
+    EXPECT_EQ(e.buf[dr0_read + 11], 0x58u);
     EXPECT_EQ(e.buf[dr0_read + 12], 0x48u);
     EXPECT_EQ(e.buf[dr0_read + 13], 0x0Bu);
     EXPECT_EQ(e.buf[dr0_read + 14], 0x45u);
-    EXPECT_EQ(e.buf[dr0_read + 15], 0x60u);  // Dr3
-
-    // Followed by `test rax, rax` (48 85 C0) and a `jnz rel8`.
+    EXPECT_EQ(e.buf[dr0_read + 15], 0x60u);
     EXPECT_EQ(e.buf[dr0_read + 16], 0x48u);
     EXPECT_EQ(e.buf[dr0_read + 17], 0x85u);
     EXPECT_EQ(e.buf[dr0_read + 18], 0xC0u);
-    EXPECT_EQ(e.buf[dr0_read + 19], 0x75u);  // jnz rel8 opcode
-}
-
-TEST(GuardVehEmitter, StrideAdvanceMatchesSixtyFourByteDescriptor) {
-    RawEmitter e;
-    (void)emit_guard_veh_handler(e);
-    // add rsi, 64   =  48 83 C6 40
-    const size_t pos = find_pattern(e.buf, {0x48, 0x83, 0xC6, 0x40});
-    EXPECT_NE(pos, std::string::npos);
-    // And the old 16-byte stride must NOT still be present.
-    const size_t old_pos = find_pattern(e.buf, {0x48, 0x83, 0xC6, 0x10});
-    EXPECT_EQ(old_pos, std::string::npos)
-        << "Old 16-byte stride leaked into Commit 3b handler";
+    EXPECT_EQ(e.buf[dr0_read + 19], 0x75u);
 }
 
 // ---------------------------------------------------------------------------
-// Patch-slot offsets point at zero placeholders and match the bytes
-// reported by the emitter.
+// 64-byte descriptor stride.
+// ---------------------------------------------------------------------------
+
+TEST(GuardVehEmitter, StrideAdvanceMatchesSixtyFourByteDescriptor) {
+    RawEmitter e;
+    Randomizer rng(kFixedSeed);
+    (void)emit_guard_veh_handler(e, rng);
+    const size_t pos = find_pattern(e.buf, {0x48, 0x83, 0xC6, 0x40});
+    EXPECT_NE(pos, std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Patch-slot offsets point at zero placeholders.
 // ---------------------------------------------------------------------------
 
 TEST(GuardVehEmitter, PatchSlotsPointAtZeroPlaceholders) {
     RawEmitter e;
-    const auto p = emit_guard_veh_handler(e);
+    Randomizer rng(kFixedSeed);
+    const auto p = emit_guard_veh_handler(e, rng);
 
-    // module_base_sub_imm32 is the 4-byte imm32 of the `sub rbx,
-    // imm32` — originally zero.
     EXPECT_EQ(read_u32_le(e.buf, p.module_base_sub_imm32_offset), 0u);
-
-    // descriptor_table_rel32 is the 4-byte rel32 of the
-    // `lea rsi, [rip + rel32]` — originally zero.
     EXPECT_EQ(read_u32_le(e.buf, p.descriptor_table_rel32_offset), 0u);
-
-    // descriptor_count_imm32 is the 4-byte imm32 of
-    // `mov r8d, imm32` — originally zero.
     EXPECT_EQ(read_u32_le(e.buf, p.descriptor_count_imm32_offset), 0u);
 
-    // And the anchor/end offsets sanity-check against each other.
     EXPECT_EQ(p.descriptor_table_rel32_end_offset,
               p.descriptor_table_rel32_offset + 4);
     EXPECT_GT(p.module_base_lea_anchor_offset, 0u);
@@ -263,23 +236,19 @@ TEST(GuardVehEmitter, PatchSlotsPointAtZeroPlaceholders) {
 }
 
 // ---------------------------------------------------------------------------
-// The module-base `lea rbx, [rip + 0]` must precede the `sub rbx`
-// and the rel32 slot must be zero.
+// Module-base lea/sub shape.
 // ---------------------------------------------------------------------------
 
 TEST(GuardVehEmitter, ModuleBaseLeaAndSubShape) {
     RawEmitter e;
-    const auto p = emit_guard_veh_handler(e);
-    // lea opcode = 48 8D 1D. `module_base_lea_anchor_offset` is the
-    // byte right after the lea's 4-byte rel32, so the opcode is at
-    // `anchor - 7`, the rel32 slot at `anchor - 4`.
+    Randomizer rng(kFixedSeed);
+    const auto p = emit_guard_veh_handler(e, rng);
     const uint32_t lea_opcode_offset = p.module_base_lea_anchor_offset - 7;
     EXPECT_EQ(e.buf[lea_opcode_offset + 0], 0x48u);
     EXPECT_EQ(e.buf[lea_opcode_offset + 1], 0x8Du);
     EXPECT_EQ(e.buf[lea_opcode_offset + 2], 0x1Du);
     EXPECT_EQ(read_u32_le(e.buf, lea_opcode_offset + 3), 0u);
 
-    // sub rbx, imm32: opcode 48 81 EB, imm32 at sub_imm32_offset.
     const uint32_t sub_opcode_offset = p.module_base_sub_imm32_offset - 3;
     EXPECT_EQ(e.buf[sub_opcode_offset + 0], 0x48u);
     EXPECT_EQ(e.buf[sub_opcode_offset + 1], 0x81u);
@@ -287,28 +256,79 @@ TEST(GuardVehEmitter, ModuleBaseLeaAndSubShape) {
 }
 
 // ---------------------------------------------------------------------------
-// Determinism — two emissions produce identical bytes.
+// Determinism: same seed → bit-identical handler bytes.
 // ---------------------------------------------------------------------------
 
-TEST(GuardVehEmitter, DeterministicOutput) {
-    RawEmitter a;
-    RawEmitter b;
-    (void)emit_guard_veh_handler(a);
-    (void)emit_guard_veh_handler(b);
+TEST(GuardVehEmitter, DeterministicForIdenticalSeeds) {
+    RawEmitter a, b;
+    Randomizer rng_a(kFixedSeed);
+    Randomizer rng_b(kFixedSeed);
+    (void)emit_guard_veh_handler(a, rng_a);
+    (void)emit_guard_veh_handler(b, rng_b);
     EXPECT_EQ(a.buf, b.buf);
 }
 
 // ---------------------------------------------------------------------------
-// Patch offsets are relative to handler start, NOT to emitter start.
+// Commit 7: polymorphism — two different seeds MUST produce either
+// different lengths or different trailing bytes (or both). The
+// deterministic core body [0..230) stays identical for every seed
+// because no RNG is consumed there; all variance comes from the
+// tail.
+// ---------------------------------------------------------------------------
+
+TEST(GuardVehEmitter, PolymorphicTailVariesAcrossSeeds) {
+    constexpr size_t kAttempts = 16;
+    RawEmitter baseline;
+    Randomizer baseline_rng(1u);
+    (void)emit_guard_veh_handler(baseline, baseline_rng);
+
+    bool found_different = false;
+    for (size_t seed = 2; seed <= kAttempts + 2 && !found_different; ++seed) {
+        RawEmitter other;
+        Randomizer other_rng(static_cast<uint32_t>(seed));
+        (void)emit_guard_veh_handler(other, other_rng);
+        if (other.size() != baseline.size() || other.buf != baseline.buf) {
+            found_different = true;
+        }
+    }
+
+    EXPECT_TRUE(found_different)
+        << "Expected at least one seed in 2.." << (kAttempts + 2)
+        << " to produce a different handler from seed 1 — polymorphic "
+           "tail is not contributing any per-build variance";
+}
+
+TEST(GuardVehEmitter, DeterministicCoreRegardlessOfSeed) {
+    // The first 230 bytes of the handler (up to the final `ret`)
+    // are seed-independent. Only the tail bytes vary.
+    RawEmitter a, b;
+    Randomizer rng_a(123u);
+    Randomizer rng_b(456u);
+    (void)emit_guard_veh_handler(a, rng_a);
+    (void)emit_guard_veh_handler(b, rng_b);
+
+    const size_t core = 230u;
+    ASSERT_GE(a.size(), core);
+    ASSERT_GE(b.size(), core);
+    for (size_t i = 0; i < core; ++i) {
+        ASSERT_EQ(a.buf[i], b.buf[i])
+            << "Core handler byte " << i << " differs across seeds";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Patch offsets are relative to handler start, not emitter start.
 // ---------------------------------------------------------------------------
 
 TEST(GuardVehEmitter, PatchOffsetsAreRelativeToHandlerStart) {
     RawEmitter a;
-    const auto pa = emit_guard_veh_handler(a);
+    Randomizer rng_a(kFixedSeed);
+    const auto pa = emit_guard_veh_handler(a, rng_a);
 
     RawEmitter b;
     b.buf.resize(100, 0xCCu);
-    const auto pb = emit_guard_veh_handler(b);
+    Randomizer rng_b(kFixedSeed);
+    const auto pb = emit_guard_veh_handler(b, rng_b);
 
     EXPECT_EQ(pa.module_base_sub_imm32_offset,
               pb.module_base_sub_imm32_offset);

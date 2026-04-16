@@ -72,7 +72,7 @@
 
 namespace mx::guard {
 
-GuardVehEmit emit_guard_veh_handler(RawEmitter& e) {
+GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     GuardVehEmit out{};
     const uint32_t handler_start = static_cast<uint32_t>(e.size());
 
@@ -442,6 +442,41 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e) {
     patch_rel8(decrypt_done_rel8_slot,   decrypt_done_label);
     patch_rel32(entry_call_rel32_slot,   decrypt_body_label);
     patch_rel32(exit_call_rel32_slot,    decrypt_body_label);
+
+    // =================================================================
+    // Commit 7 — Per-build polymorphic random tail.
+    //
+    // Append 0..kGuardVehMaxTailJunk random bytes AFTER the final
+    // `ret` inside `.decrypt_body`. These bytes are never executed
+    // (every control-flow path through the handler ends with a
+    // `ret`), but they:
+    //
+    //   * Change the handler's total byte length per build, which
+    //     shifts every downstream rel32 / imm32 patch in the
+    //     `.mxguard` section (descriptor table rel32 from the
+    //     handler, the TLS installer's handler_rel32 and
+    //     crc_walk_rel32, the installer's crc_size_imm32, and
+    //     the TLS callback VA computed by `GuardPass`).
+    //
+    //   * Change the CRC that the TLS installer's self-check
+    //     compares against (Commit 6 pins the expected value at
+    //     build time over the FULL handler byte range including
+    //     this tail, so runtime verification still matches).
+    //
+    //   * Break naive byte-signature matching across builds —
+    //     two builds of the same source binary will have
+    //     different handler hashes and different .mxguard byte
+    //     streams.
+    //
+    // The tail's bytes are drawn uniformly from `rng.next_u8()`.
+    // It is the ONLY randomness source inside the handler proper
+    // (other than what GuardPass already contributes via per-
+    // guard XOR keys and per-page junk tails).
+    // =================================================================
+    const uint32_t tail_len = rng.next_range(0, kGuardVehMaxTailJunk);
+    for (uint32_t i = 0; i < tail_len; ++i) {
+        e.u8(rng.next_u8());
+    }
 
     return out;
 }
