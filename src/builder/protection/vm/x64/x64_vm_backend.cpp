@@ -32,58 +32,21 @@
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
 #include "mxprotector/protection/vm/x64/x64_vflags.hpp"
+#include "mxprotector/protection/vm/x64/x64_vm_variants.hpp"
 
 namespace mx::vm::x64 {
 
 namespace {
 
-/// How many handler variants each canonical VmOp emits. Ops with multiple
-/// variants have two (or more) mathematically equivalent emission forms;
-/// the encoder picks one at random per instruction to defeat simple
-/// opcode-table recovery (G4 — handler-id polymorphism) and, for
-/// add/sub/xor_rr, optionally dispatch through a nested inner VM
-/// (G2 — nested VM).
-constexpr uint8_t variant_count_for(VmOp op) {
-    switch (op) {
-        // add_rr / sub_rr / xor_rr each have THREE variants:
-        //   V0 canonical direct ALU
-        //   V1 MBA / neg / mba alternative
-        //   V2 G2 nested — outer handler body calls into the inner VM
-        //                  runtime and returns via `ret`
-        case VmOp::add_rr:
-        case VmOp::sub_rr:
-        case VmOp::xor_rr:
-        case VmOp::and_rr:   // V0 direct, V1 De Morgan, V2 nested
-        case VmOp::or_rr:    // V0 direct, V1 De Morgan, V2 nested
-        case VmOp::mov_rr:   // V0 mov/mov,  V1 push/pop, V2 nested
-        case VmOp::not_r:    // V0 not r/m64, V1 xor -1,  V2 nested
-        case VmOp::neg_r:    // V0 neg r/m64, V1 not+inc, V2 nested
-            return 3;
-        // Immediate-form ALU / mov: no MBA alternative today, so
-        // V0 direct and V1 nested — 50/50 choice per bytecode
-        // instruction. Adding an MBA-style V2 later is welcome but
-        // out of scope for G2.
-        case VmOp::mov_ri32:
-        case VmOp::add_ri32:
-        case VmOp::sub_ri32:
-        case VmOp::xor_ri32:
-        case VmOp::and_ri32:
-        case VmOp::or_ri32:
-            return 2;
-        case VmOp::vjcc:
-            return 16;   // one handler per x86 condition code (0..F)
-        case VmOp::dead:
-            return 1;    // G4: one dead-op handler, called from random bc positions
-        case VmOp::opq_branch:
-            return 1;    // G4: single opaque-branch handler (fakes vjmp at the byte level)
-        default:
-            return 1;
-    }
-}
-
 // ----------------------------------------------------------------------------
-// G1 — Per-build handler specialisation
+// G1 — Per-build handler specialisation (runtime side)
 // ----------------------------------------------------------------------------
+//
+// The compile-time metadata for specialisation — `kMaxSpecializations`,
+// `kSpecializableOps`, `is_specializable_op`, `alu_op_mr_for` and the
+// generic `variant_count_for` table — lives in `x64_vm_variants.hpp`.
+// What stays here is the runtime tuple that binds those tables to the
+// per-build handler-id allocator.
 //
 // A `Specialization` is a (op, dst_vreg, src_vreg) tuple for which the
 // backend will emit a dedicated handler with the destination and source
@@ -100,54 +63,6 @@ struct Specialization {
     uint8_t src_vreg{};   // 0..15, ≠ junk_slot
     uint8_t handler_id{}; // assigned during slot allocation
 };
-
-/// Maximum specialisations per build. Each one consumes one handler_id
-/// and adds ~10 bytes of body (plus the standard tail dispatch). Eight
-/// fits comfortably under the 255-handler budget even for regions with
-/// dozens of native escapes.
-constexpr size_t kMaxSpecializations = 8;
-
-/// Ops whose r-r form has a tractable specialised body. imul_rr is
-/// excluded because its opcode is `48 0F AF` (4 prefix bytes) and would
-/// need a different specialised emitter; can be added later.
-constexpr VmOp kSpecializableOps[] = {
-    VmOp::mov_rr,
-    VmOp::add_rr,
-    VmOp::sub_rr,
-    VmOp::xor_rr,
-    VmOp::and_rr,
-    VmOp::or_rr,
-};
-
-/// True if a VmOp is a candidate for specialisation. Used in the bytecode
-/// encoder to skip the spec_match search for non-r-r ops.
-constexpr bool is_specializable_op(VmOp op) {
-    switch (op) {
-        case VmOp::mov_rr:
-        case VmOp::add_rr:
-        case VmOp::sub_rr:
-        case VmOp::xor_rr:
-        case VmOp::and_rr:
-        case VmOp::or_rr:
-            return true;
-        default:
-            return false;
-    }
-}
-
-/// Maps a specialisable VmOp to the `op_mr` byte expected by
-/// `emit_handler_alu_rr_specialized`. mov_rr is special-cased by the
-/// caller (it uses the dedicated `emit_handler_mov_rr_specialized`).
-constexpr uint8_t alu_op_mr_for(VmOp op) {
-    switch (op) {
-        case VmOp::add_rr: return 0x01;
-        case VmOp::sub_rr: return 0x29;
-        case VmOp::xor_rr: return 0x31;
-        case VmOp::and_rr: return 0x21;
-        case VmOp::or_rr:  return 0x09;
-        default:           return 0x00;  // unreachable for specialisations
-    }
-}
 
 } // anonymous namespace
 
