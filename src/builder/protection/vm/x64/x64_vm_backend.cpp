@@ -39,10 +39,12 @@
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_bytecode_encoder.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
+#include "mxprotector/protection/vm/x64/x64_entry_stub.hpp"
 #include "mxprotector/protection/vm/x64/x64_handlers.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
 #include "mxprotector/protection/vm/x64/x64_vflags.hpp"
+#include "mxprotector/protection/vm/x64/x64_vm_patch_records.hpp"
 #include "mxprotector/protection/vm/x64/x64_vm_variants.hpp"
 
 namespace mx::vm::x64 {
@@ -113,7 +115,10 @@ private:
     // ==== Step 3 — runtime blob state =======================================
     RawEmitter rt;
 
-    struct TablePatch { size_t rel32_offset; size_t instruction_end; };
+    // Patch record types (`TablePatch`, `TrampolineTarget`,
+    // `PendingTrampoline`, `TrampolineFixup`) are shared with the entry
+    // stub emitter and other step-3 components via
+    // `x64_vm_patch_records.hpp`.
     std::vector<TablePatch> table_patches;
     std::vector<anti_tamper::SelfCrcPatchRecord> self_crc_patches;
 
@@ -128,20 +133,6 @@ private:
 
     std::vector<size_t> table_key_patches;
     std::vector<size_t> handler_offset_by_id;
-
-    struct TrampolineTarget {
-        enum class Kind : uint8_t { Handler, Trampoline };
-        Kind     kind;
-        uint32_t id;
-    };
-    struct PendingTrampoline {
-        uint32_t          slot;
-        TrampolineTarget  target;
-    };
-    struct TrampolineFixup {
-        TrampolineTarget         target;
-        vm::x64::TrampolinePatch patch;
-    };
 
     std::vector<size_t>            trampoline_offset_by_slot;
     std::vector<uint32_t>          head_slot_of_handler;
@@ -408,337 +399,44 @@ void GenerationSession::step2_emit_bytecode() {
 //                         Step 3a — entry stub emission
 // ============================================================================
 //
-// Emits the entry stub into `rt`:
-//   [pushfq] [G7 pad] [16 pushes] [rolling-key seed] [vflags scramble]
-//   [ImageBase-key derivation + G6 loop + MBA + integrity check]
-//   [anti-emulation] [anti-tamper]
-//   [lea r11, [rip + bytecode]] [inline first dispatch]
+// Delegated to `x64_entry_stub.cpp`. The emitter owns the full byte
+// layout of the entry stub (pushfq, G7 pad, 16 register pushes, rolling-
+// key seed, vflags scramble, ImageBase-derived handler-table key block,
+// G6 loop + MBA + integrity check, anti-emulation / anti-tamper picks,
+// lea r11 + inline first dispatch) and appends to the caller's patch
+// sinks (`table_patches`, `table_key_patches`, `self_crc_patches`) as
+// it goes.
+//
+// The inner-VM ISA permutation and the trampoline bookkeeping are not
+// strictly part of the entry stub — they're session-level state consumed
+// by step 3b / step 3f — so they're initialised here after the stub
+// emission.
 // ============================================================================
 
 void GenerationSession::step3a_emit_entry_stub() {
-    entry_offset = rt.size();
+    const EntryStubInputs stub_in{
+        opts, layout,
+        rolling_key_disp, rflags_disp,
+        initial_key, vflags_key, vflags_rol,
+        rolling, total_handlers, rng,
+    };
+    const EntryStubSinks sinks{
+        table_patches, table_key_patches, self_crc_patches,
+    };
+    const EntryStubOutputs stub_out = emit_entry_stub(rt, stub_in, sinks);
 
-    emit_pushfq(rt);
-
-    // G7: extra padding slots between RFLAGS and the GPR area. After pushfq,
-    // before the 16 reg pushes, emit `extra_pad_slots` × `push imm32` so the
-    // GPR area still lands at [rsp + 0..120] but RFLAGS sits 8*N bytes higher.
-    for (uint8_t p = 0; p < layout.extra_pad_slots; ++p) {
-        rt.u8(0x68);
-        rt.u32(rng.next_u32());
-    }
-
-    // 16 register pushes, permuted per-build. Push at position K lands at
-    // offset (15-K)*8, so to put slot V at [rsp + V*8] we push it at K=15-V.
-    // The junk slot (native RSP's would-be home) is filled with a dummy
-    // `push rax` — its byte becomes the rolling-key scratch.
-    for (int k = 0; k < 16; ++k) {
-        const uint8_t v = static_cast<uint8_t>(15 - k);
-        if (v == layout.junk_slot) {
-            emit_push_reg(rt, 0);  // dummy push rax (value irrelevant)
-        } else {
-            emit_push_reg(rt, layout.slot_to_native[v]);
-        }
-    }
-
-    // Seed the rolling key inside the junk slot. Displacement varies per-build.
-    //   C6 44 24 disp8 ib     (disp ≤ 120 always)
-    rt.u8(0xC6); rt.u8(0x44); rt.u8(0x24);
-    rt.u8(static_cast<uint8_t>(rolling_key_disp));
-    rt.u8(initial_key);
-
-    // Transform the raw RFLAGS the entry's pushfq just wrote into the
-    // scrambled form: slot = rol(real, vflags_rol) ^ vflags_key.
-    if (vflags_key != 0 || vflags_rol != 0) {
-        emit_vflags_inslot_scramble(rt, pick_inslot_variant(rng),
-                                     vflags_key, vflags_rol, rflags_disp);
-    }
-
-    // Handler-table key derivation: if `opts.use_imagebase_key` is set,
-    // compute the key at runtime from PEB.ImageBaseAddress and store it in
-    // the upper 4 bytes of the junk slot ([rsp + rolling_key_disp + 4]).
-    // Every tail dispatch then reads `xor eax, [rsp + disp8]` instead of
-    // carrying an imm32 — the table key never appears as a literal.
-    imagebase_key_disp =
-        opts.use_imagebase_key ? (rolling_key_disp + 4) : -1;
-
-    // Handler-table encryption key.
-    table_xor_key = opts.use_imagebase_key
-        ? rng.next_u32()
-        : (rng.next_u32() | 1);  // legacy path wants non-zero
-
-    // Patch offsets for the integrity check that is emitted inside the
-    // ImageBase block. Zero when integrity is not enabled.
-    integrity_table_lea_patch = 0;
-    integrity_expected_patch  = 0;
-
-    if (opts.use_imagebase_key) {
-        //   65 48 8B 04 25 60 00 00 00   mov rax, gs:[0x60]    ; PEB
-        //   48 8B 40 10                  mov rax, [rax + 0x10] ; ImageBase
-        //   <G6 loop>                    iterated bit-mix: eax = f^N(IB_low32)
-        //   <MBA chain>                  transforms loop_output -> table_xor_key
-        //   <integrity check>            xor'd into eax (zero on intact table)
-        //   89 44 24 <disp8>             mov [rsp + key_disp], eax
-        rt.u8(0x65); rt.u8(0x48); rt.u8(0x8B); rt.u8(0x04); rt.u8(0x25);
-        rt.u8(0x60); rt.u8(0x00); rt.u8(0x00); rt.u8(0x00);
-        rt.u8(0x48); rt.u8(0x8B); rt.u8(0x40); rt.u8(0x10);
-
-        const uint32_t ib_low32 =
-            static_cast<uint32_t>(opts.preferred_image_base & 0xFFFFFFFFULL);
-
-        // ----------------------------------------------------------
-        // G6 — loop-based key schedule.
-        //
-        // Before feeding the ImageBase into the MBA chain, run a
-        // short iterated bit-mix `f(x) = g(x) op K` applied N times.
-        // A symbolic execution engine (angr, KLEE, Triton) that
-        // tries to express the full key derivation as a single
-        // constraint has to either unroll the loop N times (path
-        // explosion for N≥32) or infer a closed-form invariant for
-        // the iterated rotate-xor transform (no general technique
-        // does this at bit level). The loop adds ~17 emitted bytes
-        // and ~N ALU ops at runtime — microseconds for any
-        // sensible N, invisible next to the syscalls the tail
-        // anti-tamper checks already make.
-        //
-        // Three polymorphic shapes are chosen uniformly per build.
-        // Each is an 8-byte body encoded by hand; they all use
-        // eax as accumulator and no other register, so the loop
-        // counter sits in ecx without interference. ecx is freely
-        // clobberable here — the very next thing the entry stub
-        // emits after the MBA chain is a `mov ecx, total_handlers`
-        // for the integrity-check loop, so ecx is already dead at
-        // this point. Likewise for rflags: every instruction down
-        // to the anti-tamper checks clobbers them.
-        //
-        // Invariant: apply the runtime loop body N times to
-        // `ib_low32` at build time and feed the result into the
-        // MBA chain as its new input. The MBA chain still maps
-        // that input to `table_xor_key`, so the handler-table
-        // encryption, integrity-check expected sum, and every
-        // downstream consumer of the key see the same value they
-        // did pre-G6.
-        // ----------------------------------------------------------
-        constexpr uint32_t kLoopVariantCount = 3;
-        enum : uint32_t {
-            kVariantRolXor = 0,  // rol eax, rot; xor eax, K
-            kVariantRorAdd = 1,  // ror eax, rot; add eax, K
-            kVariantXorRol = 2,  // xor eax, K;   rol eax, rot
-        };
-
-        const uint32_t loop_variant = rng.next_range(0, kLoopVariantCount - 1);
-        const uint32_t loop_count   = rng.next_range(32, 128);
-        const uint8_t  loop_rot     = static_cast<uint8_t>(rng.next_range(1, 31));
-        const uint32_t loop_key     = rng.next_u32();
-
-        auto apply_loop_step = [&](uint32_t x) -> uint32_t {
-            switch (loop_variant) {
-                case kVariantRolXor: {
-                    const uint32_t r = (x << loop_rot) |
-                                       (x >> (32u - loop_rot));
-                    return r ^ loop_key;
-                }
-                case kVariantRorAdd: {
-                    const uint32_t r = (x >> loop_rot) |
-                                       (x << (32u - loop_rot));
-                    return r + loop_key;
-                }
-                case kVariantXorRol: {
-                    const uint32_t y = x ^ loop_key;
-                    return (y << loop_rot) | (y >> (32u - loop_rot));
-                }
-                default:
-                    return x;  // unreachable — next_range clamps.
-            }
-        };
-
-        uint32_t loop_output = ib_low32;
-        for (uint32_t i = 0; i < loop_count; ++i) {
-            loop_output = apply_loop_step(loop_output);
-        }
-
-        //   mov ecx, loop_count           B9 imm32
-        rt.u8(0xB9);
-        rt.u32(loop_count);
-        // .loop:
-        const size_t g6_loop_body_start = rt.size();
-        switch (loop_variant) {
-            case kVariantRolXor:
-                //   rol eax, rot          C1 C0 rot
-                rt.u8(0xC1); rt.u8(0xC0); rt.u8(loop_rot);
-                //   xor eax, K            35 imm32
-                rt.u8(0x35); rt.u32(loop_key);
-                break;
-            case kVariantRorAdd:
-                //   ror eax, rot          C1 C8 rot
-                rt.u8(0xC1); rt.u8(0xC8); rt.u8(loop_rot);
-                //   add eax, K            05 imm32
-                rt.u8(0x05); rt.u32(loop_key);
-                break;
-            case kVariantXorRol:
-                //   xor eax, K            35 imm32
-                rt.u8(0x35); rt.u32(loop_key);
-                //   rol eax, rot          C1 C0 rot
-                rt.u8(0xC1); rt.u8(0xC0); rt.u8(loop_rot);
-                break;
-            default:
-                break;
-        }
-        //   dec ecx                       FF C9
-        rt.u8(0xFF); rt.u8(0xC9);
-        //   jnz .loop                     75 rel8
-        {
-            const size_t jnz_end = rt.size() + 2;
-            const int32_t rel8 = static_cast<int32_t>(g6_loop_body_start) -
-                                 static_cast<int32_t>(jnz_end);
-            rt.u8(0x75);
-            rt.u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
-        }
-
-        MbaTransitionGenerator mba_gen(Architecture::x64);
-        auto chain = mba_gen.generate(
-            loop_output, table_xor_key, mx::x86::Reg::rax, rng,
-            /*state_preserved=*/true);
-        rt.bytes(ByteView{chain.data(), chain.size()});
-
-        // Handler-table integrity check.
-        // lea rbx, [rip + rel32]    48 8D 1D rel32
-        rt.u8(0x48); rt.u8(0x8D); rt.u8(0x1D);
-        integrity_table_lea_patch = rt.size();
-        rt.u32(0);
-        table_patches.push_back(
-            {integrity_table_lea_patch, rt.size()});
-
-        // mov ecx, total_handlers    B9 imm32
-        rt.u8(0xB9);
-        rt.u32(total_handlers);
-
-        // xor edx, edx               31 D2
-        rt.u8(0x31); rt.u8(0xD2);
-
-        // .loop:
-        const size_t loop_start = rt.size();
-        rt.u8(0x33); rt.u8(0x13);              // xor edx, [rbx]
-        rt.u8(0x48); rt.u8(0x83); rt.u8(0xC3); rt.u8(0x04);  // add rbx, 4
-        rt.u8(0xFF); rt.u8(0xC9);              // dec ecx
-        const size_t jnz_end = rt.size() + 2;
-        const int32_t  rel8    = static_cast<int32_t>(loop_start) -
-                                 static_cast<int32_t>(jnz_end);
-        rt.u8(0x75); rt.u8(static_cast<uint8_t>(static_cast<int8_t>(rel8))); // jnz
-
-        // xor edx, <expected>        81 F2 imm32
-        rt.u8(0x81); rt.u8(0xF2);
-        integrity_expected_patch = rt.size();
-        rt.u32(0);
-
-        // xor eax, edx               31 D0
-        rt.u8(0x31); rt.u8(0xD0);
-
-        // mov [rsp + disp8], eax    89 44 24 disp8
-        rt.u8(0x89); rt.u8(0x44); rt.u8(0x24);
-        rt.u8(static_cast<uint8_t>(static_cast<int8_t>(imagebase_key_disp)));
-
-        // Anti-emulation checks. Suppressed when the caller opted
-        // out via `skip_anti_tamper_checks` — see VmGenOptions docs
-        // for why S2c's inner VM needs this.
-        if (!opts.skip_anti_tamper_checks) {
-            static const anti_emulation::CheckRegistry registry;
-            if (registry.size() > 0) {
-                const size_t upper = std::min<size_t>(registry.size(), 2);
-                const size_t count = rng.next_range(1, static_cast<uint32_t>(upper));
-                const auto picks = registry.pick_random(count, rng);
-                for (const auto* check : picks) {
-                    check->emit(rt, imagebase_key_disp, rng);
-                }
-            }
-        }
-
-        // G3 — Anti-tamper checks.
-        //
-        // These probe the running process for live debuggers, hardware
-        // breakpoints, EDR hooks, and suspicious memory permissions.
-        // The registry contains a mix of syscall-based checks
-        // (hw_breakpoint_sweep, page_protection_sweep) and user-mode
-        // checks (import_hook_detect, self_crc). We cap at one
-        // pick per build: anti-tamper check bodies range from ~50 to
-        // ~150 bytes each, and stacking several would bloat the entry
-        // stub without proportional gain.
-        //
-        // The check's `required_syscall_name()` tells us whether we
-        // need to emit a Hell's Gate resolver before the check runs,
-        // and which function it should resolve. For non-syscall
-        // checks the name is null and we skip the ~155-byte resolver
-        // block entirely — this is what makes it cheap to add new
-        // user-mode checks without touching the orchestration here.
-        // The backend folds a per-call random salt into both the
-        // target-hash constant and the runtime DJB2 seed, so the
-        // emitted resolver's `cmp eax, imm32` and `mov eax, imm32`
-        // slots change from build to build.
-        //
-        // Suppressed when the caller opted out via
-        // `skip_anti_tamper_checks`. Specifically, `page_protection_check`
-        // reads its containing section's protection mask via
-        // NtQueryVirtualMemory and expects the packer to have revoked
-        // WRITE; S2c's inner VM lives in `.mxstr` which is
-        // intentionally R+W+X (for the in-place XOR decrypt + sticky
-        // flag), so the check would corrupt the handler-table key
-        // on roughly one build in four.
-        if (!opts.skip_anti_tamper_checks) {
-            static const anti_tamper::CheckRegistry tamper_registry;
-            if (tamper_registry.size() > 0) {
-                const auto picks = tamper_registry.pick_random(1, rng);
-                if (!picks.empty()) {
-                    const anti_tamper::ICheck* picked = picks[0];
-
-                    // Emit the Hell's Gate SSN resolver ONLY when
-                    // the picked check actually needs a syscall.
-                    const char* syscall_name =
-                        picked->required_syscall_name();
-                    if (syscall_name != nullptr && *syscall_name != '\0') {
-                        const uint32_t salt = rng.next_u32();
-                        const uint32_t target_hash =
-                            anti_tamper::djb2_ascii_hash_salted(
-                                syscall_name, salt);
-                        anti_tamper::emit_hells_gate_resolver(
-                            rt, target_hash, salt);
-                    }
-
-                    // Build the per-region context. Self-CRC reads
-                    // `entry_offset` from here to compute the rip-
-                    // relative rel32 back to the entry stub start,
-                    // and pushes into `self_crc_patches` so the
-                    // backend can finalise its expected-CRC imm32
-                    // after every other post-hoc patch has landed.
-                    anti_tamper::CheckContext ctx{};
-                    ctx.entry_offset     = entry_offset;
-                    ctx.self_crc_patches = &self_crc_patches;
-                    picked->emit(rt, imagebase_key_disp, rng, ctx);
-                }
-            }
-        }
-    }
-
-    // lea r11, [rip + bytecode_rel32]
-    entry_bc_patch = emit_lea_r11_rip_rel32(rt);
-    entry_bc_patch_end = rt.size();
-
-    // Inline first dispatch. Polymorphism on: entry is a prime signature
-    // target, so it gets a random table-base reg and dispatch shape just
-    // like handler tails.
-    const auto entry_tail = emit_tail_dispatch(rt, rolling_key_disp, rolling,
-                                                false, table_key_patches,
-                                                vflags_key, vflags_rol,
-                                                rflags_disp, &rng,
-                                                imagebase_key_disp);
-    table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
+    entry_offset              = stub_out.entry_offset;
+    entry_bc_patch            = stub_out.entry_bc_patch;
+    entry_bc_patch_end        = stub_out.entry_bc_patch_end;
+    imagebase_key_disp        = stub_out.imagebase_key_disp;
+    table_xor_key             = stub_out.table_xor_key;
+    integrity_table_lea_patch = stub_out.integrity_table_lea_patch;
+    integrity_expected_patch  = stub_out.integrity_expected_patch;
 
     // Per-build inner-VM ISA permutation. Computed ONCE here and threaded
     // through every nested-wrapper emission + the final
     // `emit_inner_vm_runtime` call — so the byte values in the inline inner
-    // bytecodes and the handler table ordering agree. Two builds of the
-    // same input produce two different permutations, so the byte-level
-    // shape of every inner-VM call site differs per build even though the
-    // semantics are identical.
+    // bytecodes and the handler table ordering agree.
     inner_vm_isa = make_random_inner_vm_isa(rng);
 
     // Reset per-handler emission bookkeeping.
