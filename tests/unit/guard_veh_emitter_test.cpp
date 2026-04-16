@@ -94,12 +94,13 @@ using mx::guard::GuardVehEmit;
 TEST(GuardVehEmitter, TotalSizeInExpectedEnvelope) {
     RawEmitter e;
     (void)emit_guard_veh_handler(e);
-    // Commit 3b handler: 209 bytes (prologue + filter + bailout
-    // tail + proceed + loop + entry_match + exit_match + success
-    // tail + decrypt_body). Any resize by more than a few bytes
-    // should trigger a re-audit — this test is the tripwire.
+    // Commit 3b base handler: 209 bytes.
+    // Commit 4 adds 21 bytes of HW breakpoint sweep in entry_match
+    // (mov+3×or+test+jnz) → 230 bytes.
+    // Any resize outside this window triggers a re-audit — this
+    // test is the tripwire for accidental size drift.
     EXPECT_GE(e.size(), 200u);
-    EXPECT_LE(e.size(), 230u);
+    EXPECT_LE(e.size(), 260u);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,45 @@ TEST(GuardVehEmitter, DecryptBodyLoopContainsKeyReadPattern) {
 // `add rsi, 64` instruction must be present (16 would be `48 83 C6 10`,
 // 64 is `48 83 C6 40`).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Commit 4: HW breakpoint sweep in entry_match.
+// ---------------------------------------------------------------------------
+
+TEST(GuardVehEmitter, HardwareBreakpointSweepReadsDr0ThroughDr3) {
+    RawEmitter e;
+    (void)emit_guard_veh_handler(e);
+
+    // The sweep reads CONTEXT.Dr0 (offset 0x48) via
+    // `mov rax, [rbp + 0x48]` = `48 8B 45 48`. That's the defining
+    // instruction — look for it.
+    const size_t dr0_read = find_pattern(
+        e.buf, {0x48, 0x8B, 0x45, 0x48});
+    ASSERT_NE(dr0_read, std::string::npos)
+        << "Expected `mov rax, [rbp + 0x48]` (Dr0 read) somewhere in the "
+           "handler";
+
+    // Each subsequent `or rax, [rbp + disp]` is 4 bytes.
+    // Dr1 at 0x50, Dr2 at 0x58, Dr3 at 0x60.
+    EXPECT_EQ(e.buf[dr0_read + 4],  0x48u);
+    EXPECT_EQ(e.buf[dr0_read + 5],  0x0Bu);  // or
+    EXPECT_EQ(e.buf[dr0_read + 6],  0x45u);
+    EXPECT_EQ(e.buf[dr0_read + 7],  0x50u);  // Dr1
+    EXPECT_EQ(e.buf[dr0_read + 8],  0x48u);
+    EXPECT_EQ(e.buf[dr0_read + 9],  0x0Bu);
+    EXPECT_EQ(e.buf[dr0_read + 10], 0x45u);
+    EXPECT_EQ(e.buf[dr0_read + 11], 0x58u);  // Dr2
+    EXPECT_EQ(e.buf[dr0_read + 12], 0x48u);
+    EXPECT_EQ(e.buf[dr0_read + 13], 0x0Bu);
+    EXPECT_EQ(e.buf[dr0_read + 14], 0x45u);
+    EXPECT_EQ(e.buf[dr0_read + 15], 0x60u);  // Dr3
+
+    // Followed by `test rax, rax` (48 85 C0) and a `jnz rel8`.
+    EXPECT_EQ(e.buf[dr0_read + 16], 0x48u);
+    EXPECT_EQ(e.buf[dr0_read + 17], 0x85u);
+    EXPECT_EQ(e.buf[dr0_read + 18], 0xC0u);
+    EXPECT_EQ(e.buf[dr0_read + 19], 0x75u);  // jnz rel8 opcode
+}
 
 TEST(GuardVehEmitter, StrideAdvanceMatchesSixtyFourByteDescriptor) {
     RawEmitter e;

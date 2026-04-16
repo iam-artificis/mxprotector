@@ -233,6 +233,31 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e) {
     // =================================================================
     // .entry_match
     //
+    // Commit 4 anti-debug: hardware-breakpoint sweep BEFORE doing any
+    // state change or decryption. If any of the four debug-address
+    // registers (Dr0..Dr3 at CONTEXT offsets 0x48/0x50/0x58/0x60)
+    // hold a non-zero value, the thread has at least one HW bp armed
+    // — a strong signal that a reverser is attached and single-
+    // stepping into the guard. Bail out via the existing fall-through
+    // bailout tail (continue_search + pops + ret) without touching
+    // the open_count or the body bytes. This leaves the body fully
+    // encrypted at rest and pushes the unhandled int3 onwards, which
+    // typically terminates the process.
+    //
+    // The HW bp sweep only runs on CONFIRMED guard int3 events, so a
+    // debugger breaking on an UNRELATED hw bp does not interfere
+    // with our bailout path.
+    //
+    //   mov rax, [rbp + 0x48]            48 8B 45 48     ; Dr0
+    //   or  rax, [rbp + 0x50]            48 0B 45 50     ; | Dr1
+    //   or  rax, [rbp + 0x58]            48 0B 45 58     ; | Dr2
+    //   or  rax, [rbp + 0x60]            48 0B 45 60     ; | Dr3
+    //   test rax, rax                    48 85 C0
+    //   jnz  .bailout_tail               75 rel8
+    //
+    // Fall-through into the decrypt/set-Rip block on the clean path.
+    //
+    // Then:
     //   mov eax, 1                       B8 01 00 00 00
     //   lock xadd [rsi + 0x14], eax      F0 0F C1 46 14
     //   test eax, eax                    85 C0
@@ -247,6 +272,16 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e) {
     //   jmp .done_success                EB rel8
     // =================================================================
     const uint32_t entry_match_label = static_cast<uint32_t>(e.size());
+
+    // HW breakpoint sweep (Commit 4) — Dr0 | Dr1 | Dr2 | Dr3.
+    e.u8(0x48); e.u8(0x8B); e.u8(0x45); e.u8(0x48);  // mov rax, [rbp + 0x48]
+    e.u8(0x48); e.u8(0x0B); e.u8(0x45); e.u8(0x50);  // or rax, [rbp + 0x50]
+    e.u8(0x48); e.u8(0x0B); e.u8(0x45); e.u8(0x58);  // or rax, [rbp + 0x58]
+    e.u8(0x48); e.u8(0x0B); e.u8(0x45); e.u8(0x60);  // or rax, [rbp + 0x60]
+    e.u8(0x48); e.u8(0x85); e.u8(0xC0);              // test rax, rax
+    e.u8(0x75);                                       // jnz rel8 → bailout_tail
+    const uint32_t hw_bp_bailout_rel8_slot = static_cast<uint32_t>(e.size());
+    e.u8(0x00);
 
     e.u8(0xB8); e.u8(0x01); e.u8(0x00); e.u8(0x00); e.u8(0x00);
     e.u8(0xF0); e.u8(0x0F); e.u8(0xC1); e.u8(0x46); e.u8(0x14);
@@ -400,6 +435,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e) {
     patch_rel8(jz_bailout_slot,          bailout_target);
     patch_rel8(je_entry_slot,            entry_match_label);
     patch_rel8(je_exit_slot,             exit_match_label);
+    patch_rel8(hw_bp_bailout_rel8_slot,  bailout_target);
     patch_rel8(entry_skip_rel8_slot,     entry_skip_label);
     patch_rel8(entry_done_rel8_slot,     done_success_label);
     patch_rel8(exit_skip_rel8_slot,      exit_skip_label);
