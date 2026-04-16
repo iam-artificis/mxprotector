@@ -50,6 +50,8 @@
 #include "mxprotector/protection/guard/guard_tls_installer.hpp"
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"  // fnv1a_32
+#include "mxprotector/protection/vm/vm_lifter.hpp"
+#include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
 #include <algorithm>
 #include <array>
@@ -298,14 +300,74 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             tmp.buf.begin(), tmp.buf.end());
     }
 
+    // ------------------------------------------------------------------
+    // Phase 3b — VM-lift the decrypt unit.
+    //
+    // The decrypt subroutine (FNV-hash-unmasked XOR loop) is the
+    // single piece of the guard dispatcher that an attacker MUST
+    // understand to recover the encryption key from a memory dump.
+    // By lifting it into the VM engine, the native x64 instructions
+    // disappear from the binary — the attacker must first reverse
+    // the per-build VM handler table, opcode permutation, and
+    // bytecode encryption to recover the decrypt logic.
+    //
+    // Steps:
+    //   1. Emit native decrypt_unit bytes (54B) as raw material.
+    //   2. Replace trailing `ret` with `nop` so the lifter sees a
+    //      complete region (it rejects RET). VmOp::exit replaces
+    //      the `ret` semantics at the VM level.
+    //   3. Lift through VmLifter (Zydis decode → VmInstructions).
+    //   4. Append VmOp::exit.
+    //   5. Generate VM runtime (entry + dispatcher + handlers +
+    //      encrypted bytecode).
+    //   6. Place the VM blob in the section.
+    // ------------------------------------------------------------------
     const uint32_t decrypt_unit_offset =
         static_cast<uint32_t>(section_data.size());
-    GuardDecryptUnitEmit decrypt_patches{};
+    uint32_t decrypt_vm_entry_offset = 0;
     {
-        RawEmitter tmp{};
-        decrypt_patches = emit_guard_decrypt_unit(tmp);
+        RawEmitter native_tmp{};
+        (void)emit_guard_decrypt_unit(native_tmp);
+
+        native_tmp.buf.back() = 0x90;
+
+        ByteView code{native_tmp.buf.data(), native_tmp.buf.size()};
+        vm::VmLifter lifter(*ctx.disassembler());
+        auto lift_result = lifter.lift(code, 0);
+        if (!lift_result) {
+            return std::unexpected(MxError{
+                ErrorCategory::protection,
+                static_cast<uint16_t>(ProtectionErrorCode::pass_failed),
+                "GuardPass: VM-lift decrypt unit: " +
+                    lift_result.error().message()});
+        }
+
+        auto [vm_insns, report] = std::move(*lift_result);
+        vm_insns.push_back(vm::VmInstruction{.op = vm::VmOp::exit});
+
+        ctx.log_fmt("GuardPass: decrypt unit lifted: "
+                    "generic={}, native={}, total={}",
+            report.generic_ops, report.native_ops, report.total_insns);
+
+        vm::VmRuntimeGenerator gen;
+        vm::VmGenOptions opts;
+        opts.skip_anti_tamper_checks = true;
+        auto vm_result = gen.generate(vm_insns, rng, opts);
+        if (!vm_result) {
+            return std::unexpected(MxError{
+                ErrorCategory::protection,
+                static_cast<uint16_t>(ProtectionErrorCode::pass_failed),
+                "GuardPass: VM runtime gen: " +
+                    vm_result.error().message()});
+        }
+
+        decrypt_vm_entry_offset = vm_result->entry_offset;
         section_data.insert(section_data.end(),
-            tmp.buf.begin(), tmp.buf.end());
+            vm_result->blob.begin(), vm_result->blob.end());
+
+        ctx.log_fmt("GuardPass: decrypt VM blob {} bytes, "
+                    "entry @ +0x{:X}",
+            vm_result->blob.size(), decrypt_vm_entry_offset);
     }
 
     const uint32_t tls_installer_offset =
@@ -573,20 +635,24 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             decrypt_unit_offset - veh_handler_offset;
 
         // Patch the two `call rel32` slots inside the handler to
-        // target the decrypt unit. Both calls jump to the same
-        // function but from different offsets, so the rel32 differs.
+        // target the VM-lifted decrypt unit's entry point. Both
+        // calls jump to the same VM entry but from different
+        // offsets, so the rel32 differs.
         {
+            const uint32_t decrypt_entry =
+                decrypt_unit_offset + decrypt_vm_entry_offset;
+
             const uint32_t entry_slot_in_section =
                 veh_handler_offset + veh_patches.entry_call_decrypt_rel32_offset;
             const int32_t entry_rel32 = static_cast<int32_t>(
-                static_cast<int64_t>(decrypt_unit_offset) -
+                static_cast<int64_t>(decrypt_entry) -
                 static_cast<int64_t>(entry_slot_in_section + 4));
             write_i32_le(guard_section.data, entry_slot_in_section, entry_rel32);
 
             const uint32_t exit_slot_in_section =
                 veh_handler_offset + veh_patches.exit_call_decrypt_rel32_offset;
             const int32_t exit_rel32 = static_cast<int32_t>(
-                static_cast<int64_t>(decrypt_unit_offset) -
+                static_cast<int64_t>(decrypt_entry) -
                 static_cast<int64_t>(exit_slot_in_section + 4));
             write_i32_le(guard_section.data, exit_slot_in_section, exit_rel32);
         }
