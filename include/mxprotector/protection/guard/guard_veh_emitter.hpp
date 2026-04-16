@@ -128,8 +128,22 @@ struct GuardVehEmit {
 
 /// Size of one descriptor table entry in bytes. Must match the x64
 /// offsets the handler body bakes in via `cmp [rsi+0]` / `mov eax,
-/// [rsi+8]` etc.
-inline constexpr uint32_t kGuardDescriptorStride = 16;
+/// [rsi+8]` / `lock xadd [rsi+0x14]` / `[rsi + r9 + 0x18]` etc.
+///
+/// Layout:
+/// ```
+///   +0x00  uint32  entry_int3_rva
+///   +0x04  uint32  exit_int3_rva
+///   +0x08  uint32  body_start_rva
+///   +0x0C  uint32  return_rva
+///   +0x10  uint32  body_size
+///   +0x14  uint32  open_count    (atomically updated via LOCK XADD)
+///   +0x18  u8[32]  per-guard XOR key
+///   +0x38  u8[8]   reserved / future polymorphism slot
+/// ```
+inline constexpr uint32_t kGuardDescriptorStride    = 64;
+inline constexpr uint32_t kGuardDescriptorKeyOffset = 0x18;
+inline constexpr uint32_t kGuardDescriptorKeySize   = 32;
 
 /**
  * @brief Append the full VEH handler body to `e`.

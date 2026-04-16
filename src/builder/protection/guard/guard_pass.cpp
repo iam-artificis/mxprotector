@@ -50,6 +50,7 @@
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <format>
 #include <vector>
@@ -306,15 +307,21 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
     // ------------------------------------------------------------------
     // Phase 4 — inject the .mxguard section.
     //
-    // R + X characteristics. No WRITE bit: Commit 3b will toggle W
-    // per-page at runtime via NtProtect, so the static flag stays
-    // off to reduce the "suspiciously writable code section" RE
-    // fingerprint.
+    // R + W + X characteristics. The WRITE bit is required because
+    // the VEH decrypts and re-encrypts guard bodies in place at
+    // runtime (Commit 3b). Going through `NtProtectVirtualMemory`
+    // to toggle W per-call was the cleaner alternative on paper but
+    // would need a cached syscall pointer in a writable scratch
+    // slot — which itself needs a writable section. Baking W into
+    // .mxguard at build time is simpler, matches .mxpack's existing
+    // R+W+X layout, and avoids a second "small writable tail
+    // section" fingerprint.
     // ------------------------------------------------------------------
     constexpr uint32_t kGuardCharacteristics =
         pe::IMAGE_SCN_CNT_CODE |
         pe::IMAGE_SCN_MEM_EXECUTE |
-        pe::IMAGE_SCN_MEM_READ;
+        pe::IMAGE_SCN_MEM_READ |
+        pe::IMAGE_SCN_MEM_WRITE;
 
     SectionManager sec_mgr(ctx.pe_image());
     const std::string& guard_section_name = ctx.section_names().guard;
@@ -392,16 +399,74 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             entry_int3_rva);
 
         // ---- Descriptor table entry ----
+        //
+        // The 64-byte descriptor layout must match the offsets the
+        // VEH handler's emitted byte stream bakes in:
+        //
+        //   +0x00  entry_int3_rva           (walked by cmp [rsi])
+        //   +0x04  exit_int3_rva            (walked by cmp [rsi+4])
+        //   +0x08  body_start_rva           (loaded by mov eax, [rsi+8])
+        //   +0x0C  return_rva               (loaded by mov eax, [rsi+12])
+        //   +0x10  body_size                (loaded by mov ecx, [rsi+0x10])
+        //   +0x14  open_count = 0           (LOCK XADD target)
+        //   +0x18..+0x38  per-guard XOR key (indexed by [rsi+r9+0x18])
+        //   +0x38..+0x40  reserved (zero)
+        //
+        // The key is generated fresh per guard from the same
+        // randomiser the page layout uses. Every guard gets its
+        // own 32 random bytes — two guards never share a key, so
+        // leaking one body's plaintext does not compromise any
+        // other body.
         const uint32_t entry_offset_in_section =
             descriptor_table_offset + pg.guard_id * kGuardDescriptorStride;
-        write_u32_le(guard_section.data, entry_offset_in_section + 0,
+
+        // --- RVAs + sizes ---
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x00,
                      entry_int3_rva);
-        write_u32_le(guard_section.data, entry_offset_in_section + 4,
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x04,
                      exit_int3_rva);
-        write_u32_le(guard_section.data, entry_offset_in_section + 8,
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x08,
                      body_start_rva);
-        write_u32_le(guard_section.data, entry_offset_in_section + 12,
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x0C,
                      pg.return_rva);
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x10,
+                     pg.layout.body_size);
+        // open_count is already zero from the initial resize of
+        // section_data, but be explicit for auditability.
+        write_u32_le(guard_section.data, entry_offset_in_section + 0x14, 0);
+
+        // --- Per-guard key ---
+        std::array<uint8_t, guard::kGuardDescriptorKeySize> key{};
+        for (auto& b : key) b = rng.next_u8();
+        std::memcpy(
+            guard_section.data.data()
+                + entry_offset_in_section + guard::kGuardDescriptorKeyOffset,
+            key.data(),
+            key.size());
+
+        // --- XOR-encrypt body bytes in place ---
+        //
+        // The body currently sits at [page_offset + body_offset ..
+        // page_offset + body_offset + body_size) as plaintext (it
+        // was written verbatim by build_guard_page). Encrypt it in
+        // place with the freshly-generated key so that the dump-on-
+        // disk `.mxguard` section shows ciphertext for every guard
+        // body; the VEH decrypts on entry and re-encrypts on exit
+        // via the same XOR pass (XOR is self-inverse).
+        //
+        // The int3+tag windows at [page_offset + 0..5) and
+        // [page_offset + body_offset + body_size..
+        //    + body_offset + body_size + 5) are deliberately NOT
+        // touched — they are the plaintext "skip windows" the CPU
+        // needs to execute to raise STATUS_BREAKPOINT.
+        {
+            const uint32_t body_start_in_section =
+                pg.page_offset_in_section + pg.layout.body_offset;
+            for (uint32_t i = 0; i < pg.layout.body_size; ++i) {
+                guard_section.data[body_start_in_section + i] ^=
+                    key[i % guard::kGuardDescriptorKeySize];
+            }
+        }
 
         GuardDescriptor d{};
         d.source_section_index    = pg.source_section_index;
