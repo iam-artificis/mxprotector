@@ -156,6 +156,80 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u8(0x48); e.u8(0x29); e.u8(0xDF);
 
     // =================================================================
+    // Commit 8 — self-hash walk over handler body.
+    //
+    // Compute FNV-1a over the handler's own byte stream and leave
+    // the result in `r11d`. The decrypt_body subroutine uses r11d
+    // as a 4-byte rolling XOR mask over the stored per-guard key
+    // so that the "real" key (used for body encryption at build
+    // time) is never materialized in the descriptor table. An
+    // attacker with a memory dump sees the descriptor's stored
+    // key + the plaintext handler bytes, but must:
+    //
+    //   1. Identify the FNV walk (not obvious in a sea of handler
+    //      instructions)
+    //   2. Correctly determine the hashed byte range
+    //   3. Compute the same hash offline
+    //   4. XOR the stored key to recover the real key
+    //
+    // Side benefit: any runtime tamper of the handler bytes
+    // changes r11d → wrong mask → wrong key → decrypt to garbage.
+    // This complements Commit 6's installer-time self-CRC with a
+    // per-invocation integrity check that doesn't bail out (to
+    // avoid giving the attacker a clear "tamper detected" signal)
+    // but silently garbles decryption.
+    //
+    //   mov r11d, 0x811C9DC5      41 BB imm32       FNV init
+    //   lea r10, [rip + 0]        4C 8D 15 00000000 cursor
+    //   sub r10, <imm32>          49 81 EA imm32    → handler start
+    //   mov ecx, <size>           B9 imm32          byte count
+    //   mov r8d, 0x01000193       41 B8 imm32       FNV prime
+    //   .hw:
+    //     movzx eax, byte [r10]   41 0F B6 02       (3 bytes)
+    //     xor r11d, eax           41 31 C3          (3)
+    //     imul r11d, r8d          45 0F AF D8       (4)
+    //     inc r10                 49 FF C2          (3)
+    //     dec ecx                 FF C9             (2)
+    //     jnz .hw                 75 rel8           (2)
+    // =================================================================
+    e.u8(0x41); e.u8(0xBB);
+    e.u32(0x811C9DC5u);
+
+    e.u8(0x4C); e.u8(0x8D); e.u8(0x15);
+    e.u8(0x00); e.u8(0x00); e.u8(0x00); e.u8(0x00);
+    out.self_hash_lea_anchor_offset =
+        static_cast<uint32_t>(e.size()) - handler_start;
+
+    e.u8(0x49); e.u8(0x81); e.u8(0xEA);
+    out.self_hash_sub_imm32_offset =
+        static_cast<uint32_t>(e.size()) - handler_start;
+    e.u32(0);
+
+    e.u8(0xB9);
+    out.self_hash_size_imm32_offset =
+        static_cast<uint32_t>(e.size()) - handler_start;
+    e.u32(0);
+
+    e.u8(0x41); e.u8(0xB8);
+    e.u32(0x01000193u);
+
+    const uint32_t hw_loop_start = static_cast<uint32_t>(e.size());
+    e.u8(0x41); e.u8(0x0F); e.u8(0xB6); e.u8(0x02);   // movzx eax, [r10]
+    e.u8(0x41); e.u8(0x31); e.u8(0xC3);                // xor r11d, eax
+    e.u8(0x45); e.u8(0x0F); e.u8(0xAF); e.u8(0xD8);   // imul r11d, r8d
+    e.u8(0x49); e.u8(0xFF); e.u8(0xC2);                // inc r10
+    e.u8(0xFF); e.u8(0xC9);                            // dec ecx
+    e.u8(0x75);                                         // jnz .hw
+    {
+        const uint32_t slot = static_cast<uint32_t>(e.size());
+        e.u8(0x00);
+        const int32_t rel8 =
+            static_cast<int32_t>(hw_loop_start) -
+            static_cast<int32_t>(slot + 1);
+        e.buf[slot] = static_cast<uint8_t>(static_cast<int8_t>(rel8));
+    }
+
+    // =================================================================
     // Descriptor table pointer + count.
     //   lea rsi, [rip + rel32]   48 8D 35 rel32
     //   mov r8d, imm32           41 B8 imm32
@@ -380,12 +454,51 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     // Clobbers: rax, rcx, rdx, r9.
     // Preserves: rsi, rbx, rbp, rdi, r8.
     // =================================================================
+    // =================================================================
+    // .decrypt_body — XOR-cipher pass WITH hash-derived key unmask.
+    //
+    // Commit 8 change: r11d carries the handler self-hash computed
+    // at handler entry. Before XOR-ing the body byte, each stored
+    // key byte is first XOR-masked with the corresponding byte of
+    // the rolling r8d hash register (initialised from r11d). The
+    // rotation `ror r8d, 8` cycles through all 4 bytes of the hash,
+    // wrapping every 4 iterations. Since 32 (key length) is a
+    // multiple of 4, the alignment stays consistent across key-index
+    // wraps.
+    //
+    //   mov edx, [rsi + 8]                   body_start_rva
+    //   add rdx, rbx                         body_va
+    //   mov ecx, [rsi + 0x10]                body_size
+    //   xor r9d, r9d                         key index
+    //   mov r8d, r11d                        ← NEW: rolling mask init
+    //   test ecx, ecx
+    //   jz .decrypt_done
+    //   .decrypt_loop:
+    //     movzx eax, byte [rsi + r9 + 0x18]  stored_key[r9]
+    //     xor al, r8b                         ← NEW: unmask with hash byte
+    //     ror r8d, 8                          ← NEW: rotate to next hash byte
+    //     xor [rdx], al
+    //     inc rdx
+    //     inc r9d
+    //     cmp r9d, 32
+    //     jb .no_wrap
+    //     xor r9d, r9d
+    //   .no_wrap:
+    //     dec ecx
+    //     jnz .decrypt_loop
+    //   .decrypt_done:
+    //     ret
+    //
+    // Clobbers: rax, rcx, rdx, r8, r9.
+    // Preserves: rsi, rbx, rbp, rdi, r11 (hash is READ, not written).
+    // =================================================================
     const uint32_t decrypt_body_label = static_cast<uint32_t>(e.size());
 
     e.u8(0x8B); e.u8(0x56); e.u8(0x08);
     e.u8(0x48); e.u8(0x01); e.u8(0xDA);
     e.u8(0x8B); e.u8(0x4E); e.u8(0x10);
-    e.u8(0x45); e.u8(0x31); e.u8(0xC9);
+    e.u8(0x45); e.u8(0x31); e.u8(0xC9);            // xor r9d, r9d
+    e.u8(0x45); e.u8(0x89); e.u8(0xD8);            // mov r8d, r11d  ← NEW
     e.u8(0x85); e.u8(0xC9);
     e.u8(0x74);
     const uint32_t decrypt_done_rel8_slot = static_cast<uint32_t>(e.size());
@@ -393,6 +506,8 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
 
     const uint32_t decrypt_loop_label = static_cast<uint32_t>(e.size());
     e.u8(0x42); e.u8(0x0F); e.u8(0xB6); e.u8(0x44); e.u8(0x0E); e.u8(0x18);
+    e.u8(0x44); e.u8(0x30); e.u8(0xC0);            // xor al, r8b   ← NEW
+    e.u8(0x41); e.u8(0xC1); e.u8(0xC8); e.u8(0x08); // ror r8d, 8   ← NEW
     e.u8(0x30); e.u8(0x02);
     e.u8(0x48); e.u8(0xFF); e.u8(0xC2);
     e.u8(0x41); e.u8(0xFF); e.u8(0xC1);

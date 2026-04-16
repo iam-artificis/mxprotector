@@ -100,7 +100,7 @@ TEST(GuardVehEmitter, TotalSizeInExpectedEnvelope) {
     (void)emit_guard_veh_handler(e, rng);
     // Commit 3b base: 209 bytes. Commit 4 HW bp sweep: +21 → 230.
     // Commit 7 polymorphic tail: +0..kGuardVehMaxTailJunk.
-    const size_t base = 230u;
+    const size_t base = 288u;
     EXPECT_GE(e.size(), base);
     EXPECT_LE(e.size(), base + kGuardVehMaxTailJunk);
 }
@@ -307,7 +307,7 @@ TEST(GuardVehEmitter, DeterministicCoreRegardlessOfSeed) {
     (void)emit_guard_veh_handler(a, rng_a);
     (void)emit_guard_veh_handler(b, rng_b);
 
-    const size_t core = 230u;
+    const size_t core = 288u;
     ASSERT_GE(a.size(), core);
     ASSERT_GE(b.size(), core);
     for (size_t i = 0; i < core; ++i) {

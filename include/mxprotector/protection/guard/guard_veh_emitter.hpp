@@ -125,6 +125,36 @@ struct GuardVehEmit {
     uint32_t descriptor_table_rel32_offset     = 0;
     uint32_t descriptor_table_rel32_end_offset = 0;
     uint32_t descriptor_count_imm32_offset     = 0;
+
+    /// Commit 8 — runtime handler self-hash walk.
+    ///
+    /// The handler recomputes FNV-1a over its own body on every
+    /// invocation (~1µs, negligible for guards that are called
+    /// rarely) and uses the resulting 32-bit value to un-XOR the
+    /// per-guard key stored in the descriptor. Even though the
+    /// handler bytes are dumpable, the attacker must identify
+    /// this walk, replicate the hash over the exact byte range,
+    /// and derive the mask to extract the real key — the
+    /// descriptor key by itself is now useless.
+    ///
+    ///   * `self_hash_lea_anchor_offset` — offset of the byte
+    ///     right after the handler's own rip-relative
+    ///     `lea r10, [rip + 0]`. The caller patches
+    ///     `self_hash_sub_imm32_offset` with this exact value
+    ///     so the subsequent `sub r10, imm32` resolves `r10` to
+    ///     the handler's own start address.
+    ///
+    ///   * `self_hash_sub_imm32_offset` — offset of the imm32
+    ///     inside the `sub r10, imm32` that finalises
+    ///     `r10 = handler_start`.
+    ///
+    ///   * `self_hash_size_imm32_offset` — offset of the imm32
+    ///     inside `mov ecx, <size>` that loads the FNV walk
+    ///     byte count. The caller writes the total handler
+    ///     byte count (including the Commit 7 polymorphic tail).
+    uint32_t self_hash_lea_anchor_offset  = 0;
+    uint32_t self_hash_sub_imm32_offset   = 0;
+    uint32_t self_hash_size_imm32_offset  = 0;
 };
 
 /// Size of one descriptor table entry in bytes. Must match the x64

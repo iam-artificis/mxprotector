@@ -548,28 +548,41 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
             tls_installer_offset + tls_patches.handler_rel32_offset,
             handler_rel32);
 
+        // Handler byte count — used by both Commit 8 self-hash and
+        // Commit 6 CRC. Declared here because both need it.
+        const uint32_t veh_handler_size =
+            tls_installer_offset - veh_handler_offset;
+
+        // --- Commit 8: self-hash walk patch slots (BEFORE CRC!) ---
+        //
+        // These write to HANDLER bytes and MUST happen before the
+        // Commit 6 fnv1a_32 hash computation, otherwise the build-
+        // time CRC would be computed on the pre-patch zeros while
+        // the runtime CRC walk sees the patched values → mismatch
+        // → installer skips AddVectoredExceptionHandler → first
+        // guard int3 goes unhandled.
+        write_i32_le(
+            guard_section.data,
+            veh_handler_offset + veh_patches.self_hash_sub_imm32_offset,
+            static_cast<int32_t>(veh_patches.self_hash_lea_anchor_offset));
+
+        write_u32_le(
+            guard_section.data,
+            veh_handler_offset + veh_patches.self_hash_size_imm32_offset,
+            veh_handler_size);
+
         // --- Commit 6: self-CRC over the VEH handler bytes ---
         //
         // The TLS installer walks the handler byte-range at runtime
         // and computes fnv1a_32 over it, comparing against a
         // build-time-baked expected value. The expected value is
         // fnv1a_32(handler_bytes, handler_size) computed RIGHT HERE
-        // (after all VEH patches have been applied: module_base
-        // imm32, descriptor table rel32, descriptor count imm32).
+        // (after all VEH + self-hash patches have been applied).
         // Any runtime patch applied between PE mapping and TLS
         // callback execution shifts the hash and causes the
         // installer to silently skip AVEH, leaving the VEH
         // unregistered — the first guard int3 then terminates the
         // process.
-        //
-        // The handler size is fixed per build (emitter output
-        // length), so we compute it from `veh_handler_offset` and
-        // `tls_installer_offset`. Not perfectly tight if future
-        // commits append bytes between handler and installer, but
-        // good enough here because emission is dense.
-        const uint32_t veh_handler_size =
-            tls_installer_offset - veh_handler_offset;
-
         const uint32_t handler_crc = packer::fnv1a_32(
             ByteView{
                 guard_section.data.data() + veh_handler_offset,
@@ -609,6 +622,36 @@ MxStatus GuardPass::execute(ProtectionContext& ctx) {
         ctx.log_fmt("GuardPass: VEH handler CRC = 0x{:08X} "
                     "over {} bytes @ 0x{:X}",
             handler_crc, veh_handler_size, veh_handler_rva);
+
+        // --- Commit 8: XOR-mask stored keys with handler_hash ---
+        //
+        // Each per-guard stored key is XOR'd with the 4-byte hash
+        // (cycling every 4 bytes). At runtime, the VEH's decrypt_body
+        // subroutine XORs each stored_key byte with the corresponding
+        // hash byte (via the rolling r8d register initialised from
+        // r11d) before applying it to the body. The XOR is its own
+        // inverse, so the two passes cancel and the body is decrypted
+        // with the ORIGINAL key. But an attacker reading the descriptor
+        // sees `stored_key = real_key ^ hash_mask` — useless without
+        // replicating the handler hash walk.
+        {
+            const std::array<uint8_t, 4> hash_mask = {
+                static_cast<uint8_t>(handler_crc),
+                static_cast<uint8_t>(handler_crc >> 8),
+                static_cast<uint8_t>(handler_crc >> 16),
+                static_cast<uint8_t>(handler_crc >> 24),
+            };
+            for (const auto& pg : pendings) {
+                const uint32_t key_offset_in_section =
+                    descriptor_table_offset
+                    + pg.guard_id * kGuardDescriptorStride
+                    + guard::kGuardDescriptorKeyOffset;
+                for (uint32_t i = 0; i < guard::kGuardDescriptorKeySize; ++i) {
+                    guard_section.data[key_offset_in_section + i] ^=
+                        hash_mask[i % 4];
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
