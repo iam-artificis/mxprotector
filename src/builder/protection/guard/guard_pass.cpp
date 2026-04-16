@@ -2,39 +2,21 @@
  * @file guard_pass.cpp
  * @brief [BUILDER] Implementation of `GuardPass` — see guard_pass.hpp.
  *
- * Commit 3a brings the full VEH infrastructure online. The section
- * layout produced by `GuardPass` is now:
+ * Section layout produced by GuardPass:
  *
  * ```
- *     [guard_page_0]          kGuardPageSize bytes  ┐
- *     [guard_page_1]          kGuardPageSize bytes  │  N pages
- *     ...                                            │  (one per MX_GUARD pair)
- *     [guard_page_{N-1}]      kGuardPageSize bytes  ┘
- *     [descriptor_table]      N × 16 bytes           ← VEH input
- *     [veh_handler]           ~125 bytes             ← installed by TLS thunk
- *     [tls_installer]         ~180 bytes             ← registered via ctx
+ *     [guard_page_0..N-1]    N × kGuardPageSize      (one per MX_GUARD pair)
+ *     [descriptor_table]     N × 64 bytes             (VEH input)
+ *     [veh_handler]          ~234 bytes + tail         (installed by TLS thunk)
+ *     [decrypt_vm_blob]      ~16 KB                   (VM-lifted decrypt unit)
+ *     [tls_installer]        ~240 bytes               (registered via ctx)
  * ```
  *
- * The descriptor table is the single source of truth for which
- * int3 addresses correspond to which guards. Entries contain:
- *
- * ```
- *     +0x00  uint32  entry_int3_rva
- *     +0x04  uint32  exit_int3_rva
- *     +0x08  uint32  body_start_rva
- *     +0x0C  uint32  return_rva
- * ```
- *
- * The `guard_tls_installer` gets its absolute VA (image_base +
- * installer_rva) stored into `ctx.extra_tls_callback_va`. When
- * `PackerPass::execute` later builds its own TLS callback array it
- * reads this field and appends the installer to the array, ensuring
- * the VEH gets registered at `DLL_PROCESS_ATTACH` before any guarded
- * code executes.
- *
- * Failure modes are identical to Commit 2 — each guard is processed
- * independently and a failure for any one guard results in a logged
- * warning and a skipped entry rather than a pipeline-wide error.
+ * Commit 9: the decrypt subroutine (FNV-hash-unmasked XOR loop) is
+ * extracted into `guard_decrypt_unit` and VM-lifted via VmLifter +
+ * VmRuntimeGenerator. The VEH handler calls the VM entry via
+ * `call rel32` — the key derivation path is no longer visible as
+ * native x64 in any memory dump.
  */
 
 #include "mxprotector/protection/guard/guard_pass.hpp"
