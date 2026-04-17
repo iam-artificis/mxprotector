@@ -37,6 +37,7 @@
 #include "mxprotector/protection/anti_tamper/self_crc_check.hpp"
 #include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
+#include "mxprotector/protection/vm/x64/x64_blob_patcher.hpp"
 #include "mxprotector/protection/vm/x64/x64_bytecode_encoder.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_entry_stub.hpp"
@@ -529,118 +530,22 @@ void GenerationSession::step3g_emit_table_and_bytecode() {
 //                        Step 4 — apply all patches
 // ============================================================================
 //
-// Rel32 fixups for entry → bytecode, every tail-dispatch lea → handler
-// table, legacy table-key imm32 placeholders, trampoline chain fixups,
-// handler-table entry encryption, integrity expected-sum, self-CRC.
+// Delegated to `x64_blob_patcher.cpp`. Session passes references to
+// every patch record / offset list it accumulated during steps 3a–3g;
+// the patcher walks them in the right order to finalise the blob.
 // ============================================================================
 
 MxResult<void> GenerationSession::step4_apply_patches() {
-    // Entry → bytecode (via lea r11, [rip + rel32])
-    patch_rel32(rt.buf, entry_bc_patch, entry_bc_patch_end, bytecode_offset);
-
-    // All tail-dispatch lea reg, [rip + rel32] → handler_table
-    for (const auto& p : table_patches) {
-        patch_rel32(rt.buf, p.rel32_offset, p.instruction_end, handler_table_offset);
-    }
-
-    // Patch the legacy `xor eax, imm32` placeholders in tail dispatches.
-    // (The ImageBase path leaves `table_key_patches` empty.)
-    for (const auto patch_off : table_key_patches) {
-        std::memcpy(rt.buf.data() + patch_off, &table_xor_key, 4);
-    }
-
-    // G5: patch each trampoline's placeholder int32 slot with
-    // `target_offset - anchor_offset`, sending runtime rip to the
-    // next link in the chain. The target can be either a real
-    // handler (for the terminal trampoline) or another trampoline
-    // (for head / intermediate links). The anchor semantics are
-    // shape-specific (see `emit_trampoline`): for Direct and
-    // PushRet it is the byte right after the rel32 slot; for
-    // CallPop it is the byte right after the `call rel32 = 0`
-    // that leaked the anchor onto the stack. The formula is
-    // uniform — the shape-specific math is baked into
-    // `anchor_offset` at emit time.
-    //
-    // Every emitted handler has a corresponding chain with every
-    // chain slot allocated up front. A missing handler offset or
-    // trampoline slot offset means the emission loop lost track
-    // of something, which is a bug — we surface it explicitly
-    // instead of silently leaving a trampoline whose final jump
-    // lands on offset 0.
-    for (const auto& tf : trampoline_fixups) {
-        size_t target_offset = 0;
-        switch (tf.target.kind) {
-            case TrampolineTarget::Kind::Handler: {
-                if (handler_offset_by_id[tf.target.id] == SIZE_MAX) {
-                    return std::unexpected(MxError(
-                        ProtectionErrorCode::vm_translation_error,
-                        std::format("X64VmBackend: trampoline chain targets un-emitted handler {}",
-                                     tf.target.id)));
-                }
-                target_offset = handler_offset_by_id[tf.target.id];
-                break;
-            }
-            case TrampolineTarget::Kind::Trampoline: {
-                if (tf.target.id >= trampoline_offset_by_slot.size() ||
-                    trampoline_offset_by_slot[tf.target.id] == SIZE_MAX) {
-                    return std::unexpected(MxError(
-                        ProtectionErrorCode::vm_translation_error,
-                        std::format("X64VmBackend: trampoline chain targets un-emitted slot {}",
-                                     tf.target.id)));
-                }
-                target_offset = trampoline_offset_by_slot[tf.target.id];
-                break;
-            }
-        }
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(target_offset) -
-            static_cast<int64_t>(tf.patch.anchor_offset));
-        std::memcpy(rt.buf.data() + tf.patch.fixup_offset, &rel, 4);
-    }
-
-    // handler_table entries: each = (head_trampoline_offset - table_offset) ^ table_xor_key.
-    //
-    // G5 phase 3: the entry points at the head of each handler's
-    // trampoline chain. Intermediate and terminal trampolines in
-    // the chain are reachable only by following the head, which
-    // itself reads as one of three polymorphic shapes. The
-    // integrity-check XOR sum still works byte-for-byte — it
-    // hashes whatever the entries hold, agnostic of what the
-    // targets represent — so the check's expected-sum imm32
-    // patched below remains correct.
-    uint32_t table_xor_sum = 0;
-    for (uint32_t h = 0; h < total_handlers; ++h) {
-        const uint32_t head_slot = head_slot_of_handler[h];
-        if (head_slot == UINT32_MAX ||
-            head_slot >= trampoline_offset_by_slot.size() ||
-            trampoline_offset_by_slot[head_slot] == SIZE_MAX) {
-            return std::unexpected(MxError(
-                ProtectionErrorCode::vm_translation_error,
-                std::format("X64VmBackend: handler id {} missing trampoline chain", h)));
-        }
-        auto rel = static_cast<int32_t>(
-            static_cast<int64_t>(trampoline_offset_by_slot[head_slot]) -
-            static_cast<int64_t>(handler_table_offset));
-        rel ^= static_cast<int32_t>(table_xor_key);
-        std::memcpy(rt.buf.data() + handler_table_offset + h * 4, &rel, 4);
-        table_xor_sum ^= static_cast<uint32_t>(rel);
-    }
-
-    // Patch the integrity-check expected-XOR-sum into the entry stub.
-    if (integrity_expected_patch != 0) {
-        std::memcpy(rt.buf.data() + integrity_expected_patch,
-                    &table_xor_sum, 4);
-    }
-
-    // Self-CRC finalisation. Must run AFTER every other patch has
-    // modified the entry-stub bytes, because the Self-CRC check's
-    // CRC range includes bytes that only become stable here (the
-    // integrity-check rel32, the integrity expected-sum imm32, and
-    // the tail-dispatch rel32s). Computing the expected CRC over
-    // the finalised buffer guarantees the runtime loop — which
-    // reads the same finalised bytes — gets an identical value.
-    anti_tamper::finalize_self_crc_patches(rt, self_crc_patches);
-    return {};
+    const BlobPatchInputs patch_in{
+        entry_bc_patch, entry_bc_patch_end, bytecode_offset,
+        table_patches, handler_table_offset,
+        table_key_patches, table_xor_key,
+        trampoline_fixups, handler_offset_by_id, trampoline_offset_by_slot,
+        total_handlers, head_slot_of_handler,
+        integrity_expected_patch,
+        self_crc_patches,
+    };
+    return apply_blob_patches(rt, patch_in);
 }
 
 // === GenerationSession helpers (begin_handler / end_handler_tail /

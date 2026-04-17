@@ -47,6 +47,7 @@ set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handlers.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_inner_vm.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_inner_vm_wrappers.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_blob_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_bytecode_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_entry_stub.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handler_emitter.cpp

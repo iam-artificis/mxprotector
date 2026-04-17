@@ -80,6 +80,7 @@ set(BUILDER_SOURCES
     protection/vm/x64/x64_handlers.cpp
     protection/vm/x64/x64_inner_vm.cpp
     protection/vm/x64/x64_inner_vm_wrappers.cpp
+    protection/vm/x64/x64_blob_patcher.cpp
     protection/vm/x64/x64_bytecode_encoder.cpp
     protection/vm/x64/x64_entry_stub.cpp
     protection/vm/x64/x64_handler_emitter.cpp
