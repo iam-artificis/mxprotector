@@ -1,25 +1,35 @@
 /**
  * @file x64_vm_backend.cpp
- * @brief [BUILDER, x64] X64-specific VM runtime backend.
+ * @brief [BUILDER, x64] X64-specific VM runtime backend — orchestrator.
  *
- * Owns `X64VmBackend::generate`, the orchestration that used to live
- * inside `VmRuntimeGenerator::generate` in the legacy
- * `vm_runtime_gen.cpp` monolith. The byte emission has moved into
- * `x64_emitters.cpp`, `x64_vflags.cpp`, and `x64_handlers.cpp`. This
- * file is the conductor: it picks per-build randomization, lays out
- * the bytecode stream, drives the entry stub, every handler body,
- * the per-instruction native-escape handlers, the encrypted handler
- * table, and the final patch-up.
+ * `X64VmBackend::generate` is the public entry point for producing the
+ * x64 VM runtime blob for one virtualised region. The heavy lifting
+ * lives in five sibling compilation units:
  *
- * Internal structure: the orchestration lives in `GenerationSession`,
- * a session-scoped class in the anonymous namespace that holds every
- * per-call piece of state (RawEmitter, bytecode buffer, patch lists,
- * trampoline bookkeeping, per-build random parameters) as members and
- * implements the step pipeline as private methods. `X64VmBackend::generate`
- * is a thin facade: validate inputs, construct a session, run it.
- * The split prepares for follow-on refactors (R1.3+) that extract
- * individual steps into dedicated files; the field names mirror the
- * original locals so future extractions move bodies verbatim.
+ *   * `x64_bytecode_encoder.cpp` — `encode_bytecode`: instructions
+ *     → encrypted bytecode + native-handler index map.
+ *   * `x64_entry_stub.cpp` — `emit_entry_stub`: pushfq + 16 pushes
+ *     + rolling-key seed + vflags scramble + ImageBase-derived
+ *     handler-table key block + anti-emulation / anti-tamper picks
+ *     + inline first dispatch.
+ *   * `x64_handler_emitter.cpp` — `emit_all_handlers`: every handler
+ *     body (generic + native + specialised) with trampoline chain
+ *     bookkeeping and G5 drain.
+ *   * `x64_inner_vm.cpp` — `emit_inner_vm_runtime`: the shared 88-byte
+ *     nested interpreter (step 3f still calls this directly and
+ *     patches the outer `call rel32 inner_vm_entry` placeholders).
+ *   * `x64_blob_patcher.cpp` — `apply_blob_patches`: rel32s, trampoline
+ *     chain fixups, handler-table entry encryption with running XOR
+ *     sum, integrity expected-sum imm32, self-CRC finalisation.
+ *
+ * This file is the conductor. It defines `GenerationSession`, the
+ * anon-namespace class that owns every per-call piece of state and
+ * drives the step pipeline in order, then exposes the thin
+ * `X64VmBackend::generate` facade. Step methods either do a small
+ * amount of in-place work (phase-1 randomisation, step-3f inner-VM
+ * placement + call patching, step-3g table + bytecode layout) or
+ * package the session state into inputs / sinks structs and forward
+ * to one of the extracted components.
  */
 
 #include "mxprotector/protection/vm/x64/x64_vm_backend.hpp"
@@ -29,23 +39,14 @@
 #include <format>
 #include <numeric>
 
-#include "mxprotector/analysis/x86_encoding.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
-#include "mxprotector/protection/anti_emulation/check_registry.hpp"
-#include "mxprotector/protection/anti_tamper/check_registry.hpp"
-#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/anti_tamper/self_crc_check.hpp"
-#include "mxprotector/protection/cfg/mba_transition_gen.hpp"
 #include "mxprotector/protection/vm/vm_stack_layout.hpp"
 #include "mxprotector/protection/vm/x64/x64_blob_patcher.hpp"
 #include "mxprotector/protection/vm/x64/x64_bytecode_encoder.hpp"
-#include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_entry_stub.hpp"
 #include "mxprotector/protection/vm/x64/x64_handler_emitter.hpp"
-#include "mxprotector/protection/vm/x64/x64_handlers.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
-#include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
-#include "mxprotector/protection/vm/x64/x64_vflags.hpp"
 #include "mxprotector/protection/vm/x64/x64_vm_patch_records.hpp"
 #include "mxprotector/protection/vm/x64/x64_vm_variants.hpp"
 
@@ -97,8 +98,6 @@ private:
     int32_t rolling_key_disp{};
     int32_t rflags_disp{};
     int32_t native_shift{};
-    uint32_t native_count{};
-    uint32_t generic_variant_total{};
     uint32_t total_handlers{};
     std::vector<Specialization> specializations;
     std::vector<std::vector<uint8_t>> variant_handler_ids;
@@ -127,7 +126,6 @@ private:
     size_t entry_offset{};
     int32_t imagebase_key_disp{-1};
     uint32_t table_xor_key{};
-    size_t integrity_table_lea_patch{};
     size_t integrity_expected_patch{};
 
     size_t entry_bc_patch{};
@@ -219,12 +217,12 @@ MxResult<void> GenerationSession::step1_randomize() {
     rflags_disp      = layout.rflags_offset();
     native_shift     = layout.native_frame_shift();
 
-    native_count = static_cast<uint32_t>(std::count_if(
+    const uint32_t native_count = static_cast<uint32_t>(std::count_if(
         instructions.begin(), instructions.end(),
         [](const VmInstruction& v) { return v.op == VmOp::native; }));
 
     // Total generic variant slots (sum of variants across all canonical VmOps).
-    generic_variant_total = 0;
+    uint32_t generic_variant_total = 0;
     for (uint32_t i = 0; i < kVmOpCount; ++i) {
         generic_variant_total += variant_count_for(static_cast<VmOp>(i));
     }
@@ -406,13 +404,15 @@ void GenerationSession::step3a_emit_entry_stub() {
     };
     const EntryStubOutputs stub_out = emit_entry_stub(rt, stub_in, sinks);
 
-    entry_offset              = stub_out.entry_offset;
-    entry_bc_patch            = stub_out.entry_bc_patch;
-    entry_bc_patch_end        = stub_out.entry_bc_patch_end;
-    imagebase_key_disp        = stub_out.imagebase_key_disp;
-    table_xor_key             = stub_out.table_xor_key;
-    integrity_table_lea_patch = stub_out.integrity_table_lea_patch;
-    integrity_expected_patch  = stub_out.integrity_expected_patch;
+    entry_offset             = stub_out.entry_offset;
+    entry_bc_patch           = stub_out.entry_bc_patch;
+    entry_bc_patch_end       = stub_out.entry_bc_patch_end;
+    imagebase_key_disp       = stub_out.imagebase_key_disp;
+    table_xor_key            = stub_out.table_xor_key;
+    integrity_expected_patch = stub_out.integrity_expected_patch;
+    // `integrity_table_lea_patch` is already recorded inside
+    // `sinks.table_patches` by the entry-stub emitter; the patcher
+    // walks that list without a dedicated entry on the Session.
 
     // Per-build inner-VM ISA permutation. Computed ONCE here and threaded
     // through every nested-wrapper emission + the final
@@ -547,11 +547,6 @@ MxResult<void> GenerationSession::step4_apply_patches() {
     };
     return apply_blob_patches(rt, patch_in);
 }
-
-// === GenerationSession helpers (begin_handler / end_handler_tail /
-//     emit_op_variant / trampoline bookkeeping) moved to
-//     x64_handler_emitter.cpp in R1.5.
-
 
 } // anonymous namespace
 

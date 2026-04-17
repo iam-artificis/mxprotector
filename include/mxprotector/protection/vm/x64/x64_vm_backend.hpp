@@ -1,19 +1,32 @@
 /**
  * @file x64_vm_backend.hpp
- * @brief [BUILDER, x64] X64-specific VM runtime backend.
+ * @brief [BUILDER, x64] X64-specific VM runtime backend — public entry.
  *
- * `X64VmBackend` owns the orchestration that used to live directly
- * inside `VmRuntimeGenerator::generate`: pick a per-build random
- * register / stack layout, derive the rolling-key seed and the
- * vEFLAGS scramble parameters, lay out the bytecode stream, emit the
- * entry stub, every handler, the native-escape handler instances,
- * the encrypted handler table, and finally patch all rel32s.
+ * `X64VmBackend` is the facade the caller uses to produce a finished
+ * VM runtime blob for one virtualised region. The class is an empty
+ * value type: all per-call state lives in a session helper inside the
+ * implementation file (`GenerationSession`), and the step pipeline is
+ * split across five sibling compilation units:
  *
- * The class is intentionally a regular value type with one entry
- * point — `generate` — that takes the lifted instruction list and
- * returns a fully-assembled `vm::VmRuntime` blob. The public
- * `VmRuntimeGenerator` (in `vm_runtime_gen.hpp`) is now a thin
- * facade that just instantiates this backend and forwards.
+ *   * `x64_bytecode_encoder.{hpp,cpp}` — instructions → encrypted
+ *     bytecode + native-handler index map.
+ *   * `x64_entry_stub.{hpp,cpp}` — entry pushfq + 16 pushes + rolling-
+ *     key seed + vflags scramble + ImageBase key block (G6 loop +
+ *     MBA + integrity check) + anti-emulation / anti-tamper picks +
+ *     inline first dispatch.
+ *   * `x64_handler_emitter.{hpp,cpp}` — every handler body (generic
+ *     + per-instruction native + G1 specialised) with G5 trampoline
+ *     bookkeeping and the deterministic drain.
+ *   * `x64_inner_vm.{hpp,cpp}` — the shared 88-byte nested interpreter
+ *     (called directly from the orchestrator's step-3f).
+ *   * `x64_blob_patcher.{hpp,cpp}` — rel32 fixups, trampoline chain
+ *     fixups, handler-table entry encryption, integrity expected-sum,
+ *     self-CRC finalisation.
+ *
+ * Shared types: `x64_vm_patch_records.hpp` defines the small patch-
+ * record structs (`TablePatch`, `TrampolineTarget`, `PendingTrampoline`,
+ * `TrampolineFixup`) that cross component boundaries. Compile-time
+ * variant metadata lives in `x64_vm_variants.hpp`.
  *
  * Why a class and not a free function? Two reasons:
  *
@@ -27,14 +40,9 @@
  *      lands. For now we keep the seam at the concrete class so the
  *      x64 refactor lands without touching the arch package.
  *
- *   2. Internal helpers grow. The orchestration uses many
- *      x64-specific lambdas / tables / patch records. Hiding them
- *      inside a class with private members is cleaner than a nest
- *      of free helpers in an anonymous namespace inside a single
- *      .cpp file.
- *
- * All of the byte-emission machinery this class drives lives in
- * `x64_emitters.hpp`, `x64_vflags.hpp`, and `x64_handlers.hpp`.
+ *   2. The class is the obvious extension point when a new per-call
+ *      option shows up — subclassing the facade or swapping the
+ *      session helper is cheaper than juggling many free functions.
  */
 
 #pragma once
