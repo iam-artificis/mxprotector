@@ -35,6 +35,7 @@
 #include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
+#include "mxprotector/protection/packer/packer_tls_finalizer.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
@@ -542,132 +543,12 @@ private:
     }
 
     void step6_finalize_tls() {
-        // --------------------------------------------------
-        // P4 — TLS callback finalisation.
-        //
-        // At this point the .mxpack section has been placed at
-        // `stub_rva_` and every byte of stub_buf_ has been copied
-        // into `pack_sec.data`. We can now compute the absolute VAs
-        // for our TLS callback, the callback array, the TLS
-        // directory fields, and the (optional) index slot, and patch
-        // them into the section bytes. Finally we update
-        // `DataDirectory[TLS]` in the PE header to point at the new
-        // directory.
-        //
-        // Absolute VAs are safe because the packer strips base
-        // relocations at the very top of step1 (via
-        // `prepare_oep_steal` → `disable_relocations`), so the
-        // runtime image base equals the build-time preferred base.
+        // Delegates to packer_tls_finalizer — fills the callback
+        // array, IMAGE_TLS_DIRECTORY64 fields, and updates the PE
+        // header's DataDirectory[TLS] entry to point at the new
+        // directory inside .mxpack.
         auto& pack_sec = ctx_.pe_image().sections()[pack_section_index_];
-        const auto image_base =
-            static_cast<uint64_t>(ctx_.pe_image().image_base());
-        const uint64_t cb_body_va =
-            image_base + stub_rva_ + artifacts_.tls_cb.body_offset;
-        const uint64_t tls_dir_va =
-            image_base + stub_rva_ + artifacts_.tls_dir_offset_in_stub;
-        const uint64_t cb_array_va =
-            image_base + stub_rva_ + artifacts_.tls_cb_array_offset_in_stub;
-
-        // 1. Patch the `xor byte [rip + rel32], imm8` inside the
-        //    callback body to point at one byte of a per-build random
-        //    cipher layer's RC4 key. Corrupting ANY layer's key is
-        //    sufficient to cascade: a wrong S-box for one layer
-        //    produces a wrong PRGA output which means the other
-        //    layers decrypt the intermediate bytes into garbage.
-        //    Randomising the target layer per build denies reversers
-        //    a stable pivot — extracting the corruption site from one
-        //    binary tells them nothing about the next. The rel32 is
-        //    computed from the end of the xor instruction
-        //    (`xor_instruction_end`) to the target byte.
-        const uint32_t key_target_offset_in_stub =
-            artifacts_.key_offsets_in_stub[artifacts_.tls_cb.key_layer_index] +
-            artifacts_.tls_cb.key_byte_offset_in_key;
-        const int32_t xor_rel32 = static_cast<int32_t>(
-            static_cast<int64_t>(key_target_offset_in_stub) -
-            static_cast<int64_t>(artifacts_.tls_cb.xor_instruction_end));
-        write_i32(pack_sec.data, artifacts_.tls_cb.xor_key_rel32_offset, xor_rel32);
-
-        // 2. Fill the callback array: our packer callback first, then
-        //    (optional) the runtime-guards VEH installer from
-        //    `ctx_.extra_tls_callback_va`, then every existing
-        //    callback from the input TLS directory in its original
-        //    order, then a NULL terminator.
-        //
-        // Ordering rationale: packer_cb MUST run first so the
-        // anti-debug key-corruption gag fires before any other
-        // callback has a chance to inspect the stub. The guard
-        // installer MUST run before any existing user callback
-        // because user callbacks may execute code that later
-        // triggers guarded paths — if the VEH isn't installed yet,
-        // those int3s crash the process. So:
-        //     [packer_cb][guard_install_cb?][user_cb_0][user_cb_1]...[NULL]
-        uint32_t write_off = artifacts_.tls_cb_array_offset_in_stub;
-        write_u64_le(pack_sec.data, write_off, cb_body_va);
-        write_off += 8;
-        if (artifacts_.has_extra_tls_cb) {
-            write_u64_le(pack_sec.data, write_off,
-                         ctx_.extra_tls_callback_va());
-            write_off += 8;
-        }
-        if (artifacts_.existing_tls_opt.has_value()) {
-            for (const uint64_t old_cb : artifacts_.existing_tls_opt->callbacks) {
-                write_u64_le(pack_sec.data, write_off, old_cb);
-                write_off += 8;
-            }
-        }
-        write_u64_le(pack_sec.data, write_off, 0);  // terminator
-
-        // 3. Fill the TLS directory. Non-callback fields come from the
-        //    existing directory when present, so C++
-        //    `__declspec(thread)` data still works.
-        uint64_t index_va = 0;
-        uint64_t start_va = 0;
-        uint64_t end_va   = 0;
-        uint32_t zero_fill = 0;
-        uint32_t characteristics = 0;
-        if (artifacts_.existing_tls_opt.has_value()) {
-            const auto& ex   = *artifacts_.existing_tls_opt;
-            start_va         = ex.start_va;
-            end_va           = ex.end_va;
-            index_va         = ex.index_va;
-            zero_fill        = ex.size_of_zero_fill;
-            characteristics  = ex.characteristics;
-        } else {
-            // No existing TLS — point AddressOfIndex at our own
-            // 4-byte scratch slot inside .mxpack.
-            index_va = image_base + stub_rva_ + artifacts_.tls_index_slot_offset_in_stub;
-        }
-        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x00, start_va);
-        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x08, end_va);
-        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x10, index_va);
-        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x18, cb_array_va);
-        write_u32_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x20, zero_fill);
-        write_u32_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x24, characteristics);
-
-        // 4. Point the PE header's TLS data directory at our new
-        //    in-.mxpack directory.
-        const Rva tls_dir_rva =
-            static_cast<Rva>(stub_rva_ + artifacts_.tls_dir_offset_in_stub);
-        std::visit([&](auto& nt) {
-            if (pe::IMAGE_DIRECTORY_ENTRY_TLS < nt.OptionalHeader.NumberOfRvaAndSizes) {
-                nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress
-                    = tls_dir_rva;
-                nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].Size
-                    = 40;
-            }
-        }, ctx_.pe_image().nt_headers());
-
-        ctx_.log_fmt("PackerPass: P4 TLS callback planted @ RVA=0x{:08X}, "
-                     "chain length {} (existing={}, ours=1), "
-                     "corrupts key[layer={}, byte={}]",
-            stub_rva_ + artifacts_.tls_cb.body_offset,
-            static_cast<uint32_t>(artifacts_.tls_cb_array_entries - 1),
-            artifacts_.existing_tls_opt.has_value()
-                ? static_cast<uint32_t>(artifacts_.existing_tls_opt->callbacks.size())
-                : 0u,
-            artifacts_.tls_cb.key_layer_index,
-            artifacts_.tls_cb.key_byte_offset_in_key);
-        (void)tls_dir_va;  // reserved for future use (direct self-reference)
+        packer::finalize_tls_metadata(ctx_, pack_sec.data, stub_rva_, artifacts_);
     }
 
     [[nodiscard]] MxStatus step7_hash_and_encrypt() {
