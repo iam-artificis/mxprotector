@@ -310,486 +310,538 @@ struct PackerStubInjection {
     return PackerStubInjection{pack_idx, stub_rva};
 }
 
-/// Shared encrypted-packer pipeline. Parameterised on `Emitter` so EXE
-/// and DLL both flow through the same steps, differing only in the
-/// policy type's save/restore shell (and, for DLL, its PROCESS_ATTACH
-/// gate). The emitter's `patches_type` must inherit from both
-/// `CommonStubPatches` and `CipherBodyPatches`, which the concept +
-/// multi-inheritance of the concrete patch types statically guarantee.
+/// Orchestration state for one `execute_encrypted_stub<Emitter>` call.
+///
+/// R2.1 decomposition: what used to be a 600-line template function
+/// with ~20 interleaved concerns is now a small class with step
+/// methods wrapping private state. Nothing about the runtime wire
+/// format or log output changes — this is a pure readability
+/// refactor laying the groundwork for R2.2+ which peel off each
+/// concern (P3 VM-lift, P4 TLS finalise, P6 hash+encrypt, etc.)
+/// into its own compilation unit.
 ///
 /// Pipeline:
-///   1. Collect target sections (`.text`, vm blob, cff blob).
-///   2. `prepare_oep_steal` — strip relocations, locate entry, steal
-///      safe prologue bytes, 0xCC the stolen range in place.
-///   3. Make `.rdata` writable so the stub can wipe the Import
-///      Directory at runtime.
-///   4. Generate the per-build random 32-byte RC4 key and encrypt
-///      every target section in place (KSA seeded with j = 0 at
-///      build time — see the anti-debug bias comment in Rc4State).
-///   5. Ask the emitter for the stub bytes.
-///   6. Append key, S-box scratch, optional P3 VM KSA blob, reprotect
-///      section table, all into the same stub buffer so everything
-///      lives inside one `.mxpack` section.
-///   7. `finalize_packer_stub` — inject section, patch common rel32
-///      slots (jmp → real entry, stolen CALL fix-ups), retarget
-///      AddressOfEntryPoint.
-///   8. Patch cipher-body rel32s (per-section LEA/ECX, key, S-box,
-///      reprotect table, IAT wipe). Optionally overwrite the KSA
-///      range with a `call rel32 <vm_entry>` if the VM lift
-///      succeeded in step 6.
+///   step1 — collect target sections, OEP steal, make .rdata writable.
+///   step2 — clamp layer_count, generate per-layer RC4 keys, walk
+///           targets into `encrypted_`, gate the VEH trap flag.
+///   step3 — ask the policy Emitter for the stub code bytes.
+///   step4 — append per-layer keys, S-box scratch, P3 VM blob (if a
+///           disassembler is available), reprotect table, P4 TLS
+///           artefacts (callback body, directory, callback array,
+///           optional index slot).
+///   step5 — inject the .mxpack section, apply per-layer / sbox /
+///           ImageBase / reprotect / IAT rel32 patches, overwrite the
+///           KSA block with `call rel32 <vm_entry>` if the lift
+///           succeeded.
+///   step6 — P4 TLS finalise: fill in the callback array + directory
+///           + point DataDirectory[TLS] at the new directory.
+///   step7 — P6: compute stub self-hash → derive effective per-layer
+///           keys → RC4-encrypt every target section in build order.
+///
+/// Every step is a method so each sub-step's scope is explicit, and
+/// the cross-step variables are clearly visible as private members.
+/// Early exits from steps 1 or 2 set `skip_` so the rest of the
+/// pipeline short-circuits back to the ctx.log + return path.
 template <StubEmitter Emitter>
     requires std::constructible_from<Emitter, StubEmissionParams>
-[[nodiscard]] MxStatus execute_encrypted_stub(ProtectionContext& ctx,
-                                              std::string_view   steal_label)
-{
-    auto target_indices = collect_target_sections(ctx.pe_image(),
-                                                   ctx.section_names());
-    if (target_indices.empty()) {
-        ctx.log("PackerPass: нет подходящих секций, пропуск");
+class PackerPipeline {
+public:
+    PackerPipeline(ProtectionContext& ctx, std::string_view steal_label) noexcept
+        : ctx_(ctx), steal_label_(steal_label) {}
+
+    [[nodiscard]] MxStatus execute() {
+        step1_prepare();
+        if (skip_) return {};
+        step2_generate_keys_and_targets();
+        if (skip_) return {};
+        step3_emit_stub_body();
+        step4_append_artifacts();
+        if (auto r = step5_inject_and_patch(); !r) return r;
+        step6_finalize_tls();
+        if (auto r = step7_hash_and_encrypt(); !r) return r;
+        ctx_.log("PackerPass: упаковка завершена");
         return {};
     }
 
-    auto steal_opt = prepare_oep_steal(ctx, steal_label);
-    if (!steal_opt) return {};
-    auto& steal = *steal_opt;
-
-    // Make .rdata writable so the stub can zero the Import Directory at runtime.
-    for (auto& sec : ctx.pe_image().sections()) {
-        if (sec.name == ".rdata") {
-            sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
-        }
-    }
-
-    // P2 — Multi-layer cipher rounds. Each round has its own RC4 key
-    // and its own PRGA decrypt loop. Layer 0 is the innermost (runtime
-    // decrypted LAST, anti-debug bias woven into its KSA); build-time
-    // encryption applies layers in the reverse of runtime order, i.e.
-    // `layer 0 first, then 1, ..., then N-1`. `layer_count` is clamped
-    // to at least 1 — a config value of 0 is promoted to 1 so the
-    // decrypt body still emits one cipher round.
-    const uint32_t layer_count =
-        std::max<uint32_t>(1, ctx.config().packer_cipher_layers);
-
-    Randomizer rng;
-    std::vector<ByteBuffer> layer_keys(layer_count);
-    for (auto& k : layer_keys) {
-        k.resize(kKeySize);
-        for (auto& b : k) b = rng.next_u8();
-    }
-
+private:
     struct EncryptedTarget {
         size_t   image_index;
         Rva      rva;
         uint32_t size;
     };
-    std::vector<EncryptedTarget> encrypted;
-    encrypted.reserve(target_indices.size());
 
-    // Walk the target sections once to skip empty ones and mark them
-    // writable. The layer-encryption loop below re-walks the resulting
-    // `encrypted` vector so every layer sees the same section order
-    // that the runtime stub's PRGA loops will walk.
-    for (const size_t idx : target_indices) {
-        auto& sec = ctx.pe_image().sections()[idx];
-        const uint32_t sec_size = static_cast<uint32_t>(sec.data.size());
-        if (sec_size == 0) continue;
+    // --- step methods -------------------------------------------------
 
-        // Allow the stub to decrypt in place.
-        sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+    void step1_prepare() {
+        target_indices_ = collect_target_sections(ctx_.pe_image(),
+                                                   ctx_.section_names());
+        if (target_indices_.empty()) {
+            ctx_.log("PackerPass: нет подходящих секций, пропуск");
+            skip_ = true;
+            return;
+        }
 
-        encrypted.push_back({idx, sec.virtual_address, sec_size});
+        auto steal_opt = prepare_oep_steal(ctx_, steal_label_);
+        if (!steal_opt) {
+            skip_ = true;
+            return;
+        }
+        steal_ = std::move(*steal_opt);
+
+        // Make .rdata writable so the stub can zero the Import
+        // Directory at runtime.
+        for (auto& sec : ctx_.pe_image().sections()) {
+            if (sec.name == ".rdata") {
+                sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+            }
+        }
     }
 
-    if (encrypted.empty()) {
-        ctx.log("PackerPass: все кандидаты пусты, пропуск");
+    void step2_generate_keys_and_targets() {
+        // P2 — Multi-layer cipher rounds. Each round has its own RC4
+        // key and its own PRGA decrypt loop. Layer 0 is the innermost
+        // (runtime decrypted LAST, anti-debug bias woven into its KSA);
+        // build-time encryption applies layers in the reverse of
+        // runtime order, i.e. `layer 0 first, then 1, ..., then N-1`.
+        // `layer_count` is clamped to at least 1 — a config value of 0
+        // is promoted to 1 so the decrypt body still emits one cipher
+        // round.
+        layer_count_ =
+            std::max<uint32_t>(1, ctx_.config().packer_cipher_layers);
+
+        layer_keys_.assign(layer_count_, ByteBuffer{});
+        for (auto& k : layer_keys_) {
+            k.resize(kKeySize);
+            for (auto& b : k) b = rng_.next_u8();
+        }
+
+        encrypted_.reserve(target_indices_.size());
+
+        // Walk the target sections once to skip empty ones and mark
+        // them writable. The layer-encryption loop later re-walks the
+        // resulting `encrypted_` vector so every layer sees the same
+        // section order that the runtime stub's PRGA loops will walk.
+        for (const size_t idx : target_indices_) {
+            auto& sec = ctx_.pe_image().sections()[idx];
+            const uint32_t sec_size = static_cast<uint32_t>(sec.data.size());
+            if (sec_size == 0) continue;
+
+            // Allow the stub to decrypt in place.
+            sec.characteristics |= pe::IMAGE_SCN_MEM_WRITE;
+
+            encrypted_.push_back({idx, sec.virtual_address, sec_size});
+        }
+
+        if (encrypted_.empty()) {
+            ctx_.log("PackerPass: все кандидаты пусты, пропуск");
+            skip_ = true;
+            return;
+        }
+
+        // P6 — section encryption is DEFERRED until after the stub is
+        // fully assembled and patched. The effective cipher keys that
+        // encrypt each section are a function of the stub's FNV-1a
+        // self-integrity hash, which can only be computed once every
+        // rel32 inside the stub and the hash count imm32 have been
+        // finalised. The sections stay plaintext in `pe_image` until
+        // step7 (`P6 hash + derive + encrypt`) which runs after TLS
+        // callback finalisation. Nothing between here and that step
+        // reads section contents — every downstream step only needs
+        // section RVAs and sizes, which are already captured in
+        // `encrypted_`.
+
+        // G3 Phase 2 VEH INT3 trap gate: opt-in AND EXE-only. DLL
+        // stubs cannot safely install a VEH — it would outlive the
+        // DLL's unload and leave a dangling handler in the host
+        // process. The DllFullStubEmitter forces
+        // `enable_veh_trap=false` inside its emit() regardless of what
+        // we pass here, but we still clear the flag at this level so
+        // the log / params reflect reality.
+        const bool pe_is_exe =
+            ctx_.pe_image().pe_type() == PeType::executable;
+        enable_veh_trap_ =
+            ctx_.config().enable_veh_anti_tamper && pe_is_exe;
+
+        if (ctx_.config().enable_veh_anti_tamper && !pe_is_exe) {
+            ctx_.log("PackerPass: --anti-tamper-veh проигнорирован для DLL "
+                     "(VEH переживёт unload — unsafe)");
+        } else if (enable_veh_trap_) {
+            ctx_.log("PackerPass: G3 Phase 2 VEH INT3 trap включён");
+        }
+    }
+
+    void step3_emit_stub_body() {
+        Emitter emitter{StubEmissionParams{
+            .section_count   = static_cast<uint32_t>(encrypted_.size()),
+            .layer_count     = layer_count_,
+            .enable_veh_trap = enable_veh_trap_,
+        }};
+        auto [stub_buf, patches] = emitter.emit(
+            rng_,
+            ByteView{steal_.stolen_bytes.data(), steal_.stolen_bytes.size()});
+        stub_buf_ = std::move(stub_buf);
+        patches_  = std::move(patches);
+    }
+
+    void step4_append_artifacts() {
+        // Append each layer's 32-byte RC4 key to the stub buffer and
+        // record the stub-relative offsets so each layer's
+        // `lea rsi, key_K` rel32 can be patched after the stub
+        // section is injected.
+        key_offsets_in_stub_.resize(layer_count_);
+        for (uint32_t layer = 0; layer < layer_count_; ++layer) {
+            key_offsets_in_stub_[layer] =
+                static_cast<uint32_t>(stub_buf_.size());
+            stub_buf_.insert(stub_buf_.end(),
+                             layer_keys_[layer].begin(),
+                             layer_keys_[layer].end());
+        }
+
+        // S-box scratch: 256 bytes. At runtime the KSA overwrites the
+        // whole region — the build-time content doesn't matter, we
+        // just need the space inside the section so `lea r8, sbox`
+        // points at valid memory.
+        sbox_offset_in_stub_ = static_cast<uint32_t>(stub_buf_.size());
+        stub_buf_.insert(stub_buf_.end(), kSboxSize, uint8_t{0});
+
+        // P3 — VM-protected KSA. If a disassembler is available, lift
+        // the RC4 KSA range through the existing VM engine and append
+        // the runtime blob to the stub buffer; the original plaintext
+        // KSA bytes are later overwritten with `call rel32 <vm_entry>`.
+        if (ctx_.disassembler() != nullptr &&
+            patches_.ksa_block_end_offset > patches_.ksa_block_start_offset)
+        {
+            const size_t ksa_size =
+                patches_.ksa_block_end_offset - patches_.ksa_block_start_offset;
+            ByteView ksa_view{
+                stub_buf_.data() + patches_.ksa_block_start_offset,
+                ksa_size};
+
+            vm::VmLifter lifter(*ctx_.disassembler());
+            constexpr Va kFakeKsaBase = 0x0000000140000000ULL;
+            auto lift_result = lifter.lift(ksa_view, kFakeKsaBase);
+            if (!lift_result) {
+                ctx_.log_fmt("PackerPass: P3 VM-lift KSA failed ({}), keeping plaintext",
+                    lift_result.error().message());
+            } else {
+                auto [vm_insns, report] = *lift_result;
+                ctx_.log_fmt("PackerPass: P3 VM-lift OK — total={}, generic={}, native={}",
+                    report.total_insns, report.generic_ops, report.native_ops);
+
+                vm::VmRuntimeGenerator gen;
+                // `use_imagebase_key` reads `PEB.ImageBaseAddress` at
+                // VM runtime and folds it into the handler-table key
+                // via a build-time MBA chain anchored on
+                // `preferred_image_base`. For an EXE, PEB.ImageBase
+                // == the exe's own preferred base (we strip
+                // relocations), so the chain agrees. For a DLL,
+                // PEB.ImageBase is the HOST exe's base regardless of
+                // which module is running — a DLL VM using this key
+                // would compute the wrong table_xor_key and dispatch
+                // every handler into garbage. `VirtualizationPass`
+                // has the same gate for the same reason.
+                const bool is_exe =
+                    ctx_.pe_image().pe_type() == PeType::executable;
+                const vm::VmGenOptions opts{
+                    .emit_exit_as_jmp        = false,
+                    .use_imagebase_key       = is_exe,
+                    .preferred_image_base    =
+                        static_cast<uint64_t>(ctx_.pe_image().image_base()),
+                    .skip_anti_tamper_checks = true,
+                };
+                auto runtime = gen.generate(vm_insns, rng_, opts);
+                if (!runtime) {
+                    ctx_.log_fmt("PackerPass: P3 VM-lift generate failed ({}), keeping plaintext",
+                        runtime.error().message());
+                } else {
+                    while (stub_buf_.size() % 16 != 0) {
+                        stub_buf_.push_back(0xCC);
+                    }
+                    packer_vm_blob_offset_   = stub_buf_.size();
+                    packer_vm_entry_offset_  = runtime->entry_offset;
+                    stub_buf_.insert(stub_buf_.end(),
+                                     runtime->blob.begin(),
+                                     runtime->blob.end());
+                    packer_vm_lift_succeeded_ = true;
+                    ctx_.log_fmt("PackerPass: P3 VM blob {} байт, entry @ stub+0x{:X}",
+                        runtime->blob.size(),
+                        packer_vm_blob_offset_ + packer_vm_entry_offset_);
+                }
+            }
+        }
+
+        // Embed the reprotect section table right after the VM blob.
+        reprotect_table_offset_in_stub_ =
+            static_cast<uint32_t>(stub_buf_.size());
+        stub_buf_.insert(stub_buf_.end(), encrypted_.size() * 8, uint8_t{0});
+
+        // --------------------------------------------------
+        // P4 — TLS callback artefacts.
+        //
+        // Layout appended to the end of stub_buf_ (all inside the
+        // same .mxpack section, so everything lives in one R+W+X
+        // page the loader maps as one unit):
+        //
+        //     [callback body]           ~32 bytes
+        //     [8-byte alignment pad]
+        //     [IMAGE_TLS_DIRECTORY64]   40 bytes
+        //     [8-byte alignment pad]
+        //     [callback array]          (N+2) × 8 bytes, NULL terminated
+        //     [optional index slot]     4 bytes, only if no existing TLS
+        //
+        // For inputs that already ship with a TLS directory (C++
+        // programs with `__declspec(thread)` statics, for instance) we
+        // parse the existing one first and preserve its fields —
+        // StartAddressOfRawData / EndAddressOfRawData / AddressOfIndex
+        // / SizeOfZeroFill / Characteristics — verbatim. Our new
+        // callback prepends itself to the front of the existing
+        // callback array so the anti-debug probe fires before any
+        // CRT-registered TLS initialiser, and every original callback
+        // still runs in its original order afterward.
+        //
+        // Everything past this point lives at a fixed offset inside
+        // `stub_buf_`; the runtime RVA of each slot is
+        // `stub_rva + offset_in_stub_buf`. step6 back-patches them
+        // (along with the RC4-key rel32 inside the callback body)
+        // after `finalize_packer_stub` has placed the .mxpack section
+        // and we know `stub_rva_`.
+        existing_tls_opt_ = read_existing_tls_directory(ctx_.pe_image());
+
+        // Align to 8 bytes before the callback body so every
+        // downstream 8-byte field lands at a naturally-aligned
+        // offset.
+        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
+
+        tls_cb_ = emit_tls_callback_body(stub_buf_, rng_, layer_count_);
+
+        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
+        tls_dir_offset_in_stub_ = static_cast<uint32_t>(stub_buf_.size());
+        stub_buf_.insert(stub_buf_.end(), 40, uint8_t{0});  // IMAGE_TLS_DIRECTORY64
+
+        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
+        tls_cb_array_offset_in_stub_ =
+            static_cast<uint32_t>(stub_buf_.size());
+
+        // Callback array sizing: packer_cb + (optional guard
+        // installer) + existing user callbacks + NULL terminator. The
+        // guard installer slot is only reserved when an earlier pass
+        // (GuardPass) set `ctx_.extra_tls_callback_va`; otherwise we
+        // keep the old layout.
+        has_extra_tls_cb_ = ctx_.extra_tls_callback_va() != 0;
+        tls_cb_array_entries_ =
+            (existing_tls_opt_.has_value()
+                ? existing_tls_opt_->callbacks.size()
+                : 0)
+            + (has_extra_tls_cb_ ? 1u : 0u)
+            + 2u;  // +1 for our packer cb, +1 for the NULL terminator
+        stub_buf_.insert(stub_buf_.end(),
+                         tls_cb_array_entries_ * 8,
+                         uint8_t{0});
+
+        // Index slot — only needed when the input had no TLS
+        // directory of its own. If an existing directory was found
+        // its AddressOfIndex already points at a valid 4-byte slot in
+        // one of the preserved input sections, so we reuse that.
+        if (!existing_tls_opt_.has_value()) {
+            while (stub_buf_.size() % 4 != 0) stub_buf_.push_back(0xCC);
+            tls_index_slot_offset_in_stub_ =
+                static_cast<uint32_t>(stub_buf_.size());
+            stub_buf_.insert(stub_buf_.end(), 4, uint8_t{0});
+        }
+    }
+
+    [[nodiscard]] MxStatus step5_inject_and_patch() {
+        // Inject the .mxpack section + apply the common rel32
+        // patches. Characteristics include MEM_WRITE because the RC4
+        // KSA rebuilds the S-box scratch area at runtime and the
+        // scratch lives inside the stub section itself.
+        constexpr uint32_t pack_characteristics =
+            pe::IMAGE_SCN_CNT_CODE |
+            pe::IMAGE_SCN_MEM_EXECUTE |
+            pe::IMAGE_SCN_MEM_READ |
+            pe::IMAGE_SCN_MEM_WRITE;
+
+        auto inject = finalize_packer_stub(
+            ctx_, std::move(stub_buf_),
+            pack_characteristics, steal_, patches_);
+        if (!inject) return std::unexpected(inject.error());
+
+        pack_section_index_ = inject->pack_section_index;
+        stub_rva_           = inject->stub_rva;
+        auto& pack_sec      = ctx_.pe_image().sections()[pack_section_index_];
+
+        // Per-layer patching: every layer has its own `lea rsi, key_K`
+        // and its own per-section `lea rdi / mov ecx` pair.
+        for (uint32_t layer = 0; layer < layer_count_; ++layer) {
+            const auto& lp = patches_.layers[layer];
+
+            // lea rsi, [rip + rel] → this layer's 32-byte RC4 key.
+            {
+                const Rva lea_end_rva = stub_rva_ + lp.rel_to_key_at + 4;
+                const Rva key_rva     = stub_rva_ + key_offsets_in_stub_[layer];
+                const int32_t rel = static_cast<int32_t>(
+                    static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
+                write_i32(pack_sec.data, lp.rel_to_key_at, rel);
+            }
+
+            // Per-section: lea rdi → section base, mov ecx → section size.
+            for (size_t i = 0; i < encrypted_.size(); ++i) {
+                const auto& ds  = lp.sections[i];
+                const auto& tgt = encrypted_[i];
+
+                const Rva lea_end_rva = stub_rva_ + ds.patch_lea_at + 4;
+                const int32_t rel = static_cast<int32_t>(
+                    static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
+                write_i32(pack_sec.data, ds.patch_lea_at, rel);
+                write_i32(pack_sec.data, ds.patch_size_at,
+                          static_cast<int32_t>(tgt.size));
+            }
+        }
+
+        // lea r8, [rip + rel] → 256-byte S-box scratch area.
+        {
+            const Rva lea_end_rva = stub_rva_ + patches_.rel_to_sbox_at + 4;
+            const Rva sbox_rva    = stub_rva_ + sbox_offset_in_stub_;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(pack_sec.data, patches_.rel_to_sbox_at, rel);
+        }
+
+        // P3 — if the KSA block was successfully lifted, overwrite
+        // the plaintext KSA bytes with `call rel32 <vm_entry>` + NOP
+        // pad.
+        if (packer_vm_lift_succeeded_) {
+            const Rva vm_entry_rva =
+                stub_rva_ +
+                static_cast<Rva>(packer_vm_blob_offset_) +
+                static_cast<Rva>(packer_vm_entry_offset_);
+            const uint32_t ksa_off = patches_.ksa_block_start_offset;
+            const Rva    call_rva    = stub_rva_ + ksa_off;
+            const Rva    call_end_rva = call_rva + 5;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(vm_entry_rva) -
+                static_cast<int64_t>(call_end_rva));
+
+            pack_sec.data[ksa_off + 0] = 0xE8;  // call rel32
+            pack_sec.data[ksa_off + 1] = static_cast<uint8_t>(rel        & 0xFF);
+            pack_sec.data[ksa_off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
+            pack_sec.data[ksa_off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
+            pack_sec.data[ksa_off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
+            for (uint32_t i = ksa_off + 5; i < patches_.ksa_block_end_offset; ++i) {
+                pack_sec.data[i] = 0x90;
+            }
+            ctx_.log_fmt("PackerPass: P3 KSA replaced with call vm_entry @ RVA=0x{:08X}",
+                vm_entry_rva);
+        }
+
+        // ImageBase rip-relative computation. The `lea rbx, [rip + 0];
+        // sub rbx, imm32` pair in the reprotect block needs `imm32 =
+        // stub_section_rva + imagebase_lea_anchor_offset` so that at
+        // runtime `rbx = current_rip - imm32 = module_base`. This
+        // works for both EXE (host == packed module) and DLL (host !=
+        // packed module) — we never read PEB.ImageBaseAddress.
+        {
+            const uint32_t imm32 =
+                stub_rva_ + patches_.imagebase_lea_anchor_offset;
+            write_i32(pack_sec.data, patches_.imagebase_sub_imm32_at,
+                      static_cast<int32_t>(imm32));
+        }
+
+        // lea r14, [rip + rel] → reprotect section table + fill data.
+        {
+            const Rva lea_end_rva = stub_rva_ + patches_.rel_to_reprotect_table_at + 4;
+            const Rva table_rva   = stub_rva_ + reprotect_table_offset_in_stub_;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(table_rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(pack_sec.data, patches_.rel_to_reprotect_table_at, rel);
+
+            for (size_t i = 0; i < encrypted_.size(); ++i) {
+                const uint32_t entry_off =
+                    reprotect_table_offset_in_stub_ + static_cast<uint32_t>(i * 8);
+                write_i32(pack_sec.data, entry_off + 0,
+                          static_cast<int32_t>(encrypted_[i].rva));
+                write_i32(pack_sec.data, entry_off + 4,
+                          static_cast<int32_t>(encrypted_[i].size));
+            }
+        }
+
+        // IAT destruction: patch lea rdi → Import Directory + the size.
+        {
+            Rva impdir_rva = 0;
+            uint32_t impdir_size = 0;
+            std::visit([&](const auto& nt) {
+                if (pe::IMAGE_DIRECTORY_ENTRY_IMPORT < nt.OptionalHeader.NumberOfRvaAndSizes) {
+                    impdir_rva  = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                    impdir_size = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                }
+            }, ctx_.pe_image().nt_headers());
+
+            if (impdir_rva != 0 && impdir_size >= 4) {
+                const Rva lea_end_rva = stub_rva_ + patches_.rel_to_impdir_at + 4;
+                const int32_t rel = static_cast<int32_t>(
+                    static_cast<int64_t>(impdir_rva) - static_cast<int64_t>(lea_end_rva));
+                write_i32(pack_sec.data, patches_.rel_to_impdir_at, rel);
+                write_i32(pack_sec.data, patches_.impdir_size_at,
+                          static_cast<int32_t>(impdir_size / 4));
+                ctx_.log_fmt("PackerPass: IAT destruction — Import Directory 0x{:08X} ({} байт) "
+                             "будет обнулён при запуске",
+                    impdir_rva, impdir_size);
+            } else {
+                write_i32(pack_sec.data, patches_.impdir_size_at, 0);
+            }
+        }
         return {};
     }
 
-    // P6 — section encryption is DEFERRED until after the stub is
-    // fully assembled and patched. The effective cipher keys that
-    // encrypt each section are a function of the stub's FNV-1a self
-    // integrity hash, which can only be computed once every rel32
-    // inside the stub and the hash count imm32 have been finalised.
-    // The sections stay plaintext in `pe_image` until the final
-    // "hash + derive + encrypt" block at the end of this function,
-    // which runs after TLS callback finalisation. Nothing between
-    // here and that block reads section contents — every downstream
-    // step only needs section RVAs and sizes, which are already
-    // captured in `encrypted`.
-
-    // G3 Phase 2 VEH INT3 trap gate: opt-in AND EXE-only. DLL stubs
-    // cannot safely install a VEH — it would outlive the DLL's
-    // unload and leave a dangling handler in the host process. The
-    // DllFullStubEmitter forces `enable_veh_trap=false` inside its
-    // emit() regardless of what we pass here, but we still clear
-    // the flag at this level so the log / params reflect reality.
-    const bool pe_is_exe =
-        ctx.pe_image().pe_type() == PeType::executable;
-    const bool enable_veh_trap =
-        ctx.config().enable_veh_anti_tamper && pe_is_exe;
-
-    if (ctx.config().enable_veh_anti_tamper && !pe_is_exe) {
-        ctx.log("PackerPass: --anti-tamper-veh проигнорирован для DLL "
-                "(VEH переживёт unload — unsafe)");
-    } else if (enable_veh_trap) {
-        ctx.log("PackerPass: G3 Phase 2 VEH INT3 trap включён");
-    }
-
-    // Emit the stub via the policy-specified emitter.
-    Emitter emitter{StubEmissionParams{
-        .section_count   = static_cast<uint32_t>(encrypted.size()),
-        .layer_count     = layer_count,
-        .enable_veh_trap = enable_veh_trap,
-    }};
-    auto [stub_buf, patches] = emitter.emit(
-        rng, ByteView{steal.stolen_bytes.data(), steal.stolen_bytes.size()});
-
-    // Append each layer's 32-byte RC4 key to the stub buffer and
-    // record the stub-relative offsets so each layer's `lea rsi, key_K`
-    // rel32 can be patched after the stub section is injected.
-    std::vector<uint32_t> key_offsets_in_stub(layer_count);
-    for (uint32_t layer = 0; layer < layer_count; ++layer) {
-        key_offsets_in_stub[layer] = static_cast<uint32_t>(stub_buf.size());
-        stub_buf.insert(stub_buf.end(),
-                        layer_keys[layer].begin(),
-                        layer_keys[layer].end());
-    }
-
-    // S-box scratch: 256 bytes. At runtime the KSA overwrites the
-    // whole region — the build-time content doesn't matter, we just
-    // need the space inside the section so `lea r8, sbox` points at
-    // valid memory.
-    const uint32_t sbox_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
-    stub_buf.insert(stub_buf.end(), kSboxSize, uint8_t{0});
-
-    // P3 — VM-protected KSA. If a disassembler is available, lift
-    // the RC4 KSA range through the existing VM engine and append
-    // the runtime blob to the stub buffer; the original plaintext
-    // KSA bytes are later overwritten with `call rel32 <vm_entry>`.
-    size_t   packer_vm_blob_offset    = 0;
-    uint32_t packer_vm_entry_offset   = 0;
-    bool     packer_vm_lift_succeeded = false;
-    if (ctx.disassembler() != nullptr &&
-        patches.ksa_block_end_offset > patches.ksa_block_start_offset)
-    {
-        const size_t ksa_size =
-            patches.ksa_block_end_offset - patches.ksa_block_start_offset;
-        ByteView ksa_view{
-            stub_buf.data() + patches.ksa_block_start_offset,
-            ksa_size};
-
-        vm::VmLifter lifter(*ctx.disassembler());
-        constexpr Va kFakeKsaBase = 0x0000000140000000ULL;
-        auto lift_result = lifter.lift(ksa_view, kFakeKsaBase);
-        if (!lift_result) {
-            ctx.log_fmt("PackerPass: P3 VM-lift KSA failed ({}), keeping plaintext",
-                lift_result.error().message());
-        } else {
-            auto [vm_insns, report] = *lift_result;
-            ctx.log_fmt("PackerPass: P3 VM-lift OK — total={}, generic={}, native={}",
-                report.total_insns, report.generic_ops, report.native_ops);
-
-            vm::VmRuntimeGenerator gen;
-            // `use_imagebase_key` reads `PEB.ImageBaseAddress` at VM
-            // runtime and folds it into the handler-table key via a
-            // build-time MBA chain anchored on `preferred_image_base`.
-            // For an EXE, PEB.ImageBase == the exe's own preferred
-            // base (we strip relocations), so the chain agrees. For
-            // a DLL, PEB.ImageBase is the HOST exe's base regardless
-            // of which module is running — a DLL VM using this key
-            // would compute the wrong table_xor_key and dispatch
-            // every handler into garbage. `VirtualizationPass` has
-            // the same gate for the same reason.
-            const bool is_exe =
-                ctx.pe_image().pe_type() == PeType::executable;
-            const vm::VmGenOptions opts{
-                .emit_exit_as_jmp        = false,
-                .use_imagebase_key       = is_exe,
-                .preferred_image_base    =
-                    static_cast<uint64_t>(ctx.pe_image().image_base()),
-                .skip_anti_tamper_checks = true,
-            };
-            auto runtime = gen.generate(vm_insns, rng, opts);
-            if (!runtime) {
-                ctx.log_fmt("PackerPass: P3 VM-lift generate failed ({}), keeping plaintext",
-                    runtime.error().message());
-            } else {
-                while (stub_buf.size() % 16 != 0) {
-                    stub_buf.push_back(0xCC);
-                }
-                packer_vm_blob_offset   = stub_buf.size();
-                packer_vm_entry_offset  = runtime->entry_offset;
-                stub_buf.insert(stub_buf.end(),
-                                runtime->blob.begin(),
-                                runtime->blob.end());
-                packer_vm_lift_succeeded = true;
-                ctx.log_fmt("PackerPass: P3 VM blob {} байт, entry @ stub+0x{:X}",
-                    runtime->blob.size(),
-                    packer_vm_blob_offset + packer_vm_entry_offset);
-            }
-        }
-    }
-
-    // Embed the reprotect section table right after the VM blob.
-    const uint32_t reprotect_table_offset_in_stub =
-        static_cast<uint32_t>(stub_buf.size());
-    stub_buf.insert(stub_buf.end(), encrypted.size() * 8, uint8_t{0});
-
-    // ----------------------------------------------------------
-    // P4 — TLS callback artefacts.
-    //
-    // Layout appended to the end of stub_buf (all inside the same
-    // .mxpack section, so everything lives in one R+W+X page the
-    // loader maps as one unit):
-    //
-    //     [callback body]           ~32 bytes
-    //     [8-byte alignment pad]
-    //     [IMAGE_TLS_DIRECTORY64]   40 bytes
-    //     [8-byte alignment pad]
-    //     [callback array]          (N+2) × 8 bytes, NULL terminated
-    //     [optional index slot]     4 bytes, only if no existing TLS
-    //
-    // For inputs that already ship with a TLS directory (C++
-    // programs with `__declspec(thread)` statics, for instance) we
-    // parse the existing one first and preserve its fields —
-    // StartAddressOfRawData / EndAddressOfRawData / AddressOfIndex /
-    // SizeOfZeroFill / Characteristics — verbatim. Our new callback
-    // prepends itself to the front of the existing callback array
-    // so the anti-debug probe fires before any CRT-registered TLS
-    // initialiser, and every original callback still runs in its
-    // original order afterward.
-    //
-    // Everything past this point lives at a fixed offset inside
-    // `stub_buf`; the runtime RVA of each slot is
-    // `stub_rva + offset_in_stub_buf`. We record the offsets now
-    // and back-patch them (along with the RC4-key rel32 inside the
-    // callback body) after `finalize_packer_stub` has placed the
-    // .mxpack section and we know `stub_rva`.
-    const auto existing_tls_opt = read_existing_tls_directory(ctx.pe_image());
-
-    // Align to 8 bytes before the callback body so every downstream
-    // 8-byte field lands at a naturally-aligned offset.
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
-
-    const TlsCallbackEmit tls_cb = emit_tls_callback_body(stub_buf, rng, layer_count);
-
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
-    const uint32_t tls_dir_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
-    stub_buf.insert(stub_buf.end(), 40, uint8_t{0});  // IMAGE_TLS_DIRECTORY64
-
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
-    const uint32_t tls_cb_array_offset_in_stub =
-        static_cast<uint32_t>(stub_buf.size());
-    // Callback array sizing: packer_cb + (optional guard installer) +
-    // existing user callbacks + NULL terminator. The guard installer
-    // slot is only reserved when an earlier pass (GuardPass) set
-    // `ctx.extra_tls_callback_va`; otherwise we keep the old layout.
-    const bool has_extra_tls_cb = ctx.extra_tls_callback_va() != 0;
-    const size_t tls_cb_array_entries =
-        (existing_tls_opt.has_value()
-            ? existing_tls_opt->callbacks.size()
-            : 0)
-        + (has_extra_tls_cb ? 1u : 0u)
-        + 2u;  // +1 for our packer cb, +1 for the NULL terminator
-    stub_buf.insert(stub_buf.end(), tls_cb_array_entries * 8, uint8_t{0});
-
-    // Index slot — only needed when the input had no TLS directory
-    // of its own. If an existing directory was found its
-    // AddressOfIndex already points at a valid 4-byte slot in one
-    // of the preserved input sections, so we reuse that.
-    uint32_t tls_index_slot_offset_in_stub = 0;
-    if (!existing_tls_opt.has_value()) {
-        while (stub_buf.size() % 4 != 0) stub_buf.push_back(0xCC);
-        tls_index_slot_offset_in_stub =
-            static_cast<uint32_t>(stub_buf.size());
-        stub_buf.insert(stub_buf.end(), 4, uint8_t{0});
-    }
-
-    // Inject the .mxpack section + apply the common rel32 patches.
-    // Characteristics include MEM_WRITE because the RC4 KSA rebuilds
-    // the S-box scratch area at runtime and the scratch lives inside
-    // the stub section itself.
-    constexpr uint32_t pack_characteristics =
-        pe::IMAGE_SCN_CNT_CODE |
-        pe::IMAGE_SCN_MEM_EXECUTE |
-        pe::IMAGE_SCN_MEM_READ |
-        pe::IMAGE_SCN_MEM_WRITE;
-
-    auto inject = finalize_packer_stub(
-        ctx, std::move(stub_buf), pack_characteristics, steal, patches);
-    if (!inject) return std::unexpected(inject.error());
-
-    auto& pack_sec = ctx.pe_image().sections()[inject->pack_section_index];
-    const Rva stub_rva = inject->stub_rva;
-
-    // Per-layer patching: every layer has its own `lea rsi, key_K`
-    // and its own per-section `lea rdi / mov ecx` pair.
-    for (uint32_t layer = 0; layer < layer_count; ++layer) {
-        const auto& lp = patches.layers[layer];
-
-        // lea rsi, [rip + rel] → this layer's 32-byte RC4 key.
-        {
-            const Rva lea_end_rva = stub_rva + lp.rel_to_key_at + 4;
-            const Rva key_rva     = stub_rva + key_offsets_in_stub[layer];
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
-            write_i32(pack_sec.data, lp.rel_to_key_at, rel);
-        }
-
-        // Per-section: lea rdi → section base, mov ecx → section size.
-        for (size_t i = 0; i < encrypted.size(); ++i) {
-            const auto& ds  = lp.sections[i];
-            const auto& tgt = encrypted[i];
-
-            const Rva lea_end_rva = stub_rva + ds.patch_lea_at + 4;
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
-            write_i32(pack_sec.data, ds.patch_lea_at, rel);
-            write_i32(pack_sec.data, ds.patch_size_at,
-                      static_cast<int32_t>(tgt.size));
-        }
-    }
-
-    // lea r8, [rip + rel] → 256-byte S-box scratch area.
-    {
-        const Rva lea_end_rva = stub_rva + patches.rel_to_sbox_at + 4;
-        const Rva sbox_rva    = stub_rva + sbox_offset_in_stub;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_sbox_at, rel);
-    }
-
-    // P3 — if the KSA block was successfully lifted, overwrite the
-    // plaintext KSA bytes with `call rel32 <vm_entry>` + NOP pad.
-    if (packer_vm_lift_succeeded) {
-        const Rva vm_entry_rva =
-            stub_rva +
-            static_cast<Rva>(packer_vm_blob_offset) +
-            static_cast<Rva>(packer_vm_entry_offset);
-        const uint32_t ksa_off = patches.ksa_block_start_offset;
-        const Rva    call_rva   = stub_rva + ksa_off;
-        const Rva    call_end_rva = call_rva + 5;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(vm_entry_rva) -
-            static_cast<int64_t>(call_end_rva));
-
-        pack_sec.data[ksa_off + 0] = 0xE8;  // call rel32
-        pack_sec.data[ksa_off + 1] = static_cast<uint8_t>(rel        & 0xFF);
-        pack_sec.data[ksa_off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
-        pack_sec.data[ksa_off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
-        pack_sec.data[ksa_off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
-        for (uint32_t i = ksa_off + 5; i < patches.ksa_block_end_offset; ++i) {
-            pack_sec.data[i] = 0x90;
-        }
-        ctx.log_fmt("PackerPass: P3 KSA replaced with call vm_entry @ RVA=0x{:08X}",
-            vm_entry_rva);
-    }
-
-    // ImageBase rip-relative computation. The `lea rbx, [rip + 0];
-    // sub rbx, imm32` pair in the reprotect block needs `imm32 =
-    // stub_section_rva + imagebase_lea_anchor_offset` so that at
-    // runtime `rbx = current_rip - imm32 = module_base`. This works
-    // for both EXE (host == packed module) and DLL (host != packed
-    // module) — we never read PEB.ImageBaseAddress.
-    {
-        const uint32_t imm32 =
-            stub_rva + patches.imagebase_lea_anchor_offset;
-        write_i32(pack_sec.data, patches.imagebase_sub_imm32_at,
-                  static_cast<int32_t>(imm32));
-    }
-
-    // lea r14, [rip + rel] → reprotect section table + fill data.
-    {
-        const Rva lea_end_rva = stub_rva + patches.rel_to_reprotect_table_at + 4;
-        const Rva table_rva   = stub_rva + reprotect_table_offset_in_stub;
-        const int32_t rel = static_cast<int32_t>(
-            static_cast<int64_t>(table_rva) - static_cast<int64_t>(lea_end_rva));
-        write_i32(pack_sec.data, patches.rel_to_reprotect_table_at, rel);
-
-        for (size_t i = 0; i < encrypted.size(); ++i) {
-            const uint32_t entry_off =
-                reprotect_table_offset_in_stub + static_cast<uint32_t>(i * 8);
-            write_i32(pack_sec.data, entry_off + 0,
-                      static_cast<int32_t>(encrypted[i].rva));
-            write_i32(pack_sec.data, entry_off + 4,
-                      static_cast<int32_t>(encrypted[i].size));
-        }
-    }
-
-    // IAT destruction: patch lea rdi → Import Directory + the size.
-    {
-        Rva impdir_rva = 0;
-        uint32_t impdir_size = 0;
-        std::visit([&](const auto& nt) {
-            if (pe::IMAGE_DIRECTORY_ENTRY_IMPORT < nt.OptionalHeader.NumberOfRvaAndSizes) {
-                impdir_rva  = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-                impdir_size = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
-            }
-        }, ctx.pe_image().nt_headers());
-
-        if (impdir_rva != 0 && impdir_size >= 4) {
-            const Rva lea_end_rva = stub_rva + patches.rel_to_impdir_at + 4;
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(impdir_rva) - static_cast<int64_t>(lea_end_rva));
-            write_i32(pack_sec.data, patches.rel_to_impdir_at, rel);
-            write_i32(pack_sec.data, patches.impdir_size_at,
-                      static_cast<int32_t>(impdir_size / 4));
-            ctx.log_fmt("PackerPass: IAT destruction — Import Directory 0x{:08X} ({} байт) "
-                        "будет обнулён при запуске",
-                impdir_rva, impdir_size);
-        } else {
-            write_i32(pack_sec.data, patches.impdir_size_at, 0);
-        }
-    }
-
-    // ----------------------------------------------------------
-    // P4 — TLS callback finalisation.
-    //
-    // At this point the .mxpack section has been placed at
-    // `stub_rva` and every byte of stub_buf has been copied into
-    // `pack_sec.data`. We can now compute the absolute VAs for our
-    // TLS callback, the callback array, the TLS directory fields,
-    // and the (optional) index slot, and patch them into the
-    // section bytes. Finally we update `DataDirectory[TLS]` in the
-    // PE header to point at the new directory.
-    //
-    // Absolute VAs are safe because the packer strips base
-    // relocations at the very top of `execute_encrypted_stub`
-    // (via `prepare_oep_steal` → `disable_relocations`), so the
-    // runtime image base equals the build-time preferred base.
-    {
+    void step6_finalize_tls() {
+        // --------------------------------------------------
+        // P4 — TLS callback finalisation.
+        //
+        // At this point the .mxpack section has been placed at
+        // `stub_rva_` and every byte of stub_buf_ has been copied
+        // into `pack_sec.data`. We can now compute the absolute VAs
+        // for our TLS callback, the callback array, the TLS
+        // directory fields, and the (optional) index slot, and patch
+        // them into the section bytes. Finally we update
+        // `DataDirectory[TLS]` in the PE header to point at the new
+        // directory.
+        //
+        // Absolute VAs are safe because the packer strips base
+        // relocations at the very top of step1 (via
+        // `prepare_oep_steal` → `disable_relocations`), so the
+        // runtime image base equals the build-time preferred base.
+        auto& pack_sec = ctx_.pe_image().sections()[pack_section_index_];
         const auto image_base =
-            static_cast<uint64_t>(ctx.pe_image().image_base());
+            static_cast<uint64_t>(ctx_.pe_image().image_base());
         const uint64_t cb_body_va =
-            image_base + stub_rva + tls_cb.body_offset;
+            image_base + stub_rva_ + tls_cb_.body_offset;
         const uint64_t tls_dir_va =
-            image_base + stub_rva + tls_dir_offset_in_stub;
+            image_base + stub_rva_ + tls_dir_offset_in_stub_;
         const uint64_t cb_array_va =
-            image_base + stub_rva + tls_cb_array_offset_in_stub;
+            image_base + stub_rva_ + tls_cb_array_offset_in_stub_;
 
         // 1. Patch the `xor byte [rip + rel32], imm8` inside the
-        //    callback body to point at one byte of a per-build
-        //    random cipher layer's RC4 key. Corrupting ANY layer's
-        //    key is sufficient to cascade: a wrong S-box for one
-        //    layer produces a wrong PRGA output which means the
-        //    other layers decrypt the intermediate bytes into
-        //    garbage. Randomising the target layer per build
-        //    denies reversers a stable pivot — extracting the
-        //    corruption site from one binary tells them nothing
-        //    about the next. The rel32 is computed from the end
-        //    of the xor instruction (`xor_instruction_end`) to
-        //    the target byte.
+        //    callback body to point at one byte of a per-build random
+        //    cipher layer's RC4 key. Corrupting ANY layer's key is
+        //    sufficient to cascade: a wrong S-box for one layer
+        //    produces a wrong PRGA output which means the other
+        //    layers decrypt the intermediate bytes into garbage.
+        //    Randomising the target layer per build denies reversers
+        //    a stable pivot — extracting the corruption site from one
+        //    binary tells them nothing about the next. The rel32 is
+        //    computed from the end of the xor instruction
+        //    (`xor_instruction_end`) to the target byte.
         const uint32_t key_target_offset_in_stub =
-            key_offsets_in_stub[tls_cb.key_layer_index] +
-            tls_cb.key_byte_offset_in_key;
+            key_offsets_in_stub_[tls_cb_.key_layer_index] +
+            tls_cb_.key_byte_offset_in_key;
         const int32_t xor_rel32 = static_cast<int32_t>(
             static_cast<int64_t>(key_target_offset_in_stub) -
-            static_cast<int64_t>(tls_cb.xor_instruction_end));
-        write_i32(pack_sec.data, tls_cb.xor_key_rel32_offset, xor_rel32);
+            static_cast<int64_t>(tls_cb_.xor_instruction_end));
+        write_i32(pack_sec.data, tls_cb_.xor_key_rel32_offset, xor_rel32);
 
-        // 2. Fill the callback array: our packer callback first,
-        //    then (optional) the runtime-guards VEH installer from
-        //    `ctx.extra_tls_callback_va`, then every existing
+        // 2. Fill the callback array: our packer callback first, then
+        //    (optional) the runtime-guards VEH installer from
+        //    `ctx_.extra_tls_callback_va`, then every existing
         //    callback from the input TLS directory in its original
         //    order, then a NULL terminator.
         //
@@ -801,52 +853,52 @@ template <StubEmitter Emitter>
         // triggers guarded paths — if the VEH isn't installed yet,
         // those int3s crash the process. So:
         //     [packer_cb][guard_install_cb?][user_cb_0][user_cb_1]...[NULL]
-        uint32_t write_off = tls_cb_array_offset_in_stub;
+        uint32_t write_off = tls_cb_array_offset_in_stub_;
         write_u64_le(pack_sec.data, write_off, cb_body_va);
         write_off += 8;
-        if (has_extra_tls_cb) {
+        if (has_extra_tls_cb_) {
             write_u64_le(pack_sec.data, write_off,
-                         ctx.extra_tls_callback_va());
+                         ctx_.extra_tls_callback_va());
             write_off += 8;
         }
-        if (existing_tls_opt.has_value()) {
-            for (const uint64_t old_cb : existing_tls_opt->callbacks) {
+        if (existing_tls_opt_.has_value()) {
+            for (const uint64_t old_cb : existing_tls_opt_->callbacks) {
                 write_u64_le(pack_sec.data, write_off, old_cb);
                 write_off += 8;
             }
         }
         write_u64_le(pack_sec.data, write_off, 0);  // terminator
 
-        // 3. Fill the TLS directory. Non-callback fields come from
-        //    the existing directory when present, so C++
+        // 3. Fill the TLS directory. Non-callback fields come from the
+        //    existing directory when present, so C++
         //    `__declspec(thread)` data still works.
         uint64_t index_va = 0;
         uint64_t start_va = 0;
         uint64_t end_va   = 0;
         uint32_t zero_fill = 0;
         uint32_t characteristics = 0;
-        if (existing_tls_opt.has_value()) {
-            start_va        = existing_tls_opt->start_va;
-            end_va          = existing_tls_opt->end_va;
-            index_va        = existing_tls_opt->index_va;
-            zero_fill       = existing_tls_opt->size_of_zero_fill;
-            characteristics = existing_tls_opt->characteristics;
+        if (existing_tls_opt_.has_value()) {
+            start_va        = existing_tls_opt_->start_va;
+            end_va          = existing_tls_opt_->end_va;
+            index_va        = existing_tls_opt_->index_va;
+            zero_fill       = existing_tls_opt_->size_of_zero_fill;
+            characteristics = existing_tls_opt_->characteristics;
         } else {
             // No existing TLS — point AddressOfIndex at our own
             // 4-byte scratch slot inside .mxpack.
-            index_va = image_base + stub_rva + tls_index_slot_offset_in_stub;
+            index_va = image_base + stub_rva_ + tls_index_slot_offset_in_stub_;
         }
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub + 0x00, start_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub + 0x08, end_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub + 0x10, index_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub + 0x18, cb_array_va);
-        write_u32_le(pack_sec.data, tls_dir_offset_in_stub + 0x20, zero_fill);
-        write_u32_le(pack_sec.data, tls_dir_offset_in_stub + 0x24, characteristics);
+        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x00, start_va);
+        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x08, end_va);
+        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x10, index_va);
+        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x18, cb_array_va);
+        write_u32_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x20, zero_fill);
+        write_u32_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x24, characteristics);
 
         // 4. Point the PE header's TLS data directory at our new
         //    in-.mxpack directory.
         const Rva tls_dir_rva =
-            static_cast<Rva>(stub_rva + tls_dir_offset_in_stub);
+            static_cast<Rva>(stub_rva_ + tls_dir_offset_in_stub_);
         std::visit([&](auto& nt) {
             if (pe::IMAGE_DIRECTORY_ENTRY_TLS < nt.OptionalHeader.NumberOfRvaAndSizes) {
                 nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress
@@ -854,72 +906,73 @@ template <StubEmitter Emitter>
                 nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].Size
                     = 40;
             }
-        }, ctx.pe_image().nt_headers());
+        }, ctx_.pe_image().nt_headers());
 
-        ctx.log_fmt("PackerPass: P4 TLS callback planted @ RVA=0x{:08X}, "
-                    "chain length {} (existing={}, ours=1), "
-                    "corrupts key[layer={}, byte={}]",
-            stub_rva + tls_cb.body_offset,
-            static_cast<uint32_t>(tls_cb_array_entries - 1),
-            existing_tls_opt.has_value()
-                ? static_cast<uint32_t>(existing_tls_opt->callbacks.size())
+        ctx_.log_fmt("PackerPass: P4 TLS callback planted @ RVA=0x{:08X}, "
+                     "chain length {} (existing={}, ours=1), "
+                     "corrupts key[layer={}, byte={}]",
+            stub_rva_ + tls_cb_.body_offset,
+            static_cast<uint32_t>(tls_cb_array_entries_ - 1),
+            existing_tls_opt_.has_value()
+                ? static_cast<uint32_t>(existing_tls_opt_->callbacks.size())
                 : 0u,
-            tls_cb.key_layer_index,
-            tls_cb.key_byte_offset_in_key);
+            tls_cb_.key_layer_index,
+            tls_cb_.key_byte_offset_in_key);
         (void)tls_dir_va;  // reserved for future use (direct self-reference)
     }
 
-    // ----------------------------------------------------------
-    // P6 — stub-self-integrity hash + effective-key derivation.
-    //
-    // Every rel32 inside the cipher body has been patched (layer
-    // keys, sections, sbox, ImageBase, reprotect table, IAT wipe,
-    // optional VM-lift call, TLS plumbing outside the hash range).
-    // We now:
-    //
-    //   1. Patch the runtime self-hash loop's `count imm32` slot
-    //      with the finalised `hash_range_end_offset`. The count
-    //      is INSIDE the hashed range, so this write must happen
-    //      before we compute the build-time hash.
-    //
-    //   2. Compute `fnv1a_32` over `pack_sec.data[0 ..
-    //      hash_range_end_offset)`. Bit-exact against what the
-    //      runtime self-hash loop will produce on a clean host.
-    //      Any tamper that changes any byte in this range at
-    //      runtime — debugger INT3, hotpatch, NOP'd anti-debug
-    //      probe, hooked reprotect syscall, etc. — will cascade
-    //      through the per-layer key derivation and produce a
-    //      diverged effective key.
-    //
-    //   3. For each cipher layer, copy the base key into a
-    //      scratch `effective` buffer and apply
-    //      `derive_effective_key_in_place(hash, effective)`. The
-    //      stub's runtime derivation loop produces the same
-    //      32 bytes per layer, so encrypting the target sections
-    //      with `effective` here gives the runtime a cascade that
-    //      unwinds to plaintext on a clean host.
-    //
-    //   4. Encrypt every target section by running RC4 with the
-    //      per-layer effective key in BUILD order (0 → N-1). The
-    //      runtime decrypts in reverse order (N-1 → 0) and each
-    //      RC4 round is self-inverse, so the cascade unwinds.
-    //      Build-time anti-debug bias is 0 (clean host), matching
-    //      layer 0's runtime seed when no debugger is attached.
-    //
-    // Base keys remain unmodified inside the stub's data tail —
-    // the runtime re-derives effective keys from `base + hash`
-    // every time the process starts. An attacker who statically
-    // reads the keys out of `.mxpack` no longer has enough
-    // information to decrypt the sections offline; they must
-    // also simulate the exact FNV-1a hash over the stub code
-    // AND the FNV-1a-chain derivation. That's a real bump in
-    // reverser effort for mass-protected samples.
-    {
-        const uint32_t hash_range_end = patches.hash_range_end_offset;
+    [[nodiscard]] MxStatus step7_hash_and_encrypt() {
+        // --------------------------------------------------
+        // P6 — stub-self-integrity hash + effective-key derivation.
+        //
+        // Every rel32 inside the cipher body has been patched (layer
+        // keys, sections, sbox, ImageBase, reprotect table, IAT wipe,
+        // optional VM-lift call, TLS plumbing outside the hash
+        // range). We now:
+        //
+        //   1. Patch the runtime self-hash loop's `count imm32` slot
+        //      with the finalised `hash_range_end_offset`. The count
+        //      is INSIDE the hashed range, so this write must happen
+        //      before we compute the build-time hash.
+        //
+        //   2. Compute `fnv1a_32` over `pack_sec.data[0 ..
+        //      hash_range_end_offset)`. Bit-exact against what the
+        //      runtime self-hash loop will produce on a clean host.
+        //      Any tamper that changes any byte in this range at
+        //      runtime — debugger INT3, hotpatch, NOP'd anti-debug
+        //      probe, hooked reprotect syscall, etc. — will cascade
+        //      through the per-layer key derivation and produce a
+        //      diverged effective key.
+        //
+        //   3. For each cipher layer, copy the base key into a
+        //      scratch `effective` buffer and apply
+        //      `derive_effective_key_in_place(hash, effective)`. The
+        //      stub's runtime derivation loop produces the same
+        //      32 bytes per layer, so encrypting the target sections
+        //      with `effective` here gives the runtime a cascade that
+        //      unwinds to plaintext on a clean host.
+        //
+        //   4. Encrypt every target section by running RC4 with the
+        //      per-layer effective key in BUILD order (0 → N-1). The
+        //      runtime decrypts in reverse order (N-1 → 0) and each
+        //      RC4 round is self-inverse, so the cascade unwinds.
+        //      Build-time anti-debug bias is 0 (clean host), matching
+        //      layer 0's runtime seed when no debugger is attached.
+        //
+        // Base keys remain unmodified inside the stub's data tail —
+        // the runtime re-derives effective keys from `base + hash`
+        // every time the process starts. An attacker who statically
+        // reads the keys out of `.mxpack` no longer has enough
+        // information to decrypt the sections offline; they must also
+        // simulate the exact FNV-1a hash over the stub code AND the
+        // FNV-1a-chain derivation. That's a real bump in reverser
+        // effort for mass-protected samples.
+        auto& pack_sec = ctx_.pe_image().sections()[pack_section_index_];
+        const uint32_t hash_range_end = patches_.hash_range_end_offset;
         if (hash_range_end == 0 ||
             hash_range_end > pack_sec.data.size())
         {
-            ctx.log("PackerPass: P6 — некорректный hash_range_end, пропуск");
+            ctx_.log("PackerPass: P6 — некорректный hash_range_end, пропуск");
             return std::unexpected(
                 MxError{ProtectionErrorCode::pass_failed,
                         "P6: hash_range_end_offset out of bounds"});
@@ -927,24 +980,24 @@ template <StubEmitter Emitter>
 
         // (1) Patch the runtime count imm32 with the finalised byte count.
         write_i32(pack_sec.data,
-                  patches.self_hash.count_imm32_offset,
+                  patches_.self_hash.count_imm32_offset,
                   static_cast<int32_t>(hash_range_end));
 
         // (2) Compute FNV-1a over the now-finalised hashed range.
         const uint32_t stub_hash = fnv1a_32(
             ByteView{pack_sec.data.data(), hash_range_end});
 
-        ctx.log_fmt("PackerPass: P6 stub self-hash = 0x{:08X} over [0, 0x{:X})",
+        ctx_.log_fmt("PackerPass: P6 stub self-hash = 0x{:08X} over [0, 0x{:X})",
             stub_hash, hash_range_end);
 
         // (3) + (4) Derive effective keys and encrypt every target
         //           section with them. We reuse the base key buffers
         //           already written into the stub at build time — the
-        //           derivation is applied to a local COPY so the stub's
-        //           in-section bytes stay as base keys (which is what
-        //           the runtime derivation loop consumes).
-        for (uint32_t layer = 0; layer < layer_count; ++layer) {
-            ByteBuffer effective = layer_keys[layer];
+        //           derivation is applied to a local COPY so the
+        //           stub's in-section bytes stay as base keys (which
+        //           is what the runtime derivation loop consumes).
+        for (uint32_t layer = 0; layer < layer_count_; ++layer) {
+            ByteBuffer effective = layer_keys_[layer];
             derive_effective_key_in_place(
                 stub_hash,
                 MutableByteView{effective.data(), effective.size()});
@@ -953,23 +1006,72 @@ template <StubEmitter Emitter>
             rc4_init(rc4,
                      ByteView{effective.data(), effective.size()},
                      /*anti_debug_bias=*/0);
-            for (const auto& tgt : encrypted) {
-                auto& sec = ctx.pe_image().sections()[tgt.image_index];
+            for (const auto& tgt : encrypted_) {
+                auto& sec = ctx_.pe_image().sections()[tgt.image_index];
                 rc4_process(rc4,
                             MutableByteView{sec.data.data(), sec.data.size()});
             }
         }
 
-        for (const auto& tgt : encrypted) {
-            const auto& sec = ctx.pe_image().sections()[tgt.image_index];
-            ctx.log_fmt("PackerPass: зашифрована (RC4 ×{}, P6) '{}' "
-                        "(RVA=0x{:08X}, {} байт)",
-                layer_count, sec.name, sec.virtual_address, tgt.size);
+        for (const auto& tgt : encrypted_) {
+            const auto& sec = ctx_.pe_image().sections()[tgt.image_index];
+            ctx_.log_fmt("PackerPass: зашифрована (RC4 ×{}, P6) '{}' "
+                         "(RVA=0x{:08X}, {} байт)",
+                layer_count_, sec.name, sec.virtual_address, tgt.size);
         }
+        return {};
     }
 
-    ctx.log("PackerPass: упаковка завершена");
-    return {};
+    // --- inputs ------------------------------------------------------
+    ProtectionContext& ctx_;
+    std::string_view   steal_label_;
+
+    // --- shared rng used across steps 2/3/4 --------------------------
+    Randomizer rng_{};
+
+    // --- step1 outputs -----------------------------------------------
+    bool skip_ = false;
+    std::vector<size_t> target_indices_;
+    OepStealResult      steal_{};
+
+    // --- step2 outputs -----------------------------------------------
+    uint32_t                layer_count_     = 1;
+    std::vector<ByteBuffer> layer_keys_;
+    std::vector<EncryptedTarget> encrypted_;
+    bool                    enable_veh_trap_ = false;
+
+    // --- step3 outputs (emitter) -------------------------------------
+    ByteBuffer                     stub_buf_;
+    typename Emitter::patches_type patches_{};
+
+    // --- step4 outputs -----------------------------------------------
+    std::vector<uint32_t> key_offsets_in_stub_;
+    uint32_t              sbox_offset_in_stub_            = 0;
+    size_t                packer_vm_blob_offset_          = 0;
+    uint32_t              packer_vm_entry_offset_         = 0;
+    bool                  packer_vm_lift_succeeded_       = false;
+    uint32_t              reprotect_table_offset_in_stub_ = 0;
+    std::optional<ExistingTlsDirectory> existing_tls_opt_;
+    TlsCallbackEmit       tls_cb_{};
+    uint32_t              tls_dir_offset_in_stub_         = 0;
+    uint32_t              tls_cb_array_offset_in_stub_    = 0;
+    uint32_t              tls_index_slot_offset_in_stub_  = 0;
+    bool                  has_extra_tls_cb_               = false;
+    size_t                tls_cb_array_entries_           = 0;
+
+    // --- step5 outputs -----------------------------------------------
+    size_t pack_section_index_ = 0;
+    Rva    stub_rva_           = 0;
+};
+
+/// Thin wrapper retained so the facade below keeps its familiar
+/// call-site shape. Behaviour is entirely in `PackerPipeline`.
+template <StubEmitter Emitter>
+    requires std::constructible_from<Emitter, StubEmissionParams>
+[[nodiscard]] MxStatus execute_encrypted_stub(ProtectionContext& ctx,
+                                              std::string_view   steal_label)
+{
+    return PackerPipeline<Emitter>(ctx, steal_label).execute();
 }
 
 } // anonymous namespace
