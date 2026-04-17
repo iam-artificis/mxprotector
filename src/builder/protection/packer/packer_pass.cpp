@@ -32,13 +32,12 @@
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
 #include "mxprotector/protection/packer/cipher_body.hpp"
+#include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"
 #include "mxprotector/protection/packer/tls_callback.hpp"
-#include "mxprotector/protection/vm/vm_lifter.hpp"
-#include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -504,71 +503,20 @@ private:
         sbox_offset_in_stub_ = static_cast<uint32_t>(stub_buf_.size());
         stub_buf_.insert(stub_buf_.end(), kSboxSize, uint8_t{0});
 
-        // P3 — VM-protected KSA. If a disassembler is available, lift
-        // the RC4 KSA range through the existing VM engine and append
-        // the runtime blob to the stub buffer; the original plaintext
-        // KSA bytes are later overwritten with `call rel32 <vm_entry>`.
-        if (ctx_.disassembler() != nullptr &&
-            patches_.ksa_block_end_offset > patches_.ksa_block_start_offset)
-        {
-            const size_t ksa_size =
-                patches_.ksa_block_end_offset - patches_.ksa_block_start_offset;
-            ByteView ksa_view{
-                stub_buf_.data() + patches_.ksa_block_start_offset,
-                ksa_size};
-
-            vm::VmLifter lifter(*ctx_.disassembler());
-            constexpr Va kFakeKsaBase = 0x0000000140000000ULL;
-            auto lift_result = lifter.lift(ksa_view, kFakeKsaBase);
-            if (!lift_result) {
-                ctx_.log_fmt("PackerPass: P3 VM-lift KSA failed ({}), keeping plaintext",
-                    lift_result.error().message());
-            } else {
-                auto [vm_insns, report] = *lift_result;
-                ctx_.log_fmt("PackerPass: P3 VM-lift OK — total={}, generic={}, native={}",
-                    report.total_insns, report.generic_ops, report.native_ops);
-
-                vm::VmRuntimeGenerator gen;
-                // `use_imagebase_key` reads `PEB.ImageBaseAddress` at
-                // VM runtime and folds it into the handler-table key
-                // via a build-time MBA chain anchored on
-                // `preferred_image_base`. For an EXE, PEB.ImageBase
-                // == the exe's own preferred base (we strip
-                // relocations), so the chain agrees. For a DLL,
-                // PEB.ImageBase is the HOST exe's base regardless of
-                // which module is running — a DLL VM using this key
-                // would compute the wrong table_xor_key and dispatch
-                // every handler into garbage. `VirtualizationPass`
-                // has the same gate for the same reason.
-                const bool is_exe =
-                    ctx_.pe_image().pe_type() == PeType::executable;
-                const vm::VmGenOptions opts{
-                    .emit_exit_as_jmp        = false,
-                    .use_imagebase_key       = is_exe,
-                    .preferred_image_base    =
-                        static_cast<uint64_t>(ctx_.pe_image().image_base()),
-                    .skip_anti_tamper_checks = true,
-                };
-                auto runtime = gen.generate(vm_insns, rng_, opts);
-                if (!runtime) {
-                    ctx_.log_fmt("PackerPass: P3 VM-lift generate failed ({}), keeping plaintext",
-                        runtime.error().message());
-                } else {
-                    while (stub_buf_.size() % 16 != 0) {
-                        stub_buf_.push_back(0xCC);
-                    }
-                    packer_vm_blob_offset_   = stub_buf_.size();
-                    packer_vm_entry_offset_  = runtime->entry_offset;
-                    stub_buf_.insert(stub_buf_.end(),
-                                     runtime->blob.begin(),
-                                     runtime->blob.end());
-                    packer_vm_lift_succeeded_ = true;
-                    ctx_.log_fmt("PackerPass: P3 VM blob {} байт, entry @ stub+0x{:X}",
-                        runtime->blob.size(),
-                        packer_vm_blob_offset_ + packer_vm_entry_offset_);
-                }
-            }
-        }
+        // P3 — VM-protected KSA. Delegates to packer_ksa_vm_lifter,
+        // which appends the VM runtime blob to `stub_buf_` on success
+        // (plus the needed 16-byte padding) and leaves the buffer
+        // untouched on any failure path. step5_inject_and_patch uses
+        // `packer_vm_lift_succeeded_` to decide whether to overwrite
+        // the plaintext KSA bytes with `call rel32 <vm_entry>`.
+        const auto p3 = packer::try_lift_ksa_to_vm(
+            ctx_, stub_buf_,
+            patches_.ksa_block_start_offset,
+            patches_.ksa_block_end_offset,
+            rng_);
+        packer_vm_blob_offset_    = p3.vm_blob_offset_in_stub;
+        packer_vm_entry_offset_   = p3.vm_entry_offset;
+        packer_vm_lift_succeeded_ = p3.succeeded;
 
         // Embed the reprotect section table right after the VM blob.
         reprotect_table_offset_in_stub_ =
