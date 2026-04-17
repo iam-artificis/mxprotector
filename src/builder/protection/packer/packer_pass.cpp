@@ -34,6 +34,7 @@
 #include "mxprotector/protection/packer/cipher_body.hpp"
 #include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
+#include "mxprotector/protection/packer/packer_stub_patcher.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
@@ -520,126 +521,23 @@ private:
         stub_rva_           = inject->stub_rva;
         auto& pack_sec      = ctx_.pe_image().sections()[pack_section_index_];
 
-        // Per-layer patching: every layer has its own `lea rsi, key_K`
-        // and its own per-section `lea rdi / mov ecx` pair.
-        for (uint32_t layer = 0; layer < layer_count_; ++layer) {
-            const auto& lp = patches_.layers[layer];
-
-            // lea rsi, [rip + rel] → this layer's 32-byte RC4 key.
-            {
-                const Rva lea_end_rva = stub_rva_ + lp.rel_to_key_at + 4;
-                const Rva key_rva     = stub_rva_ + artifacts_.key_offsets_in_stub[layer];
-                const int32_t rel = static_cast<int32_t>(
-                    static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
-                write_i32(pack_sec.data, lp.rel_to_key_at, rel);
-            }
-
-            // Per-section: lea rdi → section base, mov ecx → section size.
-            for (size_t i = 0; i < encrypted_.size(); ++i) {
-                const auto& ds  = lp.sections[i];
-                const auto& tgt = encrypted_[i];
-
-                const Rva lea_end_rva = stub_rva_ + ds.patch_lea_at + 4;
-                const int32_t rel = static_cast<int32_t>(
-                    static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
-                write_i32(pack_sec.data, ds.patch_lea_at, rel);
-                write_i32(pack_sec.data, ds.patch_size_at,
-                          static_cast<int32_t>(tgt.size));
-            }
+        // Thin the EncryptedTarget vector down to just {rva, size}
+        // for the patcher — it doesn't need `image_index` (that's
+        // step7's concern).
+        std::vector<packer::TargetSection> tgt_sections(encrypted_.size());
+        for (size_t i = 0; i < encrypted_.size(); ++i) {
+            tgt_sections[i] = {encrypted_[i].rva, encrypted_[i].size};
         }
 
-        // lea r8, [rip + rel] → 256-byte S-box scratch area.
-        {
-            const Rva lea_end_rva = stub_rva_ + patches_.rel_to_sbox_at + 4;
-            const Rva sbox_rva    = stub_rva_ + artifacts_.sbox_offset_in_stub;
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
-            write_i32(pack_sec.data, patches_.rel_to_sbox_at, rel);
-        }
+        // Delegate every rel32 / imm32 / anchor patch (per-layer
+        // keys, per-section LEAs, sbox, optional P3 KSA overwrite,
+        // ImageBase anchor, reprotect table + entries, IAT wipe) to
+        // the dedicated patcher.
+        packer::apply_post_inject_patches(
+            ctx_, pack_sec.data, stub_rva_,
+            layer_count_, patches_, artifacts_,
+            std::span<const packer::TargetSection>{tgt_sections});
 
-        // P3 — if the KSA block was successfully lifted, overwrite
-        // the plaintext KSA bytes with `call rel32 <vm_entry>` + NOP
-        // pad.
-        if (artifacts_.packer_vm_lift_succeeded) {
-            const Rva vm_entry_rva =
-                stub_rva_ +
-                static_cast<Rva>(artifacts_.packer_vm_blob_offset) +
-                static_cast<Rva>(artifacts_.packer_vm_entry_offset);
-            const uint32_t ksa_off = patches_.ksa_block_start_offset;
-            const Rva    call_rva    = stub_rva_ + ksa_off;
-            const Rva    call_end_rva = call_rva + 5;
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(vm_entry_rva) -
-                static_cast<int64_t>(call_end_rva));
-
-            pack_sec.data[ksa_off + 0] = 0xE8;  // call rel32
-            pack_sec.data[ksa_off + 1] = static_cast<uint8_t>(rel        & 0xFF);
-            pack_sec.data[ksa_off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
-            pack_sec.data[ksa_off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
-            pack_sec.data[ksa_off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
-            for (uint32_t i = ksa_off + 5; i < patches_.ksa_block_end_offset; ++i) {
-                pack_sec.data[i] = 0x90;
-            }
-            ctx_.log_fmt("PackerPass: P3 KSA replaced with call vm_entry @ RVA=0x{:08X}",
-                vm_entry_rva);
-        }
-
-        // ImageBase rip-relative computation. The `lea rbx, [rip + 0];
-        // sub rbx, imm32` pair in the reprotect block needs `imm32 =
-        // stub_section_rva + imagebase_lea_anchor_offset` so that at
-        // runtime `rbx = current_rip - imm32 = module_base`. This
-        // works for both EXE (host == packed module) and DLL (host !=
-        // packed module) — we never read PEB.ImageBaseAddress.
-        {
-            const uint32_t imm32 =
-                stub_rva_ + patches_.imagebase_lea_anchor_offset;
-            write_i32(pack_sec.data, patches_.imagebase_sub_imm32_at,
-                      static_cast<int32_t>(imm32));
-        }
-
-        // lea r14, [rip + rel] → reprotect section table + fill data.
-        {
-            const Rva lea_end_rva = stub_rva_ + patches_.rel_to_reprotect_table_at + 4;
-            const Rva table_rva   = stub_rva_ + artifacts_.reprotect_table_offset_in_stub;
-            const int32_t rel = static_cast<int32_t>(
-                static_cast<int64_t>(table_rva) - static_cast<int64_t>(lea_end_rva));
-            write_i32(pack_sec.data, patches_.rel_to_reprotect_table_at, rel);
-
-            for (size_t i = 0; i < encrypted_.size(); ++i) {
-                const uint32_t entry_off =
-                    artifacts_.reprotect_table_offset_in_stub + static_cast<uint32_t>(i * 8);
-                write_i32(pack_sec.data, entry_off + 0,
-                          static_cast<int32_t>(encrypted_[i].rva));
-                write_i32(pack_sec.data, entry_off + 4,
-                          static_cast<int32_t>(encrypted_[i].size));
-            }
-        }
-
-        // IAT destruction: patch lea rdi → Import Directory + the size.
-        {
-            Rva impdir_rva = 0;
-            uint32_t impdir_size = 0;
-            std::visit([&](const auto& nt) {
-                if (pe::IMAGE_DIRECTORY_ENTRY_IMPORT < nt.OptionalHeader.NumberOfRvaAndSizes) {
-                    impdir_rva  = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-                    impdir_size = nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
-                }
-            }, ctx_.pe_image().nt_headers());
-
-            if (impdir_rva != 0 && impdir_size >= 4) {
-                const Rva lea_end_rva = stub_rva_ + patches_.rel_to_impdir_at + 4;
-                const int32_t rel = static_cast<int32_t>(
-                    static_cast<int64_t>(impdir_rva) - static_cast<int64_t>(lea_end_rva));
-                write_i32(pack_sec.data, patches_.rel_to_impdir_at, rel);
-                write_i32(pack_sec.data, patches_.impdir_size_at,
-                          static_cast<int32_t>(impdir_size / 4));
-                ctx_.log_fmt("PackerPass: IAT destruction — Import Directory 0x{:08X} ({} байт) "
-                             "будет обнулён при запуске",
-                    impdir_rva, impdir_size);
-            } else {
-                write_i32(pack_sec.data, patches_.impdir_size_at, 0);
-            }
-        }
         return {};
     }
 
