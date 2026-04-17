@@ -92,6 +92,7 @@ set(BUILDER_SOURCES
     protection/packer/packer_stub_artifacts.cpp
     protection/packer/packer_stub_patcher.cpp
     protection/packer/packer_tls_finalizer.cpp
+    protection/packer/packer_section_encryptor.cpp
     protection/packer/cipher_body.cpp
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
