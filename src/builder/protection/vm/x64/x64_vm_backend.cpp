@@ -40,6 +40,7 @@
 #include "mxprotector/protection/vm/x64/x64_bytecode_encoder.hpp"
 #include "mxprotector/protection/vm/x64/x64_emitters.hpp"
 #include "mxprotector/protection/vm/x64/x64_entry_stub.hpp"
+#include "mxprotector/protection/vm/x64/x64_handler_emitter.hpp"
 #include "mxprotector/protection/vm/x64/x64_handlers.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm.hpp"
 #include "mxprotector/protection/vm/x64/x64_inner_vm_wrappers.hpp"
@@ -138,7 +139,6 @@ private:
     std::vector<uint32_t>          head_slot_of_handler;
     std::vector<PendingTrampoline> pending_trampolines;
     std::vector<TrampolineFixup>   trampoline_fixups;
-    uint8_t current_handler_id{};
     uint32_t exit_jmp_offset{};
     std::vector<size_t> inner_vm_call_patches;
     InnerVmIsa inner_vm_isa{};
@@ -146,31 +146,14 @@ private:
     size_t handler_table_offset{};
     size_t bytecode_offset{};
 
-    // Constants that were local `constexpr` in the original function.
-    static constexpr uint32_t kMaxChainLen = 3;
-
     // ==== Step methods ======================================================
     [[nodiscard]] MxResult<void> step1_randomize();
     void                         step2_emit_bytecode();
     void                         step3a_emit_entry_stub();
-    void                         step3b_emit_handlers();
-    void                         step3c_emit_native_handlers();
-    void                         step3d_emit_specialised_handlers();
-    void                         step3e_drain_trampolines();
+    void                         step3_emit_handlers();
     void                         step3f_emit_inner_vm_runtime();
     void                         step3g_emit_table_and_bytecode();
     [[nodiscard]] MxResult<void> step4_apply_patches();
-
-    // ==== Shared helpers (were lambdas inside `generate`) ====================
-    uint32_t allocate_trampoline_slot();
-    void     queue_trampoline_chain(uint8_t handler_id);
-    void     emit_one_pending_trampoline();
-    void     maybe_drain_trampolines();
-    void     begin_handler(uint8_t handler_id);
-    void     emit_handler_key_fold_in(uint8_t handler_id);
-    void     finish_handler_chain();
-    void     end_handler_tail();
-    bool     emit_op_variant(VmOp op, uint32_t variant);
 };
 
 // ============================================================================
@@ -185,10 +168,7 @@ MxResult<VmRuntime> GenerationSession::run() {
     }
     step2_emit_bytecode();
     step3a_emit_entry_stub();
-    step3b_emit_handlers();
-    step3c_emit_native_handlers();
-    step3d_emit_specialised_handlers();
-    step3e_drain_trampolines();
+    step3_emit_handlers();
     step3f_emit_inner_vm_runtime();
     step3g_emit_table_and_bytecode();
     if (auto r = step4_apply_patches(); !r) {
@@ -451,184 +431,36 @@ void GenerationSession::step3a_emit_entry_stub() {
 }
 
 // ============================================================================
-//               Step 3b — generic handler bodies (all variants)
-// ============================================================================
-
-void GenerationSession::step3b_emit_handlers() {
-    // Generic handlers: emit every variant of every canonical VmOp.
-    for (uint32_t opi = 0; opi < kVmOpCount; ++opi) {
-        const auto op = static_cast<VmOp>(opi);
-        const auto& variants = variant_handler_ids[opi];
-        for (uint32_t v = 0; v < variants.size(); ++v) {
-            begin_handler(variants[v]);
-            const bool needs_tail = emit_op_variant(op, v);
-            if (needs_tail) {
-                end_handler_tail();
-            }
-        }
-    }
-}
-
-// ============================================================================
-//            Step 3c — per-instruction native handlers (VmOp::native)
-// ============================================================================
-
-void GenerationSession::step3c_emit_native_handlers() {
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        if (instructions[i].op != VmOp::native) continue;
-        const uint8_t hid = native_handler_ids[native_handler_of_insn[i]];
-        begin_handler(hid);
-
-        // sub rsp, 24   — reserve scratch for vpc save (the comment in
-        // vm_runtime_gen.cpp said "16" but the encoded imm is 0x18 = 24)
-        rt.u8(0x48); rt.u8(0x83); rt.u8(0xEC); rt.u8(0x18);
-        // mov [rsp], r11   — save vpc
-        rt.u8(0x4C); rt.u8(0x89); rt.u8(0x1C); rt.u8(0x24);
-
-        // Reload native regs from ctx. After `sub rsp, 24` the ctx lives at
-        // [rsp + 24 + slot * 8]. Each native reg N (N != 4) lives at its
-        // per-build permuted slot.
-        struct RegLoad { uint8_t native_reg; int32_t offset; };
-        RegLoad loads[15];
-        {
-            size_t k = 0;
-            for (uint8_t n = 0; n < 16; ++n) {
-                if (n == 4) continue;   // skip RSP
-                const uint8_t slot = layout.native_to_slot[n];
-                loads[k++] = {n, 24 + static_cast<int32_t>(slot) * 8};
-            }
-        }
-
-        auto emit_mem_mov = [&](uint8_t opcode, uint8_t reg, int32_t disp) {
-            // opcode=0x8B (load) or 0x89 (store)
-            uint8_t rex = 0x48 | ((reg >= 8) ? 0x04 : 0x00);
-            rt.u8(rex);
-            rt.u8(opcode);
-            const uint8_t reg3 = reg & 0x07;
-            if (disp >= -128 && disp <= 127) {
-                rt.u8(static_cast<uint8_t>((1 << 6) | (reg3 << 3) | 4));
-                rt.u8(0x24);
-                rt.u8(static_cast<uint8_t>(static_cast<int8_t>(disp)));
-            } else {
-                rt.u8(static_cast<uint8_t>((2 << 6) | (reg3 << 3) | 4));
-                rt.u8(0x24);
-                rt.u32(static_cast<uint32_t>(disp));
-            }
-        };
-
-        for (const auto& l : loads) emit_mem_mov(0x8B, l.native_reg, l.offset);
-
-        // Restore CPU flags from ctx so flag-dependent native instructions
-        // (CMOV, ADC, SBB, etc.) see the correct state.
-        {
-            const int32_t rf_disp = 24 + rflags_disp;
-            const auto popfq_v = pick_popfq_variant(rng);
-            const bool uses_rax = (popfq_v != VflagsPopfqV::InPlace);
-            if (uses_rax) {
-                rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            }
-            emit_vflags_popfq(rt, popfq_v, vflags_key, vflags_rol, rf_disp);
-            if (uses_rax) {
-                rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            }
-        }
-
-        // Shift rsp to caller frame via LEA (flag-preserving).
-        rt.u8(0x48); rt.u8(0x8D); rt.u8(0xA4); rt.u8(0x24);
-        rt.u32(static_cast<uint32_t>(native_shift));
-
-        // Execute native bytes (sees correct GPRs, flags, and caller frame).
-        rt.bytes(ByteView{
-            instructions[i].native_bytes.data(),
-            instructions[i].native_bytes.size()});
-
-        // Shift rsp back via LEA (flag-preserving).
-        rt.u8(0x48); rt.u8(0x8D); rt.u8(0xA4); rt.u8(0x24);
-        rt.u32(static_cast<uint32_t>(-native_shift));
-
-        // Save CPU flags after native execution into ctx so the NEXT
-        // handler (or VJCC) sees the correct flags.
-        {
-            const int32_t rf_disp = 24 + rflags_disp;
-            const auto store_v = pick_store_variant(rng);
-            const bool uses_rax = (store_v != VflagsStoreV::InPlace);
-            if (uses_rax) {
-                rt.u8(0x48); rt.u8(0x89); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            }
-            emit_vflags_store(rt, store_v, vflags_key, vflags_rol, rf_disp);
-            if (uses_rax) {
-                rt.u8(0x48); rt.u8(0x8B); rt.u8(0x44); rt.u8(0x24); rt.u8(0x08);
-            }
-        }
-
-        // Save all native regs back to ctx.
-        for (const auto& l : loads) emit_mem_mov(0x89, l.native_reg, l.offset);
-
-        // Restore vpc: mov r11, [rsp]    4C 8B 1C 24
-        rt.u8(0x4C); rt.u8(0x8B); rt.u8(0x1C); rt.u8(0x24);
-        // lea rsp, [rsp + 24]    48 8D 64 24 18  (flags-preserving)
-        rt.u8(0x48); rt.u8(0x8D); rt.u8(0x64); rt.u8(0x24); rt.u8(0x18);
-
-        // save_rflags=false: native handler already saved flags above.
-        // G4 rolling-key fold-in: current_handler_id was set by
-        // begin_handler(hid) at the top of the native-handler loop
-        // body, so the fold-in folds this native handler's key
-        // into the live rolling-key state before the tail fetch.
-        emit_handler_key_fold_in(current_handler_id);
-        {
-            const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
-                                              false, table_key_patches,
-                                              vflags_key, vflags_rol,
-                                              rflags_disp, &rng,
-                                              imagebase_key_disp);
-            table_patches.push_back({p.rel32_offset, p.instruction_end});
-        }
-        // G5: native handlers join the same trampoline chain
-        // mechanism as generic/specialised handlers. The chain
-        // length roll is independent per handler so native
-        // handlers get the same 1..3 distribution.
-        queue_trampoline_chain(current_handler_id);
-        maybe_drain_trampolines();
-    }
-}
-
-// ============================================================================
-//                     Step 3d — specialised handlers (G1)
+//   Step 3 (handlers) — generic + native + specialised + trampoline drain
 // ============================================================================
 //
-// Each specialisation emits a body with hard-coded slot disps. No operand
-// fetch, no remap, no reusable shape — every specialised handler differs
-// from the others and from every generic handler.
+// Delegated to `x64_handler_emitter.cpp`. The emitter owns the huge
+// `emit_op_variant` switch, the trampoline-chain bookkeeping (G5), the
+// G4 per-handler fold-in helper, the begin/end-handler hooks, and the
+// three emission loops (generic, native, specialised) + the
+// deterministic drain.
 // ============================================================================
 
-void GenerationSession::step3d_emit_specialised_handlers() {
-    for (const auto& spec : specializations) {
-        begin_handler(spec.handler_id);
-        const uint8_t dst_disp = static_cast<uint8_t>(spec.dst_vreg * 8);
-        const uint8_t src_disp = static_cast<uint8_t>(spec.src_vreg * 8);
-        if (spec.op == VmOp::mov_rr) {
-            emit_handler_mov_rr_specialized(rt, dst_disp, src_disp);
-        } else {
-            emit_handler_alu_rr_specialized(rt, alu_op_mr_for(spec.op),
-                                             dst_disp, src_disp);
-        }
-        end_handler_tail();
-    }
-}
-
-// ============================================================================
-//                   Step 3e — drain remaining trampolines (G5)
-// ============================================================================
-//
-// The random-draw drain inside `end_handler_tail` and the native loop only
-// flushes when the dice roll picks the drain path, so the tail of the run
-// usually has a handful of stragglers. This step empties the queue fully.
-// ============================================================================
-
-void GenerationSession::step3e_drain_trampolines() {
-    while (!pending_trampolines.empty()) {
-        emit_one_pending_trampoline();
-    }
+void GenerationSession::step3_emit_handlers() {
+    const HandlerEmitterInputs handler_in{
+        rt, rng,
+        rolling_key_disp, imagebase_key_disp,
+        rolling, has_branches,
+        vflags_key, vflags_rol, rflags_disp, native_shift,
+        layout, emit_exit_as_jmp,
+        per_handler_key, variant_handler_ids,
+        native_handler_ids, specializations,
+        instructions, native_handler_of_insn,
+        inner_vm_isa,
+    };
+    HandlerEmitterSinks handler_sinks{
+        handler_offset_by_id, trampoline_offset_by_slot,
+        head_slot_of_handler, pending_trampolines,
+        trampoline_fixups, table_patches,
+        table_key_patches, inner_vm_call_patches,
+        exit_jmp_offset,
+    };
+    emit_all_handlers(handler_in, handler_sinks);
 }
 
 // ============================================================================
@@ -811,481 +643,10 @@ MxResult<void> GenerationSession::step4_apply_patches() {
     return {};
 }
 
-// ============================================================================
-//                 Shared helpers (were lambdas inside `generate`)
-// ============================================================================
+// === GenerationSession helpers (begin_handler / end_handler_tail /
+//     emit_op_variant / trampoline bookkeeping) moved to
+//     x64_handler_emitter.cpp in R1.5.
 
-uint32_t GenerationSession::allocate_trampoline_slot() {
-    const uint32_t slot = static_cast<uint32_t>(trampoline_offset_by_slot.size());
-    trampoline_offset_by_slot.push_back(SIZE_MAX);
-    return slot;
-}
-
-// Register a chain of random length for the just-emitted handler:
-// allocate `len` slots, wire each slot's target at the next slot (or at
-// the handler for the terminal), remember the head slot in
-// `head_slot_of_handler`, and drop every slot into the pending queue so
-// subsequent drains can flush them in random order. Chain length
-// distribution is biased toward shorter chains (len==1 ~50%, len==2 ~33%,
-// len==3 ~17%) to keep amortised trampoline overhead moderate while still
-// producing a meaningful fraction of multi-hop chains.
-void GenerationSession::queue_trampoline_chain(uint8_t handler_id) {
-    const uint32_t roll = rng.next_range(0, 5);
-    uint32_t chain_len;
-    if (roll < 3)      chain_len = 1;   // 3/6
-    else if (roll < 5) chain_len = 2;   // 2/6
-    else               chain_len = 3;   // 1/6
-    if (chain_len > kMaxChainLen) chain_len = kMaxChainLen;
-
-    // Allocate all slots for this chain up front so we can set every
-    // slot's target to point at its successor before any of them are
-    // drained.
-    std::array<uint32_t, kMaxChainLen> slots{};
-    for (uint32_t i = 0; i < chain_len; ++i) {
-        slots[i] = allocate_trampoline_slot();
-    }
-    head_slot_of_handler[handler_id] = slots[0];
-
-    for (uint32_t i = 0; i < chain_len; ++i) {
-        TrampolineTarget tgt{};
-        if (i + 1 < chain_len) {
-            tgt.kind = TrampolineTarget::Kind::Trampoline;
-            tgt.id   = slots[i + 1];
-        } else {
-            tgt.kind = TrampolineTarget::Kind::Handler;
-            tgt.id   = handler_id;
-        }
-        pending_trampolines.push_back({slots[i], tgt});
-    }
-}
-
-void GenerationSession::emit_one_pending_trampoline() {
-    if (pending_trampolines.empty()) return;
-    // Pop a random slot, not FIFO. FIFO would correlate the physical
-    // blob position of trampolines with their handler completion order;
-    // random draws decorrelate them so chains end up scrambled across
-    // the handler block.
-    const uint32_t idx = rng.next_range(
-        0, static_cast<uint32_t>(pending_trampolines.size() - 1));
-    const PendingTrampoline pt = pending_trampolines[idx];
-    pending_trampolines[idx] = pending_trampolines.back();
-    pending_trampolines.pop_back();
-
-    trampoline_offset_by_slot[pt.slot] = rt.size();
-    const auto tp = vm::x64::emit_trampoline(rt, rng, /*max_junk_bytes=*/8);
-    trampoline_fixups.push_back({pt.target, tp});
-}
-
-// After each handler's end_tail we queue a fresh chain for the handler
-// and, with some probability, flush one or more queued entries right
-// now. Flushing follows a geometric distribution (0 ~2/3, 1 ~2/9, 2 ~2/27,
-// ...), so over the full emission trampolines from different chains end
-// up interleaved with handler bodies. Any stragglers are flushed by the
-// deterministic drain after the last handler.
-void GenerationSession::maybe_drain_trampolines() {
-    while (!pending_trampolines.empty() && rng.next_range(0, 2) == 0) {
-        emit_one_pending_trampoline();
-    }
-}
-
-void GenerationSession::begin_handler(uint8_t handler_id) {
-    current_handler_id = handler_id;
-    handler_offset_by_id[handler_id] = rt.size();
-    emit_junk_prologue(rt, rng, /*max_bytes=*/8);
-}
-
-// G4: `xor byte [rsp + rolling_key_disp], imm8=per_handler_key[id]`.
-// Emitted right before the tail dispatch, so the fetch of the next opcode
-// byte sees the post-fold key. Skipped entirely in static-cipher regions
-// (rolling == false) where there is no mutable key state to fold into.
-void GenerationSession::emit_handler_key_fold_in(uint8_t handler_id) {
-    if (!rolling) return;
-    // 80 /6 ib — xor r/m8, imm8
-    //   ModRM: 01 110 100 = 0x74  (mod=01 disp8, reg=/6=xor, rm=100 SIB)
-    //   SIB:   00 100 100 = 0x24  (scale=00, index=100 none, base=rsp)
-    rt.u8(0x80); rt.u8(0x74); rt.u8(0x24);
-    rt.u8(static_cast<uint8_t>(rolling_key_disp));
-    rt.u8(per_handler_key[handler_id]);
-}
-
-// G5 invariant: every handler_id the backend begins via `begin_handler`
-// MUST later get a trampoline chain queued via `queue_trampoline_chain`,
-// otherwise the post-emit handler_table patch fires the "handler id N
-// missing trampoline chain" error. The standard path goes through
-// `end_handler_tail`, which emits the tail dispatch AND queues the chain
-// in one shot. A handful of `VmOp` cases (dead / opq_branch / native)
-// emit their own inline tail and `return false` from `emit_op_variant` to
-// tell the surrounding loop "don't call end_handler_tail" — they must
-// still call `finish_handler_chain` themselves so the invariant holds.
-void GenerationSession::finish_handler_chain() {
-    queue_trampoline_chain(current_handler_id);
-    maybe_drain_trampolines();
-}
-
-void GenerationSession::end_handler_tail() {
-    emit_handler_key_fold_in(current_handler_id);
-    const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
-                                      has_branches, table_key_patches,
-                                      vflags_key, vflags_rol,
-                                      rflags_disp, &rng,
-                                      imagebase_key_disp);
-    table_patches.push_back({p.rel32_offset, p.instruction_end});
-    finish_handler_chain();
-}
-
-// ----------------------------------------------------------------------------
-// emit_op_variant — the big switch. Produces one variant body for a given
-// canonical VmOp. Returns true if the surrounding loop still needs to call
-// `end_handler_tail` after the variant (the standard path); false for
-// inline-tail variants (native / dead / opq_branch / exit) that take care
-// of their own tail and trampoline-chain registration.
-// ----------------------------------------------------------------------------
-bool GenerationSession::emit_op_variant(VmOp op, uint32_t variant) {
-    switch (op) {
-        case VmOp::mov_rr:
-            if (variant == 0) {
-                emit_handler_mov_rr(rt, rolling_key_disp, rolling);
-            } else if (variant == 1) {
-                emit_handler_mov_rr_pushpop(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_mov_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::add_rr:
-            if (variant == 0) {
-                emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x01);
-            } else if (variant == 1) {
-                emit_handler_add_rr_mba(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, InnerVmOp::iadd_rr,
-                                            patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::sub_rr:
-            if (variant == 0) {
-                emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x29);
-            } else if (variant == 1) {
-                emit_handler_sub_rr_neg(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, InnerVmOp::isub_rr,
-                                            patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::xor_rr:
-            if (variant == 0) {
-                emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x31);
-            } else if (variant == 1) {
-                emit_handler_xor_rr_mba(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, InnerVmOp::ixor_rr,
-                                            patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::and_rr:
-            if (variant == 0) {
-                emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x21);
-            } else if (variant == 1) {
-                emit_handler_and_rr_demorgan(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, InnerVmOp::iand_rr,
-                                            patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::or_rr:
-            if (variant == 0) {
-                emit_handler_alu_rr(rt, rolling_key_disp, rolling, 0x09);
-            } else if (variant == 1) {
-                emit_handler_or_rr_demorgan(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_rr_nested(rt, rolling_key_disp, rolling,
-                                            inner_vm_isa, InnerVmOp::ior_rr,
-                                            patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::imul_rr:  emit_handler_imul_rr(rt, rolling_key_disp, rolling);            return true;
-
-        case VmOp::mov_ri32:
-            if (variant == 0) {
-                emit_handler_mov_ri32(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_mov_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::add_ri32:
-            if (variant == 0) {
-                emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x01);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, InnerVmOp::iadd_rr,
-                                              patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::sub_ri32:
-            if (variant == 0) {
-                emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x29);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, InnerVmOp::isub_rr,
-                                              patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::xor_ri32:
-            if (variant == 0) {
-                emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x31);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, InnerVmOp::ixor_rr,
-                                              patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::and_ri32:
-            if (variant == 0) {
-                emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x21);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, InnerVmOp::iand_rr,
-                                              patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::or_ri32:
-            if (variant == 0) {
-                emit_handler_alu_ri32(rt, rolling_key_disp, rolling, 0x09);
-            } else {
-                size_t patch = 0;
-                emit_handler_alu_ri32_nested(rt, rolling_key_disp, rolling,
-                                              inner_vm_isa, InnerVmOp::ior_rr,
-                                              patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::mov_ri64: emit_handler_mov_ri64(rt, rolling_key_disp, rolling);           return true;
-
-        case VmOp::not_r:
-            if (variant == 0) {
-                emit_handler_unary(rt, rolling_key_disp, rolling, 2);
-            } else if (variant == 1) {
-                emit_handler_not_r_xor(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_not_r_nested(rt, rolling_key_disp, rolling,
-                                           inner_vm_isa, patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::neg_r:
-            if (variant == 0) {
-                emit_handler_unary(rt, rolling_key_disp, rolling, 3);
-            } else if (variant == 1) {
-                emit_handler_neg_r_notinc(rt, rolling_key_disp, rolling);
-            } else {
-                size_t patch = 0;
-                emit_handler_neg_r_nested(rt, rolling_key_disp, rolling,
-                                           inner_vm_isa, patch);
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-
-        case VmOp::shl_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 4);           return true;
-        case VmOp::shr_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 5);           return true;
-        case VmOp::sar_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 7);           return true;
-        case VmOp::rol_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 0);           return true;
-        case VmOp::ror_ri:   emit_handler_shift(rt, rolling_key_disp, rolling, 1);           return true;
-
-        case VmOp::vjmp:
-            emit_handler_vjmp(rt, rolling_key_disp, rolling);
-            return true;
-
-        case VmOp::vjcc: {
-            // Coin flip per handler body: 50% chance the taken path is
-            // the V0 direct `add r11, rax`, 50% it's the V2 nested
-            // `mov r15, rax; call inner_vm_entry`. Because vjcc's
-            // variant axis is already fully consumed by the condition
-            // code (16 values), this build-time randomization is the
-            // only diversity knob available for its handler bodies.
-            const bool nested = rng.next_bool();
-            size_t patch = 0;
-            emit_handler_vjcc(rt, rolling_key_disp, rolling,
-                              static_cast<uint8_t>(variant),
-                              vflags_key, vflags_rol,
-                              rflags_disp, rng,
-                              nested ? &inner_vm_isa : nullptr,
-                              nested ? &patch : nullptr);
-            if (nested) {
-                inner_vm_call_patches.push_back(patch);
-            }
-            return true;
-        }
-
-        case VmOp::native:
-            // Generic native slot is never invoked — each native insn gets
-            // its own handler. Trap with ud2 (no tail). Still needs a
-            // trampoline chain queued so the handler_table entry for this
-            // id has a valid target and the integrity-check XOR sum
-            // matches; the trampoline points at `ud2` and only fires if
-            // something dispatches through the generic native slot by
-            // mistake, in which case the process crashes immediately —
-            // which is exactly what we want.
-            emit_ud2(rt);
-            finish_handler_chain();
-            return false;
-
-        case VmOp::dead: {
-            // G4 dead opcode — empty handler body. The encoder inserts
-            // `dead` bytes into the bytecode stream at random positions
-            // between real instructions; this handler consumes its byte,
-            // runs NO body, and dispatches to the next handler without
-            // touching vflags.
-            //
-            // IMPORTANT: the tail dispatch here is emitted with
-            // save_rflags=FALSE even in branch-containing regions where
-            // all other handlers use save=TRUE.
-            //
-            // Why: on entry to this handler, host rflags do NOT reflect
-            // the previous real handler's guest ALU — they reflect the
-            // previous handler's TAIL-DISPATCH fetch/xor sequence, which
-            // clobbered rflags after the real save happened. If we let
-            // the dead handler's tail call emit_vflags_store, it would
-            // write those fetch-clobbered garbage flags to `vflags`,
-            // overwriting the real guest flags that were already safely
-            // stored there by the previous handler's tail. A downstream
-            // `vjcc` would then see garbage ZF/SF/CF and mispredict the
-            // branch.
-            //
-            // Skipping the save leaves vflags untouched — the real guest
-            // flags remain visible to the next `vjcc`. Net effect of the
-            // dead handler on the VM state: r11 advanced by 1 (via the
-            // fetch inside the tail), nothing else. That's exactly what
-            // a "no-op insert" should do.
-            emit_handler_key_fold_in(current_handler_id);
-            const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
-                                               /*save_rflags=*/false,
-                                               table_key_patches,
-                                               vflags_key, vflags_rol,
-                                               rflags_disp, &rng,
-                                               imagebase_key_disp);
-            table_patches.push_back({p.rel32_offset, p.instruction_end});
-            finish_handler_chain();  // G5: inline-tail path still owes a chain
-            return false;
-        }
-
-        case VmOp::opq_branch: {
-            // G4 opaque branch. Shape-compatible with `vjmp`: a 4-byte
-            // rel32-shaped operand is fetched by the handler body, but
-            // NEVER added to r11. Falls through to the next instruction
-            // regardless of what the operand bytes say.
-            //
-            // The fetch IS necessary — without it, r11 would still point
-            // at the rel32 bytes when the tail dispatch fetches, and
-            // those bytes would get dispatched as a handler_id
-            // (misdecode).
-            //
-            // As with `dead`, the tail is emitted inline with
-            // save_rflags=false to avoid clobbering the real guest flags
-            // in vflags. `emit_fetch_dword` clobbers host rflags via its
-            // xor sequences, and we don't want those garbage flags
-            // landing in vflags where a downstream `vjcc` would read
-            // them.
-            emit_fetch_dword(rt, rolling_key_disp, rolling);
-            emit_handler_key_fold_in(current_handler_id);
-            const auto p = emit_tail_dispatch(rt, rolling_key_disp, rolling,
-                                               /*save_rflags=*/false,
-                                               table_key_patches,
-                                               vflags_key, vflags_rol,
-                                               rflags_disp, &rng,
-                                               imagebase_key_disp);
-            table_patches.push_back({p.rel32_offset, p.instruction_end});
-            finish_handler_chain();  // G5: inline-tail path still owes a chain
-            return false;
-        }
-
-        case VmOp::exit: {
-            if (vflags_key != 0 || vflags_rol != 0) {
-                emit_vflags_inslot_descramble(rt, pick_inslot_variant(rng),
-                                               vflags_key, vflags_rol,
-                                               rflags_disp);
-            }
-
-            // Pop all 16 slots in slot order.
-            for (uint8_t v = 0; v < 16; ++v) {
-                if (v == layout.junk_slot) {
-                    // add rsp, 8       48 83 C4 08
-                    rt.u8(0x48); rt.u8(0x83); rt.u8(0xC4); rt.u8(0x08);
-                } else {
-                    emit_pop_reg(rt, layout.slot_to_native[v]);
-                }
-            }
-
-            // G7: discard the extra padding slots that entry pushed.
-            if (layout.extra_pad_slots > 0) {
-                rt.u8(0x48); rt.u8(0x83); rt.u8(0xC4);
-                rt.u8(static_cast<uint8_t>(layout.extra_pad_slots * 8));
-            }
-
-            emit_popfq(rt);
-            if (emit_exit_as_jmp) {
-                // Cross-VM: jmp rel32 to next sub-VM entry (patched later)
-                rt.u8(0xE9);
-                exit_jmp_offset = static_cast<uint32_t>(rt.size());
-                rt.u32(0);
-            } else {
-                emit_ret(rt);
-            }
-            // G5: exit handler has no tail dispatch (it unwinds the VM
-            // state and returns), but it still needs a trampoline chain
-            // queued — the handler_table entry for exit must point at a
-            // valid trampoline so the integrity-check XOR sum stays
-            // consistent. The trampoline jmps into the exit body; on
-            // dispatch, the body pops registers and returns to the
-            // caller, exactly as a direct call would.
-            finish_handler_chain();
-            return false;
-        }
-        case VmOp::count_:
-            return false;
-    }
-    return false;
-}
 
 } // anonymous namespace
 

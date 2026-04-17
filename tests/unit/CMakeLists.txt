@@ -49,6 +49,7 @@ set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_inner_vm_wrappers.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_bytecode_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_entry_stub.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handler_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_backend.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/zydis_disassembler.cpp
 )
