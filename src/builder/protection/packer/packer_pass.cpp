@@ -33,6 +33,7 @@
 #include "mxprotector/protection/packer/byte_io.hpp"
 #include "mxprotector/protection/packer/cipher_body.hpp"
 #include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
+#include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
@@ -84,6 +85,9 @@ using mx::packer::TlsCallbackEmit;
 using mx::packer::ExistingTlsDirectory;
 using mx::packer::read_existing_tls_directory;
 using mx::packer::emit_tls_callback_body;
+
+using mx::packer::StubArtifactsInfo;
+using mx::packer::append_stub_artifacts;
 
 using mx::packer::DecryptSection;
 using mx::packer::LayerPatches;
@@ -483,119 +487,17 @@ private:
     }
 
     void step4_append_artifacts() {
-        // Append each layer's 32-byte RC4 key to the stub buffer and
-        // record the stub-relative offsets so each layer's
-        // `lea rsi, key_K` rel32 can be patched after the stub
-        // section is injected.
-        key_offsets_in_stub_.resize(layer_count_);
-        for (uint32_t layer = 0; layer < layer_count_; ++layer) {
-            key_offsets_in_stub_[layer] =
-                static_cast<uint32_t>(stub_buf_.size());
-            stub_buf_.insert(stub_buf_.end(),
-                             layer_keys_[layer].begin(),
-                             layer_keys_[layer].end());
-        }
-
-        // S-box scratch: 256 bytes. At runtime the KSA overwrites the
-        // whole region — the build-time content doesn't matter, we
-        // just need the space inside the section so `lea r8, sbox`
-        // points at valid memory.
-        sbox_offset_in_stub_ = static_cast<uint32_t>(stub_buf_.size());
-        stub_buf_.insert(stub_buf_.end(), kSboxSize, uint8_t{0});
-
-        // P3 — VM-protected KSA. Delegates to packer_ksa_vm_lifter,
-        // which appends the VM runtime blob to `stub_buf_` on success
-        // (plus the needed 16-byte padding) and leaves the buffer
-        // untouched on any failure path. step5_inject_and_patch uses
-        // `packer_vm_lift_succeeded_` to decide whether to overwrite
-        // the plaintext KSA bytes with `call rel32 <vm_entry>`.
-        const auto p3 = packer::try_lift_ksa_to_vm(
-            ctx_, stub_buf_,
+        // Delegates to packer_stub_artifacts, which walks the fixed
+        // post-emit layout (keys, sbox, P3 VM blob, reprotect table,
+        // P4 TLS callback body + directory + callback array +
+        // optional index slot) and returns every recorded offset.
+        artifacts_ = packer::append_stub_artifacts(
+            ctx_, stub_buf_, rng_,
+            layer_keys_,
+            layer_count_,
+            encrypted_.size(),
             patches_.ksa_block_start_offset,
-            patches_.ksa_block_end_offset,
-            rng_);
-        packer_vm_blob_offset_    = p3.vm_blob_offset_in_stub;
-        packer_vm_entry_offset_   = p3.vm_entry_offset;
-        packer_vm_lift_succeeded_ = p3.succeeded;
-
-        // Embed the reprotect section table right after the VM blob.
-        reprotect_table_offset_in_stub_ =
-            static_cast<uint32_t>(stub_buf_.size());
-        stub_buf_.insert(stub_buf_.end(), encrypted_.size() * 8, uint8_t{0});
-
-        // --------------------------------------------------
-        // P4 — TLS callback artefacts.
-        //
-        // Layout appended to the end of stub_buf_ (all inside the
-        // same .mxpack section, so everything lives in one R+W+X
-        // page the loader maps as one unit):
-        //
-        //     [callback body]           ~32 bytes
-        //     [8-byte alignment pad]
-        //     [IMAGE_TLS_DIRECTORY64]   40 bytes
-        //     [8-byte alignment pad]
-        //     [callback array]          (N+2) × 8 bytes, NULL terminated
-        //     [optional index slot]     4 bytes, only if no existing TLS
-        //
-        // For inputs that already ship with a TLS directory (C++
-        // programs with `__declspec(thread)` statics, for instance) we
-        // parse the existing one first and preserve its fields —
-        // StartAddressOfRawData / EndAddressOfRawData / AddressOfIndex
-        // / SizeOfZeroFill / Characteristics — verbatim. Our new
-        // callback prepends itself to the front of the existing
-        // callback array so the anti-debug probe fires before any
-        // CRT-registered TLS initialiser, and every original callback
-        // still runs in its original order afterward.
-        //
-        // Everything past this point lives at a fixed offset inside
-        // `stub_buf_`; the runtime RVA of each slot is
-        // `stub_rva + offset_in_stub_buf`. step6 back-patches them
-        // (along with the RC4-key rel32 inside the callback body)
-        // after `finalize_packer_stub` has placed the .mxpack section
-        // and we know `stub_rva_`.
-        existing_tls_opt_ = read_existing_tls_directory(ctx_.pe_image());
-
-        // Align to 8 bytes before the callback body so every
-        // downstream 8-byte field lands at a naturally-aligned
-        // offset.
-        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
-
-        tls_cb_ = emit_tls_callback_body(stub_buf_, rng_, layer_count_);
-
-        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
-        tls_dir_offset_in_stub_ = static_cast<uint32_t>(stub_buf_.size());
-        stub_buf_.insert(stub_buf_.end(), 40, uint8_t{0});  // IMAGE_TLS_DIRECTORY64
-
-        while (stub_buf_.size() % 8 != 0) stub_buf_.push_back(0xCC);
-        tls_cb_array_offset_in_stub_ =
-            static_cast<uint32_t>(stub_buf_.size());
-
-        // Callback array sizing: packer_cb + (optional guard
-        // installer) + existing user callbacks + NULL terminator. The
-        // guard installer slot is only reserved when an earlier pass
-        // (GuardPass) set `ctx_.extra_tls_callback_va`; otherwise we
-        // keep the old layout.
-        has_extra_tls_cb_ = ctx_.extra_tls_callback_va() != 0;
-        tls_cb_array_entries_ =
-            (existing_tls_opt_.has_value()
-                ? existing_tls_opt_->callbacks.size()
-                : 0)
-            + (has_extra_tls_cb_ ? 1u : 0u)
-            + 2u;  // +1 for our packer cb, +1 for the NULL terminator
-        stub_buf_.insert(stub_buf_.end(),
-                         tls_cb_array_entries_ * 8,
-                         uint8_t{0});
-
-        // Index slot — only needed when the input had no TLS
-        // directory of its own. If an existing directory was found
-        // its AddressOfIndex already points at a valid 4-byte slot in
-        // one of the preserved input sections, so we reuse that.
-        if (!existing_tls_opt_.has_value()) {
-            while (stub_buf_.size() % 4 != 0) stub_buf_.push_back(0xCC);
-            tls_index_slot_offset_in_stub_ =
-                static_cast<uint32_t>(stub_buf_.size());
-            stub_buf_.insert(stub_buf_.end(), 4, uint8_t{0});
-        }
+            patches_.ksa_block_end_offset);
     }
 
     [[nodiscard]] MxStatus step5_inject_and_patch() {
@@ -626,7 +528,7 @@ private:
             // lea rsi, [rip + rel] → this layer's 32-byte RC4 key.
             {
                 const Rva lea_end_rva = stub_rva_ + lp.rel_to_key_at + 4;
-                const Rva key_rva     = stub_rva_ + key_offsets_in_stub_[layer];
+                const Rva key_rva     = stub_rva_ + artifacts_.key_offsets_in_stub[layer];
                 const int32_t rel = static_cast<int32_t>(
                     static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
                 write_i32(pack_sec.data, lp.rel_to_key_at, rel);
@@ -649,7 +551,7 @@ private:
         // lea r8, [rip + rel] → 256-byte S-box scratch area.
         {
             const Rva lea_end_rva = stub_rva_ + patches_.rel_to_sbox_at + 4;
-            const Rva sbox_rva    = stub_rva_ + sbox_offset_in_stub_;
+            const Rva sbox_rva    = stub_rva_ + artifacts_.sbox_offset_in_stub;
             const int32_t rel = static_cast<int32_t>(
                 static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
             write_i32(pack_sec.data, patches_.rel_to_sbox_at, rel);
@@ -658,11 +560,11 @@ private:
         // P3 — if the KSA block was successfully lifted, overwrite
         // the plaintext KSA bytes with `call rel32 <vm_entry>` + NOP
         // pad.
-        if (packer_vm_lift_succeeded_) {
+        if (artifacts_.packer_vm_lift_succeeded) {
             const Rva vm_entry_rva =
                 stub_rva_ +
-                static_cast<Rva>(packer_vm_blob_offset_) +
-                static_cast<Rva>(packer_vm_entry_offset_);
+                static_cast<Rva>(artifacts_.packer_vm_blob_offset) +
+                static_cast<Rva>(artifacts_.packer_vm_entry_offset);
             const uint32_t ksa_off = patches_.ksa_block_start_offset;
             const Rva    call_rva    = stub_rva_ + ksa_off;
             const Rva    call_end_rva = call_rva + 5;
@@ -698,14 +600,14 @@ private:
         // lea r14, [rip + rel] → reprotect section table + fill data.
         {
             const Rva lea_end_rva = stub_rva_ + patches_.rel_to_reprotect_table_at + 4;
-            const Rva table_rva   = stub_rva_ + reprotect_table_offset_in_stub_;
+            const Rva table_rva   = stub_rva_ + artifacts_.reprotect_table_offset_in_stub;
             const int32_t rel = static_cast<int32_t>(
                 static_cast<int64_t>(table_rva) - static_cast<int64_t>(lea_end_rva));
             write_i32(pack_sec.data, patches_.rel_to_reprotect_table_at, rel);
 
             for (size_t i = 0; i < encrypted_.size(); ++i) {
                 const uint32_t entry_off =
-                    reprotect_table_offset_in_stub_ + static_cast<uint32_t>(i * 8);
+                    artifacts_.reprotect_table_offset_in_stub + static_cast<uint32_t>(i * 8);
                 write_i32(pack_sec.data, entry_off + 0,
                           static_cast<int32_t>(encrypted_[i].rva));
                 write_i32(pack_sec.data, entry_off + 4,
@@ -762,11 +664,11 @@ private:
         const auto image_base =
             static_cast<uint64_t>(ctx_.pe_image().image_base());
         const uint64_t cb_body_va =
-            image_base + stub_rva_ + tls_cb_.body_offset;
+            image_base + stub_rva_ + artifacts_.tls_cb.body_offset;
         const uint64_t tls_dir_va =
-            image_base + stub_rva_ + tls_dir_offset_in_stub_;
+            image_base + stub_rva_ + artifacts_.tls_dir_offset_in_stub;
         const uint64_t cb_array_va =
-            image_base + stub_rva_ + tls_cb_array_offset_in_stub_;
+            image_base + stub_rva_ + artifacts_.tls_cb_array_offset_in_stub;
 
         // 1. Patch the `xor byte [rip + rel32], imm8` inside the
         //    callback body to point at one byte of a per-build random
@@ -780,12 +682,12 @@ private:
         //    computed from the end of the xor instruction
         //    (`xor_instruction_end`) to the target byte.
         const uint32_t key_target_offset_in_stub =
-            key_offsets_in_stub_[tls_cb_.key_layer_index] +
-            tls_cb_.key_byte_offset_in_key;
+            artifacts_.key_offsets_in_stub[artifacts_.tls_cb.key_layer_index] +
+            artifacts_.tls_cb.key_byte_offset_in_key;
         const int32_t xor_rel32 = static_cast<int32_t>(
             static_cast<int64_t>(key_target_offset_in_stub) -
-            static_cast<int64_t>(tls_cb_.xor_instruction_end));
-        write_i32(pack_sec.data, tls_cb_.xor_key_rel32_offset, xor_rel32);
+            static_cast<int64_t>(artifacts_.tls_cb.xor_instruction_end));
+        write_i32(pack_sec.data, artifacts_.tls_cb.xor_key_rel32_offset, xor_rel32);
 
         // 2. Fill the callback array: our packer callback first, then
         //    (optional) the runtime-guards VEH installer from
@@ -801,16 +703,16 @@ private:
         // triggers guarded paths — if the VEH isn't installed yet,
         // those int3s crash the process. So:
         //     [packer_cb][guard_install_cb?][user_cb_0][user_cb_1]...[NULL]
-        uint32_t write_off = tls_cb_array_offset_in_stub_;
+        uint32_t write_off = artifacts_.tls_cb_array_offset_in_stub;
         write_u64_le(pack_sec.data, write_off, cb_body_va);
         write_off += 8;
-        if (has_extra_tls_cb_) {
+        if (artifacts_.has_extra_tls_cb) {
             write_u64_le(pack_sec.data, write_off,
                          ctx_.extra_tls_callback_va());
             write_off += 8;
         }
-        if (existing_tls_opt_.has_value()) {
-            for (const uint64_t old_cb : existing_tls_opt_->callbacks) {
+        if (artifacts_.existing_tls_opt.has_value()) {
+            for (const uint64_t old_cb : artifacts_.existing_tls_opt->callbacks) {
                 write_u64_le(pack_sec.data, write_off, old_cb);
                 write_off += 8;
             }
@@ -825,28 +727,29 @@ private:
         uint64_t end_va   = 0;
         uint32_t zero_fill = 0;
         uint32_t characteristics = 0;
-        if (existing_tls_opt_.has_value()) {
-            start_va        = existing_tls_opt_->start_va;
-            end_va          = existing_tls_opt_->end_va;
-            index_va        = existing_tls_opt_->index_va;
-            zero_fill       = existing_tls_opt_->size_of_zero_fill;
-            characteristics = existing_tls_opt_->characteristics;
+        if (artifacts_.existing_tls_opt.has_value()) {
+            const auto& ex   = *artifacts_.existing_tls_opt;
+            start_va         = ex.start_va;
+            end_va           = ex.end_va;
+            index_va         = ex.index_va;
+            zero_fill        = ex.size_of_zero_fill;
+            characteristics  = ex.characteristics;
         } else {
             // No existing TLS — point AddressOfIndex at our own
             // 4-byte scratch slot inside .mxpack.
-            index_va = image_base + stub_rva_ + tls_index_slot_offset_in_stub_;
+            index_va = image_base + stub_rva_ + artifacts_.tls_index_slot_offset_in_stub;
         }
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x00, start_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x08, end_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x10, index_va);
-        write_u64_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x18, cb_array_va);
-        write_u32_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x20, zero_fill);
-        write_u32_le(pack_sec.data, tls_dir_offset_in_stub_ + 0x24, characteristics);
+        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x00, start_va);
+        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x08, end_va);
+        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x10, index_va);
+        write_u64_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x18, cb_array_va);
+        write_u32_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x20, zero_fill);
+        write_u32_le(pack_sec.data, artifacts_.tls_dir_offset_in_stub + 0x24, characteristics);
 
         // 4. Point the PE header's TLS data directory at our new
         //    in-.mxpack directory.
         const Rva tls_dir_rva =
-            static_cast<Rva>(stub_rva_ + tls_dir_offset_in_stub_);
+            static_cast<Rva>(stub_rva_ + artifacts_.tls_dir_offset_in_stub);
         std::visit([&](auto& nt) {
             if (pe::IMAGE_DIRECTORY_ENTRY_TLS < nt.OptionalHeader.NumberOfRvaAndSizes) {
                 nt.OptionalHeader.DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress
@@ -859,13 +762,13 @@ private:
         ctx_.log_fmt("PackerPass: P4 TLS callback planted @ RVA=0x{:08X}, "
                      "chain length {} (existing={}, ours=1), "
                      "corrupts key[layer={}, byte={}]",
-            stub_rva_ + tls_cb_.body_offset,
-            static_cast<uint32_t>(tls_cb_array_entries_ - 1),
-            existing_tls_opt_.has_value()
-                ? static_cast<uint32_t>(existing_tls_opt_->callbacks.size())
+            stub_rva_ + artifacts_.tls_cb.body_offset,
+            static_cast<uint32_t>(artifacts_.tls_cb_array_entries - 1),
+            artifacts_.existing_tls_opt.has_value()
+                ? static_cast<uint32_t>(artifacts_.existing_tls_opt->callbacks.size())
                 : 0u,
-            tls_cb_.key_layer_index,
-            tls_cb_.key_byte_offset_in_key);
+            artifacts_.tls_cb.key_layer_index,
+            artifacts_.tls_cb.key_byte_offset_in_key);
         (void)tls_dir_va;  // reserved for future use (direct self-reference)
     }
 
@@ -993,19 +896,7 @@ private:
     typename Emitter::patches_type patches_{};
 
     // --- step4 outputs -----------------------------------------------
-    std::vector<uint32_t> key_offsets_in_stub_;
-    uint32_t              sbox_offset_in_stub_            = 0;
-    size_t                packer_vm_blob_offset_          = 0;
-    uint32_t              packer_vm_entry_offset_         = 0;
-    bool                  packer_vm_lift_succeeded_       = false;
-    uint32_t              reprotect_table_offset_in_stub_ = 0;
-    std::optional<ExistingTlsDirectory> existing_tls_opt_;
-    TlsCallbackEmit       tls_cb_{};
-    uint32_t              tls_dir_offset_in_stub_         = 0;
-    uint32_t              tls_cb_array_offset_in_stub_    = 0;
-    uint32_t              tls_index_slot_offset_in_stub_  = 0;
-    bool                  has_extra_tls_cb_               = false;
-    size_t                tls_cb_array_entries_           = 0;
+    StubArtifactsInfo artifacts_{};
 
     // --- step5 outputs -----------------------------------------------
     size_t pack_section_index_ = 0;
