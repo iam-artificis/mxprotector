@@ -1,26 +1,53 @@
 /**
  * @file packer_pass.cpp
- * @brief [BUILDER] PackerPass — self-unpacking PE protector implementation.
+ * @brief [BUILDER] PackerPass — self-unpacking PE protector orchestrator.
  *
- * Strategy:
- *   1. Strip base relocations (set IMAGE_FILE_RELOCS_STRIPPED, clear DYNAMIC_BASE,
- *      clear the IMAGE_DIRECTORY_ENTRY_BASERELOC directory). The loader will
- *      load at the preferred ImageBase without applying any fixups, so the
- *      encrypted bytes survive loader → stub unchanged.
- *   2. Generate a per-build random 256-byte XOR key.
- *   3. Encrypt .text in place: enc[i] = plain[i] ^ key[i % 256]. Mark .text
- *      writable so the stub can decrypt in place.
- *   4. Emit an x64 decryption stub into a new .mxpack section. The stub:
- *        - uses RIP-relative LEAs to locate .text and the embedded key,
- *        - masks the byte index against 0xFF so a single-byte counter drives
- *          the key stream,
- *        - jmps to the original entry point via rel32.
- *   5. Retarget the PE entry point to the stub.
+ * `PackerPass` is a thin facade over a seven-step pipeline. Every
+ * sub-step lives in its own translation unit; this file is the
+ * orchestrator that threads them together and owns the
+ * EXE/DLL-specific stub-shape choice.
  *
- * Limitations (MVP):
- *   - Only .text is encrypted.
- *   - .reloc is stripped — binaries must be loadable at ImageBase.
- *   - Stub does not restore the .text page protection after decrypting.
+ * Pipeline (decrypt order at runtime is the reverse):
+ *
+ *   step1 — strip base relocations, collect target sections, steal a
+ *           safe OEP prologue, make `.rdata` writable for the IAT
+ *           wipe. Free-function helpers `disable_relocations`,
+ *           `collect_target_sections`, `prepare_oep_steal`.
+ *
+ *   step2 — clamp `packer_cipher_layers`, draw per-layer 32-byte RC4
+ *           base keys, mark target sections writable, decide the G3
+ *           VEH trap gate.
+ *
+ *   step3 — the policy Emitter (`ExeStubEmitter` /
+ *           `DllFullStubEmitter` from `stub_emitter.hpp`) produces
+ *           the stub code bytes + `CipherBodyPatches`.
+ *
+ *   step4 — `packer::append_stub_artifacts` walks the fixed
+ *           stub-tail layout: per-layer keys, sbox scratch, P3
+ *           VM blob (`packer_ksa_vm_lifter`), reprotect table, P4
+ *           TLS callback body + directory + callback array + optional
+ *           index slot.
+ *
+ *   step5 — inject the .mxpack section via `finalize_packer_stub`,
+ *           then delegate every rel32 / imm32 / anchor patch to
+ *           `packer::apply_post_inject_patches` (analogue of
+ *           `x64_blob_patcher`).
+ *
+ *   step6 — `packer::finalize_tls_metadata` fills the TLS directory
+ *           and callback array, points `DataDirectory[TLS]` at the
+ *           new directory.
+ *
+ *   step7 — `packer::hash_derive_and_encrypt` stamps the self-hash
+ *           count imm32, computes FNV-1a over the stub, derives
+ *           effective per-layer keys, and RC4-encrypts every target
+ *           section in build order.
+ *
+ * Shared pre/post helpers: `disable_relocations`,
+ * `collect_target_sections`, `prepare_oep_steal`, and
+ * `finalize_packer_stub` stay in this TU because they own
+ * cross-cutting PE mutations (relocation-dir stamping, entry
+ * redirection, section injection with rel32 fixups) that no
+ * downstream extractor needs to see in isolation.
  */
 
 #include "mxprotector/protection/packer/packer_pass.hpp"
@@ -29,10 +56,8 @@
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
-#include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
 #include "mxprotector/protection/packer/cipher_body.hpp"
-#include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
 #include "mxprotector/protection/packer/packer_section_encryptor.hpp"
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
@@ -40,73 +65,29 @@
 #include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
-#include "mxprotector/protection/packer/stub_self_hash.hpp"
-#include "mxprotector/protection/packer/tls_callback.hpp"
-
-#include <Zydis/Zydis.h>
 
 #include <algorithm>
-#include <array>
 #include <concepts>
-#include <cstring>
-#include <format>
 #include <optional>
+#include <span>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace mx {
 
 namespace {
 
-// Pull the packer helpers into this TU's anonymous namespace so the
-// existing unqualified references to `kKeySize`, `kSboxSize`,
-// `Rc4State`, `rc4_init`, `rc4_process`, `kMinStolenBytes`,
-// `kMaxStolenBytes`, `StolenReloc`, `StolenPlan`, and
-// `plan_stolen_bytes` keep compiling after the extraction. Future
-// commits that split the stub emitter / cipher body / TLS callback
-// out of this file will move their call sites to the fully-qualified
-// `packer::` form.
 using mx::packer::kKeySize;
-using mx::packer::kSboxSize;
-using mx::packer::Rc4State;
-using mx::packer::rc4_init;
-using mx::packer::rc4_process;
-
-using mx::packer::kMinStolenBytes;
-using mx::packer::kMaxStolenBytes;
-using mx::packer::StolenReloc;
-using mx::packer::StolenPlan;
 using mx::packer::plan_stolen_bytes;
-
+using mx::packer::StolenPlan;
 using mx::packer::write_i32;
-using mx::packer::write_u32_le;
-using mx::packer::write_u64_le;
-using mx::packer::read_u32_le;
-using mx::packer::read_u64_le;
-
-using mx::packer::TlsCallbackEmit;
-using mx::packer::ExistingTlsDirectory;
-using mx::packer::read_existing_tls_directory;
-using mx::packer::emit_tls_callback_body;
-
-using mx::packer::StubArtifactsInfo;
-using mx::packer::append_stub_artifacts;
-
-using mx::packer::DecryptSection;
-using mx::packer::LayerPatches;
-using mx::packer::CipherBodyPatches;
-using mx::packer::emit_decrypt_body;
-
 using mx::packer::CommonStubPatches;
-using mx::packer::ExeStubPatches;
-using mx::packer::DllFullStubPatches;
+using mx::packer::StubArtifactsInfo;
 using mx::packer::StubEmitter;
 using mx::packer::StubEmissionParams;
 using mx::packer::ExeStubEmitter;
 using mx::packer::DllFullStubEmitter;
-
-using mx::packer::fnv1a_32;
-using mx::packer::derive_effective_key_in_place;
 
 
 /// Strip base relocations: clear the directory entry, set the file header's
@@ -318,36 +299,15 @@ struct PackerStubInjection {
 
 /// Orchestration state for one `execute_encrypted_stub<Emitter>` call.
 ///
-/// R2.1 decomposition: what used to be a 600-line template function
-/// with ~20 interleaved concerns is now a small class with step
-/// methods wrapping private state. Nothing about the runtime wire
-/// format or log output changes — this is a pure readability
-/// refactor laying the groundwork for R2.2+ which peel off each
-/// concern (P3 VM-lift, P4 TLS finalise, P6 hash+encrypt, etc.)
-/// into its own compilation unit.
+/// Holds all cross-step state (`steal_`, `layer_keys_`, `encrypted_`,
+/// `stub_buf_`, `patches_`, `artifacts_`, `stub_rva_`) as private
+/// members. `execute()` walks the seven steps in order; steps 1 and
+/// 2 can short-circuit via `skip_` when the image has no encryptable
+/// target, and steps 5 and 7 can propagate `MxStatus` errors
+/// (section-injection failure, bad hash range).
 ///
-/// Pipeline:
-///   step1 — collect target sections, OEP steal, make .rdata writable.
-///   step2 — clamp layer_count, generate per-layer RC4 keys, walk
-///           targets into `encrypted_`, gate the VEH trap flag.
-///   step3 — ask the policy Emitter for the stub code bytes.
-///   step4 — append per-layer keys, S-box scratch, P3 VM blob (if a
-///           disassembler is available), reprotect table, P4 TLS
-///           artefacts (callback body, directory, callback array,
-///           optional index slot).
-///   step5 — inject the .mxpack section, apply per-layer / sbox /
-///           ImageBase / reprotect / IAT rel32 patches, overwrite the
-///           KSA block with `call rel32 <vm_entry>` if the lift
-///           succeeded.
-///   step6 — P4 TLS finalise: fill in the callback array + directory
-///           + point DataDirectory[TLS] at the new directory.
-///   step7 — P6: compute stub self-hash → derive effective per-layer
-///           keys → RC4-encrypt every target section in build order.
-///
-/// Every step is a method so each sub-step's scope is explicit, and
-/// the cross-step variables are clearly visible as private members.
-/// Early exits from steps 1 or 2 set `skip_` so the rest of the
-/// pipeline short-circuits back to the ctx.log + return path.
+/// See the file-level docstring for the pipeline itself — the step
+/// methods below are thin wrappers around the extracted components.
 template <StubEmitter Emitter>
     requires std::constructible_from<Emitter, StubEmissionParams>
 class PackerPipeline {
