@@ -5,6 +5,7 @@
 
 #include "mxprotector/protection/cfg/cff_trampoline_section.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
@@ -23,10 +24,10 @@ constexpr uint32_t kCffSectionCharacteristics =
     pe::IMAGE_SCN_MEM_EXECUTE |
     pe::IMAGE_SCN_MEM_READ;
 
-/// Pad `buf` with 0xCC until its size is a multiple of `kFunctionAlignment`.
+/// Pad `buf` with `INT 3` until its size is a multiple of `kFunctionAlignment`.
 void pad_to_alignment(ByteBuffer& buf) {
     while (buf.size() % kFunctionAlignment != 0) {
-        buf.push_back(0xCC);
+        buf.push_back(asm64::kInt3);
     }
 }
 
