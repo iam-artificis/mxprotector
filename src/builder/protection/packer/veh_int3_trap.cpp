@@ -12,6 +12,7 @@
 
 #include "mxprotector/protection/packer/veh_int3_trap.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 #include <cstdint>
@@ -136,7 +137,7 @@ void emit_veh_int3_trap(RawEmitter& e, Randomizer& rng) {
     e.u32(0xFFFFFFFFu);
 
     // ret                                          C3
-    e.u8(0xC3);
+    e.u8(asm64::kRet);
 
     // .not_ours: — exception code or address doesn't match, delegate
     //   to the next VEH / SEH chain link. This is the path that
@@ -152,7 +153,7 @@ void emit_veh_int3_trap(RawEmitter& e, Randomizer& rng) {
     e.u8(0x31); e.u8(0xC0);
 
     // ret                                          C3
-    e.u8(0xC3);
+    e.u8(asm64::kRet);
 
     // .past_handler: — execution resumes from the `jmp short` at
     //   the top of this block. Patch the rel8.
@@ -273,7 +274,7 @@ void emit_veh_int3_trap(RawEmitter& e, Randomizer& rng) {
     //     static-analysis confusion still applies.
     // ----------------------------------------------------------------
     const size_t int3_offset = e.size();
-    e.u8(0xCC);
+    e.u8(asm64::kInt3);
     for (int i = 0; i < 6; ++i) {
         e.u8(rng.next_u8());
     }

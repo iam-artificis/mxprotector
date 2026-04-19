@@ -1,5 +1,7 @@
 #include "mxprotector/protection/guard/guard_decrypt_unit.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
+
 #include <cstdint>
 
 namespace mx::guard {
@@ -63,7 +65,7 @@ GuardDecryptUnitEmit emit_guard_decrypt_unit(RawEmitter& e) {
     // .decrypt_done:
     const uint32_t done_label = static_cast<uint32_t>(e.size());
     // ret
-    e.u8(0xC3);
+    e.u8(asm64::kRet);
 
     // Back-patch jz .decrypt_done
     {

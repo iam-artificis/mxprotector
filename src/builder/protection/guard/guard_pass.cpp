@@ -21,6 +21,7 @@
 
 #include "mxprotector/protection/guard/guard_pass.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/pe_image.hpp"
@@ -58,10 +59,9 @@ using guard::kGuardDescriptorStride;
 using guard::kGuardInt3TagSize;
 using guard::kGuardPageSize;
 
-/// Opcode + size for the source-side `jmp rel32 <page>` patch that
-/// replaces each guarded region in .text.
-constexpr uint8_t  kJmpRel32Opcode = 0xE9;
-constexpr uint32_t kJmpRel32Size   = 5;
+/// Size of the 5-byte `jmp rel32` that replaces each guarded region
+/// in the source section.
+constexpr uint32_t kJmpRel32Size = 5;
 
 /// Minimum source-side patch window — anything smaller cannot hold
 /// the `jmp rel32` and is rejected.
@@ -111,10 +111,10 @@ void write_jmp_rel32_and_pad(
         static_cast<int64_t>(source_rva) -
         static_cast<int64_t>(kJmpRel32Size));
 
-    section.data[offset] = kJmpRel32Opcode;
-    std::memcpy(section.data.data() + offset + 1, &rel32, sizeof(rel32));
-    for (uint32_t i = kJmpRel32Size; i < patch_size; ++i) {
-        section.data[offset + i] = 0x90;  // NOP
+    MutableByteView span{section.data.data() + offset, patch_size};
+    asm64::write_jmp_rel32(span.subspan(0, kJmpRel32Size), rel32);
+    if (patch_size > kJmpRel32Size) {
+        asm64::fill_nop(span.subspan(kJmpRel32Size));
     }
 }
 

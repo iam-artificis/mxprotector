@@ -195,4 +195,16 @@ inline void fill_int3(MutableByteView out) noexcept {
     for (auto& b : out) b = kInt3;
 }
 
+/// Fill every byte of `out` with `kNop` (1-byte NOP).
+///
+/// For in-place patches where the trailing bytes must stay decodable
+/// as valid x86 (e.g., a 5-byte `jmp rel32` followed by NOP padding
+/// inside an original function body). Callers that need the longer
+/// multi-byte NOPs from the Intel recommended sequence should still
+/// reach for `x86::make_nop` — this helper is the trivial
+/// byte-at-a-time fill.
+inline void fill_nop(MutableByteView out) noexcept {
+    for (auto& b : out) b = kNop;
+}
+
 } // namespace mx::asm64

@@ -5,6 +5,7 @@
 
 #include "mxprotector/protection/packer/tls_callback.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
@@ -138,7 +139,7 @@ TlsCallbackEmit emit_tls_callback_body(ByteBuffer& buf,
     //                  leave rax in a deterministic state.
     u8(0x31); u8(0xC0);
     // ret
-    u8(0xC3);
+    u8(asm64::kRet);
 
     out.body_end_offset        = static_cast<uint32_t>(buf.size());
     out.key_byte_offset_in_key = rng.next_range(0, kKeySize - 1);

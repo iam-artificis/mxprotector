@@ -14,6 +14,7 @@
 
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/protection/packer/packer_ksa_vm_lifter.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
@@ -105,15 +106,15 @@ StubArtifactsInfo append_stub_artifacts(
 
     // Align to 8 bytes before the callback body so every downstream
     // 8-byte field lands at a naturally-aligned offset.
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
+    while (stub_buf.size() % 8 != 0) stub_buf.push_back(asm64::kInt3);
 
     out.tls_cb = emit_tls_callback_body(stub_buf, rng, layer_count);
 
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
+    while (stub_buf.size() % 8 != 0) stub_buf.push_back(asm64::kInt3);
     out.tls_dir_offset_in_stub = static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), 40, uint8_t{0});  // IMAGE_TLS_DIRECTORY64
 
-    while (stub_buf.size() % 8 != 0) stub_buf.push_back(0xCC);
+    while (stub_buf.size() % 8 != 0) stub_buf.push_back(asm64::kInt3);
     out.tls_cb_array_offset_in_stub =
         static_cast<uint32_t>(stub_buf.size());
 
@@ -137,7 +138,7 @@ StubArtifactsInfo append_stub_artifacts(
     // already points at a valid 4-byte slot in one of the preserved
     // input sections, so we reuse that.
     if (!out.existing_tls_opt.has_value()) {
-        while (stub_buf.size() % 4 != 0) stub_buf.push_back(0xCC);
+        while (stub_buf.size() % 4 != 0) stub_buf.push_back(asm64::kInt3);
         out.tls_index_slot_offset_in_stub =
             static_cast<uint32_t>(stub_buf.size());
         stub_buf.insert(stub_buf.end(), 4, uint8_t{0});

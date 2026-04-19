@@ -27,6 +27,8 @@
 
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
+
 #include <cstdint>
 #include <cstring>
 
@@ -323,7 +325,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u8(0x75);
     const uint32_t entry_skip_rel8_slot = static_cast<uint32_t>(e.size());
     e.u8(0x00);
-    e.u8(0xE8);
+    e.u8(asm64::kCallRel32);
     const uint32_t entry_call_rel32_slot = static_cast<uint32_t>(e.size());
     e.u32(0);
     const uint32_t entry_skip_label = static_cast<uint32_t>(e.size());
@@ -361,7 +363,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u8(0x75);
     const uint32_t exit_skip_rel8_slot = static_cast<uint32_t>(e.size());
     e.u8(0x00);
-    e.u8(0xE8);
+    e.u8(asm64::kCallRel32);
     const uint32_t exit_call_rel32_slot = static_cast<uint32_t>(e.size());
     e.u32(0);
     const uint32_t exit_skip_label = static_cast<uint32_t>(e.size());
@@ -386,7 +388,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u8(0x5E);
     e.u8(0x5D);
     e.u8(0x5B);
-    e.u8(0xC3);
+    e.u8(asm64::kRet);
 
     // =================================================================
     // Back-patch forward rel8 jumps. The two `call decrypt_body`

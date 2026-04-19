@@ -6,6 +6,8 @@
 
 #include "mxprotector/protection/guard/guard_page_layout.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <format>
@@ -18,7 +20,7 @@ namespace {
 /// `offset` must be a valid slot — the caller guarantees bounds via
 /// the page-size check earlier in `build_guard_page`.
 void write_int3_tag(ByteBuffer& buf, uint32_t offset, uint32_t guard_id) noexcept {
-    buf[offset] = 0xCC;  // int3
+    buf[offset] = asm64::kInt3;
     std::memcpy(buf.data() + offset + 1, &guard_id, sizeof(guard_id));
 }
 
