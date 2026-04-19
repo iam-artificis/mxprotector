@@ -98,6 +98,12 @@ set(PACKER_SOURCES
 
 set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_substitution.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/opcode_swap_rule.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/direction_flip_rule.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/imm8_negation_rule.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/shift_add_rules.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/semantic_transform_rules.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/inc_dec_rules.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp
