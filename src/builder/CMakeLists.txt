@@ -83,6 +83,12 @@ set(BUILDER_SOURCES
 
     # Runtime guards — MX_GUARD_BEGIN/END relocation + VEH dispatcher
     protection/guard/guard_pass.cpp
+    protection/guard/guard_pass_pipeline.cpp
+    protection/guard/guard_collector.cpp
+    protection/guard/guard_decrypt_vm_lifter.cpp
+    protection/guard/guard_section_assembler.cpp
+    protection/guard/guard_region_finalizer.cpp
+    protection/guard/guard_handler_back_patcher.cpp
     protection/guard/guard_page_layout.cpp
     protection/guard/guard_veh_emitter.cpp
     protection/guard/guard_decrypt_unit.cpp
