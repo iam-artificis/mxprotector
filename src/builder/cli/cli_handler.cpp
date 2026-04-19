@@ -112,6 +112,21 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
         if (arg == "--anti-tamper-veh")     { config.enable_veh_anti_tamper = true; continue; }
 
+        if (arg.starts_with("--load-mode=") && arg.size() > 12) {
+            const auto mode_str = arg.substr(12);
+            if (mode_str == "os") {
+                config.load_mode = target::LoadMode::os_loaded;
+                continue;
+            }
+            if (mode_str == "manual") {
+                config.load_mode = target::LoadMode::manual_mapped;
+                continue;
+            }
+            return std::unexpected(error::config(
+                std::format("--load-mode: ожидается os|manual, получено '{}'",
+                            mode_str)));
+        }
+
         if (arg.starts_with("--strings=") && arg.size() > 10) {
             const auto mode_str = arg.substr(10);
             if (mode_str == "off" || mode_str == "disabled") {
@@ -225,6 +240,9 @@ void CliHandler::print_usage() {
         "                                ephemeral — S3 scratch-ring, no sticky cache\n"
         "                                (auto-fallback vm→stub при --no-vm)\n"
         "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
+        "  --load-mode=<режим>         Как загружается защищённый бинарь:\n"
+        "                                os     — стандартный OS-loader (по умолчанию)\n"
+        "                                manual — manual-map (kdmapper / DLL-инжектор)\n"
         "\n"
         "Информация:\n"
         "  -h, --help                  Показать эту справку\n"

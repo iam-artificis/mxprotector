@@ -28,6 +28,16 @@
 namespace mx {
 
 bool GuardPass::is_applicable(const ProtectionContext& ctx) const noexcept {
+    // Runtime-guards emit a Vectored Exception Handler and a TLS installer
+    // thunk — both are user-mode Win32 facilities. Kernel drivers run in
+    // ring0 where `RtlAddVectoredExceptionHandler` does not exist and the
+    // dispatcher shape is entirely different (IDT / KiDispatchException),
+    // so we skip driver targets outright. The stub uses x64 encoding
+    // exclusively, so PE32 / ELF / Mach-O targets skip for the same reason
+    // as every other x64-specific emitter.
+    if (!ctx.target().is_windows_pe_x64()) return false;
+    if (ctx.target().is_kernel_driver())   return false;
+
     for (const auto& m : ctx.markers()) {
         if (m.type == MarkerType::guard_begin) return true;
     }

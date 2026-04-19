@@ -33,6 +33,8 @@ set(TEST_SOURCES
     guard_veh_emitter_test.cpp
     guard_decrypt_unit_test.cpp
     guard_tls_installer_test.cpp
+    target_info_test.cpp
+    pass_applicability_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -90,11 +92,24 @@ set(STRING_PROTECT_SOURCES
 )
 
 # Packer sub-module sources needed by individual packer unit tests
-# (currently just the G3 Phase 2 VEH INT3 trap emitter; depends on
-# the Hell's Gate resolver from ANTI_TAMPER_SOURCES).
+# (veh_int3_trap + stub_self_hash for their respective tests) plus the
+# full packer-pass chain so pass_applicability_test can instantiate
+# PackerPass. Depends on hells_gate_resolver from ANTI_TAMPER_SOURCES
+# and the VM_SOURCES for the KSA VM lifter.
 set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/veh_int3_trap.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stub_self_hash.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_ksa_vm_lifter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_stub_artifacts.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_stub_patcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_tls_finalizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_section_encryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/rc4.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stolen_bytes.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stub_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/tls_callback.cpp
 )
 
 # ==============================================================================
@@ -136,16 +151,23 @@ set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
 )
 
-# Runtime-guards module sources needed for guard_* unit tests.
-# guard_pass.cpp itself is NOT needed because each test targets an
-# isolated pure-function emitter without a ProtectionContext.
-# The TLS installer pulls in the Hell's Gate resolver because its
-# body embeds the resolver bytes.
+# Runtime-guards module sources. The leaf emitters (page layout / VEH /
+# decrypt unit / TLS installer) are covered by their own isolated tests.
+# The full facade + pipeline chain is linked so pass_applicability_test
+# can instantiate `GuardPass`. The TLS installer pulls in the Hell's
+# Gate resolver because its body embeds the resolver bytes.
 set(GUARD_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_page_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_veh_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_decrypt_unit.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_tls_installer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_pass_pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_collector.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_decrypt_vm_lifter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_section_assembler.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_region_finalizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/guard/guard_handler_back_patcher.cpp
 )
 
 # ==============================================================================

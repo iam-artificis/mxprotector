@@ -1,0 +1,166 @@
+/**
+ * @file pass_applicability_test.cpp
+ * @brief [TESTS] Target-based gates on `IProtectionPass::is_applicable`.
+ *
+ * These tests pin the Stage 1 applicability gates introduced for
+ * `.sys` / driver support:
+ *
+ *   - `GuardPass` skips kernel-driver targets (no user-mode VEH).
+ *   - `StringProtectionPass` skips kernel-driver targets (runtime
+ *      stub / scratch-ring not yet audited for ring0).
+ *   - `PackerPass` skips kernel-driver targets (needs a dedicated
+ *      DriverEntry stub that does not exist yet).
+ *
+ * The positive cases (executable / dynamic_library) confirm that the
+ * gates do not over-reject — each pass still returns true for the
+ * ordinary user-mode x64 PE target when its own preconditions are met.
+ *
+ * We deliberately construct a bare-bones `ProtectionContext` — a
+ * default-constructed `PeImage`, a minimal `ProtectionConfig`, and a
+ * null disassembler. `is_applicable()` never touches the image or
+ * disassembler, so the fixture stays trivial and the gate becomes the
+ * only thing under test.
+ */
+
+#include <gtest/gtest.h>
+
+#include <memory>
+
+#include "mxprotector/config/protection_config.hpp"
+#include "mxprotector/core/context.hpp"
+#include "mxprotector/core/types.hpp"
+#include "mxprotector/pe/pe_image.hpp"
+#include "mxprotector/target/target_info.hpp"
+#include "mxprotector/protection/guard/guard_pass.hpp"
+#include "mxprotector/protection/packer/packer_pass.hpp"
+#include "mxprotector/protection/string/string_protection_pass.hpp"
+
+namespace {
+
+using mx::target::BinaryKind;
+using mx::target::LoadMode;
+
+mx::target::TargetInfo make_target(BinaryKind kind,
+                                    LoadMode mode = LoadMode::os_loaded) {
+    return mx::target::TargetInfo{
+        .os        = mx::target::Os::windows,
+        .container = mx::target::ContainerFormat::pe,
+        .arch      = mx::target::Arch::x64,
+        .kind      = kind,
+        .load_mode = mode,
+    };
+}
+
+mx::ProtectionContext make_ctx(BinaryKind kind,
+                                LoadMode mode = LoadMode::os_loaded)
+{
+    auto img = std::make_unique<mx::PeImage>();
+    img->set_architecture(mx::Architecture::x64);
+
+    mx::ProtectionConfig cfg;
+    cfg.enable_packer      = true;
+    cfg.string_protection  = mx::StringProtectionMode::stub;
+
+    mx::ProtectionContext ctx(std::move(img), std::move(cfg), nullptr);
+
+    // Seed a guard marker so GuardPass's marker loop can return true
+    // when the target gate does not reject. No-op for the other passes.
+    ctx.markers().push_back(mx::MarkedRegion{
+        .type              = mx::MarkerType::guard_begin,
+        .start_rva         = 0,
+        .end_rva           = 0x10,
+        .section_index     = 0,
+        .begin_marker_size = 0,
+        .end_marker_size   = 0,
+    });
+
+    ctx.set_target(make_target(kind, mode));
+    return ctx;
+}
+
+// --------------------------------------------------------------------
+// GuardPass
+// --------------------------------------------------------------------
+
+TEST(PassApplicability, GuardPassSkipsKernelDriver) {
+    auto ctx = make_ctx(BinaryKind::kernel_driver);
+    mx::GuardPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, GuardPassAcceptsExecutable) {
+    auto ctx = make_ctx(BinaryKind::executable);
+    mx::GuardPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, GuardPassAcceptsDynamicLibrary) {
+    auto ctx = make_ctx(BinaryKind::dynamic_library);
+    mx::GuardPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+// --------------------------------------------------------------------
+// StringProtectionPass
+// --------------------------------------------------------------------
+
+TEST(PassApplicability, StringProtectionSkipsKernelDriver) {
+    auto ctx = make_ctx(BinaryKind::kernel_driver);
+    mx::StringProtectionPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, StringProtectionAcceptsExecutable) {
+    auto ctx = make_ctx(BinaryKind::executable);
+    mx::StringProtectionPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, StringProtectionAcceptsDynamicLibrary) {
+    auto ctx = make_ctx(BinaryKind::dynamic_library);
+    mx::StringProtectionPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+// --------------------------------------------------------------------
+// PackerPass
+// --------------------------------------------------------------------
+
+TEST(PassApplicability, PackerPassSkipsKernelDriver) {
+    auto ctx = make_ctx(BinaryKind::kernel_driver);
+    mx::PackerPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, PackerPassAcceptsExecutable) {
+    auto ctx = make_ctx(BinaryKind::executable);
+    mx::PackerPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, PackerPassAcceptsDynamicLibrary) {
+    auto ctx = make_ctx(BinaryKind::dynamic_library);
+    mx::PackerPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+// --------------------------------------------------------------------
+// Manual-mapped load mode is an independent axis — it must not itself
+// cause applicability gates to trip on user-mode kinds in Stage 1.
+// (Stage 3 will introduce packer-side manual-map handling; for now the
+// packer runs whether or not the output will be manually mapped.)
+// --------------------------------------------------------------------
+
+TEST(PassApplicability, ManualMappedExecutableStillAcceptsPacker) {
+    auto ctx = make_ctx(BinaryKind::executable, LoadMode::manual_mapped);
+    mx::PackerPass pass;
+    EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, ManualMappedKernelDriverStillRejected) {
+    auto ctx = make_ctx(BinaryKind::kernel_driver, LoadMode::manual_mapped);
+    mx::PackerPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+} // namespace

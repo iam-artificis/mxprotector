@@ -282,17 +282,29 @@ int main(int argc, char** argv) {
     // ELF / Mach-O parsers are added, this is the one place that changes.
     {
         const auto& img = ctx.pe_image();
+        const auto kind = [&] {
+            switch (img.pe_type()) {
+                case mx::PeType::executable:      return mx::target::BinaryKind::executable;
+                case mx::PeType::dynamic_library: return mx::target::BinaryKind::dynamic_library;
+                case mx::PeType::kernel_driver:   return mx::target::BinaryKind::kernel_driver;
+            }
+            return mx::target::BinaryKind::unknown;
+        }();
         mx::target::TargetInfo info{
             .os        = mx::target::Os::windows,
             .container = mx::target::ContainerFormat::pe,
             .arch      = img.is_64bit() ? mx::target::Arch::x64
                                          : mx::target::Arch::x86,
+            .kind      = kind,
+            .load_mode = config.load_mode,
         };
         ctx.set_target(info);
-        std::cout << std::format("[*] Target: {}/{}/{}\n",
+        std::cout << std::format("[*] Target: {}/{}/{} kind={} load={}\n",
             mx::target::os_name(info.os),
             mx::target::container_name(info.container),
-            mx::target::arch_name(info.arch));
+            mx::target::arch_name(info.arch),
+            mx::target::binary_kind_name(info.kind),
+            mx::target::load_mode_name(info.load_mode));
     }
 
     // Pick per-build section names (random unless --debug-sections).

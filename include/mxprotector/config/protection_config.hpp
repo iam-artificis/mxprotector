@@ -19,6 +19,7 @@
 #include <string_view>
 
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/target/target_info.hpp"
 
 namespace mx {
 
@@ -103,6 +104,27 @@ struct ProtectionConfig {
 
     StringProtectionMode string_protection = StringProtectionMode::disabled;
                                           ///< `.rdata` string transform (S2/S4, см. enum)
+
+    /**
+     * @brief How the protected binary will be loaded at runtime.
+     *
+     * `os_loaded` (default) — standard deployment: the Windows image
+     * loader applies base relocations, resolves the IAT, and invokes
+     * TLS callbacks before the entry point. The packer stub may assume
+     * any of these.
+     *
+     * `manual_mapped` — a third-party mapper drops the image into
+     * memory and jumps to the entry (kdmapper for drivers, manual DLL
+     * injectors for DLLs). Nothing the OS loader normally does is
+     * guaranteed: imports may be unresolved, relocations may not be
+     * applied, TLS callbacks will not fire. The packer must be
+     * self-sufficient.
+     *
+     * Set by `--load-mode=os|manual` on the command line. Forwarded
+     * into `TargetInfo::load_mode` in `main()` so passes read it via
+     * `ctx.target().is_manually_mapped()`.
+     */
+    target::LoadMode load_mode = target::LoadMode::os_loaded;
 
     uint32_t vm_nesting_depth   = 1;      ///< Глубина VM-вложенности (1 = однослойная)
 

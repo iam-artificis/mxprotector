@@ -62,6 +62,43 @@ enum class Arch : uint8_t {
     unknown = 0xFF,
 };
 
+/// Role the binary plays at runtime. Cross-platform by design:
+///
+///   `executable`      — Windows EXE / ELF executable / stand-alone binary.
+///   `dynamic_library` — Windows DLL / ELF .so / Mach-O .dylib.
+///   `kernel_driver`   — Windows .sys / Linux .ko / macOS .kext.
+///
+/// This is derived from the input binary at parse time (e.g. PE
+/// `Subsystem==NATIVE` → `kernel_driver`). Passes that are only valid
+/// for a subset of kinds (user-mode VEH, ntdll imports, ...) must gate
+/// on the predicate form — prefer `is_kernel_driver()` over raw enum.
+enum class BinaryKind : uint8_t {
+    executable      = 0,
+    dynamic_library = 1,
+    kernel_driver   = 2,
+    unknown         = 0xFF,
+};
+
+/// How the protected binary will reach its entry point at runtime.
+///
+///   `os_loaded`     — The platform image loader runs before the stub:
+///                     imports resolved, base relocations applied, TLS
+///                     callbacks invoked. Default for ordinary EXEs /
+///                     DLLs / OS-installed drivers.
+///   `manual_mapped` — A third-party mapper dropped the image into
+///                     memory and jumped to its entry. Nothing the OS
+///                     loader usually does is guaranteed: the stub must
+///                     not rely on a populated IAT, applied relocations,
+///                     or auto-invoked TLS callbacks. Used by kdmapper
+///                     (kernel drivers) and manual DLL injectors.
+///
+/// Unlike `os/container/arch` this cannot be detected from the file —
+/// it's a *deployment* choice the user tells us via `--load-mode`.
+enum class LoadMode : uint8_t {
+    os_loaded      = 0,
+    manual_mapped  = 1,
+};
+
 /**
  * @brief Immutable descriptor of the target platform for one build.
  *
@@ -73,6 +110,8 @@ struct TargetInfo {
     Os              os;
     ContainerFormat container;
     Arch            arch;
+    BinaryKind      kind       = BinaryKind::executable;  ///< EXE / DLL / SYS role.
+    LoadMode        load_mode  = LoadMode::os_loaded;     ///< User-driven (CLI).
 
     // ------------------------------------------------------------------------
     // Factory helpers — spell out the exact target you care about.
@@ -118,6 +157,29 @@ struct TargetInfo {
         return is_windows() && is_pe() && is_x64();
     }
 
+    // ------------------------------------------------------------------------
+    // Binary-kind predicates — cheap, readable gates for passes that care.
+    // ------------------------------------------------------------------------
+
+    [[nodiscard]] constexpr bool is_executable()      const noexcept { return kind == BinaryKind::executable;      }
+    [[nodiscard]] constexpr bool is_dynamic_library() const noexcept { return kind == BinaryKind::dynamic_library; }
+    [[nodiscard]] constexpr bool is_kernel_driver()   const noexcept { return kind == BinaryKind::kernel_driver;   }
+
+    /// True for user-mode targets (EXE / DLL). False for drivers, false
+    /// for unknown. Intended for passes that assume the target runs with
+    /// a user-mode PEB / IAT / TLS-callback dispatcher (e.g. Hell's Gate,
+    /// VEH INT3 trap, the current packer stub).
+    [[nodiscard]] constexpr bool is_user_mode() const noexcept {
+        return is_executable() || is_dynamic_library();
+    }
+
+    // ------------------------------------------------------------------------
+    // Load-mode predicates — whether the OS loader ran before our stub.
+    // ------------------------------------------------------------------------
+
+    [[nodiscard]] constexpr bool is_os_loaded()      const noexcept { return load_mode == LoadMode::os_loaded;     }
+    [[nodiscard]] constexpr bool is_manually_mapped() const noexcept { return load_mode == LoadMode::manual_mapped; }
+
     [[nodiscard]] constexpr bool operator==(const TargetInfo&) const noexcept = default;
 };
 
@@ -151,6 +213,26 @@ struct TargetInfo {
         case Arch::x86:     return "x86";
         case Arch::arm64:   return "arm64";
         case Arch::unknown: return "unknown";
+    }
+    return "?";
+}
+
+/// Human-readable name of the binary kind, for logs/CLI output.
+[[nodiscard]] constexpr const char* binary_kind_name(BinaryKind k) noexcept {
+    switch (k) {
+        case BinaryKind::executable:      return "executable";
+        case BinaryKind::dynamic_library: return "dynamic_library";
+        case BinaryKind::kernel_driver:   return "kernel_driver";
+        case BinaryKind::unknown:         return "unknown";
+    }
+    return "?";
+}
+
+/// Human-readable name of the load mode, for logs/CLI output.
+[[nodiscard]] constexpr const char* load_mode_name(LoadMode m) noexcept {
+    switch (m) {
+        case LoadMode::os_loaded:     return "os_loaded";
+        case LoadMode::manual_mapped: return "manual_mapped";
     }
     return "?";
 }

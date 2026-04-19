@@ -48,6 +48,12 @@ bool StringProtectionPass::is_applicable(
     // x64 PE only: the codegen emits AMD64 bytes and the layout
     // assumes 64-bit RIP-relative LEA encoding.
     if (!ctx.target().is_windows_pe_x64()) return false;
+    // Stage 1 of .sys support: the decryptor stub is in principle pure
+    // integer code (no user-mode API calls), but the `--strings=vm`
+    // variant, the `mx_str_get` scratch-ring, and the trampoline
+    // wiring have never been validated in ring0. Skip kernel drivers
+    // until a dedicated kernel-safety audit (Stage 2) lifts this gate.
+    if (ctx.target().is_kernel_driver()) return false;
     return true;
 }
 

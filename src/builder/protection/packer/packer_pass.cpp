@@ -581,19 +581,14 @@ template <StubEmitter Emitter>
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     // The self-unpacking stub is assembled in x64 PE form; other targets
     // need their own packer implementations.
-    if (!ctx.config().enable_packer)      return false;
-    if (!ctx.target().is_windows_pe_x64()) return false;
+    if (!ctx.config().enable_packer)        return false;
+    if (!ctx.target().is_windows_pe_x64())  return false;
 
     // Kernel drivers enter via DriverEntry (PDRIVER_OBJECT, PUNICODE_STRING)
-    // and still need their own stub variant — auto-skip them.
-    // DLLs enter via DllMain (HINSTANCE, DWORD reason, LPVOID). The DLL
+    // and still need their own stub variant — auto-skip them. The DLL
     // path below emits a forwarding-only stub for now (no encryption yet);
     // full DLL packing will layer on top of that in a follow-up.
-    const auto pe_type = ctx.pe_image().pe_type();
-    if (pe_type != PeType::executable &&
-        pe_type != PeType::dynamic_library) {
-        return false;
-    }
+    if (ctx.target().is_kernel_driver()) return false;
 
     return true;
 }
