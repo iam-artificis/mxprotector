@@ -87,35 +87,38 @@
 
 namespace mx::string_protect {
 
-// ---------------------------------------------------------------------------
-// Descriptor packing
-// ---------------------------------------------------------------------------
+namespace {
 
-std::array<uint8_t, kDescriptorSize>
-pack_descriptor(const StringDescriptor& d) noexcept
+/// Byte offsets (inside the emitted buffer) of the two rip-relative
+/// `disp32` slots populated by the shared mx_str_get prologue. The
+/// caller stores these in its own output struct so the post-link
+/// patcher can point them at the final `.mxstr` descriptor table and
+/// data pool.
+struct MxStrGetPrologueOffsets {
+    size_t desc_table_disp32_offset;
+    size_t data_base_disp32_offset;
+};
+
+/// Emit the 31-byte `mx_str_get` descriptor-load prologue shared by
+/// the S2b (sticky) and S3 (ephemeral) variants.
+///
+///     lea    r10, [rip + desc_table_disp32]    ; 7 bytes
+///     lea    r10, [r10 + rcx*8]                ; 4 bytes
+///     mov    eax, dword [r10]                  ; 3 bytes
+///     movzx  ecx, word  [r10 + 4]              ; 5 bytes
+///     movzx  edx, byte  [r10 + 6]              ; 5 bytes
+///     lea    r11, [rip + data_base_disp32]     ; 7 bytes
+///
+/// After the two `disp32`s are patched, `r10` points at the
+/// per-string descriptor entry, `r11` at the data pool base,
+/// `eax`/`ecx`/`edx` hold the data_offset / length / key fields.
+/// Each variant adds its own `add` instruction next to fold the
+/// offset into either `rax` (sticky — plaintext_ptr) or `r11`
+/// (ephemeral — ciphertext_ptr).
+[[nodiscard]] MxStrGetPrologueOffsets
+emit_mx_str_desc_prologue(std::vector<uint8_t>& c)
 {
-    std::array<uint8_t, kDescriptorSize> out{};
-    // Little-endian — mirrors the x64 loads inside mx_str_get.
-    out[0] = static_cast<uint8_t>(d.data_offset & 0xFF);
-    out[1] = static_cast<uint8_t>((d.data_offset >> 8)  & 0xFF);
-    out[2] = static_cast<uint8_t>((d.data_offset >> 16) & 0xFF);
-    out[3] = static_cast<uint8_t>((d.data_offset >> 24) & 0xFF);
-    out[4] = static_cast<uint8_t>(d.length & 0xFF);
-    out[5] = static_cast<uint8_t>((d.length >> 8) & 0xFF);
-    out[6] = d.key;
-    out[7] = d.flags;
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// mx_str_get decryptor
-// ---------------------------------------------------------------------------
-
-EmittedDecryptor emit_mx_str_get()
-{
-    EmittedDecryptor out;
-    out.code.reserve(kMxStrGetSize);
-    auto& c = out.code;
+    MxStrGetPrologueOffsets out{};
 
     // lea r10, [rip + desc_table_disp32]           (7 bytes)
     // REX.W|R (0x4C) + 0x8D + ModRM(00 010 101 = 0x15) + disp32=0
@@ -147,8 +150,51 @@ EmittedDecryptor emit_mx_str_get()
     out.data_base_disp32_offset = c.size();
     c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
 
+    return out;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Descriptor packing
+// ---------------------------------------------------------------------------
+
+std::array<uint8_t, kDescriptorSize>
+pack_descriptor(const StringDescriptor& d) noexcept
+{
+    std::array<uint8_t, kDescriptorSize> out{};
+    // Little-endian — mirrors the x64 loads inside mx_str_get.
+    out[0] = static_cast<uint8_t>(d.data_offset & 0xFF);
+    out[1] = static_cast<uint8_t>((d.data_offset >> 8)  & 0xFF);
+    out[2] = static_cast<uint8_t>((d.data_offset >> 16) & 0xFF);
+    out[3] = static_cast<uint8_t>((d.data_offset >> 24) & 0xFF);
+    out[4] = static_cast<uint8_t>(d.length & 0xFF);
+    out[5] = static_cast<uint8_t>((d.length >> 8) & 0xFF);
+    out[6] = d.key;
+    out[7] = d.flags;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mx_str_get decryptor
+// ---------------------------------------------------------------------------
+
+EmittedDecryptor emit_mx_str_get()
+{
+    EmittedDecryptor out;
+    out.code.reserve(kMxStrGetSize);
+    auto& c = out.code;
+
+    // Bytes 0..30 — shared descriptor-load prologue (emits six
+    // instructions and records the two rip-relative disp32 slots).
+    const auto pro = emit_mx_str_desc_prologue(c);
+    out.desc_table_disp32_offset = pro.desc_table_disp32_offset;
+    out.data_base_disp32_offset  = pro.data_base_disp32_offset;
+
+    // [offset 31]
     // add rax, r11                                 (3 bytes)
     // REX.W|R (0x4C) + 0x01 + ModRM(11 011 000 = 0xD8)
+    // rax = data_base + data_offset = plaintext_ptr.
     c.push_back(0x4C); c.push_back(0x01); c.push_back(0xD8);
 
     // ---- S2b thread-safe claim / decrypt body ----
@@ -352,41 +398,17 @@ EmittedEphemeralDecryptor emit_mx_str_get_ephemeral()
     out.code.reserve(kMxStrGetEphemeralSize);
     auto& c = out.code;
 
-    // [offset 0]
-    // lea r10, [rip + desc_table_disp32]           (7 bytes)
-    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x15);
-    out.desc_table_disp32_offset = c.size();
-    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
-
-    // [offset 7]
-    // lea r10, [r10 + rcx*8]                       (4 bytes)
-    // REX.W|R|B (0x4D) + 0x8D + ModRM(00 010 100 = 0x14) + SIB(11 001 010)
-    c.push_back(0x4D); c.push_back(0x8D); c.push_back(0x14); c.push_back(0xCA);
-
-    // [offset 11]
-    // mov eax, dword [r10]                         (3 bytes)
-    c.push_back(0x41); c.push_back(0x8B); c.push_back(0x02);
-
-    // [offset 14]
-    // movzx ecx, word [r10 + 4]                    (5 bytes)
-    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB7);
-    c.push_back(0x4A); c.push_back(0x04);
-
-    // [offset 19]
-    // movzx edx, byte [r10 + 6]                    (5 bytes)
-    c.push_back(0x41); c.push_back(0x0F); c.push_back(0xB6);
-    c.push_back(0x52); c.push_back(0x06);
-
-    // [offset 24]
-    // lea r11, [rip + data_base_disp32]            (7 bytes)
-    c.push_back(0x4C); c.push_back(0x8D); c.push_back(0x1D);
-    out.data_base_disp32_offset = c.size();
-    c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
+    // Bytes 0..30 — shared descriptor-load prologue (emits six
+    // instructions and records the two rip-relative disp32 slots).
+    const auto pro = emit_mx_str_desc_prologue(c);
+    out.desc_table_disp32_offset = pro.desc_table_disp32_offset;
+    out.data_base_disp32_offset  = pro.data_base_disp32_offset;
 
     // [offset 31]
     // add r11, rax                                 (3 bytes)
     // REX.W|B (0x49) + 0x01 + ModRM(11 000 011 = 0xC3)
     //   `add r11, rax` — rax source, r11 dest (result in r11).
+    //   r11 = data_base + data_offset = ciphertext_ptr.
     c.push_back(0x49); c.push_back(0x01); c.push_back(0xC3);
 
     // [offset 34]
