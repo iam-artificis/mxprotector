@@ -91,4 +91,34 @@ void apply_post_inject_patches(
     const StubArtifactsInfo&        artifacts,
     std::span<const TargetSection>  sections);
 
+/**
+ * @brief Apply post-inject patches for the kernel-driver stub.
+ *
+ * The driver cipher body (see `driver_cipher_body.hpp`) emits a
+ * strict subset of the user-mode cipher body: no reprotect loop, no
+ * IAT wipe, no imagebase rip-relative computation. The corresponding
+ * `CipherBodyPatches` slots stay at their zero default, and *must
+ * not* be written to — their zero offset aliases the very start of
+ * the stub buffer, where patching would corrupt the pre-decrypt
+ * prologue.
+ *
+ * This function writes only the patches the driver body actually
+ * produces:
+ *   - per-layer `lea rsi, key_K` rel32,
+ *   - per-layer per-section `lea rdi` + `mov ecx, size`,
+ *   - shared `lea r8, sbox` rel32,
+ *   - P3 KSA VM-lift overwrite (if the lift succeeded),
+ *   - Stage-3 reloc applier (if emitted).
+ *
+ * Parameters have the same meaning as `apply_post_inject_patches`.
+ */
+void apply_driver_post_inject_patches(
+    mx::ProtectionContext&          ctx,
+    ByteBuffer&                     section_data,
+    Rva                             stub_rva,
+    uint32_t                        layer_count,
+    const CipherBodyPatches&        patches,
+    const StubArtifactsInfo&        artifacts,
+    std::span<const TargetSection>  sections);
+
 } // namespace mx::packer

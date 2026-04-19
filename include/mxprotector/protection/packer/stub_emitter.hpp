@@ -69,6 +69,27 @@ struct ExeStubPatches : CommonStubPatches, CipherBodyPatches {};
 struct DllFullStubPatches : CommonStubPatches, CipherBodyPatches {};
 
 /**
+ * @brief Kernel-driver stub patches.
+ *
+ * Shape-compatible with the user-mode patch structs (same inheritance
+ * base), but produced by a thinner cipher body (`driver_cipher_body.cpp`)
+ * that skips the user-mode-only blocks (anti-debug probe, Hell's Gate
+ * resolver, reprotect loop, IAT wipe). As a consequence the following
+ * `CipherBodyPatches` fields are *always* zero on a DriverStubPatches
+ * instance and the driver-specific patcher must not touch them:
+ *   - `rel_to_impdir_at`, `impdir_size_at`
+ *   - `rel_to_reprotect_table_at`, `reprotect_table_offset`,
+ *     `reprotect_entry_count`
+ *   - `imagebase_lea_anchor_offset`, `imagebase_sub_imm32_at`
+ *
+ * Every other field is populated exactly as in the user-mode path —
+ * the reused `emit_multi_layer_decrypt` fills `rel_to_sbox_at`,
+ * `ksa_block_start/end_offset`, and `layers[k]`, and
+ * `emit_reloc_applier` fills `reloc_applier` when enabled.
+ */
+struct DriverStubPatches : CommonStubPatches, CipherBodyPatches {};
+
+/**
  * @brief Contract every StubEmitter policy must satisfy.
  *
  * A StubEmitter is a stateless (or cheaply copyable) type that turns
@@ -228,9 +249,68 @@ private:
     StubEmissionParams params_;
 };
 
+/**
+ * @brief Build the kernel-driver stub code bytes (pre-patch).
+ *
+ * Layout:
+ *   1. Save nonvolatiles the cipher body clobbers (rbx, rbp, rsi,
+ *      rdi, r12-r15) plus the two `DriverEntry` argument registers
+ *      (rcx = PDRIVER_OBJECT, rdx = PUNICODE_STRING). 10 pushes total.
+ *   2. Driver cipher body — hash opaque predicate, `xor r15, r15`,
+ *      stub self-hash, multi-layer decrypt, optional reloc applier.
+ *      See `driver_cipher_body.hpp`.
+ *   3. Pop nonvolatiles + DriverEntry args in reverse push order.
+ *   4. Stolen DriverEntry prologue bytes inline (may be empty when
+ *      the OEP steal failed).
+ *   5. `jmp rel32` → `DriverEntry + stolen_size`. The real
+ *      DriverEntry's `ret` then returns `NTSTATUS` to the kernel
+ *      loader.
+ *
+ * DriverEntry is called exactly once per driver load — unlike DllMain
+ * there is no reason-argument gate. The stub always decrypts; no
+ * PROCESS_ATTACH-like guard is required.
+ *
+ * The stub makes no runtime calls (the reprotect / Hell's Gate blocks
+ * are absent), so the 10-push layout does not need to maintain
+ * 16-byte rsp alignment across the cipher body — internal only uses
+ * integer and stack ops.
+ */
+[[nodiscard]] std::pair<ByteBuffer, DriverStubPatches>
+build_driver_stub_bytes(Randomizer& rng,
+                        ByteView    stolen_bytes,
+                        uint32_t    section_count,
+                        uint32_t    layer_count,
+                        bool        apply_relocs_inline);
+// No `enable_veh_trap` — VEH is a user-mode Win32 facility that has
+// no ring0 analogue. Drivers never install one.
+
+/**
+ * @brief StubEmitter policy for the kernel-driver shape.
+ */
+class DriverStubEmitter {
+public:
+    using patches_type = DriverStubPatches;
+
+    explicit DriverStubEmitter(StubEmissionParams params) noexcept
+        : params_(params) {}
+
+    [[nodiscard]] std::pair<ByteBuffer, DriverStubPatches>
+    emit(Randomizer& rng, ByteView stolen_bytes) {
+        return build_driver_stub_bytes(rng, stolen_bytes,
+                                       params_.section_count,
+                                       params_.layer_count,
+                                       params_.apply_relocs_inline);
+    }
+
+private:
+    StubEmissionParams params_;
+};
+
 static_assert(StubEmitter<ExeStubEmitter>,
     "ExeStubEmitter must satisfy the StubEmitter concept");
 static_assert(StubEmitter<DllFullStubEmitter>,
     "DllFullStubEmitter must satisfy the StubEmitter concept");
+static_assert(StubEmitter<DriverStubEmitter>,
+    "DriverStubEmitter must satisfy the StubEmitter concept");
 
 } // namespace mx::packer

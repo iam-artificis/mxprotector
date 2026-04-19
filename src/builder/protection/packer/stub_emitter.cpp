@@ -6,6 +6,7 @@
 #include "mxprotector/protection/packer/stub_emitter.hpp"
 
 #include "mxprotector/core/asm_builder.hpp"
+#include "mxprotector/protection/packer/driver_cipher_body.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 
 #include <algorithm>
@@ -137,6 +138,69 @@ build_dll_full_stub_bytes(Randomizer& rng,
     e.bytes(stolen_bytes);
 
     // (7) jmp rel32 → DllMain + stolen_size
+    e.u8(asm64::kJmpRel32);
+    patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
+    e.u32(0);
+
+    return {std::move(e.buf), patches};
+}
+
+std::pair<ByteBuffer, DriverStubPatches>
+build_driver_stub_bytes(Randomizer& rng,
+                        ByteView    stolen_bytes,
+                        uint32_t    section_count,
+                        uint32_t    layer_count,
+                        bool        apply_relocs_inline)
+{
+    RawEmitter e;
+    e.buf.reserve(192 + (32 + 32 * section_count) * layer_count +
+                  stolen_bytes.size() + kKeySize * layer_count);
+
+    DriverStubPatches patches{};
+
+    // (1) Save every nonvolatile the cipher body clobbers (rbx, rbp,
+    //     rsi, rdi, r12-r15) plus the two DriverEntry arg registers
+    //     (rcx = PDRIVER_OBJECT, rdx = PUNICODE_STRING). 10 pushes
+    //     total. Unlike the DLL stub we do not have a 3rd arg to save
+    //     and we do not care about 16-byte rsp alignment across the
+    //     body — the driver cipher body makes no calls.
+    e.u8(0x53);                    // push rbx
+    e.u8(0x55);                    // push rbp
+    e.u8(0x56);                    // push rsi
+    e.u8(0x57);                    // push rdi
+    e.u8(0x41); e.u8(0x54);        // push r12
+    e.u8(0x41); e.u8(0x55);        // push r13
+    e.u8(0x41); e.u8(0x56);        // push r14
+    e.u8(0x41); e.u8(0x57);        // push r15
+    e.u8(0x51);                    // push rcx  (PDRIVER_OBJECT)
+    e.u8(0x52);                    // push rdx  (PUNICODE_STRING)
+
+    // (2) Driver cipher body — see driver_cipher_body.hpp. No VEH trap
+    //     (no VEH in ring0), no reason-argument gate (DriverEntry is
+    //     called exactly once per load).
+    emit_driver_decrypt_body(e, patches, rng,
+                             section_count, layer_count,
+                             apply_relocs_inline);
+
+    // (3) Pop nonvolatiles + DriverEntry args in reverse push order.
+    e.u8(0x5A);                    // pop rdx
+    e.u8(0x59);                    // pop rcx
+    e.u8(0x41); e.u8(0x5F);        // pop r15
+    e.u8(0x41); e.u8(0x5E);        // pop r14
+    e.u8(0x41); e.u8(0x5D);        // pop r13
+    e.u8(0x41); e.u8(0x5C);        // pop r12
+    e.u8(0x5F);                    // pop rdi
+    e.u8(0x5E);                    // pop rsi
+    e.u8(0x5D);                    // pop rbp
+    e.u8(0x5B);                    // pop rbx
+
+    // (4) Stolen DriverEntry prologue bytes inline (may be empty).
+    patches.stolen_bytes_offset = static_cast<uint32_t>(e.size());
+    e.bytes(stolen_bytes);
+
+    // (5) jmp rel32 → DriverEntry + stolen_size. The real DriverEntry
+    //     returns NTSTATUS in eax all the way back to the kernel
+    //     loader — our stub is an invisible prologue.
     e.u8(asm64::kJmpRel32);
     patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
     e.u32(0);

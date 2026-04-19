@@ -204,4 +204,131 @@ void apply_post_inject_patches(
     }
 }
 
+// ============================================================================
+// Kernel-driver post-inject patcher.
+//
+// Mirrors the subset of `apply_post_inject_patches` that the driver
+// cipher body actually needs. We deliberately do NOT call the user-
+// mode function and mask-out — the user-mode function unconditionally
+// writes into `rel_to_impdir_at`, `rel_to_reprotect_table_at`, and
+// `imagebase_sub_imm32_at`, all of which are zero for the driver body
+// and would therefore corrupt the stub prologue at offset 0.
+// ============================================================================
+
+void apply_driver_post_inject_patches(
+    mx::ProtectionContext&          ctx,
+    ByteBuffer&                     section_data,
+    Rva                             stub_rva,
+    uint32_t                        layer_count,
+    const CipherBodyPatches&        patches,
+    const StubArtifactsInfo&        artifacts,
+    std::span<const TargetSection>  sections)
+{
+    // Per-layer patching — `lea rsi, key_K` + per-section `lea rdi` +
+    // `mov ecx, size`. Identical math to the user-mode patcher.
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        const auto& lp = patches.layers[layer];
+
+        {
+            const Rva lea_end_rva = stub_rva + lp.rel_to_key_at + 4;
+            const Rva key_rva     = stub_rva + artifacts.key_offsets_in_stub[layer];
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(key_rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(section_data, lp.rel_to_key_at, rel);
+        }
+
+        for (size_t i = 0; i < sections.size(); ++i) {
+            const auto& ds  = lp.sections[i];
+            const auto& tgt = sections[i];
+
+            const Rva lea_end_rva = stub_rva + ds.patch_lea_at + 4;
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(tgt.rva) - static_cast<int64_t>(lea_end_rva));
+            write_i32(section_data, ds.patch_lea_at, rel);
+            write_i32(section_data, ds.patch_size_at,
+                      static_cast<int32_t>(tgt.size));
+        }
+    }
+
+    // Shared `lea r8, sbox` rel32.
+    {
+        const Rva lea_end_rva = stub_rva + patches.rel_to_sbox_at + 4;
+        const Rva sbox_rva    = stub_rva + artifacts.sbox_offset_in_stub;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(sbox_rva) - static_cast<int64_t>(lea_end_rva));
+        write_i32(section_data, patches.rel_to_sbox_at, rel);
+    }
+
+    // P3 — optional KSA VM-lift overwrite.
+    if (artifacts.packer_vm_lift_succeeded) {
+        const Rva vm_entry_rva =
+            stub_rva +
+            static_cast<Rva>(artifacts.packer_vm_blob_offset) +
+            static_cast<Rva>(artifacts.packer_vm_entry_offset);
+        const uint32_t ksa_off = patches.ksa_block_start_offset;
+        const Rva    call_rva     = stub_rva + ksa_off;
+        const Rva    call_end_rva = call_rva + 5;
+        const int32_t rel = static_cast<int32_t>(
+            static_cast<int64_t>(vm_entry_rva) -
+            static_cast<int64_t>(call_end_rva));
+
+        MutableByteView ksa_span{
+            section_data.data() + ksa_off,
+            patches.ksa_block_end_offset - ksa_off};
+        asm64::write_call_rel32(ksa_span.subspan(0, 5), rel);
+        if (ksa_span.size() > 5) {
+            asm64::fill_nop(ksa_span.subspan(5));
+        }
+        ctx.log_fmt("PackerPass: driver — P3 KSA replaced with call vm_entry "
+                    "@ RVA=0x{:08X}",
+            vm_entry_rva);
+    }
+
+    // Stage-3 reloc applier (optional — emitted iff the driver was
+    // built for a non-preferred-base load path). Same slot-filling
+    // logic as the user-mode patcher.
+    if (patches.reloc_applier.applier_end_offset >
+        patches.reloc_applier.applier_begin_offset)
+    {
+        const auto& ra = patches.reloc_applier;
+
+        const int32_t runtime_base_sub = static_cast<int32_t>(
+            stub_rva + ra.lea_runtime_base_anchor_offset);
+        write_i32(section_data, ra.sub_runtime_base_imm32_at,
+                  runtime_base_sub);
+
+        const uint64_t preferred_base =
+            static_cast<uint64_t>(ctx.pe_image().image_base());
+        for (int i = 0; i < 8; ++i) {
+            section_data[ra.preferred_base_imm64_at + i] =
+                static_cast<uint8_t>((preferred_base >> (8 * i)) & 0xFF);
+        }
+
+        Rva      reloc_rva  = 0;
+        uint32_t reloc_size = 0;
+        std::visit([&](const auto& nt) {
+            if (pe::IMAGE_DIRECTORY_ENTRY_BASERELOC <
+                nt.OptionalHeader.NumberOfRvaAndSizes)
+            {
+                reloc_rva = nt.OptionalHeader
+                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
+                    .VirtualAddress;
+                reloc_size = nt.OptionalHeader
+                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
+                    .Size;
+            }
+        }, ctx.pe_image().nt_headers());
+
+        write_i32(section_data, ra.reloc_rva_imm32_at,
+                  static_cast<int32_t>(reloc_rva));
+        write_i32(section_data, ra.reloc_size_imm32_at,
+                  static_cast<int32_t>(reloc_size));
+
+        ctx.log_fmt("PackerPass: driver — reloc applier patched: "
+                    ".reloc RVA=0x{:08X} size={} байт, preferred_base="
+                    "0x{:016X}",
+            reloc_rva, reloc_size, preferred_base);
+    }
+}
+
 } // namespace mx::packer
