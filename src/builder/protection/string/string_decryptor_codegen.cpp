@@ -79,6 +79,8 @@
 
 #include "mxprotector/protection/string/string_decryptor_codegen.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
+
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -273,7 +275,7 @@ EmittedDecryptor emit_mx_str_get()
 
     // [offset 92] .done:
     // ret                                          (1 byte)
-    c.push_back(0xC3);
+    c.push_back(asm64::kRet);
 
     assert(c.size() == kMxStrGetSize);
     return out;
@@ -478,7 +480,7 @@ EmittedEphemeralDecryptor emit_mx_str_get_ephemeral()
 
     // [offset 93] .done:
     // ret                                          (1 byte)
-    c.push_back(0xC3);
+    c.push_back(asm64::kRet);
 
     assert(c.size() == kMxStrGetEphemeralSize);
     return out;
@@ -570,7 +572,7 @@ EmittedTrampoline emit_trampoline(const TrampolineRequest& req)
     c.push_back(static_cast<uint8_t>((id >> 24) & 0xFF));
 
     // ---- call rel32 (mx_str_get) (5 bytes) ----
-    c.push_back(0xE8);
+    c.push_back(asm64::kCallRel32);
     out.call_rel32_offset = c.size();
     c.push_back(0x00); c.push_back(0x00); c.push_back(0x00); c.push_back(0x00);
 
@@ -594,7 +596,7 @@ EmittedTrampoline emit_trampoline(const TrampolineRequest& req)
     c.push_back(0x59);                          // pop rcx
     c.push_back(0x58);                          // pop rax
     c.push_back(0x9D);                          // popfq
-    c.push_back(0xC3);                          // ret
+    c.push_back(asm64::kRet);                   // ret
 
     assert(c.size() == trampoline_size_for(req.target_reg));
     return out;
