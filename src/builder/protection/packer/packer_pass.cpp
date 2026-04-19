@@ -88,6 +88,7 @@ using mx::packer::StubEmitter;
 using mx::packer::StubEmissionParams;
 using mx::packer::ExeStubEmitter;
 using mx::packer::DllFullStubEmitter;
+using mx::packer::DriverStubEmitter;
 
 
 /// Strip base relocations: clear the directory entry, set the file header's
@@ -171,21 +172,27 @@ struct OepStealResult {
 /// treat that as "skip the packer for this image".
 [[nodiscard]] std::optional<OepStealResult>
 prepare_oep_steal(ProtectionContext& ctx, std::string_view steal_label) {
-    // Keep the `.reloc` directory intact when the caller asked for
-    // manual-mapped output — the stub's Stage 3 reloc applier walks
-    // this data post-decrypt. The `RELOCS_STRIPPED` characteristic is
-    // set either way so the (OS or manual) loader does not touch the
-    // ciphertext before our stub has a chance to decrypt it.
-    if (ctx.target().is_manually_mapped()) {
-        // Still force `RELOCS_STRIPPED` to keep the loader off our
-        // ciphertext, but leave the data directory entry + the
-        // `.reloc` section bytes untouched so the stub can walk them.
+    // Keep the `.reloc` directory intact when the stub will need to
+    // walk it post-decrypt — either the caller opted into manual-
+    // mapped output or the target is a kernel driver (in both cases
+    // the runtime image base may differ from the preferred one and
+    // the stub's Stage 3 reloc applier owns that fix-up). The
+    // `RELOCS_STRIPPED` characteristic is set either way so the (OS
+    // or manual) loader does not touch the ciphertext before our stub
+    // gets a chance to decrypt it.
+    const bool keep_relocs =
+        ctx.target().is_manually_mapped() ||
+        ctx.target().is_kernel_driver();
+    if (keep_relocs) {
         std::visit([&](auto& nt) {
             nt.FileHeader.Characteristics |= pe::IMAGE_FILE_RELOCS_STRIPPED;
         }, ctx.pe_image().nt_headers());
-        ctx.log("PackerPass: manual-map — .reloc сохранён для stub reloc "
-                "applier (RELOCS_STRIPPED оставлен, чтобы loader не "
-                "трогал ciphertext)");
+        ctx.log_fmt(
+            "PackerPass: .reloc сохранён для stub reloc applier "
+            "(RELOCS_STRIPPED оставлен; reason: {})",
+            ctx.target().is_kernel_driver()
+                ? "kernel-driver target"
+                : "manual-map mode");
     } else {
         disable_relocations(ctx.pe_image());
         ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
@@ -452,12 +459,26 @@ private:
             ctx_.log("PackerPass: G3 Phase 2 VEH INT3 trap включён");
         }
 
-        // Stage 3 — post-decrypt base-relocation applier is emitted
-        // only for manual-mapped targets. See `reloc_applier.hpp`.
-        apply_relocs_inline_ = ctx_.target().is_manually_mapped();
+        // Stage 3 — post-decrypt base-relocation applier.
+        //
+        // Enabled when EITHER the user opted into manual-mapped output
+        // (mapper may relocate before the stub runs) OR the target is
+        // a kernel driver (the kernel loader / `MmLoadSystemImage`
+        // freely relocates drivers when the preferred base is taken,
+        // and manual driver mappers like kdmapper always relocate).
+        // For OS-loaded user-mode targets the OS loader already
+        // applied relocations, so emitting the applier would
+        // double-apply the delta — keep it off in that case.
+        apply_relocs_inline_ =
+            ctx_.target().is_manually_mapped() ||
+            ctx_.target().is_kernel_driver();
         if (apply_relocs_inline_) {
-            ctx_.log("PackerPass: manual-map mode — post-decrypt reloc "
-                     "applier will be emitted in the stub");
+            ctx_.log_fmt(
+                "PackerPass: post-decrypt reloc applier enabled "
+                "(reason: {})",
+                ctx_.target().is_kernel_driver()
+                    ? "kernel-driver target"
+                    : "manual-map mode");
         }
     }
 
@@ -517,19 +538,40 @@ private:
             tgt_sections[i] = {encrypted_[i].rva, encrypted_[i].size};
         }
 
-        // Delegate every rel32 / imm32 / anchor patch (per-layer
-        // keys, per-section LEAs, sbox, optional P3 KSA overwrite,
-        // ImageBase anchor, reprotect table + entries, IAT wipe) to
-        // the dedicated patcher.
-        packer::apply_post_inject_patches(
-            ctx_, pack_sec.data, stub_rva_,
-            layer_count_, patches_, artifacts_,
-            std::span<const packer::TargetSection>{tgt_sections});
+        // Delegate every rel32 / imm32 / anchor patch to the right
+        // patcher: the user-mode (EXE / DLL) version touches every
+        // user-mode-only slot (reprotect table, IAT wipe, imagebase
+        // anchor); the driver version skips them because the driver
+        // cipher body never emits the corresponding code (their
+        // offsets stay at zero, and writing into offset 0 would
+        // corrupt the stub prologue).
+        if constexpr (std::is_same_v<Emitter, DriverStubEmitter>) {
+            packer::apply_driver_post_inject_patches(
+                ctx_, pack_sec.data, stub_rva_,
+                layer_count_, patches_, artifacts_,
+                std::span<const packer::TargetSection>{tgt_sections});
+        } else {
+            packer::apply_post_inject_patches(
+                ctx_, pack_sec.data, stub_rva_,
+                layer_count_, patches_, artifacts_,
+                std::span<const packer::TargetSection>{tgt_sections});
+        }
 
         return {};
     }
 
     void step6_finalize_tls() {
+        // Drivers do not have TLS — kernel images do not run TLS
+        // callbacks and we never set DataDirectory[TLS] for them, so
+        // the entire finaliser is a no-op for the driver path. The
+        // TLS scratch artefacts that `step4_append_artifacts` emits
+        // remain inside `.mxpack` as dead bytes (worth ~120 bytes —
+        // a future tightening pass can drop them when the emitter is
+        // refactored to skip emission).
+        if constexpr (std::is_same_v<Emitter, DriverStubEmitter>) {
+            return;
+        }
+
         // Delegates to packer_tls_finalizer — fills the callback
         // array, IMAGE_TLS_DIRECTORY64 fields, and updates the PE
         // header's DataDirectory[TLS] entry to point at the new
@@ -610,13 +652,9 @@ bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     // need their own packer implementations.
     if (!ctx.config().enable_packer)        return false;
     if (!ctx.target().is_windows_pe_x64())  return false;
-
-    // Kernel drivers enter via DriverEntry (PDRIVER_OBJECT, PUNICODE_STRING)
-    // and still need their own stub variant — auto-skip them. The DLL
-    // path below emits a forwarding-only stub for now (no encryption yet);
-    // full DLL packing will layer on top of that in a follow-up.
-    if (ctx.target().is_kernel_driver()) return false;
-
+    // Stage 3.C lifted the kernel-driver gate — `DriverStubEmitter`
+    // now provides a ring0-safe stub variant. EXE / DLL / SYS are all
+    // accepted; the per-shape dispatch happens in `execute()`.
     return true;
 }
 
@@ -629,6 +667,9 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     }
     if (pe_type == PeType::dynamic_library) {
         return execute_encrypted_stub<DllFullStubEmitter>(ctx, "DllMain");
+    }
+    if (pe_type == PeType::kernel_driver) {
+        return execute_encrypted_stub<DriverStubEmitter>(ctx, "DriverEntry");
     }
     return {};
 }

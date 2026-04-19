@@ -138,10 +138,15 @@ TEST(PassApplicability, StringProtectionSkipsWhenDisabled) {
 // PackerPass
 // --------------------------------------------------------------------
 
-TEST(PassApplicability, PackerPassSkipsKernelDriver) {
+// Stage 3.C lifted the kernel-driver gate. The packer now dispatches
+// to `DriverStubEmitter` (see `driver_cipher_body.hpp`) which emits a
+// ring0-safe cipher body — no anti-debug PEB read, no Hell's Gate, no
+// `NtProtectVirtualMemory`, no IAT wipe. Drivers should be accepted
+// at the same shape as EXEs and DLLs.
+TEST(PassApplicability, PackerPassAcceptsKernelDriver) {
     auto ctx = make_ctx(BinaryKind::kernel_driver);
     mx::PackerPass pass;
-    EXPECT_FALSE(pass.is_applicable(ctx));
+    EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
 TEST(PassApplicability, PackerPassAcceptsExecutable) {
@@ -169,10 +174,13 @@ TEST(PassApplicability, ManualMappedExecutableStillAcceptsPacker) {
     EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
-TEST(PassApplicability, ManualMappedKernelDriverStillRejected) {
+// Stage 3.C: manual-mapped kernel driver — combines both
+// orthogonal opt-ins. PackerPass should accept it (the dispatch
+// picks DriverStubEmitter, the reloc applier is enabled).
+TEST(PassApplicability, ManualMappedKernelDriverAccepted) {
     auto ctx = make_ctx(BinaryKind::kernel_driver, LoadMode::manual_mapped);
     mx::PackerPass pass;
-    EXPECT_FALSE(pass.is_applicable(ctx));
+    EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
 } // namespace
