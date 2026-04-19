@@ -56,6 +56,14 @@ set(BUILDER_SOURCES
 
     # Phase 3: CFG Flattening
     protection/cfg/cfg_flattening_pass.cpp
+    protection/cfg/cfg_flattening_pipeline.cpp
+    protection/cfg/cfg_flattener.cpp
+    protection/cfg/cff_function_source.cpp
+    protection/cfg/cff_relocation_fixup.cpp
+    protection/cfg/cff_safety_filters.cpp
+    protection/cfg/cff_trampoline_section.cpp
+    protection/cfg/cff_trampoline_writer.cpp
+    protection/cfg/state_reg_picker.cpp
     protection/cfg/dispatcher_gen.cpp
     protection/cfg/bogus_flow.cpp
     protection/cfg/map_parser.cpp

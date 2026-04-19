@@ -112,7 +112,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_code_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/cfg_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_manager.cpp
-    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattener.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/dispatcher_gen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/bogus_flow.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/map_parser.cpp
