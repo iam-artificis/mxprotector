@@ -195,4 +195,54 @@ void emit_decrypt_body(RawEmitter&        e,
                        bool               enable_veh_trap,
                        bool               apply_relocs_inline);
 
+/**
+ * @brief Append the multi-layer RC4 decrypt block.
+ *
+ * Emits (in this order):
+ *   1. `lea r8, [rip + sbox]` — sets the shared S-box pointer.
+ *   2. For `k = layer_count - 1 → 0`:
+ *      * `lea rsi, [rip + key_k]`
+ *      * `emit_key_derivation_loop` (effective key, reads r14d)
+ *      * KSA phase 1 (init S[k] = k)
+ *      * KSA phase 2 (mix with key; layer 0 seeds `j` from r15d, outer
+ *        layers seed `j = 0`)
+ *      * PRGA state reset (`xor r9,r9; xor r10,r10`)
+ *      * Per-section PRGA decrypt loop.
+ *
+ * Writes to `patches.rel_to_sbox_at`, `patches.ksa_block_start_offset`
+ * / `ksa_block_end_offset` (layer 0 only), and `patches.layers[k]`
+ * (rel_to_key_at + per-section slots).
+ *
+ * Preconditions on entry:
+ *   - `r14d` already contains the stub integrity hash
+ *     (use `emit_stub_self_hash` upstream).
+ *   - `r15d` contains the layer-0 KSA `j` seed. In the user-mode path
+ *     that's the anti-debug bias (0 on a clean host, 1 under a
+ *     debugger); in the kernel-driver path the caller emits
+ *     `xor r15, r15` so the decrypt runs with a zero bias.
+ *   - The `rsi/r8` S-box + key pointers are computed inside this
+ *     function via the rel32 slots; the caller patches them after
+ *     section injection.
+ *
+ * Register contract:
+ *   - Clobbered: rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10.
+ *   - Preserved: r11, r12, r13 (untouched), r14 (hash carrier), r15
+ *     (bias; conceptually read-only within the loop).
+ *
+ * Shared by the user-mode cipher body (`emit_decrypt_body`) and the
+ * kernel-driver cipher body (`driver_cipher_body.cpp`). Any change
+ * to the byte-for-byte emission is caught by the byte-pin tests
+ * around P3 VM-liftability and KSA block bracketing.
+ *
+ * @param e              Emitter to append to.
+ * @param patches        Fills `rel_to_sbox_at`, `ksa_block_start/end`,
+ *                        and every `layers[k]` slot.
+ * @param section_count  Number of target sections the PRGA loop walks.
+ * @param layer_count    Number of cipher layers (≥ 1).
+ */
+void emit_multi_layer_decrypt(RawEmitter&        e,
+                              CipherBodyPatches& patches,
+                              uint32_t           section_count,
+                              uint32_t           layer_count);
+
 } // namespace mx::packer
