@@ -2,14 +2,16 @@
  * @file pass_applicability_test.cpp
  * @brief [TESTS] Target-based gates on `IProtectionPass::is_applicable`.
  *
- * These tests pin the Stage 1 applicability gates introduced for
- * `.sys` / driver support:
+ * These tests pin the Stage 1 / Stage 2 applicability gates introduced
+ * for `.sys` / driver support:
  *
  *   - `GuardPass` skips kernel-driver targets (no user-mode VEH).
- *   - `StringProtectionPass` skips kernel-driver targets (runtime
- *      stub / scratch-ring not yet audited for ring0).
  *   - `PackerPass` skips kernel-driver targets (needs a dedicated
  *      DriverEntry stub that does not exist yet).
+ *   - `StringProtectionPass` *accepts* kernel-driver targets after the
+ *      Stage 2 audit cleared the decryptor (pure XOR / `lock xadd` /
+ *      VM core, no PEB or Hell's Gate). The gate that lived here in
+ *      Stage 1 has been removed.
  *
  * The positive cases (executable / dynamic_library) confirm that the
  * gates do not over-reject — each pass still returns true for the
@@ -104,10 +106,13 @@ TEST(PassApplicability, GuardPassAcceptsDynamicLibrary) {
 // StringProtectionPass
 // --------------------------------------------------------------------
 
-TEST(PassApplicability, StringProtectionSkipsKernelDriver) {
+// Stage 2 audit lifted the kernel-driver gate. The pass should now
+// accept *all* PE x64 targets when the user enabled string protection.
+// `make_ctx` already sets `string_protection = stub`.
+TEST(PassApplicability, StringProtectionAcceptsKernelDriver) {
     auto ctx = make_ctx(BinaryKind::kernel_driver);
     mx::StringProtectionPass pass;
-    EXPECT_FALSE(pass.is_applicable(ctx));
+    EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
 TEST(PassApplicability, StringProtectionAcceptsExecutable) {
@@ -120,6 +125,13 @@ TEST(PassApplicability, StringProtectionAcceptsDynamicLibrary) {
     auto ctx = make_ctx(BinaryKind::dynamic_library);
     mx::StringProtectionPass pass;
     EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, StringProtectionSkipsWhenDisabled) {
+    auto ctx = make_ctx(BinaryKind::kernel_driver);
+    ctx.config().string_protection = mx::StringProtectionMode::disabled;
+    mx::StringProtectionPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
 }
 
 // --------------------------------------------------------------------

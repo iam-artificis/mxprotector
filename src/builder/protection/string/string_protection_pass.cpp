@@ -48,12 +48,19 @@ bool StringProtectionPass::is_applicable(
     // x64 PE only: the codegen emits AMD64 bytes and the layout
     // assumes 64-bit RIP-relative LEA encoding.
     if (!ctx.target().is_windows_pe_x64()) return false;
-    // Stage 1 of .sys support: the decryptor stub is in principle pure
-    // integer code (no user-mode API calls), but the `--strings=vm`
-    // variant, the `mx_str_get` scratch-ring, and the trampoline
-    // wiring have never been validated in ring0. Skip kernel drivers
-    // until a dedicated kernel-safety audit (Stage 2) lifts this gate.
-    if (ctx.target().is_kernel_driver()) return false;
+    // Kernel drivers: cleared by the Stage 2 kernel-safety audit.
+    //   - `stub`      — pure XOR loop + sticky-flag write into `.mxstr`.
+    //                   No user-mode APIs, no PEB access, no syscalls.
+    //   - `vm`        — decryptor lifted via VmRuntimeGenerator with
+    //                   `skip_anti_tamper_checks = true` (already enforced
+    //                   in `string_section_assembler.cpp`) and
+    //                   `use_imagebase_key = false` (auto via
+    //                   `pe_type != executable`). VM core is pure-ALU.
+    //   - `ephemeral` — `lock xadd` ring allocator + per-call XOR copy.
+    //                   `lock xadd` is legal at any IRQL; the ring lives
+    //                   in `.mxstr` which the driver maps R+W.
+    // The gate previously erred on the side of caution; the audit shows
+    // every mode is ring0-safe today.
     return true;
 }
 

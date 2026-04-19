@@ -35,6 +35,7 @@ set(TEST_SOURCES
     guard_tls_installer_test.cpp
     target_info_test.cpp
     pass_applicability_test.cpp
+    vm_kernel_safety_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for

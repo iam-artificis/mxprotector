@@ -5,8 +5,12 @@
 ## In Progress — Driver / manual-map support
 Priority order: **manually-mapped .sys → manually-mapped DLL → OS-loaded .sys → OS-loaded DLL**.
 Exceptions / `MX_GUARD` have no ring0 analogue, so guarded regions in drivers are explicitly unsupported.
-- **Stage 1 — Foundation (this commit):** `TargetInfo` extended with `BinaryKind` (executable / dynamic_library / kernel_driver) and `LoadMode` (os_loaded / manual_mapped). CLI flag `--load-mode=os|manual`. `GuardPass`, `StringProtectionPass`, `PackerPass` skip kernel drivers. Unit tests pin the predicates + gates.
-- **Stage 2 — Kernel-safety audit:** Verify `VirtualizationPass`, `MutationPass`, `ObfuscationPass`, `CfgFlatteningPass` produce ring0-safe output (no PEB / user-mode syscall assumptions). Re-enable `StringProtectionPass` for drivers if the decryptor passes audit.
+- **Stage 1 — Foundation (done):** `TargetInfo` extended with `BinaryKind` (executable / dynamic_library / kernel_driver) and `LoadMode` (os_loaded / manual_mapped). CLI flag `--load-mode=os|manual`. `GuardPass`, `StringProtectionPass`, `PackerPass` skip kernel drivers. Unit tests pin the predicates + gates.
+- **Stage 2 — Kernel-safety audit (done):** Audited VM / Mutation / Obfuscation / CFG / StringProtection runtime output against ring0 constraints. Findings:
+  - Mutation / Obfuscation / CFG — pure in-place instruction rewriters, no new imports / TLS callbacks / PEB access. Kernel-safe by construction.
+  - `VmRuntimeGenerator` — core dispatcher + handlers + bytecode are pure ALU. Two optional entry-stub blocks reach into `PEB.ImageBaseAddress` (`gs:[0x60]`): the `emit_imagebase_key_block` (already gated on `use_imagebase_key`, off for non-EXE) and the random anti-tamper / anti-emulation pick (was *on* by default, now gated by `skip_anti_tamper_checks` which `VirtualizationPass` flips true for kernel-driver targets).
+  - String decryptor (`stub` / `vm` / `ephemeral`) — all three modes are pure XOR / `lock xadd` + XOR / VM-lifted XOR with `skip_anti_tamper_checks=true`. Kernel-safe. Stage 1 gate lifted.
+  - Byte-scan unit test pins that the driver-path VM runtime never emits `mov rax, gs:[0x60]`, with a sanity counter-test that the pattern reappears when `use_imagebase_key` is flipped back on.
 - **Stage 3 — Manual-mapped user-mode packer:** Packer stub applies base relocations inline, resolves imports without loader-populated IAT, invokes any inherited TLS callbacks from the stub. DLL path covers manual injection.
 - **Stage 4 — Kernel-mode packer stub (OS-loaded):** `DriverEntry` stub, import resolution via `PsLoadedModuleList` crawl, kernel anti-debug (KUSER_SHARED_DATA / IRQL / KdDebuggerEnabled), reprotect via `MmProtectMdlSystemAddress`. Note: OS install still blocked on test-signing.
 - **Stage 5 — Manual-mapped drivers (kdmapper):** Combines Stage 3's mapper-independence with Stage 4's kernel ABI. Primary deliverable per user priority.

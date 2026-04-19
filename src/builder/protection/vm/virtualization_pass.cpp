@@ -135,15 +135,33 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     const bool packer_will_run =
         ctx.config().enable_packer &&
         ctx.pe_image().pe_type() == PeType::executable;
+    // Driver targets get the anti-tamper / anti-emulation entry-stub
+    // checks suppressed: every check in the registry assumes a user-mode
+    // process — the syscall-flavored ones resolve via Hell's Gate (which
+    // walks `PEB.Ldr` for ntdll), the user-mode-flavored ones probe live
+    // EDR hooks / VirtualProtect tracks. In ring0 `gs:[0x60]` is KPCR
+    // not PEB, so the resolver reads garbage and the check corrupts the
+    // handler-table key on the first dispatch. The VM core itself
+    // (dispatcher + handlers + bytecode) stays pure-integer, so muting
+    // these picks is sufficient — kernel drivers still get a fully
+    // randomised, encrypted VM, just without the user-mode-only outer
+    // probes.
+    const bool target_is_kernel = ctx.target().is_kernel_driver();
     const vm::VmGenOptions default_opts{
-        .emit_exit_as_jmp     = false,
-        .use_imagebase_key    = packer_will_run,
-        .preferred_image_base = static_cast<uint64_t>(ctx.pe_image().image_base()),
+        .emit_exit_as_jmp        = false,
+        .use_imagebase_key       = packer_will_run,
+        .preferred_image_base    = static_cast<uint64_t>(ctx.pe_image().image_base()),
+        .skip_anti_tamper_checks = target_is_kernel,
     };
     if (default_opts.use_imagebase_key) {
         ctx.log_fmt("VirtualizationPass: ImageBase-derived table key enabled "
                     "(preferred_base=0x{:X})",
             default_opts.preferred_image_base);
+    }
+    if (default_opts.skip_anti_tamper_checks) {
+        ctx.log("VirtualizationPass: kernel-driver target — anti-tamper / "
+                "anti-emulation entry-stub checks suppressed (no user-mode "
+                "PEB / Hell's Gate in ring0)");
     }
 
     // Собираем все blobs и отмечаем точки замены
