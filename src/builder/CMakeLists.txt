@@ -127,6 +127,11 @@ set(BUILDER_SOURCES
     protection/string/string_encryptor.cpp
     protection/string/string_decryptor_codegen.cpp
     protection/string/string_protection_pass.cpp
+    protection/string/string_protection_pipeline.cpp
+    protection/string/string_candidate_gather.cpp
+    protection/string/string_artifact_builder.cpp
+    protection/string/string_section_assembler.cpp
+    protection/string/string_section_committer.cpp
 
     # Phase 6: Anti-emulation checks — one file per technique
     protection/anti_emulation/check_registry.cpp
