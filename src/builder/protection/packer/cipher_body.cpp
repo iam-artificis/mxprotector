@@ -7,6 +7,7 @@
 
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 #include "mxprotector/protection/obfuscation/hash_opaque_predicate.hpp"
+#include "mxprotector/protection/packer/reloc_applier.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"
 #include "mxprotector/protection/packer/veh_int3_trap.hpp"
 
@@ -19,7 +20,8 @@ void emit_decrypt_body(RawEmitter&        e,
                        Randomizer&        rng,
                        uint32_t           section_count,
                        uint32_t           layer_count,
-                       bool               enable_veh_trap)
+                       bool               enable_veh_trap,
+                       bool               apply_relocs_inline)
 {
     // P2 — allocate per-layer patch storage up front. The emission loop
     // below fills entries in runtime-decrypt order (N-1 first, 0 last);
@@ -405,6 +407,26 @@ void emit_decrypt_body(RawEmitter&        e,
                 e.u8(static_cast<uint8_t>(static_cast<int8_t>(rel8)));
             }
         }
+    }
+
+    // (4.25) Optional Stage-3 base-relocation applier.
+    //
+    // Runs AFTER the innermost decrypt layer finished (every target
+    // section is now plaintext) and BEFORE the reprotect loop revokes
+    // WRITE — the relocated pages must stay writable while the applier
+    // mutates them. The applier emits its own RIP-relative runtime-
+    // base computation, so it does not depend on any state from the
+    // decrypt loop; the emission order of the two blocks is the only
+    // constraint.
+    //
+    // Enabled when the caller sets `apply_relocs_inline = true`, which
+    // `PackerPass` does iff `ctx.target().is_manually_mapped()`. In
+    // OS-load mode the loader has already applied relocations before
+    // the stub runs and running the applier would double-apply the
+    // delta; leaving the applier out also trims ~116 bytes off the
+    // common-case stub.
+    if (apply_relocs_inline) {
+        emit_reloc_applier(e, patches.reloc_applier);
     }
 
     // (4.5) Reprotect decrypted sections to PAGE_EXECUTE_READ.

@@ -171,8 +171,25 @@ struct OepStealResult {
 /// treat that as "skip the packer for this image".
 [[nodiscard]] std::optional<OepStealResult>
 prepare_oep_steal(ProtectionContext& ctx, std::string_view steal_label) {
-    disable_relocations(ctx.pe_image());
-    ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+    // Keep the `.reloc` directory intact when the caller asked for
+    // manual-mapped output — the stub's Stage 3 reloc applier walks
+    // this data post-decrypt. The `RELOCS_STRIPPED` characteristic is
+    // set either way so the (OS or manual) loader does not touch the
+    // ciphertext before our stub has a chance to decrypt it.
+    if (ctx.target().is_manually_mapped()) {
+        // Still force `RELOCS_STRIPPED` to keep the loader off our
+        // ciphertext, but leave the data directory entry + the
+        // `.reloc` section bytes untouched so the stub can walk them.
+        std::visit([&](auto& nt) {
+            nt.FileHeader.Characteristics |= pe::IMAGE_FILE_RELOCS_STRIPPED;
+        }, ctx.pe_image().nt_headers());
+        ctx.log("PackerPass: manual-map — .reloc сохранён для stub reloc "
+                "applier (RELOCS_STRIPPED оставлен, чтобы loader не "
+                "трогал ciphertext)");
+    } else {
+        disable_relocations(ctx.pe_image());
+        ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+    }
 
     const Rva oep_rva = ctx.pe_image().entry_point_rva();
     if (oep_rva == 0) {
@@ -434,13 +451,22 @@ private:
         } else if (enable_veh_trap_) {
             ctx_.log("PackerPass: G3 Phase 2 VEH INT3 trap включён");
         }
+
+        // Stage 3 — post-decrypt base-relocation applier is emitted
+        // only for manual-mapped targets. See `reloc_applier.hpp`.
+        apply_relocs_inline_ = ctx_.target().is_manually_mapped();
+        if (apply_relocs_inline_) {
+            ctx_.log("PackerPass: manual-map mode — post-decrypt reloc "
+                     "applier will be emitted in the stub");
+        }
     }
 
     void step3_emit_stub_body() {
         Emitter emitter{StubEmissionParams{
-            .section_count   = static_cast<uint32_t>(encrypted_.size()),
-            .layer_count     = layer_count_,
-            .enable_veh_trap = enable_veh_trap_,
+            .section_count        = static_cast<uint32_t>(encrypted_.size()),
+            .layer_count          = layer_count_,
+            .enable_veh_trap      = enable_veh_trap_,
+            .apply_relocs_inline  = apply_relocs_inline_,
         }};
         auto [stub_buf, patches] = emitter.emit(
             rng_,
@@ -553,6 +579,7 @@ private:
     std::vector<ByteBuffer> layer_keys_;
     std::vector<EncryptedTarget> encrypted_;
     bool                    enable_veh_trap_ = false;
+    bool                    apply_relocs_inline_ = false;
 
     // --- step3 outputs (emitter) -------------------------------------
     ByteBuffer                     stub_buf_;

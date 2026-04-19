@@ -18,7 +18,8 @@ build_exe_stub_bytes(Randomizer& rng,
                      ByteView    stolen_bytes,
                      uint32_t    section_count,
                      uint32_t    layer_count,
-                     bool        enable_veh_trap)
+                     bool        enable_veh_trap,
+                     bool        apply_relocs_inline)
 {
     RawEmitter e;
     e.buf.reserve(128 + (32 + 32 * section_count) * layer_count +
@@ -37,9 +38,11 @@ build_exe_stub_bytes(Randomizer& rng,
 
     // (2) Shared decrypt body — anti-debug, KSA, PRGA per section,
     //     reprotect, IAT wipe. Populates the CipherBodyPatches slots
-    //     of `patches` via the multi-inheritance base.
+    //     of `patches` via the multi-inheritance base. In manual-map
+    //     mode the body also appends the Stage 3 reloc applier between
+    //     the final layer and the reprotect loop.
     emit_decrypt_body(e, patches, rng, section_count, layer_count,
-                      enable_veh_trap);
+                      enable_veh_trap, apply_relocs_inline);
 
     // (3) Restore registers in reverse of the saved order (LIFO).
     for (auto it = save_order.rbegin(); it != save_order.rend(); ++it) {
@@ -64,7 +67,8 @@ std::pair<ByteBuffer, DllFullStubPatches>
 build_dll_full_stub_bytes(Randomizer& rng,
                           ByteView    stolen_bytes,
                           uint32_t    section_count,
-                          uint32_t    layer_count)
+                          uint32_t    layer_count,
+                          bool        apply_relocs_inline)
 {
     RawEmitter e;
     e.buf.reserve(192 + (32 + 32 * section_count) * layer_count +
@@ -100,9 +104,12 @@ build_dll_full_stub_bytes(Randomizer& rng,
 
     // (3) Shared decrypt body. DLLs never enable the VEH trap —
     //     a DLL-installed VEH survives the DLL's unload and would
-    //     leave a dangling handler in the host process.
+    //     leave a dangling handler in the host process. The reloc
+    //     applier flag is forwarded as-is; manual-mapped DLL is the
+    //     primary Stage 3 target.
     emit_decrypt_body(e, patches, rng, section_count, layer_count,
-                      /*enable_veh_trap=*/false);
+                      /*enable_veh_trap=*/false,
+                      apply_relocs_inline);
 
     // (4) .forward: — back-patch the jne target.
     {

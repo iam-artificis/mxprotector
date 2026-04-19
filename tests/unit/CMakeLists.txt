@@ -36,6 +36,7 @@ set(TEST_SOURCES
     target_info_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
+    reloc_applier_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -107,6 +108,7 @@ set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_tls_finalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_section_encryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/reloc_applier.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/rc4.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stolen_bytes.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stub_emitter.cpp

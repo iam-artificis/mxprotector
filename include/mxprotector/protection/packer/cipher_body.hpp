@@ -37,6 +37,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/protection/packer/reloc_applier.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"
 
 namespace mx::packer {
@@ -127,6 +128,16 @@ struct CipherBodyPatches {
      */
     StubSelfHashEmit self_hash{};
     uint32_t         hash_range_end_offset = 0;
+
+    /**
+     * Stage 3 — optional post-decrypt base-relocation applier.
+     *
+     * Populated only when the caller sets `apply_relocs_inline = true`
+     * on `emit_decrypt_body`. When disabled, the field stays at its
+     * default-constructed state and the post-inject patcher skips
+     * every slot it references.
+     */
+    RelocApplierPatches reloc_applier{};
 };
 
 /**
@@ -158,21 +169,30 @@ struct CipherBodyPatches {
  * config flag before setting the parameter to true. See
  * `veh_int3_trap.hpp` for the rationale.
  *
- * @param e               Emitter to append bytes to.
- * @param patches         Patch descriptor — filled in during emission.
- * @param rng             Randomiser for the anti-debug probe variant,
- *                        the G6 opaque predicate, and (optionally)
- *                        the VEH trap salt and junk tail.
- * @param section_count   Number of target sections each layer decrypts.
- * @param layer_count     Number of cipher layers (≥ 1).
- * @param enable_veh_trap Opt-in flag for the G3 Phase 2 VEH INT3
- *                        trap. Must be false for DLL stubs.
+ * When `apply_relocs_inline` is true (Stage 3 manual-map mode), the
+ * body emits the post-decrypt `.reloc` applier between the final
+ * decrypt layer and the reprotect loop. See `reloc_applier.hpp`.
+ *
+ * @param e                   Emitter to append bytes to.
+ * @param patches             Patch descriptor — filled in during emission.
+ * @param rng                 Randomiser for the anti-debug probe variant,
+ *                            the G6 opaque predicate, and (optionally)
+ *                            the VEH trap salt and junk tail.
+ * @param section_count       Number of target sections each layer decrypts.
+ * @param layer_count         Number of cipher layers (≥ 1).
+ * @param enable_veh_trap     Opt-in flag for the G3 Phase 2 VEH INT3
+ *                            trap. Must be false for DLL stubs.
+ * @param apply_relocs_inline Opt-in flag for the Stage 3 post-decrypt
+ *                            base-relocation applier. Enabled by the
+ *                            caller only when the target's `LoadMode`
+ *                            is `manual_mapped`.
  */
 void emit_decrypt_body(RawEmitter&        e,
                        CipherBodyPatches& patches,
                        Randomizer&        rng,
                        uint32_t           section_count,
                        uint32_t           layer_count,
-                       bool               enable_veh_trap);
+                       bool               enable_veh_trap,
+                       bool               apply_relocs_inline);
 
 } // namespace mx::packer

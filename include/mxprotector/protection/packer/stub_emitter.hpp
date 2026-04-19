@@ -106,6 +106,13 @@ struct StubEmissionParams {
     uint32_t section_count;
     uint32_t layer_count;
     bool     enable_veh_trap;
+    /**
+     * Stage 3 — emit the post-decrypt `.reloc` applier between the
+     * final decrypt layer and the reprotect loop. Enabled by the
+     * caller iff `ctx.target().is_manually_mapped()`; see
+     * `reloc_applier.hpp`.
+     */
+    bool     apply_relocs_inline;
 };
 
 /**
@@ -129,7 +136,8 @@ build_exe_stub_bytes(Randomizer& rng,
                      ByteView    stolen_bytes,
                      uint32_t    section_count,
                      uint32_t    layer_count,
-                     bool        enable_veh_trap);
+                     bool        enable_veh_trap,
+                     bool        apply_relocs_inline);
 
 /**
  * @brief Build the full-DLL stub code bytes (pre-patch).
@@ -164,10 +172,13 @@ build_exe_stub_bytes(Randomizer& rng,
 build_dll_full_stub_bytes(Randomizer& rng,
                           ByteView    stolen_bytes,
                           uint32_t    section_count,
-                          uint32_t    layer_count);
+                          uint32_t    layer_count,
+                          bool        apply_relocs_inline);
 // Note: no `enable_veh_trap` parameter — DLLs cannot safely install
 // Vectored Exception Handlers (the VEH would outlive the DLL's
 // unload). The full-DLL stub always passes false to the cipher body.
+// `apply_relocs_inline` is honoured (manual-mapped DLLs are a
+// primary use case).
 
 /**
  * @brief StubEmitter policy for the EXE shape.
@@ -188,7 +199,8 @@ public:
         return build_exe_stub_bytes(rng, stolen_bytes,
                                     params_.section_count,
                                     params_.layer_count,
-                                    params_.enable_veh_trap);
+                                    params_.enable_veh_trap,
+                                    params_.apply_relocs_inline);
     }
 
 private:
@@ -208,7 +220,8 @@ public:
     emit(Randomizer& rng, ByteView stolen_bytes) {
         return build_dll_full_stub_bytes(rng, stolen_bytes,
                                          params_.section_count,
-                                         params_.layer_count);
+                                         params_.layer_count,
+                                         params_.apply_relocs_inline);
     }
 
 private:

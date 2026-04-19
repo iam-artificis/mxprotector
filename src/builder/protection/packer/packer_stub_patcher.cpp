@@ -124,6 +124,59 @@ void apply_post_inject_patches(
         }
     }
 
+    // Stage 3 — post-decrypt reloc applier. The four imm slots land
+    // at stub-buffer offsets recorded by `emit_reloc_applier`; all are
+    // zero when the applier was not emitted (OS-load mode), so the
+    // `applier_end_offset > applier_begin_offset` check gates every
+    // write below. Details in `reloc_applier.hpp`.
+    if (patches.reloc_applier.applier_end_offset >
+        patches.reloc_applier.applier_begin_offset)
+    {
+        const auto& ra = patches.reloc_applier;
+
+        // `sub rax, imm32` imm32: anchor = stub_rva + lea_anchor_offset
+        const int32_t runtime_base_sub = static_cast<int32_t>(
+            stub_rva + ra.lea_runtime_base_anchor_offset);
+        write_i32(section_data, ra.sub_runtime_base_imm32_at,
+                  runtime_base_sub);
+
+        // `mov rbx, imm64`: preferred ImageBase.
+        const uint64_t preferred_base =
+            static_cast<uint64_t>(ctx.pe_image().image_base());
+        for (int i = 0; i < 8; ++i) {
+            section_data[ra.preferred_base_imm64_at + i] =
+                static_cast<uint8_t>((preferred_base >> (8 * i)) & 0xFF);
+        }
+
+        // `mov ecx, imm32` and `mov edx, imm32`: .reloc directory
+        // location + size from the PE header.
+        Rva      reloc_rva  = 0;
+        uint32_t reloc_size = 0;
+        std::visit([&](const auto& nt) {
+            if (pe::IMAGE_DIRECTORY_ENTRY_BASERELOC <
+                nt.OptionalHeader.NumberOfRvaAndSizes)
+            {
+                reloc_rva = nt.OptionalHeader
+                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
+                    .VirtualAddress;
+                reloc_size = nt.OptionalHeader
+                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
+                    .Size;
+            }
+        }, ctx.pe_image().nt_headers());
+
+        write_i32(section_data, ra.reloc_rva_imm32_at,
+                  static_cast<int32_t>(reloc_rva));
+        write_i32(section_data, ra.reloc_size_imm32_at,
+                  static_cast<int32_t>(reloc_size));
+
+        ctx.log_fmt("PackerPass: manual-map reloc applier patched — "
+                    ".reloc RVA=0x{:08X} size={} байт, preferred_base="
+                    "0x{:016X}, applier @ stub+0x{:X}..0x{:X}",
+            reloc_rva, reloc_size, preferred_base,
+            ra.applier_begin_offset, ra.applier_end_offset);
+    }
+
     // IAT destruction: patch lea rdi → Import Directory + the size.
     {
         Rva impdir_rva = 0;
