@@ -37,6 +37,7 @@
 
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/section_manager.hpp"
@@ -73,12 +74,10 @@ void write_call_and_pad(
         static_cast<int64_t>(target_rva) -
         static_cast<int64_t>(source_rva) - 5);
 
-    section.data[offset_in_section] = 0xE8;
-    std::memcpy(section.data.data() + offset_in_section + 1, &rel32, 4);
-
-    // Заполняем оставшиеся байты NOP'ами (x86 NOP = 0x90)
-    for (uint32_t i = 5; i < total_size; ++i) {
-        section.data[offset_in_section + i] = 0x90;
+    MutableByteView span{section.data.data() + offset_in_section, total_size};
+    asm64::write_call_rel32(span.subspan(0, 5), rel32);
+    if (span.size() > 5) {
+        asm64::fill_nop(span.subspan(5));
     }
 }
 
@@ -87,9 +86,8 @@ void write_call_and_pad(
  */
 void erase_marker(pe::SectionInfo& section, uint32_t offset_in_section, uint32_t size) {
     if (offset_in_section + size > section.data.size()) return;
-    for (uint32_t i = 0; i < size; ++i) {
-        section.data[offset_in_section + i] = 0x90;
-    }
+    asm64::fill_nop(MutableByteView{
+        section.data.data() + offset_in_section, size});
 }
 
 } // anonymous namespace
@@ -380,13 +378,13 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
 
     for (auto& p : pendings) {
         while (section_data.size() % 16 != 0) {
-            section_data.push_back(0xCC);
+            section_data.push_back(asm64::kInt3);
         }
         p.blob_offset_in_section = static_cast<uint32_t>(section_data.size());
         section_data.insert(section_data.end(),
             p.vm_blob.begin(), p.vm_blob.end());
     }
-    while (section_data.size() % 16 != 0) section_data.push_back(0xCC);
+    while (section_data.size() % 16 != 0) section_data.push_back(asm64::kInt3);
 
     constexpr uint32_t mxvm_characteristics =
         pe::IMAGE_SCN_CNT_CODE |

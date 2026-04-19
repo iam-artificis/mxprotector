@@ -5,6 +5,7 @@
 
 #include "mxprotector/protection/packer/stub_emitter.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
 
 #include <algorithm>
@@ -52,7 +53,7 @@ build_exe_stub_bytes(Randomizer& rng,
     e.bytes(stolen_bytes);
 
     // (5) jmp rel32 → OEP + stolen_size
-    e.u8(0xE9);
+    e.u8(asm64::kJmpRel32);
     patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
     e.u32(0);
 
@@ -129,7 +130,7 @@ build_dll_full_stub_bytes(Randomizer& rng,
     e.bytes(stolen_bytes);
 
     // (7) jmp rel32 → DllMain + stolen_size
-    e.u8(0xE9);
+    e.u8(asm64::kJmpRel32);
     patches.rel_to_oep_at = static_cast<uint32_t>(e.size());
     e.u32(0);
 

@@ -14,6 +14,7 @@
 
 #include <variant>
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
@@ -81,13 +82,12 @@ void apply_post_inject_patches(
             static_cast<int64_t>(vm_entry_rva) -
             static_cast<int64_t>(call_end_rva));
 
-        section_data[ksa_off + 0] = 0xE8;  // call rel32
-        section_data[ksa_off + 1] = static_cast<uint8_t>(rel        & 0xFF);
-        section_data[ksa_off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
-        section_data[ksa_off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
-        section_data[ksa_off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
-        for (uint32_t i = ksa_off + 5; i < patches.ksa_block_end_offset; ++i) {
-            section_data[i] = 0x90;
+        MutableByteView ksa_span{
+            section_data.data() + ksa_off,
+            patches.ksa_block_end_offset - ksa_off};
+        asm64::write_call_rel32(ksa_span.subspan(0, 5), rel);
+        if (ksa_span.size() > 5) {
+            asm64::fill_nop(ksa_span.subspan(5));
         }
         ctx.log_fmt("PackerPass: P3 KSA replaced with call vm_entry @ RVA=0x{:08X}",
             vm_entry_rva);

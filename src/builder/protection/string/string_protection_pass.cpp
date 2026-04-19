@@ -30,6 +30,7 @@
 
 #include "mxprotector/protection/string/string_protection_pass.hpp"
 
+#include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/pe_image.hpp"
@@ -172,17 +173,13 @@ void rewrite_lea_as_call(
         static_cast<int64_t>(trampoline_rva) -
         (static_cast<int64_t>(lea_rva) + 5));
 
-    sec->data[off + 0] = 0xE8;
-    sec->data[off + 1] = static_cast<uint8_t>(rel        & 0xFF);
-    sec->data[off + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
-    sec->data[off + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
-    sec->data[off + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
-
+    MutableByteView span{sec->data.data() + off, lea_length};
+    asm64::write_call_rel32(span.subspan(0, 5), rel);
     // NOP pad the remainder. A single 0x90 per byte is uglier than a
     // multi-byte NOP but correctness-identical; the tail is at most 2
     // bytes for a standard 7-byte LEA.
-    for (uint8_t i = 5; i < lea_length; ++i) {
-        sec->data[off + i] = 0x90;
+    if (span.size() > 5) {
+        asm64::fill_nop(span.subspan(5));
     }
 }
 
@@ -731,18 +728,16 @@ MxStatus StringProtectionPass::execute(ProtectionContext& ctx) {
         static_assert(string_protect::kMxStrGetLoopSize >= 5,
                       "VM loop window must hold at least a call rel32");
 
-        added_sec.data[loop_start_abs + 0] = 0xE8;  // call rel32
-        added_sec.data[loop_start_abs + 1] = static_cast<uint8_t>(rel        & 0xFF);
-        added_sec.data[loop_start_abs + 2] = static_cast<uint8_t>((rel >> 8)  & 0xFF);
-        added_sec.data[loop_start_abs + 3] = static_cast<uint8_t>((rel >> 16) & 0xFF);
-        added_sec.data[loop_start_abs + 4] = static_cast<uint8_t>((rel >> 24) & 0xFF);
         // NOP pad from byte loop_start+5 up to `.mark_done` at
         // decryptor_offset + kMxStrGetLoopEndOffset.
-        for (size_t i = loop_start_abs + 5;
-             i < decryptor_offset + string_protect::kMxStrGetLoopEndOffset;
-             ++i)
-        {
-            added_sec.data[i] = 0x90;
+        const size_t loop_end_abs =
+            decryptor_offset + string_protect::kMxStrGetLoopEndOffset;
+        MutableByteView span{
+            added_sec.data.data() + loop_start_abs,
+            loop_end_abs - loop_start_abs};
+        asm64::write_call_rel32(span.subspan(0, 5), rel);
+        if (span.size() > 5) {
+            asm64::fill_nop(span.subspan(5));
         }
         ctx.log_fmt("StringProtectionPass: --strings=vm: mx_str_get XOR loop replaced "
                     "with call vm_entry @ RVA=0x{:08X}", vm_entry_rva);
