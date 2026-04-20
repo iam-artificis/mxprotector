@@ -12,6 +12,9 @@
 ## NOT FROZEN (Internal Builder)
 Everything in `src/builder/` is mutable. Two builds of the same source must produce completely different output bytes.
 
+## Test-only flags (must NOT ship to production)
+- `--trace-hints` — emits `<output>.mxtrace.json` with source-linked labels for the tracing MCP (`MCP_TRACING.md`). Reveals section roles and (Phase 4+) CFF/VM/guard/string metadata. Defaults to off; never enable for released builds.
+
 ## Supported Targets
 | Target | Status | Notes |
 |---|---|---|

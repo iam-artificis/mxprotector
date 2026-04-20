@@ -31,6 +31,7 @@
 #include "mxprotector/pe/pe_builder.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/marker_scanner.hpp"
+#include "mxprotector/analysis/trace_hints.hpp"
 #include "mxprotector/target/target_info.hpp"
 #include "mxprotector/arch/arch_info.hpp"       // Phase 1 arch foundation (unused yet)
 #include "mxprotector/arch/code_emitter.hpp"    // Phase 1 arch foundation (unused yet)
@@ -50,6 +51,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -115,6 +117,71 @@ namespace {
             std::format("Ошибка записи в файл: '{}'", path.string())));
     }
 
+    return {};
+}
+
+/**
+ * @brief Формирует ISO-8601 UTC timestamp текущего момента.
+ *
+ * @return Строка формата `YYYY-MM-DDThh:mm:ssZ`.
+ *
+ * @note `std::chrono::system_clock`'s epoch is Unix UTC in C++20+,
+ *       and std::format with chrono specifiers yields UTC, so no
+ *       timezone conversion is required.
+ */
+[[nodiscard]] std::string iso8601_utc_now() {
+    const auto now = std::chrono::floor<std::chrono::seconds>(
+        std::chrono::system_clock::now());
+    return std::format("{:%Y-%m-%dT%H:%M:%SZ}", now);
+}
+
+/**
+ * @brief Сопоставляет имя секции с её логической ролью.
+ *
+ * @details Роль — это стабильный идентификатор, который MCP-
+ *          трассировщик использует вместо рандомизированного
+ *          per-build имени секции. Для секций, добавленных
+ *          MxProtector, роль берётся из `SectionNameMap`; для
+ *          исходных секций роль равна самому имени.
+ */
+[[nodiscard]] std::string_view section_role_for(
+    const std::string& section_name,
+    const mx::SectionNameMap& names)
+{
+    if (section_name == names.vm)     return "vm";
+    if (section_name == names.cff)    return "cff";
+    if (section_name == names.packer) return "packer";
+    if (section_name == names.str)    return "strings";
+    if (section_name == names.guard)  return "guard";
+    return section_name;
+}
+
+/**
+ * @brief Записывает sidecar `<output>.mxtrace.json` рядом с защищённым PE.
+ *
+ * @param output_pe_path Путь к защищённому PE.
+ * @param json           Содержимое sidecar (TraceHints::to_json()).
+ * @return Успех или ошибка I/O.
+ */
+[[nodiscard]] mx::MxStatus write_trace_hints_sidecar(
+    const std::filesystem::path& output_pe_path,
+    std::string_view json)
+{
+    auto sidecar_path = output_pe_path;
+    sidecar_path += ".mxtrace.json";
+
+    std::ofstream file(sidecar_path, std::ios::binary);
+    if (!file.is_open()) {
+        return std::unexpected(mx::error::io(std::format(
+            "Не удалось создать sidecar: '{}'", sidecar_path.string())));
+    }
+
+    if (!file.write(json.data(), static_cast<std::streamsize>(json.size()))) {
+        return std::unexpected(mx::error::io(std::format(
+            "Ошибка записи sidecar: '{}'", sidecar_path.string())));
+    }
+
+    std::cout << std::format("[*] Trace hints: {}\n", sidecar_path.string());
     return {};
 }
 
@@ -329,6 +396,37 @@ int main(int argc, char** argv) {
     if (!write_result) {
         std::cerr << std::format("[ОШИБКА] {}\n", write_result.error().message());
         return 1;
+    }
+
+    // Optional: emit the source-linked labels sidecar for the tracing
+    // MCP. Flag-gated so production builds never produce it. See
+    // MCP_TRACING.md and `include/mxprotector/analysis/trace_hints.hpp`.
+    if (config.emit_trace_hints) {
+        auto& hints = ctx.trace_hints();
+        hints.set_build_info(
+            config.input_path.string(),
+            config.output_path.string(),
+            std::string(config.level_name()),
+            iso8601_utc_now());
+
+        const auto& names = ctx.section_names();
+        for (const auto& sec : ctx.pe_image().sections()) {
+            hints.add_section(
+                section_role_for(sec.name, names),
+                sec.name,
+                sec.virtual_address,
+                sec.virtual_size,
+                sec.characteristics);
+        }
+
+        if (auto sidecar_result = write_trace_hints_sidecar(
+                config.output_path, hints.to_json());
+            !sidecar_result)
+        {
+            std::cerr << std::format("[ОШИБКА] {}\n",
+                sidecar_result.error().message());
+            return 1;
+        }
     }
 
     const auto pipeline_end = std::chrono::high_resolution_clock::now();

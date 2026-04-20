@@ -111,6 +111,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--no-header-erasure")   { config.enable_header_erasure = false; continue; }
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
         if (arg == "--anti-tamper-veh")     { config.enable_veh_anti_tamper = true; continue; }
+        if (arg == "--trace-hints")         { config.emit_trace_hints = true; continue; }
 
         if (arg.starts_with("--load-mode=") && arg.size() > 12) {
             const auto mode_str = arg.substr(12);
@@ -233,6 +234,8 @@ void CliHandler::print_usage() {
         "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
         "  --anti-tamper-veh           Install VEH INT3 trap in packer stub (EXE-only, G3 Phase 2)\n"
+        "  --trace-hints               Emit <output>.mxtrace.json sidecar for the tracing MCP\n"
+        "                                (test-only — must not ship in production builds)\n"
         "  --strings=<режим>           Защита строк в .rdata:\n"
         "                                off       — оставить plaintext\n"
         "                                stub      — decryptor как обычный x64 asm\n"

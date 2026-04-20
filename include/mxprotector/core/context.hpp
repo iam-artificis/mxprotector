@@ -28,6 +28,7 @@
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/analysis/cfg.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
+#include "mxprotector/analysis/trace_hints.hpp"
 #include "mxprotector/target/target_info.hpp"
 
 namespace mx {
@@ -217,6 +218,21 @@ public:
     }
 
     // ====================================================================
+    // Trace hints (sidecar `.mxtrace.json` — см. MCP_TRACING.md)
+    // ====================================================================
+
+    /// @brief Изменяемый доступ к контейнеру source-linked labels.
+    ///        Заполняется pass'ами только когда `config.emit_trace_hints`.
+    [[nodiscard]] analysis::TraceHints& trace_hints() noexcept {
+        return trace_hints_;
+    }
+
+    /// @brief Константный доступ к контейнеру source-linked labels.
+    [[nodiscard]] const analysis::TraceHints& trace_hints() const noexcept {
+        return trace_hints_;
+    }
+
+    // ====================================================================
     // Журнал сообщений
     // ====================================================================
 
@@ -254,6 +270,7 @@ private:
         target::TargetInfo::windows_pe_x64();                       ///< Target platform
     SectionNameMap                                   section_names_;///< Имена добавленных секций
     uint64_t                                         extra_tls_callback_va_ = 0;  ///< GuardPass → PackerPass TLS callback hand-off
+    analysis::TraceHints                             trace_hints_;  ///< Source-linked labels for tracing MCP sidecar
     std::vector<std::string>                         log_messages_; ///< Журнал
 };
 

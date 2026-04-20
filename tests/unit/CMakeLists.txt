@@ -41,6 +41,7 @@ set(TEST_SOURCES
     reloc_partition_test.cpp
     dll_characteristics_audit_test.cpp
     section_name_pool_test.cpp
+    trace_hints_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -155,9 +156,11 @@ set(CFF_SOURCES
 )
 
 # Analysis module sources needed by analysis-level unit tests (currently
-# just the marker scanner — adding more if future tests require).
+# the marker scanner + trace_hints sidecar serializer — adding more if
+# future tests require).
 set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/trace_hints.cpp
 )
 
 # CLI helpers needed by CLI-level unit tests (section name pool —

@@ -184,6 +184,22 @@ struct ProtectionConfig {
     bool enable_veh_anti_tamper = false;
 
     /**
+     * @brief Emit the `<output>.mxtrace.json` sidecar for the tracing
+     *        MCP (see MCP_TRACING.md).
+     *
+     * When true, passes populate `ProtectionContext::trace_hints()`
+     * with source-linked labels (section names, and — from Phase 4
+     * onward — CFF states, VM handlers, guard regions, string slots,
+     * IAT range), and `main()` writes the aggregated JSON next to the
+     * output PE. Default: false.
+     *
+     * **Test-only flag.** Must not ship in production builds — the
+     * sidecar reveals randomized section roles + future label metadata
+     * that negates the per-build variance defence. CLI: `--trace-hints`.
+     */
+    bool emit_trace_hints = false;
+
+    /**
      * @brief Фабричный метод: создаёт конфигурацию по уровню защиты.
      *
      * Раскладка уровней:

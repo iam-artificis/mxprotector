@@ -32,6 +32,7 @@ set(BUILDER_SOURCES
     analysis/zydis_disassembler.cpp
     analysis/cfg_builder.cpp
     analysis/marker_scanner.cpp
+    analysis/trace_hints.cpp
 
     # Инфраструктура защиты
     protection/pass_manager.cpp
