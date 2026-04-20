@@ -125,10 +125,22 @@ void apply_post_inject_patches(
     }
 
     // Stage 3 — post-decrypt reloc applier. The four imm slots land
-    // at stub-buffer offsets recorded by `emit_reloc_applier`; all are
-    // zero when the applier was not emitted (OS-load mode), so the
-    // `applier_end_offset > applier_begin_offset` check gates every
-    // write below. Details in `reloc_applier.hpp`.
+    // at stub-buffer offsets recorded by `emit_reloc_applier`; all
+    // are zero when the applier was not emitted (OS-load mode), so
+    // the `applier_end_offset > applier_begin_offset` check gates
+    // every write below. Details in `reloc_applier.hpp`.
+    //
+    // Source of the reloc table: the stub-private blob embedded in
+    // `.mxpack` by `append_stub_artifacts`, NOT the PE header's
+    // `DataDirectory[BASERELOC]`. The directory there points at
+    // mapper-applicable entries (vtables, globals); they have
+    // already been relocated by the time the stub runs. The blob
+    // holds only the entries that target encrypted sections, kept
+    // out of mapper sight by `partition_encrypted_relocs`. When
+    // partitioning produced no entries (no relocs, or no relocs
+    // target the encrypted sections), `stub_private_relocs_size`
+    // is zero — the patches go to `{rva = 0, size = 0}` and the
+    // applier's `cmp rcx, rdx; jae .done` short-circuits.
     if (patches.reloc_applier.applier_end_offset >
         patches.reloc_applier.applier_begin_offset)
     {
@@ -148,32 +160,23 @@ void apply_post_inject_patches(
                 static_cast<uint8_t>((preferred_base >> (8 * i)) & 0xFF);
         }
 
-        // `mov ecx, imm32` and `mov edx, imm32`: .reloc directory
-        // location + size from the PE header.
-        Rva      reloc_rva  = 0;
-        uint32_t reloc_size = 0;
-        std::visit([&](const auto& nt) {
-            if (pe::IMAGE_DIRECTORY_ENTRY_BASERELOC <
-                nt.OptionalHeader.NumberOfRvaAndSizes)
-            {
-                reloc_rva = nt.OptionalHeader
-                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
-                    .VirtualAddress;
-                reloc_size = nt.OptionalHeader
-                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
-                    .Size;
-            }
-        }, ctx.pe_image().nt_headers());
-
+        // `mov ecx, reloc_rva` + `mov edx, reloc_size`: location of
+        // the stub-private blob inside this very `.mxpack` section.
+        const Rva private_rva = artifacts.stub_private_relocs_size > 0
+            ? stub_rva + artifacts.stub_private_relocs_offset_in_stub
+            : 0;
         write_i32(section_data, ra.reloc_rva_imm32_at,
-                  static_cast<int32_t>(reloc_rva));
+                  static_cast<int32_t>(private_rva));
         write_i32(section_data, ra.reloc_size_imm32_at,
-                  static_cast<int32_t>(reloc_size));
+                  static_cast<int32_t>(artifacts.stub_private_relocs_size));
 
-        ctx.log_fmt("PackerPass: manual-map reloc applier patched — "
-                    ".reloc RVA=0x{:08X} size={} байт, preferred_base="
-                    "0x{:016X}, applier @ stub+0x{:X}..0x{:X}",
-            reloc_rva, reloc_size, preferred_base,
+        ctx.log_fmt(
+            "PackerPass: manual-map reloc applier patched — "
+            "stub-private blob RVA=0x{:08X} size={} байт, "
+            "preferred_base=0x{:016X}, applier @ stub+0x{:X}..0x{:X}",
+            private_rva,
+            artifacts.stub_private_relocs_size,
+            preferred_base,
             ra.applier_begin_offset, ra.applier_end_offset);
     }
 
@@ -284,9 +287,9 @@ void apply_driver_post_inject_patches(
             vm_entry_rva);
     }
 
-    // Stage-3 reloc applier (optional — emitted iff the driver was
-    // built for a non-preferred-base load path). Same slot-filling
-    // logic as the user-mode patcher.
+    // Stage-3 reloc applier (driver path always opts in). Source is
+    // the stub-private blob — same partition strategy as user-mode,
+    // see the explanatory comment in `apply_post_inject_patches`.
     if (patches.reloc_applier.applier_end_offset >
         patches.reloc_applier.applier_begin_offset)
     {
@@ -304,30 +307,21 @@ void apply_driver_post_inject_patches(
                 static_cast<uint8_t>((preferred_base >> (8 * i)) & 0xFF);
         }
 
-        Rva      reloc_rva  = 0;
-        uint32_t reloc_size = 0;
-        std::visit([&](const auto& nt) {
-            if (pe::IMAGE_DIRECTORY_ENTRY_BASERELOC <
-                nt.OptionalHeader.NumberOfRvaAndSizes)
-            {
-                reloc_rva = nt.OptionalHeader
-                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
-                    .VirtualAddress;
-                reloc_size = nt.OptionalHeader
-                    .DataDirectory[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC]
-                    .Size;
-            }
-        }, ctx.pe_image().nt_headers());
-
+        const Rva private_rva = artifacts.stub_private_relocs_size > 0
+            ? stub_rva + artifacts.stub_private_relocs_offset_in_stub
+            : 0;
         write_i32(section_data, ra.reloc_rva_imm32_at,
-                  static_cast<int32_t>(reloc_rva));
+                  static_cast<int32_t>(private_rva));
         write_i32(section_data, ra.reloc_size_imm32_at,
-                  static_cast<int32_t>(reloc_size));
+                  static_cast<int32_t>(artifacts.stub_private_relocs_size));
 
-        ctx.log_fmt("PackerPass: driver — reloc applier patched: "
-                    ".reloc RVA=0x{:08X} size={} байт, preferred_base="
-                    "0x{:016X}",
-            reloc_rva, reloc_size, preferred_base);
+        ctx.log_fmt(
+            "PackerPass: driver — reloc applier patched: "
+            "stub-private blob RVA=0x{:08X} size={} байт, "
+            "preferred_base=0x{:016X}",
+            private_rva,
+            artifacts.stub_private_relocs_size,
+            preferred_base);
     }
 }
 

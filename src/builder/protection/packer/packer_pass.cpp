@@ -63,6 +63,7 @@
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
 #include "mxprotector/protection/packer/packer_tls_finalizer.hpp"
 #include "mxprotector/protection/packer/rc4.hpp"
+#include "mxprotector/protection/packer/reloc_partition.hpp"
 #include "mxprotector/protection/packer/stolen_bytes.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
 
@@ -172,30 +173,58 @@ struct OepStealResult {
 /// treat that as "skip the packer for this image".
 [[nodiscard]] std::optional<OepStealResult>
 prepare_oep_steal(ProtectionContext& ctx, std::string_view steal_label) {
-    // Keep the `.reloc` directory intact when the stub will need to
-    // walk it post-decrypt — either the caller opted into manual-
-    // mapped output or the target is a kernel driver (in both cases
-    // the runtime image base may differ from the preferred one and
-    // the stub's Stage 3 reloc applier owns that fix-up). The
-    // `RELOCS_STRIPPED` characteristic is set either way so the (OS
-    // or manual) loader does not touch the ciphertext before our stub
-    // gets a chance to decrypt it.
-    const bool keep_relocs =
-        ctx.target().is_manually_mapped() ||
-        ctx.target().is_kernel_driver();
-    if (keep_relocs) {
+    // Decide how to handle `.reloc` based on target shape.
+    //
+    // 1. OS-loaded EXE / DLL (neither kernel driver nor manual-map):
+    //    the OS loader does all relocations; our stub never touches
+    //    `.reloc`. We strip the directory, set `RELOCS_STRIPPED`, and
+    //    clear `DYNAMIC_BASE` so the OS loader is forced to the
+    //    preferred base (required by the `use_imagebase_key` VM
+    //    handler-table derivation and by the TLS directory's
+    //    absolute-VA `AddressOfCallBacks` field).
+    //
+    // 2. User-mode manual-map (EXE / DLL + `--load-mode=manual`):
+    //    we still need the OS loader to land the binary at the
+    //    preferred base, because the TLS plumbing we emit (callback
+    //    body + directory + array) uses absolute VAs baked at build
+    //    time. So `RELOCS_STRIPPED` stays ON. Mappers that IGNORE
+    //    the flag and walk `.reloc` anyway get a safe directory:
+    //    `partition_encrypted_relocs` has already neutralised every
+    //    entry that targeted an encrypted section to
+    //    `IMAGE_REL_BASED_ABSOLUTE` (treated as padding). Mappers
+    //    that HONOUR the flag skip everything, which is also fine
+    //    because the stub handles its own entries from the private
+    //    blob.
+    //
+    // 3. Kernel driver (any load mode): no TLS directory is
+    //    finalised (kernel images do not run TLS callbacks) and the
+    //    driver cipher body contains no absolute VAs. There is
+    //    therefore nothing tying us to the preferred base, so we
+    //    leave `RELOCS_STRIPPED` at its input value and let any
+    //    mapper relocate freely — the partitioned `.reloc` +
+    //    stub-private blob cover every code scenario.
+    const bool is_driver       = ctx.target().is_kernel_driver();
+    const bool keep_relocs     = is_driver || ctx.target().is_manually_mapped();
+    if (!keep_relocs) {
+        disable_relocations(ctx.pe_image());
+        ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+    } else if (is_driver) {
+        ctx.log("PackerPass: .reloc preserved, RELOCS_STRIPPED not forced "
+                "(driver stub emits no absolute VAs; mapper may load at "
+                "any base)");
+    } else {
+        // User-mode manual-map. Force RELOCS_STRIPPED so a relocation-
+        // respecting loader lands the image at the preferred base —
+        // the stub's TLS callback array holds absolute VAs that
+        // require it. Leave the `.reloc` directory bytes intact for
+        // mappers that ignore the flag; partitioning guarantees they
+        // do not corrupt ciphertext.
         std::visit([&](auto& nt) {
             nt.FileHeader.Characteristics |= pe::IMAGE_FILE_RELOCS_STRIPPED;
         }, ctx.pe_image().nt_headers());
-        ctx.log_fmt(
-            "PackerPass: .reloc сохранён для stub reloc applier "
-            "(RELOCS_STRIPPED оставлен; reason: {})",
-            ctx.target().is_kernel_driver()
-                ? "kernel-driver target"
-                : "manual-map mode");
-    } else {
-        disable_relocations(ctx.pe_image());
-        ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
+        ctx.log("PackerPass: manual-map — RELOCS_STRIPPED set "
+                "(TLS absolute VAs require preferred base); "
+                ".reloc preserved for mappers that ignore the flag");
     }
 
     const Rva oep_rva = ctx.pe_image().entry_point_rva();
@@ -344,6 +373,7 @@ public:
         if (skip_) return {};
         step2_generate_keys_and_targets();
         if (skip_) return {};
+        step2b_partition_relocs();
         step3_emit_stub_body();
         step4_append_artifacts();
         if (auto r = step5_inject_and_patch(); !r) return r;
@@ -482,6 +512,52 @@ private:
         }
     }
 
+    /**
+     * @brief Partition the visible `.reloc` directory between
+     *        mapper-applicable entries (kept in `.reloc` as-is) and
+     *        stub-private entries (extracted into `stub_private_relocs_`
+     *        for embedding in `.mxpack`).
+     *
+     * No-op when `apply_relocs_inline_` is false — the OS-loaded
+     * EXE / DLL paths still leave the original `.reloc` for the
+     * Windows loader to apply. With `apply_relocs_inline_ == true`
+     * (manual-map or kernel driver) we pre-process `.reloc` so the
+     * entries that target encrypted sections become `ABSOLUTE`
+     * padding for the mapper, and a private copy of those entries
+     * is embedded for the stub's `emit_reloc_applier` to walk.
+     */
+    void step2b_partition_relocs() {
+        if (!apply_relocs_inline_) return;
+
+        std::vector<packer::TargetSection> tgt_sections(encrypted_.size());
+        for (size_t i = 0; i < encrypted_.size(); ++i) {
+            tgt_sections[i] =
+                {encrypted_[i].rva, encrypted_[i].size};
+        }
+
+        auto result = packer::partition_encrypted_relocs(
+            ctx_.pe_image(),
+            std::span<const packer::TargetSection>{tgt_sections});
+
+        stub_private_relocs_ = std::move(result.stub_private_blob);
+
+        if (stub_private_relocs_.empty()) {
+            ctx_.log_fmt(
+                "PackerPass: .reloc partition: 0 encrypted-section "
+                "entries (visible: {}, blob: empty)",
+                result.visible_entry_count);
+        } else {
+            ctx_.log_fmt(
+                "PackerPass: .reloc partitioned — {} encrypted-section "
+                "entries from {} block(s) moved to stub-private blob "
+                "({} bytes); {} entries remain visible to mapper",
+                result.stub_private_entry_count,
+                result.neutralised_block_count,
+                static_cast<uint32_t>(stub_private_relocs_.size()),
+                result.visible_entry_count);
+        }
+    }
+
     void step3_emit_stub_body() {
         Emitter emitter{StubEmissionParams{
             .section_count        = static_cast<uint32_t>(encrypted_.size()),
@@ -499,15 +575,18 @@ private:
     void step4_append_artifacts() {
         // Delegates to packer_stub_artifacts, which walks the fixed
         // post-emit layout (keys, sbox, P3 VM blob, reprotect table,
-        // P4 TLS callback body + directory + callback array +
-        // optional index slot) and returns every recorded offset.
+        // optional stub-private reloc blob, P4 TLS callback body +
+        // directory + callback array + optional index slot) and
+        // returns every recorded offset.
         artifacts_ = packer::append_stub_artifacts(
             ctx_, stub_buf_, rng_,
             layer_keys_,
             layer_count_,
             encrypted_.size(),
             patches_.ksa_block_start_offset,
-            patches_.ksa_block_end_offset);
+            patches_.ksa_block_end_offset,
+            ByteView{stub_private_relocs_.data(),
+                     stub_private_relocs_.size()});
     }
 
     [[nodiscard]] MxStatus step5_inject_and_patch() {
@@ -622,6 +701,11 @@ private:
     std::vector<EncryptedTarget> encrypted_;
     bool                    enable_veh_trap_ = false;
     bool                    apply_relocs_inline_ = false;
+
+    /// Stub-private reloc blob produced by `step2b_partition_relocs`.
+    /// Empty when partitioning was skipped (`apply_relocs_inline_` is
+    /// false) or when no encrypted-section relocations were found.
+    ByteBuffer              stub_private_relocs_;
 
     // --- step3 outputs (emitter) -------------------------------------
     ByteBuffer                     stub_buf_;

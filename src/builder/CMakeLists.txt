@@ -116,6 +116,7 @@ set(BUILDER_SOURCES
     protection/packer/cipher_body.cpp
     protection/packer/driver_cipher_body.cpp
     protection/packer/reloc_applier.cpp
+    protection/packer/reloc_partition.cpp
     protection/packer/rc4.cpp
     protection/packer/stolen_bytes.cpp
     protection/packer/stub_emitter.cpp

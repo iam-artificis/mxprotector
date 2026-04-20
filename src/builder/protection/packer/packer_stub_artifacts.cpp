@@ -29,7 +29,8 @@ StubArtifactsInfo append_stub_artifacts(
     uint32_t                        layer_count,
     size_t                          section_count,
     uint32_t                        ksa_block_start_offset,
-    uint32_t                        ksa_block_end_offset)
+    uint32_t                        ksa_block_end_offset,
+    ByteView                        stub_private_relocs)
 {
     StubArtifactsInfo out{};
 
@@ -72,6 +73,38 @@ StubArtifactsInfo append_stub_artifacts(
     out.reprotect_table_offset_in_stub =
         static_cast<uint32_t>(stub_buf.size());
     stub_buf.insert(stub_buf.end(), section_count * 8, uint8_t{0});
+
+    // --------------------------------------------------
+    // Stage 3 — stub-private reloc blob (see `reloc_partition.hpp`).
+    //
+    // The blob is a sequence of `IMAGE_BASE_RELOCATION` headers +
+    // 2-byte entries, identical in format to the on-disk .reloc
+    // directory. `emit_reloc_applier` consumes it verbatim.
+    //
+    // Left at size zero — and the offset at zero — when the caller
+    // did not hand us a blob. The patcher treats the zero-size case
+    // as "no work for the applier"; the `test r11, r11 / je .done`
+    // early-exit at the head of the applier already covers the
+    // delta-equals-zero path, and the entry-loop never runs when
+    // reloc_size is zero (`cmp rcx, rdx; jae .done` hits
+    // immediately).
+    // --------------------------------------------------
+    if (!stub_private_relocs.empty()) {
+        // 4-byte alignment so the stub applier's 4-byte loads of
+        // page_rva / block_size land on natural alignment. The
+        // loads are `mov r32, [rcx / rcx+4]` which x64 tolerates
+        // misaligned, but keeping the layout clean simplifies
+        // disassembly review.
+        while (stub_buf.size() % 4 != 0) stub_buf.push_back(asm64::kInt3);
+
+        out.stub_private_relocs_offset_in_stub =
+            static_cast<uint32_t>(stub_buf.size());
+        out.stub_private_relocs_size =
+            static_cast<uint32_t>(stub_private_relocs.size());
+        stub_buf.insert(stub_buf.end(),
+                        stub_private_relocs.begin(),
+                        stub_private_relocs.end());
+    }
 
     // --------------------------------------------------
     // P4 — TLS callback artefacts.

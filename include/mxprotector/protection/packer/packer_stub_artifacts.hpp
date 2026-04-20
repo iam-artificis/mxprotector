@@ -68,6 +68,12 @@ struct StubArtifactsInfo {
     /// reprotect loop reads as `{Rva rva, uint32_t size}` entries.
     uint32_t reprotect_table_offset_in_stub = 0;
 
+    /// Stub-private reloc blob (see `reloc_partition.hpp`). Zero when
+    /// the caller did not hand us a blob or the blob was empty —
+    /// the patcher treats zero-size as "no work for the applier".
+    uint32_t stub_private_relocs_offset_in_stub = 0;
+    uint32_t stub_private_relocs_size           = 0;
+
     /// Parsed input TLS directory (if any). Preserved so the caller
     /// can keep non-callback fields verbatim.
     std::optional<ExistingTlsDirectory> existing_tls_opt;
@@ -116,6 +122,16 @@ struct StubArtifactsInfo {
  *                               inside `stub_buf` (from
  *                               `CipherBodyPatches`).
  * @param ksa_block_end_offset   One-past-last byte of the slice.
+ * @param stub_private_relocs    Optional stub-private reloc blob
+ *                               from `partition_encrypted_relocs`.
+ *                               Empty / default-constructed view
+ *                               means no blob — the function
+ *                               leaves the corresponding
+ *                               `StubArtifactsInfo` fields at
+ *                               zero and the patcher will patch
+ *                               `{reloc_rva=0, reloc_size=0}`,
+ *                               turning the applier's loop into
+ *                               a no-op.
  */
 [[nodiscard]] StubArtifactsInfo append_stub_artifacts(
     mx::ProtectionContext&          ctx,
@@ -125,6 +141,7 @@ struct StubArtifactsInfo {
     uint32_t                        layer_count,
     size_t                          section_count,
     uint32_t                        ksa_block_start_offset,
-    uint32_t                        ksa_block_end_offset);
+    uint32_t                        ksa_block_end_offset,
+    ByteView                        stub_private_relocs = {});
 
 } // namespace mx::packer
