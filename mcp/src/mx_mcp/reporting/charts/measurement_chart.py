@@ -32,10 +32,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from mx_mcp.reporting.charts._mpl import (
+    DARK_THEME,
     DIRECTION_COLORS,
     FIGURE_DPI,
     matplotlib_available,
     require_matplotlib,
+    style_axis_for_dark,
+    style_figure_for_dark,
 )
 from mx_mcp.reporting.charts.base import IChartRenderer, register_chart
 
@@ -79,7 +82,7 @@ def _row_for_metric(metric: Any) -> _PlotRow | None:
         return None
 
     direction_value = metric.direction.value
-    color = DIRECTION_COLORS.get(direction_value, "#555555")
+    color = DIRECTION_COLORS.get(direction_value, DARK_THEME["spine"])
 
     if metric.scale is not None:
         score = metric.scale.normalize(float(p90))
@@ -159,10 +162,19 @@ class MeasurementChartRenderer(IChartRenderer):
             ax.text(
                 0.5, 0.5, "no benchmark results",
                 ha="center", va="center", fontsize=14,
+                color=DARK_THEME["text_dim"],
             )
-            fig.suptitle("Defense Measurement", fontsize=13)
+            fig.suptitle(
+                "Defense Measurement", fontsize=13,
+                color=DARK_THEME["accent"],
+            )
+            style_figure_for_dark(fig)
+            ax.set_facecolor(DARK_THEME["bg"])
             fig.tight_layout()
-            fig.savefig(output_path, format="png", bbox_inches="tight")
+            fig.savefig(
+                output_path, format="png", bbox_inches="tight",
+                facecolor=DARK_THEME["bg"],
+            )
             plt.close(fig)
             _LOG.info("measurement chart (empty) → %s", output_path)
             return output_path
@@ -177,14 +189,18 @@ class MeasurementChartRenderer(IChartRenderer):
         corpus_label = getattr(data, "corpus_path", "<unknown corpus>")
         fig.suptitle(
             f"Defense Measurement — {corpus_label}",
-            fontsize=12, y=0.995,
+            fontsize=12, y=0.995, color=DARK_THEME["accent"],
         )
+        style_figure_for_dark(fig)
 
         for ax, bench, rows in zip([a[0] for a in axes], benchmarks, bench_rows):
             _draw_benchmark_axis(ax, bench, rows)
 
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
-        fig.savefig(output_path, format="png", bbox_inches="tight")
+        fig.savefig(
+            output_path, format="png", bbox_inches="tight",
+            facecolor=DARK_THEME["bg"],
+        )
         plt.close(fig)
 
         _LOG.info(
@@ -196,25 +212,35 @@ class MeasurementChartRenderer(IChartRenderer):
 
 def _draw_benchmark_axis(ax: Any, bench: Any, rows: list[_PlotRow]) -> None:
     """Render one benchmark's metrics onto the supplied axis."""
+    style_axis_for_dark(ax)
+
     title = (
         f"{bench.benchmark}  "
         f"(category={bench.category}, tier={bench.tier})"
     )
-    ax.set_title(title, fontsize=10, loc="left")
+    ax.set_title(
+        title, fontsize=10, loc="left", color=DARK_THEME["accent"],
+    )
 
     if not rows:
         ax.axis("off")
         ax.text(
             0.5, 0.5, "no scored metrics",
-            ha="center", va="center", fontsize=10, color="#888",
+            ha="center", va="center", fontsize=10,
+            color=DARK_THEME["text_dim"],
             transform=ax.transAxes,
         )
         return
 
     ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("Defense score (0 = weak, 1 = strong)", fontsize=9)
-    ax.axvline(0.5, color="#bbbbbb", linestyle="--", linewidth=0.6)
-    ax.grid(axis="x", color="#eaeaea", linewidth=0.5)
+    ax.set_xlabel(
+        "Defense score (0 = weak, 1 = strong)", fontsize=9,
+        color=DARK_THEME["accent"],
+    )
+    ax.axvline(
+        0.5, color=DARK_THEME["spine"], linestyle="--", linewidth=0.7,
+    )
+    ax.grid(axis="x", color=DARK_THEME["grid"], linewidth=0.5)
     ax.set_axisbelow(True)
 
     y_positions = list(range(len(rows)))
@@ -222,7 +248,7 @@ def _draw_benchmark_axis(ax: Any, bench: Any, rows: list[_PlotRow]) -> None:
     colors = [r.color for r in rows]
     ax.barh(
         y_positions, bar_values,
-        color=colors, edgecolor="#333", linewidth=0.5, height=0.6,
+        color=colors, edgecolor=DARK_THEME["edge"], linewidth=0.5, height=0.6,
     )
 
     # Hatched overlay for rows without a scale — makes the "no real
@@ -231,12 +257,15 @@ def _draw_benchmark_axis(ax: Any, bench: Any, rows: list[_PlotRow]) -> None:
         if not row.has_scale:
             ax.barh(
                 y, 1.0,
-                facecolor="none", edgecolor="#888",
+                facecolor="none", edgecolor=DARK_THEME["hatch_edge"],
                 hatch="///", linewidth=0.4, height=0.6,
             )
 
     ax.set_yticks(y_positions)
-    ax.set_yticklabels([r.metric_name for r in rows], fontsize=9)
+    ax.set_yticklabels(
+        [r.metric_name for r in rows], fontsize=9,
+        color=DARK_THEME["accent_muted"],
+    )
     # invert so the first metric appears at the top for reading order
     ax.invert_yaxis()
 
@@ -244,5 +273,5 @@ def _draw_benchmark_axis(ax: Any, bench: Any, rows: list[_PlotRow]) -> None:
         annotation_x = 0.02 if row.score is None else min(float(row.score) + 0.02, 0.97)
         ax.text(
             annotation_x, y, row.annotation,
-            va="center", fontsize=8, color="#222",
+            va="center", fontsize=8, color=DARK_THEME["text_on_bar"],
         )

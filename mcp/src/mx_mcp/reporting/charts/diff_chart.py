@@ -25,10 +25,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from mx_mcp.reporting.charts._mpl import (
+    DARK_THEME,
     FIGURE_DPI,
     VERDICT_COLORS,
     matplotlib_available,
     require_matplotlib,
+    style_axis_for_dark,
+    style_figure_for_dark,
 )
 from mx_mcp.reporting.charts.base import IChartRenderer, register_chart
 
@@ -69,7 +72,7 @@ def _row_for_entry(entry: Any) -> _DiffRow:
         delta_s = f"{delta_val:+.1f}%"
 
     annotation = f"{delta_s}  (cur={cur_s}, base={base_s})"
-    color = VERDICT_COLORS.get(entry.verdict.value, "#666666")
+    color = VERDICT_COLORS.get(entry.verdict.value, DARK_THEME["spine"])
     return _DiffRow(
         label=label,
         verdict=entry.verdict.value,
@@ -145,10 +148,18 @@ class DiffChartRenderer(IChartRenderer):
             ax.text(
                 0.5, 0.5, "no diff entries",
                 ha="center", va="center", fontsize=13,
+                color=DARK_THEME["text_dim"],
             )
-            fig.suptitle("Defense Diff", fontsize=12)
+            fig.suptitle(
+                "Defense Diff", fontsize=12, color=DARK_THEME["accent"],
+            )
+            style_figure_for_dark(fig)
+            ax.set_facecolor(DARK_THEME["bg"])
             fig.tight_layout()
-            fig.savefig(output_path, format="png", bbox_inches="tight")
+            fig.savefig(
+                output_path, format="png", bbox_inches="tight",
+                facecolor=DARK_THEME["bg"],
+            )
             plt.close(fig)
             _LOG.info("diff chart (empty) → %s", output_path)
             return output_path
@@ -161,25 +172,30 @@ class DiffChartRenderer(IChartRenderer):
         gate_badge = "PASS" if gate_passed else "FAIL"
         fig.suptitle(
             f"Defense Diff vs '{baseline_name}'  [gate: {gate_badge}]",
-            fontsize=12, y=0.995,
+            fontsize=12, y=0.995, color=DARK_THEME["accent"],
         )
+        style_figure_for_dark(fig)
+        style_axis_for_dark(ax)
 
         y_positions = list(range(len(rows)))
         ax.barh(
             y_positions,
             [r.delta_pct for r in rows],
             color=[r.color for r in rows],
-            edgecolor="#333", linewidth=0.5, height=0.6,
+            edgecolor=DARK_THEME["edge"], linewidth=0.5, height=0.6,
         )
-        ax.axvline(0.0, color="#444", linewidth=0.8)
+        ax.axvline(0.0, color=DARK_THEME["spine"], linewidth=0.8)
 
         ax.set_xlim(*_symmetric_xlim(rows))
-        ax.set_xlabel("Δ %", fontsize=9)
-        ax.grid(axis="x", color="#eaeaea", linewidth=0.5)
+        ax.set_xlabel("Δ %", fontsize=9, color=DARK_THEME["accent"])
+        ax.grid(axis="x", color=DARK_THEME["grid"], linewidth=0.5)
         ax.set_axisbelow(True)
 
         ax.set_yticks(y_positions)
-        ax.set_yticklabels([r.label for r in rows], fontsize=8)
+        ax.set_yticklabels(
+            [r.label for r in rows], fontsize=8,
+            color=DARK_THEME["accent_muted"],
+        )
         ax.invert_yaxis()
 
         for y, row in zip(y_positions, rows):
@@ -188,24 +204,35 @@ class DiffChartRenderer(IChartRenderer):
             ax.text(
                 row.delta_pct + offset, y,
                 row.annotation,
-                va="center", ha=ha, fontsize=7.5, color="#222",
+                va="center", ha=ha, fontsize=7.5,
+                color=DARK_THEME["text_on_bar"],
             )
 
-        # Verdict legend — compact.
+        # Verdict legend — compact, matching the dark theme.
         from matplotlib.patches import Patch
 
         legend_handles = [
-            Patch(facecolor=VERDICT_COLORS[v], edgecolor="#333", label=v)
+            Patch(
+                facecolor=VERDICT_COLORS[v], edgecolor=DARK_THEME["edge"],
+                label=v,
+            )
             for v in _VERDICT_ORDER if any(r.verdict == v for r in rows)
         ]
         if legend_handles:
-            ax.legend(
+            legend = ax.legend(
                 handles=legend_handles,
-                loc="lower right", fontsize=8, framealpha=0.85,
+                loc="lower right", fontsize=8, framealpha=0.92,
+                facecolor=DARK_THEME["panel"],
+                edgecolor=DARK_THEME["spine"],
+                labelcolor=DARK_THEME["accent_muted"],
             )
+            legend.get_frame().set_linewidth(0.5)
 
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
-        fig.savefig(output_path, format="png", bbox_inches="tight")
+        fig.savefig(
+            output_path, format="png", bbox_inches="tight",
+            facecolor=DARK_THEME["bg"],
+        )
         plt.close(fig)
 
         _LOG.info(
