@@ -80,6 +80,58 @@ void emit_all_trampolines(ProtectionContext&                     ctx,
 
 } // namespace
 
+namespace {
+
+/// Emit CFF state labels into `ctx.trace_hints()` for every block of
+/// every trampolined entry. Runs only when `--trace-hints` is on;
+/// cost is a few vector pushes per state, no runtime footprint in
+/// the protected PE.
+///
+/// `dispatcher_entry_rva` = absolute RVA where this block's bytes
+///     landed in the CFF section (section_rva + entry.section_offset
+///     + placement.output_offset).
+/// `source_bb_rva` = original-image RVA of the block this state
+///     came from, or 0 for synthesised blocks (bogus).
+/// `kind` = original if the placement has a real source VA, bogus
+///     otherwise. Finer predicate/mba classification is handled by
+///     `add_opaque_predicate` at upstream sites.
+void emit_cff_state_labels(ProtectionContext&                     ctx,
+                           const std::vector<CffTrampolineEntry>& entries,
+                           Rva                                    section_rva,
+                           Va                                     image_base)
+{
+    if (!ctx.config().emit_trace_hints) return;
+
+    auto& hints = ctx.trace_hints();
+
+    // Section start doubles as the first entry's dispatcher entry;
+    // per-state dispatcher_entry_rva below gives the handler-level
+    // resolution Phase 6 metrics need.
+    hints.set_cff_dispatcher(
+        /* dispatcher_rva = */ section_rva,
+        /* state_var_rva  = */ 0 /* register-based by default */);
+
+    std::uint32_t state_id = 0;
+    for (const auto& entry : entries) {
+        for (const auto& placement : entry.block_placements) {
+            const std::uint32_t dispatcher_entry_rva =
+                section_rva + entry.section_offset + placement.output_offset;
+            const bool is_original = placement.original_va != 0;
+            const std::uint32_t source_bb_rva =
+                is_original
+                    ? static_cast<std::uint32_t>(placement.original_va - image_base)
+                    : 0u;
+            const auto kind = is_original
+                ? analysis::CffStateKind::original
+                : analysis::CffStateKind::bogus;
+            hints.add_cff_state(state_id++, dispatcher_entry_rva,
+                                source_bb_rva, kind);
+        }
+    }
+}
+
+} // namespace
+
 void commit_trampoline_section(ProtectionContext&               ctx,
                                std::vector<CffTrampolineEntry>& entries)
 {
@@ -118,6 +170,9 @@ void commit_trampoline_section(ProtectionContext&               ctx,
     }
 
     emit_all_trampolines(ctx, entries, section_rva);
+
+    // Source-linked labels for the tracing MCP. Flag-gated internally.
+    emit_cff_state_labels(ctx, entries, section_rva, image_base);
 
     // `.pdata` handling for trampolined functions.
     //

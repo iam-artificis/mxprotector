@@ -425,6 +425,34 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
                 "размер={} байт", vm_section_name, mxvm_rva, section_data.size());
 
     // ========================================================================
+    // Source-linked labels for the tracing MCP (flag-gated).
+    //
+    // Per-handler granularity is deferred — `x64_vm_backend`'s internal
+    // handler offsets are not exposed by the encoder/runtime-generator
+    // pair today. Phase 4B emits one label per VM region covering the
+    // whole blob; Phase 6 will refine if/when the backend publishes
+    // per-handler offsets.
+    // ========================================================================
+    if (ctx.config().emit_trace_hints) {
+        auto& hints = ctx.trace_hints();
+        // The first region's entry is the canonical VM dispatcher.
+        const auto& p0 = pendings.front();
+        hints.set_vm_dispatcher(
+            mxvm_rva + p0.blob_offset_in_section + p0.entry_offset_in_blob,
+            /* handler_table_rva = */ 0);
+
+        std::uint32_t region_id = 0;
+        for (const auto& p : pendings) {
+            hints.add_vm_handler(
+                region_id,
+                mxvm_rva + p.blob_offset_in_section,
+                static_cast<std::uint32_t>(p.vm_blob.size()),
+                std::format("region_{}", region_id));
+            ++region_id;
+        }
+    }
+
+    // ========================================================================
     // Патчим оригинальные регионы: CALL vm_entry + NOP fill
     // ========================================================================
     for (const auto& p : pendings) {
