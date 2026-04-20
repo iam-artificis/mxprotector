@@ -19,12 +19,11 @@ classifiers     = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 
-# Phase 0 ships no runtime deps — the scaffold only wires --version
-# and --help. Later phases pin these:
-#   mcp       (Phase 2)   — MCP stdio server
-#   frida     (Phase 2)   — DBI backend
-#   pydantic  (Phase 2)   — sidecar + tool I/O schemas
-dependencies = []
+dependencies = [
+    "mcp      >= 1.0",   # MCP stdio server
+    "pydantic >= 2.0",   # sidecar + tool I/O schemas
+    "frida    >= 17.0",  # DBI backend
+]
 
 [project.optional-dependencies]
 dev = [

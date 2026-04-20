@@ -1,7 +1,8 @@
 """Entry point for ``py -3 -m mx_tracing``.
 
-Phase 0 wires only ``--version`` and ``--help``. The MCP stdio server
-itself arrives in Phase 2.
+Phase 2: default behavior (no args) is to run the MCP stdio server.
+Phase 0 smoke flags ``--version`` / ``--help`` are preserved for
+diagnostic use.
 """
 
 from __future__ import annotations
@@ -13,23 +14,28 @@ from mx_tracing import __version__
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the Phase 0 argument parser (``--version`` / ``--help``)."""
     parser = argparse.ArgumentParser(
         prog="mx-tracing",
-        description="Runtime tracer MCP server for MxProtector (Phase 0 scaffold).",
+        description="Runtime tracer MCP server for MxProtector.",
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"mx-tracing MCP server v{__version__}",
     )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.add_parser(
+        "serve",
+        help="Run the MCP stdio server (default when no command is given).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse CLI args and return the process exit code."""
-    _build_parser().parse_args(argv)
-    print(f"mx-tracing MCP server v{__version__} (Phase 0 scaffold)")
+    args = _build_parser().parse_args(argv)
+    if args.command in (None, "serve"):
+        from mx_tracing.server import run
+        return run()
     return 0
 
 

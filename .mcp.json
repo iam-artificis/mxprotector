@@ -3,9 +3,8 @@
     "mx-tracing": {
       "command": "py",
       "args": ["-3", "-m", "mx_tracing"],
-      "cwd": "mcp-tools/tracing",
       "env": {
-        "PYTHONPATH": "src"
+        "PYTHONPATH": "mcp-tools/tracing/src"
       }
     }
   }
