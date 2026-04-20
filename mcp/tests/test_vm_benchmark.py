@@ -75,8 +75,10 @@ def _write_synthetic_sidecar(
       * ``include_vm=False`` — omits the 'vm' entry from ``sections``.
       * ``vm_size=0`` — section present but empty (virtualization pass
         emitted nothing).
-      * ``handler_count`` — controls ``vm.handlers`` length; fed into
-        the ``vm_region_count`` metric.
+      * ``handler_count`` — controls ``vm.handlers`` length. The
+        benchmark no longer exposes this as a metric but still reads
+        the list for post-mortem evidence; tests accept the knob so
+        sidecars stay realistic.
     """
     sections: dict = {}
     handlers: list[dict] = []
@@ -206,13 +208,20 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path: Path, monkeypatch):
     assert result.tier == "fast"
     assert result.errors == []
 
-    assert len(result.metrics) == 4
+    assert len(result.metrics) == 3
     for m in result.metrics:
         assert m.direction is MetricDirection.HIGHER_BETTER
         assert len(m.samples) == 2
 
     sample_names = {s.sample_name for s in result.metrics[0].samples}
     assert sample_names == {"alpha", "beta"}
+
+    metric_names = {m.name for m in result.metrics}
+    assert metric_names == {
+        "vm_bytecode_entropy",
+        "vm_bytecode_bigram_entropy",
+        "vm_bytecode_bytes",
+    }
 
 
 def test_untagged_entry_skipped(tmp_path: Path, monkeypatch):
@@ -244,8 +253,8 @@ def test_no_vm_tagged_entries_reports_error(tmp_path: Path, monkeypatch):
 
 def test_metric_values_match_inputs(tmp_path: Path, monkeypatch):
     """Exact-value roundtrip: a uniform byte-distribution payload yields
-    maximal Shannon entropy; section size and region count surface
-    unchanged from the synthetic sidecar / bytes."""
+    maximal Shannon entropy; section size surfaces unchanged from the
+    synthetic sidecar / bytes."""
     # 256 bytes each occurring exactly once → byte entropy = 8 bits.
     uniform = bytes(range(256))
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
@@ -253,7 +262,6 @@ def test_metric_values_match_inputs(tmp_path: Path, monkeypatch):
         monkeypatch,
         bytes_map={"alpha": uniform},
         sidecar_vm_size=len(uniform),
-        sidecar_handler_count=5,
     )
     bench = vb.VmStaticBenchmark()
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
@@ -261,7 +269,6 @@ def test_metric_values_match_inputs(tmp_path: Path, monkeypatch):
     by_name = {m.name: m for m in result.metrics}
     assert math.isclose(by_name["vm_bytecode_entropy"].samples[0].value, 8.0, abs_tol=1e-9)
     assert by_name["vm_bytecode_bytes"].samples[0].value == 256
-    assert by_name["vm_region_count"].samples[0].value == 5
     # Bigram entropy on a rotating-cycle payload like range(256) is
     # non-zero but well under the theoretical 16 — sanity check only.
     assert by_name["vm_bytecode_bigram_entropy"].samples[0].value > 0.0
@@ -364,27 +371,28 @@ def test_section_not_found_reports_entry_error(tmp_path: Path, monkeypatch):
 
 
 # ============================================================================
-# Handler count is sourced from the sidecar, not the byte scan.
+# Evidence — sidecar details surface in MetricSample.evidence for
+# post-mortem even though handler count is no longer a metric.
 # ============================================================================
 
 
-def test_region_count_reflects_sidecar_handlers(tmp_path: Path, monkeypatch):
+def test_evidence_carries_virtualized_region_count(tmp_path: Path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(monkeypatch, sidecar_handler_count=7)
     bench = vb.VmStaticBenchmark()
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    by_name = {m.name: m for m in result.metrics}
-    assert by_name["vm_region_count"].samples[0].value == 7
+    evidence = result.metrics[0].samples[0].evidence
+    assert evidence["virtualized_regions"] == 7
 
 
-def test_zero_handlers_reported_as_zero(tmp_path: Path, monkeypatch):
+def test_zero_handlers_still_produces_quality_samples(tmp_path: Path, monkeypatch):
     """Section present (so we still read bytes) but handler list empty —
-    covers the "sidecar partial" edge rather than dropping the entry."""
+    covers the "sidecar partial" edge rather than dropping the entry.
+    Quality metrics still populate."""
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(monkeypatch, sidecar_handler_count=0)
     bench = vb.VmStaticBenchmark()
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
     by_name = {m.name: m for m in result.metrics}
-    assert by_name["vm_region_count"].samples[0].value == 0
-    # Quality metrics still emitted.
     assert by_name["vm_bytecode_entropy"].samples[0].value > 0.0
+    assert by_name["vm_bytecode_entropy"].samples[0].evidence["virtualized_regions"] == 0

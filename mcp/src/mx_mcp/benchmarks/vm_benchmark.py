@@ -20,7 +20,6 @@ full IDA + Hex-Rays round-trip, the VM benchmark is *static-only*:
 | ``vm_bytecode_entropy``         | ↑ | quality | Byte-level Shannon entropy of the VM section. Low values mean repeating opcodes / fixed operand patterns — an attacker can cluster them trivially. |
 | ``vm_bytecode_bigram_entropy``  | ↑ | quality | 16-bit bigram Shannon entropy. Catches short-range repetition that single-byte entropy masks (e.g. a common two-byte opcode prefix). |
 | ``vm_bytecode_bytes``           | ↑ | surface | Raw VM section size. Zero means virtualization pass did not run or the corpus entry had no ``MX_VM_BEGIN/END`` markers. |
-| ``vm_region_count``             | ↑ | surface | Number of virtualized source regions (``sidecar.vm.handlers``). Per-handler granularity is deferred to the angr benchmark in P4. |
 
 ## Failure modes
 
@@ -94,11 +93,14 @@ _LOG = logging.getLogger(__name__)
 #   virtualized code is a reasonable "strong deployment" target for
 #   the seed corpus; expand ``strong_value`` as the corpus grows into
 #   larger inputs. p90=16.2 KiB → score≈0.49.
-# * ``vm_region_count``            — One label per ``MX_VM_BEGIN/_END``
-#   pair. The seed corpus virtualizes a single function per entry, so
-#   p90=1 with this scale reads 0.20 — an honest "this defence is
-#   under-deployed on this corpus" signal. When new entries start
-#   virtualizing multiple functions, retune to keep the centre useful.
+#
+# A previous revision exposed ``vm_region_count`` (count of
+# ``MX_VM_BEGIN/_END`` pairs). Removed: that count is source-code
+# dependent, not protector-controlled — an entry with ten markers
+# scores 10× higher than one with a single marker for reasons
+# unrelated to defence quality. Its only honest signal (pass ran at
+# all) is already covered by ``vm_bytecode_bytes=0`` as a regression
+# alarm.
 #
 # Retune after the corpus changes materially — these are declarative
 # contracts with the reporting layer and no runtime code branches on
@@ -113,9 +115,6 @@ _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("vm_bytecode_bytes",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=0.0, strong_value=32768.0)),
-    ("vm_region_count",
-     MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=5.0)),
 )
 
 
@@ -127,8 +126,8 @@ class VmStaticBenchmark(IBenchmark):
     description = (
         "Static VM bytecode metrics on VM-tagged corpus entries. "
         "Emits vm_bytecode_entropy / vm_bytecode_bigram_entropy as "
-        "quality signals and vm_bytecode_bytes / vm_region_count as "
-        "surface indicators. No emulation or decompilation required."
+        "quality signals and vm_bytecode_bytes as a surface indicator. "
+        "No emulation or decompilation required."
     )
     category = "vm"
     tier = "fast"
@@ -271,20 +270,23 @@ async def _process_entry(
 
     byte_entropy = _shannon_byte_entropy(bytecode)
     bigram_entropy = _shannon_bigram_entropy(bytecode)
-    region_count = len(sidecar.vm.handlers)
     section_bytes = len(bytecode)
 
     _LOG.info(
-        "%s: vm section [0x%X..0x%X) %d B — entropy=%.3f bigram=%.3f regions=%d",
+        "%s: vm section [0x%X..0x%X) %d B — entropy=%.3f bigram=%.3f",
         entry.name, vm_section.rva, vm_section.rva + vm_section.size,
-        section_bytes, byte_entropy, bigram_entropy, region_count,
+        section_bytes, byte_entropy, bigram_entropy,
     )
 
+    # ``sidecar.vm.handlers`` is still read for evidence (helps post-
+    # mortem when a build misbehaves) but is no longer exposed as a
+    # metric — see the _METRIC_DEFS comment for the rationale.
     evidence = {
         "rva": vm_section.rva,
         "sidecar_size": vm_section.size,
         "bytes_read": section_bytes,
         "dispatcher_rva": sidecar.vm.dispatcher_rva,
+        "virtualized_regions": len(sidecar.vm.handlers),
     }
     sample_name = entry.name
 
@@ -292,7 +294,6 @@ async def _process_entry(
         "vm_bytecode_entropy": byte_entropy,
         "vm_bytecode_bigram_entropy": bigram_entropy,
         "vm_bytecode_bytes": section_bytes,
-        "vm_region_count": region_count,
     }
     for metric_name, value in values.items():
         samples_by_metric[metric_name].append(MetricSample(
