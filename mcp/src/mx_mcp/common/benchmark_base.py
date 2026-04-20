@@ -135,14 +135,20 @@ class MetricScale(BaseModel):
         Zero-span (``weak == strong``) returns ``0.5`` as a
         well-defined neutral — callers usually treat this as "no
         signal" rather than special-case the branch.
+
+        IEEE-754 signed zero note: when ``v == weak`` and ``span`` is
+        negative (LOWER_BETTER direction where ``weak > strong``),
+        the raw ratio is ``-0.0``. ``<= 0.0`` clamps that to a plain
+        ``0.0`` so downstream ``f"{score:.2f}"`` renders "0.00"
+        rather than the distracting "-0.00".
         """
         span = self.strong_value - self.weak_value
         if span == 0:
             return 0.5
         ratio = (v - self.weak_value) / span
-        if ratio < 0.0:
+        if ratio <= 0.0:
             return 0.0
-        if ratio > 1.0:
+        if ratio >= 1.0:
             return 1.0
         return ratio
 

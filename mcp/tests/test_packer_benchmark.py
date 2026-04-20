@@ -183,19 +183,25 @@ def test_happy_path_single_buildable_entry(tmp_path: Path, monkeypatch):
     assert result.benchmark == "packer_pesieve"
     assert result.category == "packer"
     assert result.errors == []
-    assert len(result.metrics) == 3
+    # Two scored metrics: dumped_modules + fingerprint_count.
+    # implanted_pe is a canary (see docstring + canary tests below).
+    assert len(result.metrics) == 2
     for m in result.metrics:
         assert m.direction is MetricDirection.LOWER_BETTER
         assert len(m.samples) == 1
     by_name = {m.name: m for m in result.metrics}
     assert by_name["pesieve_dumped_modules"].samples[0].value == 0
-    assert by_name["pesieve_implanted_pe"].samples[0].value == 0
-    assert by_name["pesieve_modified_total"].samples[0].value == 2
+    assert by_name["pesieve_fingerprint_count"].samples[0].value == 2
 
 
 def test_happy_path_mixed_fresh_and_legacy(tmp_path: Path, monkeypatch):
     """Buildable + pre_protected entries both produce samples; the
-    pe-sieve runner is called once per entry."""
+    pe-sieve runner is called once per entry.
+
+    Neither entry trips the canary (implanted_pe stays at the normal
+    baseline of 0), so ``errors`` is empty. Canary behaviour is
+    covered separately below.
+    """
     corpus = _make_corpus(tmp_path, [
         {"name": "fresh", "binary": "bin/fresh.exe",
          "tags": ["packer", "exe"]},
@@ -207,7 +213,7 @@ def test_happy_path_mixed_fresh_and_legacy(tmp_path: Path, monkeypatch):
         monkeypatch,
         run_map={
             "fresh":  _ok_result(dumped=1, implanted_pe=0, modified_total=2),
-            "legacy": _ok_result(dumped=3, implanted_pe=1, modified_total=4),
+            "legacy": _ok_result(dumped=3, implanted_pe=0, modified_total=4),
         },
     )
     bench = pb.PackerPeSieveBenchmark()
@@ -222,23 +228,26 @@ def test_happy_path_mixed_fresh_and_legacy(tmp_path: Path, monkeypatch):
 
 
 def test_values_sourced_from_report(tmp_path: Path, monkeypatch):
-    """The three metrics pull their values directly from
-    report.dumped.modules / implanted_pe / modified.total."""
+    """Each scored metric pulls its value directly from the matching
+    pe-sieve report field. implanted_pe is NOT scored — it is a
+    canary surfaced via evidence / errors, verified in a separate
+    test below."""
     corpus = _make_corpus(tmp_path, [
         {"name": "alpha", "binary": "bin/alpha.exe",
          "tags": ["packer", "exe"]},
     ])
     _install_mocks(
         monkeypatch,
-        run_map={"alpha": _ok_result(dumped=7, implanted_pe=2, modified_total=9)},
+        run_map={"alpha": _ok_result(dumped=7, implanted_pe=0, modified_total=9)},
     )
     result = asyncio.run(pb.PackerPeSieveBenchmark().run(
         corpus, _fake_session(tmp_path),
     ))
     by_name = {m.name: m for m in result.metrics}
     assert by_name["pesieve_dumped_modules"].samples[0].value == 7
-    assert by_name["pesieve_implanted_pe"].samples[0].value == 2
-    assert by_name["pesieve_modified_total"].samples[0].value == 9
+    assert by_name["pesieve_fingerprint_count"].samples[0].value == 9
+    # implanted_pe does not get its own metric.
+    assert "pesieve_implanted_pe" not in by_name
 
 
 # ============================================================================
@@ -331,7 +340,7 @@ def test_empty_corpus_returns_empty_metrics_and_note(tmp_path: Path, monkeypatch
     result = asyncio.run(pb.PackerPeSieveBenchmark().run(
         corpus, _fake_session(tmp_path),
     ))
-    assert len(result.metrics) == 3
+    assert len(result.metrics) == 2
     for m in result.metrics:
         assert m.samples == []
     assert any("no corpus entries tagged" in e for e in result.errors)
@@ -394,3 +403,62 @@ def test_sample_evidence_contains_pesieve_diagnostics(
     # Path rendering differs across platforms (Windows backslashes,
     # POSIX forward slashes) — assert the filename component only.
     assert [Path(p).name for p in ev["dump_files"]] == ["dump.exe"]
+    # Canary reading surfaces in evidence even when it is zero, so a
+    # reviewer can confirm "we did check" rather than "the key is
+    # missing because nobody looked".
+    assert ev["canary_implanted_pe"] == 0
+
+
+# ============================================================================
+# Canary — implanted_pe is not a metric; a non-zero value trips an
+# entry-level warning while the scored metrics continue to populate.
+# ============================================================================
+
+
+def test_canary_implanted_pe_zero_produces_no_error(
+    tmp_path: Path, monkeypatch,
+):
+    """Baseline — implanted_pe=0 means no canary, no error added."""
+    corpus = _make_corpus(tmp_path, [
+        {"name": "alpha", "binary": "bin/alpha.exe",
+         "tags": ["packer", "exe"]},
+    ])
+    _install_mocks(
+        monkeypatch,
+        run_map={"alpha": _ok_result(dumped=1, implanted_pe=0, modified_total=1)},
+    )
+    result = asyncio.run(pb.PackerPeSieveBenchmark().run(
+        corpus, _fake_session(tmp_path),
+    ))
+    assert result.errors == []
+
+
+def test_canary_implanted_pe_nonzero_appends_entry_warning(
+    tmp_path: Path, monkeypatch,
+):
+    """Non-zero implanted_pe means pe-sieve flagged our output as
+    a hollowing-style attack — a regression we want surfaced loudly.
+    The sample still populates so we do not also lose the metric
+    data; the canary shows up alongside it."""
+    corpus = _make_corpus(tmp_path, [
+        {"name": "alpha", "binary": "bin/alpha.exe",
+         "tags": ["packer", "exe"]},
+    ])
+    _install_mocks(
+        monkeypatch,
+        run_map={"alpha": _ok_result(dumped=1, implanted_pe=3, modified_total=2)},
+    )
+    result = asyncio.run(pb.PackerPeSieveBenchmark().run(
+        corpus, _fake_session(tmp_path),
+    ))
+    # Canary text present + identifies the entry and the count.
+    assert len(result.errors) == 1
+    msg = result.errors[0]
+    assert "alpha" in msg
+    assert "CANARY" in msg
+    assert "implanted_pe=3" in msg
+    # Samples still recorded — the score metrics do not depend on
+    # canary state.
+    by_name = {m.name: m for m in result.metrics}
+    assert by_name["pesieve_dumped_modules"].samples[0].value == 1
+    assert by_name["pesieve_fingerprint_count"].samples[0].value == 2

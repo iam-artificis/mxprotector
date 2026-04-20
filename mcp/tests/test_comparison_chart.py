@@ -154,7 +154,7 @@ def test_align_preserves_left_benchmark_order():
     right = [_bench("b", [_metric(name="m", p90=1.0)]),
              _bench("c", [_metric(name="m", p90=1.0)])]
     groups = _align_benchmarks(left, right)
-    assert [name for name, _ in groups] == ["a", "b", "c"]
+    assert [g.bench_name for g in groups] == ["a", "b", "c"]
 
 
 def test_align_metric_appears_in_both_sides():
@@ -162,7 +162,7 @@ def test_align_metric_appears_in_both_sides():
     right = [_bench("b", [_metric(name="m", p90=8.0)])]
     groups = _align_benchmarks(left, right)
     assert len(groups) == 1
-    _, rows = groups[0]
+    rows = groups[0].rows
     assert len(rows) == 1
     row = rows[0]
     assert row.left_score is not None and row.right_score is not None

@@ -91,6 +91,9 @@ def test_row_for_metric_with_scale_produces_score():
     assert row.score is not None
     # Interior value on [1,30] → roughly 0.48 for p90=15.
     assert 0.40 < row.score < 0.55
+    # Sample count surfaces in the annotation so readers never have
+    # to guess how many entries contributed to the p90.
+    assert "n=1" in row.annotation
 
 
 def test_row_for_metric_without_scale_marks_no_scale():
@@ -105,6 +108,7 @@ def test_row_for_metric_without_scale_marks_no_scale():
     assert row.has_scale is False
     assert row.score is None
     assert "no scale" in row.annotation
+    assert "n=1" in row.annotation
 
 
 def test_row_for_metric_with_no_data_returns_none():

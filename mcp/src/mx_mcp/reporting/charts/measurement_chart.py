@@ -84,9 +84,16 @@ def _row_for_metric(metric: Any) -> _PlotRow | None:
     direction_value = metric.direction.value
     color = DIRECTION_COLORS.get(direction_value, DARK_THEME["spine"])
 
+    # Sample count — number of corpus entries that actually produced
+    # a value for this metric. Entries that erred at the benchmark
+    # level (build failed, pe-sieve couldn't attach, …) are *not*
+    # represented here; they land in ``BenchmarkResult.errors`` and
+    # surface in the subplot title via ``_draw_benchmark_axis``.
+    n = metric.aggregate.n_samples
+
     if metric.scale is not None:
         score = metric.scale.normalize(float(p90))
-        annotation = f"{score:.2f}  (p90={float(p90):.4g})"
+        annotation = f"{score:.2f}  (p90={float(p90):.4g}, n={n})"
         return _PlotRow(
             metric_name=metric.name,
             score=score,
@@ -103,7 +110,7 @@ def _row_for_metric(metric: Any) -> _PlotRow | None:
         metric_name=metric.name,
         score=None,
         raw_p90=float(p90),
-        annotation=f"p90={float(p90):.4g}  (no scale)",
+        annotation=f"p90={float(p90):.4g}, n={n}  (no scale)",
         color=color,
         has_scale=False,
     )
@@ -214,10 +221,18 @@ def _draw_benchmark_axis(ax: Any, bench: Any, rows: list[_PlotRow]) -> None:
     """Render one benchmark's metrics onto the supplied axis."""
     style_axis_for_dark(ax)
 
+    # Subplot title carries both taxonomy (category/tier) and an error
+    # count. A non-zero ``bench.errors`` length is the canonical
+    # signal that fewer samples than corpus entries made it through
+    # — rendering it in the title prevents a reader from mis-reading
+    # the p90 bar as "all N corpus entries agree on this value".
     title = (
         f"{bench.benchmark}  "
         f"(category={bench.category}, tier={bench.tier})"
     )
+    n_errors = len(getattr(bench, "errors", []))
+    if n_errors:
+        title += f"  ·  {n_errors} error(s)"
     ax.set_title(
         title, fontsize=10, loc="left", color=DARK_THEME["accent"],
     )
