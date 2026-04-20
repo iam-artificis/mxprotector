@@ -4,19 +4,19 @@
     {
       "name": "pure_vm",
       "binary": "bin/unprotected/pure_vm.exe",
-      "tags": ["vm", "pure", "exe", "packer"],
+      "tags": ["vm", "pure", "exe", "packer", "diffing"],
       "launch_args": ["--hold", "3"]
     },
     {
       "name": "pure_cff",
       "binary": "bin/unprotected/pure_cff.exe",
-      "tags": ["cff", "pure", "exe", "packer"],
+      "tags": ["cff", "pure", "exe", "packer", "diffing"],
       "launch_args": ["--hold", "3"]
     },
     {
       "name": "mixed",
       "binary": "bin/unprotected/mixed.exe",
-      "tags": ["vm", "cff", "mixed", "strings", "mutation", "exe", "packer"],
+      "tags": ["vm", "cff", "mixed", "strings", "mutation", "exe", "packer", "diffing"],
       "launch_args": ["--hold", "3"]
     },
     {
