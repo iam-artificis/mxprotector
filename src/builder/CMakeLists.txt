@@ -18,6 +18,7 @@ set(BUILDER_SOURCES
 
     # CLI
     cli/cli_handler.cpp
+    cli/section_name_pool.cpp
 
     # PE-модуль
     pe/pe_parser.cpp

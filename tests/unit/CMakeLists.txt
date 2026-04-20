@@ -40,6 +40,7 @@ set(TEST_SOURCES
     driver_cipher_body_test.cpp
     reloc_partition_test.cpp
     dll_characteristics_audit_test.cpp
+    section_name_pool_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for
@@ -159,6 +160,12 @@ set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
 )
 
+# CLI helpers needed by CLI-level unit tests (section name pool —
+# adding more if future tests require).
+set(CLI_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/cli/section_name_pool.cpp
+)
+
 # Runtime-guards module sources. The leaf emitters (page layout / VEH /
 # decrypt unit / TLS installer) are covered by their own isolated tests.
 # The full facade + pipeline chain is linked so pass_applicability_test
@@ -192,6 +199,7 @@ add_executable(mxprotector_tests
     ${STRING_PROTECT_SOURCES}
     ${PACKER_SOURCES}
     ${ANALYSIS_SOURCES}
+    ${CLI_SOURCES}
     ${GUARD_SOURCES})
 
 target_compile_features(mxprotector_tests PRIVATE cxx_std_23)

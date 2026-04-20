@@ -19,6 +19,7 @@
  */
 
 #include "cli/cli_handler.hpp"
+#include "cli/section_name_pool.hpp"
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
@@ -157,60 +158,6 @@ void print_summary(
     std::cout << "\n";
 }
 
-/**
- * @brief Pick a section name the target PE plausibly could have contained.
- *
- * The pool mixes real PE section names used by common toolchains with slight
- * variations (`.rdata2`, `.tls1`, `.xdata$x`, ...) so the resulting binary
- * blends in with MSVC / clang output. Names are never longer than 8 bytes
- * (PE section name limit) and always begin with a dot.
- */
-const std::vector<std::string>& stealth_section_pool() {
-    static const std::vector<std::string> kPool = {
-        ".rdata2", ".rdata3", ".xdata2", ".xdata3",
-        ".tls1",   ".tls2",   ".CRT$XC", ".00cfg",
-        ".jcr",    ".gfids",  ".didat",  ".edata1",
-        ".ptab",   ".seh",    ".tbase",  ".bss2",
-        ".xtors",  ".ctors",  ".dtors",  ".orpc",
-    };
-    return kPool;
-}
-
-/**
- * @brief Generate 3 distinct random section names, or the fixed debug set.
- *
- * When `cfg.debug_section_names` is true, returns `.mxvm / .mxprot1 / .mxpack`
- * for easy debugging. Otherwise draws 3 distinct names from the stealth pool
- * so the protected binary doesn't advertise which sections MxProtector added.
- */
-mx::SectionNameMap generate_section_names(const mx::ProtectionConfig& cfg,
-                                           mx::Randomizer& rng)
-{
-    if (cfg.debug_section_names) {
-        return mx::SectionNameMap{
-            .vm     = ".mxvm",
-            .cff    = ".mxprot1",
-            .packer = ".mxpack",
-            .str    = ".mxstr",
-            .guard  = ".mxguard",
-        };
-    }
-
-    auto pool = stealth_section_pool();
-    // Fisher-Yates shuffle so we can just take the first 5.
-    for (size_t i = pool.size() - 1; i > 0; --i) {
-        const uint32_t j = rng.next_range(0, static_cast<uint32_t>(i));
-        std::swap(pool[i], pool[j]);
-    }
-    return mx::SectionNameMap{
-        .vm     = pool[0],
-        .cff    = pool[1],
-        .packer = pool[2],
-        .str    = pool[3],
-        .guard  = pool[4],
-    };
-}
-
 } // anonymous namespace
 
 // ============================================================================
@@ -307,13 +254,21 @@ int main(int argc, char** argv) {
             mx::target::load_mode_name(info.load_mode));
     }
 
-    // Pick per-build section names (random unless --debug-sections).
+    // Pick per-build section names. The pool is target-kind aware
+    // so a kernel driver gets kernel-flavoured names
+    // (`PAGEBGFX`, `PAGEKD`, ...) instead of user-mode MSVC idioms
+    // (`.rdata2`, `.CRT$XC`, ...) — the latter would stand out in a
+    // kernel debugger's module list. See `cli/section_name_pool.hpp`.
     {
         mx::Randomizer name_rng;
-        auto names = generate_section_names(ctx.config(), name_rng);
+        auto names = mx::pick_section_names(
+            ctx.target().kind,
+            ctx.config().debug_section_names,
+            name_rng);
         std::cout << std::format(
-            "[*] Секции: vm='{}' cff='{}' pack='{}' guard='{}'\n",
-            names.vm, names.cff, names.packer, names.guard);
+            "[*] Секции: vm='{}' cff='{}' pack='{}' "
+            "str='{}' guard='{}'\n",
+            names.vm, names.cff, names.packer, names.str, names.guard);
         ctx.set_section_names(std::move(names));
     }
 
