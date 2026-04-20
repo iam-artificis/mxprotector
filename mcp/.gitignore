@@ -12,3 +12,7 @@ venv/
 
 # Dev smoke output — scripts/_smoke_* writes here; not a repo artifact.
 _smoke_*.png
+
+# Auto-captured measurement snapshots — volatile per-run archive.
+# Review historical runs with the `compare_snapshots` tool, not git.
+snapshots/

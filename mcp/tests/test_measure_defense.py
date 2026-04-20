@@ -265,3 +265,170 @@ def test_output_png_graceful_when_renderer_unavailable(
     assert out.png_note is not None
     assert "matplotlib" in out.png_note
     assert not target.exists()
+
+
+# ============================================================================
+# Snapshot persistence — auto-save wiring. All tests stub
+# ``ensure_protected`` at the module level to avoid pulling the real
+# builder; snapshot save then exercises the real ``SnapshotStore``.
+# ============================================================================
+
+
+def _stub_ensure_protected(monkeypatch: pytest.MonkeyPatch):
+    """Install a fake ``ensure_protected`` that fabricates a valid
+    ProtectedBuild + sidecar on disk so the snapshot save actually
+    copies bytes. Returns a list that records every (name, output_dir)
+    the fake saw."""
+    from mx_mcp.common.builder import ProtectedBuild
+    from mx_mcp.tools import measure_defense as md
+
+    calls: list[tuple[str, Path]] = []
+
+    async def fake_ensure(entry, *, output_dir: Path, **kw):
+        calls.append((entry.name, output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / f"{entry.name}.mx.exe"
+        output.write_bytes(b"\x4d\x5a")
+        sidecar = output.parent / f"{output.name}.mxtrace.json"
+        sidecar.write_text('{"schema_version":1}', encoding="utf-8")
+        return ProtectedBuild(
+            unprotected_binary=entry.unprotected_binary or output,
+            protected_binary=output, sidecar_path=sidecar,
+            duration_ms=1, stdout_tail="", stderr_tail="",
+        )
+
+    monkeypatch.setattr(md, "ensure_protected", fake_ensure)
+    # Builder path existence check inside _build_canonicals is
+    # also via md's bound name — patch that too so the short-circuit
+    # does not fire.
+    fake_builder = Path(str(monkeypatch)) if False else None
+    monkeypatch.setattr(
+        md, "resolve_builder_path",
+        lambda root: root / "fake_builder.exe",
+    )
+    # Create the fake builder file so the "exists" probe passes.
+    return calls
+
+
+def test_snapshot_disabled_skips_persistence(tmp_path: Path):
+    """``snapshot=False`` means no filesystem touching, no ids."""
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root), snapshot=False,
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    assert out.snapshot_id is None
+    assert out.snapshot_path is None
+    assert not (tmp_path / "mcp" / "snapshots").exists()
+
+
+def test_snapshot_saved_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Happy path: benchmarks ran, builder stubbed, snapshot lands
+    on disk with measurement + artifacts."""
+    corpus_root = _make_corpus(tmp_path, names=("alpha", "beta"))
+    _stub_ensure_protected(monkeypatch)
+    # Realise the fake builder file so the "exists" probe in
+    # _build_canonicals sees it.
+    (tmp_path / "fake_builder.exe").write_bytes(b"\x4d\x5a")
+    monkeypatch.setattr(
+        "mx_mcp.tools.measure_defense.resolve_builder_path",
+        lambda root: tmp_path / "fake_builder.exe",
+    )
+
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        snapshots_root=str(tmp_path / "snapshots"),
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    assert out.snapshot_id is not None
+    assert out.snapshot_path is not None
+    snap_dir = Path(out.snapshot_path)
+    assert snap_dir.exists()
+    assert (snap_dir / "manifest.json").exists()
+    assert (snap_dir / "measurement.json").exists()
+    # Two entries × (exe + sidecar) = 4 artifacts.
+    artifacts = sorted(p.name for p in (snap_dir / "artifacts").iterdir())
+    assert artifacts == [
+        "alpha.mx.exe", "alpha.mx.exe.mxtrace.json",
+        "beta.mx.exe",  "beta.mx.exe.mxtrace.json",
+    ]
+
+
+def test_snapshot_still_saved_when_builder_absent(tmp_path: Path):
+    """No builder on disk → canonicals cannot be built. The snapshot
+    is still persisted (measurement.json + manifest have standalone
+    value for cross-version comparison); artifacts are empty and a
+    note explains the reason."""
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        snapshots_root=str(tmp_path / "snapshots"),
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    # Benchmark ran and produced metrics.
+    assert out.benchmark_count == 1
+    # Snapshot persisted — measurement still queryable later.
+    assert out.snapshot_id is not None
+    assert out.snapshot_path is not None
+    assert any("builder missing" in n for n in out.notes)
+    # But artifacts/ is empty because canonical build was skipped.
+    artifacts_dir = Path(out.snapshot_path) / "artifacts"
+    assert list(artifacts_dir.iterdir()) == []
+
+
+def test_snapshot_skipped_when_no_benchmarks_ran(tmp_path: Path):
+    """Empty registry means no measurement to archive — skip cleanly,
+    no note-spam about builder/store issues."""
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [])
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        snapshots_root=str(tmp_path / "snapshots"),
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    assert out.snapshot_id is None
+    # The snapshots dir was never touched.
+    assert not (tmp_path / "snapshots").exists()
+
+
+def test_snapshot_manifest_records_git_and_corpus_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Manifest on disk carries the metadata the comparison tool
+    will later read: git commit + corpus path + builder level."""
+    corpus_root = _make_corpus(tmp_path)
+    _stub_ensure_protected(monkeypatch)
+    (tmp_path / "fake_builder.exe").write_bytes(b"\x4d\x5a")
+    monkeypatch.setattr(
+        "mx_mcp.tools.measure_defense.resolve_builder_path",
+        lambda root: tmp_path / "fake_builder.exe",
+    )
+
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        snapshots_root=str(tmp_path / "snapshots"),
+        level="strong",
+        builder_args=["--trace-hints"],
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    manifest = json.loads(
+        (Path(out.snapshot_path) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["builder_level"] == "strong"
+    assert manifest["builder_args"] == ["--trace-hints"]
+    assert manifest["corpus_path"] == str(corpus_root)
+    # git_* fields may be None when the test env lacks git, but the
+    # key must exist.
+    assert "git_commit" in manifest
+    assert "git_dirty" in manifest
