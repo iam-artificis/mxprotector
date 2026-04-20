@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "name": "pure_vm",
+      "binary": "bin/unprotected/pure_vm.exe",
+      "tags": ["vm", "pure", "exe"]
+    },
+    {
+      "name": "pure_cff",
+      "binary": "bin/unprotected/pure_cff.exe",
+      "tags": ["cff", "pure", "exe"]
+    },
+    {
+      "name": "mixed",
+      "binary": "bin/unprotected/mixed.exe",
+      "tags": ["vm", "cff", "mixed", "strings", "mutation", "exe"]
+    }
+  ]
+}

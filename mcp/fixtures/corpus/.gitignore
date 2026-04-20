@@ -1,0 +1,7 @@
+# Corpus binaries are rebuilt locally via build.bat from a Developer
+# Command Prompt. Only the source, manifest, and build script are
+# versioned — the .exe / .obj / .pdb artefacts are regenerable.
+bin/
+*.obj
+*.pdb
+*.ilk

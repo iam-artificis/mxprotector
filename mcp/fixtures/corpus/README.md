@@ -1,35 +1,77 @@
 # Benchmark corpus
 
-Curated mini-binaries used by `mcp/src/mx_mcp/benchmarks/` as the
-input population for defense metrics. Distinct from `build_testapp/`
-(functional stress testing) — benchmarks need a stable, small,
-well-characterised set so that metric variance reflects defense
-changes rather than corpus churn.
+Curated mini-binaries used as the input population for defense
+benchmarks. Distinct from `build_testapp/` (functional stress testing)
+— benchmarks need stable, small, well-characterised inputs so metric
+variance reflects defense changes rather than corpus churn.
 
-## Contract
+## Layout
 
-Each entry covers a specific protection surface so benchmarks can
-gate per-surface regressions without running the full pipeline:
+```
+corpus/
+├── corpus.json            — manifest (schema v1)
+├── build.bat              — MSVC build script for unprotected inputs
+├── src/
+│   ├── pure_vm.cpp        — VM-heavy, no CFF surface
+│   ├── pure_cff.cpp       — CFF surface, no VM markers
+│   └── mixed.cpp          — realistic mix (VM + mutation + strings)
+└── bin/unprotected/       — build output (gitignored, regenerable)
+    ├── pure_vm.exe
+    ├── pure_cff.exe
+    └── mixed.exe
+```
 
-- `pure_vm_*.exe`        — VM-heavy, minimal non-VM code
-- `pure_cff_*.exe`       — CFF-dense without VM
-- `mixed_*.exe`          — realistic mix (strong-level preset)
-- `tls_heavy_*.exe`      — many TLS callbacks (early-entry metrics)
-- `seh_*.exe`            — SEH / C++ exceptions (VEH interaction)
-- `dll_*.dll`            — dynamic library variant
-- `driver_*.sys`         — kernel driver variant (when ring0 gated)
+## Build
 
-## Population
+From a Visual Studio Developer Command Prompt (x64):
 
-Empty at migration (this commit). Populated in the "Benchmark infra"
-phase (P1 per `MCP.md`) using small source files under
-`tests/testapp/` or new fixture sources. Each binary lives in git
-alongside its `.mxtrace.json` sidecar (both regenerated when the
-corpus is refreshed).
+```cmd
+cd path\to\mxprotector\mcp\fixtures\corpus
+build.bat
+```
 
-## Rebuild
+The script produces `bin/unprotected/*.exe`. Benchmarks invoke the
+MxProtector builder on each of these inputs at run time, so the
+protected binaries always reflect the current builder state — there
+is no stale "protected corpus" checked in.
 
-A fresh corpus build is a reproducibility question only — the
-benchmarks compare a run against a baseline, both produced from the
-same corpus. Corpus refreshes therefore require a coordinated
-baseline refresh via `record_baseline`.
+## Manifest (`corpus.json`)
+
+Schema v1. Each entry declares:
+
+| Field    | Meaning                                                        |
+|----------|----------------------------------------------------------------|
+| `name`   | Stable identifier; shows up in metric evidence.                |
+| `binary` | Path to the unprotected binary, relative to the corpus root.   |
+| `tags`   | Protection-surface tags used by benchmark filters.             |
+
+### Tag vocabulary
+
+- `vm` / `cff` / `mutation` / `strings` — the pass this sample is
+  meant to exercise.
+- `pure`  — single-surface sample (isolates one pass's contribution).
+- `mixed` — multi-surface, realistic mix.
+- `exe`  — PE executable (as opposed to `dll` / `sys`).
+
+Benchmarks filter via `corpus.with_tags("vm")` etc. A benchmark with
+`corpus_tags=frozenset()` runs on the whole corpus.
+
+## Extending
+
+Add a new sample:
+
+1. Drop a source file under `src/<name>.cpp`.
+2. Add a `cl …` line to `build.bat` for the new source.
+3. Append an entry to `corpus.json` with its path + tags.
+4. Rebuild locally (`build.bat`) — the new binary lands in
+   `bin/unprotected/`.
+
+Avoid splitting samples across subdirectories; the flat layout keeps
+the manifest and build script readable.
+
+## Rebuild policy
+
+A fresh corpus build is a reproducibility question only — benchmarks
+compare a run against a baseline, both produced from the same corpus.
+Corpus refreshes therefore require a coordinated baseline refresh via
+the `record_baseline` MCP tool.
