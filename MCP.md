@@ -83,8 +83,22 @@ Direction: `↑` = higher-is-better, `↓` = lower-is-better, `false-best` = boo
 |---|---|---|---|
 | d810 state recovery rate (per-fn p90) | ↓ | IDA+d810 | FAIL ≥50% |
 | Dispatcher transition entropy | ↑ | sidecar | warn Δ≥0.2 bit |
-| HexRays microcode blocks/goto/cyclomatic (per-fn p90) | ↑ | IDA | warn on ≥15% regression |
+| HexRays microcode blocks/goto/cyclomatic (section-aggregate) | ↑ | IDA | warn on ≥15% regression |
 | Back-edge / irreducible-region ratio | ↑ | IDA | warn |
+
+**Population contract (implementation note).** The CFF benchmark
+measures ``sections["cff"]`` as a *single region* — not per-function.
+The CFF pass emits each source function's dispatcher + state handlers
+into that section; IDA's auto-analysis does not create functions at
+the dispatcher entries (they're reachable only through indirect
+jumps), so any "iterate IDA functions" population filter returns
+zero matches. The benchmark therefore hands IDA one explicit range
+via ``MX_MCP_IDA_REGIONS`` and runs
+``ida_hexrays.gen_microcode(..., MMAT_GLBOPT3)`` directly on the
+bytes — which requires the on-disk bytes to be *plaintext*, so the
+benchmark builds with ``--no-packer`` (packer encrypts the section
+at build time; it decrypts only at runtime). Packer quality gets its
+own benchmark later.
 
 ### VM
 

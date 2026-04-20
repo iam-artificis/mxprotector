@@ -37,6 +37,7 @@ so the benchmark reports something useful even in a partial run.
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import time
@@ -58,6 +59,7 @@ from mx_mcp.common.builder import (
     build_protected,
     resolve_builder_path,
 )
+from mx_mcp.common.sidecar import Sidecar, load_sidecar
 from mx_mcp.static.ida.runner import (
     IdaNotFoundError,
     run_ida_script,
@@ -77,34 +79,48 @@ SCRIPT_PATH = (
 
 # Metric declarations: (name, direction, scale).
 #
-# Scales were picked empirically against the seed corpus + common CFF
-# behaviour:
+# Scales anchor a *whole-section* metric. The benchmark measures the
+# entire cff section's microcode per corpus entry — dispatcher(s) +
+# state handlers + MBA-transition blocks all land in one ``mba_t``.
+# The numbers below therefore reflect aggregate counts across the
+# section, not per-function values.
 #
-# * ``mc_blocks``         — 1 block is a trivially-deflattenable linear
-#                            function; ~30 blocks is a fully-flattened
-#                            dispatcher + all its state handlers.
-# * ``mc_gotos``          — 0 = no CFF artefacts; ~10 = dispatcher with
-#                            fallbacks.
-# * ``mc_cyclomatic``     — 1 = linear; ~20 = densely-interconnected CFG.
-# * ``mc_backedge_ratio`` — 0 = reducible CFG (trivial to normalise);
-#                            ~0.3 = substantial irreducibility.
+# Calibration targets score ≈ 0.5 at the current ``strong`` defence
+# level on the seed corpus (measured: 92.8 mc_blocks /
+# 43 mc_gotos / 42.9 mc_cyclomatic / 0.29 mc_backedge_ratio).
+# Keeping scores mid-scale leaves room to flag both improvements and
+# regressions — a saturated 1.0 hides gains; an anchored 0.0 hides
+# losses.
 #
-# Tune as real baselines accumulate across the corpus. The value here is
-# a declarative contract between the benchmark and the reporting layer
-# — no runtime code branches on it.
+# ``strong`` end rationale per metric:
+#
+# * ``mc_blocks``         — 200 blocks = dense dispatcher array with
+#                            many flattened states + MBA transitions;
+#                            saturates an attacker's CFG visualiser.
+# * ``mc_gotos``          — 90 = tight goto-mesh, every original
+#                            branch re-encoded as a dispatcher jump.
+# * ``mc_cyclomatic``     — 90 = a CFG most human analysts abandon
+#                            without tool assistance.
+# * ``mc_backedge_ratio`` — 0.6 = substantial irreducibility (half the
+#                            edges point backwards in quasi-topological
+#                            order).
+#
+# Re-tune when the corpus grows or the CFF pass materially changes.
+# The scale is a declarative contract with the reporting layer — no
+# runtime code branches on these numbers.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("mc_blocks",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=1.0,  strong_value=30.0)),
+     MetricScale(weak_value=0.0, strong_value=200.0)),
     ("mc_gotos",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0,  strong_value=10.0)),
+     MetricScale(weak_value=0.0, strong_value=90.0)),
     ("mc_cyclomatic",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=1.0,  strong_value=20.0)),
+     MetricScale(weak_value=0.0, strong_value=90.0)),
     ("mc_backedge_ratio",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0,  strong_value=0.3)),
+     MetricScale(weak_value=0.0, strong_value=0.6)),
 )
 
 
@@ -228,15 +244,51 @@ async def _process_entry(
             unprotected=entry.unprotected_binary,
             output=protected_path,
             builder_path=builder_path,
+            # ``--no-packer`` keeps the CFF / VM / string sections
+            # as plaintext in the on-disk file. Packed builds encrypt
+            # those sections at build time (they're decrypted only at
+            # runtime by the stub), so IDA loads encrypted bytes and
+            # cannot analyse dispatchers. Benchmarking CFF therefore
+            # requires the non-packed variant — packer quality gets
+            # its own benchmark in a later phase.
+            extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )
     except (BuilderError, FileNotFoundError) as e:
         return [f"{entry.name}: build failed: {e}"]
 
+    # Sidecar is MANDATORY — the benchmark reads ``sections["cff"]``
+    # (range) from it to tell IDA exactly what byte range contains the
+    # dispatcher code. A build that did not emit a sidecar has no way
+    # to convey that range, so we abort the entry.
+    sidecar = _load_sidecar_or_error(pb.sidecar_path, entry.name)
+    if isinstance(sidecar, str):
+        return [sidecar]
+
+    cff_section = sidecar.sections.get("cff")
+    if cff_section is None or cff_section.size == 0:
+        return [
+            f"{entry.name}: sidecar has no (non-empty) 'cff' section — "
+            f"CFF disabled or --no-cfg-flattening in effect"
+        ]
+
+    # Hand IDA exactly one region to measure. The script uses
+    # ``gen_microcode`` directly on this byte range, bypassing
+    # ``ida_funcs.get_func`` — necessary because IDA does not create
+    # functions at CFF dispatcher entries (only the .text trampolines
+    # are found through the entry-point call-graph, and they are
+    # tiny jmp stubs). See ``static/ida/scripts/cff_metrics.py``.
+    regions = [{
+        "name": "cff_section",
+        "rva": cff_section.rva,
+        "size": cff_section.size,
+    }]
+
     try:
         ida_result = await run_ida_script(
             binary=pb.protected_binary,
             script=SCRIPT_PATH,
+            extra_env={"MX_MCP_IDA_REGIONS": json.dumps(regions)},
         )
     except IdaNotFoundError as e:
         return [f"{entry.name}: IDA missing: {e}"]
@@ -250,18 +302,27 @@ async def _process_entry(
     if not ida_out.get("hexrays_available", False):
         return [f"{entry.name}: Hex-Rays not available in IDA"]
 
-    functions = ida_out.get("functions", [])
-    if not functions:
-        errors.append(f"{entry.name}: no functions decompiled")
+    records = ida_out.get("functions", [])
 
-    for fn in functions:
-        fn_name = fn.get("name") or f"sub_{fn.get('ea', 0):X}"
+    _LOG.info(
+        "%s: cff region [0x%X..0x%X) → %d IDA record(s)",
+        entry.name, cff_section.rva, cff_section.rva + cff_section.size,
+        len(records),
+    )
+
+    if not records:
+        errors.append(
+            f"{entry.name}: gen_microcode produced no blocks for the "
+            f"cff section [0x{cff_section.rva:X}..{cff_section.rva + cff_section.size:X}) "
+            f"— bytes may be encrypted (packer on?) or invalid"
+        )
+
+    for fn in records:
+        fn_name = fn.get("name") or f"region_{fn.get('rva', 0):X}"
         sample_name = f"{entry.name}::{fn_name}"
-        # ``mba_maturity`` surfaces whether MMAT_GLBOPT3 (what d810
-        # attacks) or the decompile-driven fallback produced the
-        # numbers. Absent on older script output → None.
         evidence_base = {
             "ea": fn.get("ea"),
+            "rva": fn.get("rva"),
             "fn_size": fn.get("size"),
             "mba_maturity": fn.get("mba_maturity"),
         }
@@ -273,6 +334,29 @@ async def _process_entry(
             ))
 
     for err in ida_out.get("errors", []):
-        errors.append(f"{entry.name}: ida-fn: {err}")
+        errors.append(f"{entry.name}: ida-region: {err}")
 
     return errors
+
+
+def _load_sidecar_or_error(
+    sidecar_path: Path | None, entry_name: str,
+) -> Sidecar | str:
+    """Return the parsed sidecar or an error-string suitable for the
+    entry's ``errors`` list.
+
+    Split out as a helper so the main control flow above reads top-
+    to-bottom — one successful path, early returns for each failure
+    mode.
+    """
+    if sidecar_path is None:
+        return (
+            f"{entry_name}: build produced no sidecar (trace-hints off?) "
+            f"— benchmark cannot identify the cff section"
+        )
+    try:
+        return load_sidecar(sidecar_path)
+    except Exception as e:  # noqa: BLE001 — fail-closed: one entry, not the whole run
+        return f"{entry_name}: sidecar load failed: {type(e).__name__}: {e}"
+
+
