@@ -226,6 +226,22 @@ MxStatus commit_string_section(
         wipe_plaintext(image, ks.rva_start, ks.length);
     }
 
+    // Source-linked labels for the tracing MCP (flag-gated). One
+    // label per kept string: desc_rva points at the *original*
+    // plaintext RVA (now wiped), so Phase 6 string_leak invariants
+    // can say "these bytes must no longer be readable as plaintext
+    // at runtime".
+    if (ctx.config().emit_trace_hints) {
+        auto& hints = ctx.trace_hints();
+        for (std::size_t i = 0; i < gathered.kept_strings.size(); ++i) {
+            const auto& ks = gathered.kept_strings[i];
+            hints.add_string_slot(
+                static_cast<std::uint32_t>(i),
+                ks.rva_start,
+                ks.length);
+        }
+    }
+
     ctx.log_fmt(
         "StringProtectionPass: защищено {} строк, переписано {} LEA xref'ов, "
         "режим={}, секция '{}' RVA=0x{:08X} размер={} байт",

@@ -108,6 +108,18 @@ MxStatus GuardPassPipeline::execute()
         return s;
     }
 
+    // Source-linked labels for the tracing MCP (flag-gated). One label
+    // per relocated guard body — final body_start_rva and body_size are
+    // known from the finalized descriptors.
+    if (ctx_.config().emit_trace_hints) {
+        auto& hints = ctx_.trace_hints();
+        for (const auto& desc : descriptors) {
+            hints.add_guard_region(desc.guard_id,
+                                   desc.body_start_rva,
+                                   desc.body_size);
+        }
+    }
+
     // --- Phase 6 — back-patch VEH+TLS with final RVAs + CRC + mask ---
     if (auto s = back_patch_guard_handlers(
             ctx_, guard_section, *assembly, pendings); !s)

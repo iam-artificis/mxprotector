@@ -419,6 +419,18 @@ int main(int argc, char** argv) {
                 sec.characteristics);
         }
 
+        // IAT range — from DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].
+        // Many MSVC-built binaries populate this summary directory;
+        // when it's 0/0 we leave the label as the schema default
+        // (already zero after set_iat is not called).
+        std::visit([&](const auto& nt) {
+            const auto& dir = nt.OptionalHeader.DataDirectory[
+                mx::pe::IMAGE_DIRECTORY_ENTRY_IAT];
+            if (dir.VirtualAddress != 0 || dir.Size != 0) {
+                hints.set_iat(dir.VirtualAddress, dir.Size);
+            }
+        }, ctx.pe_image().nt_headers());
+
         if (auto sidecar_result = write_trace_hints_sidecar(
                 config.output_path, hints.to_json());
             !sidecar_result)

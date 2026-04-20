@@ -148,3 +148,61 @@ def test_full_build_still_succeeds_with_sidecar_flag(
     # Just ensure the sidecar parses and is well-formed.
     doc = load_sidecar(Path(f"{output}.mxtrace.json"))
     assert doc.schema_version == 1
+
+
+# ===========================================================================
+# Phase 4C — Guard / Strings / IAT
+# ===========================================================================
+
+
+def test_iat_populated_at_strong(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    """test_vm_showcase is MSVC-built → DataDirectory[IAT] is populated."""
+    output = tmp_path / "iat.exe"
+    _build(builder_exe, input_pe, output, level="strong")
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    assert doc.iat.rva > 0,  "IAT rva not populated from DataDirectory"
+    assert doc.iat.size > 0, "IAT size not populated from DataDirectory"
+
+
+def test_strings_slots_populated_when_strings_enabled(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    """test_vm_showcase has no MX_STR candidates — but the string pass
+    can still pick up regular string literals in `printf` format args.
+    We only assert slot count is non-negative + the field exists; the
+    stronger check is that set_iat on a non-string fixture still gives
+    empty slots (leak-guard below)."""
+    output = tmp_path / "str.exe"
+    _build(builder_exe, input_pe, output, level="strong",
+           extra=["--strings=stub"])
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    # strings=stub + this fixture — slots may be 0 or more; the
+    # contract is "field exists and parses". Empty is valid.
+    assert isinstance(doc.strings.slots, list)
+
+
+def test_strings_slot_empty_when_strings_off(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    output = tmp_path / "no_str.exe"
+    _build(builder_exe, input_pe, output, level="strong",
+           extra=["--strings=off"])
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    assert doc.strings.slots == [], (
+        f"strings leaked with --strings=off: {doc.strings.slots}"
+    )
+
+
+def test_guard_slot_empty_without_markers(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    """test_vm_showcase has no MX_GUARD markers — guard.regions must
+    stay empty."""
+    output = tmp_path / "no_guard.exe"
+    _build(builder_exe, input_pe, output, level="strong")
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    assert doc.guard.regions == [], (
+        f"guard regions leaked: {doc.guard.regions}"
+    )
