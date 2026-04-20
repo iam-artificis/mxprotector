@@ -63,6 +63,7 @@ mcp/
     ├── benchmarks/              cff, vm, packer, mutation,
     │                            anti_analysis, diffing, budget_to_crack
     ├── invariants/              oep_is_stub, packer_decrypted
+    ├── reporting/               text_formatter + charts/ (matplotlib)
     └── tools/                   measure_defense, diff_defense_baseline,
                                  record_baseline, verify_protection_invariants
 ```
@@ -133,6 +134,42 @@ Direction: `↑` = higher-is-better, `↓` = lower-is-better, `false-best` = boo
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | angr symbolic steps to reach OEP | ↑ | angr | warn on regression |
+
+## Visualisation
+
+Each per-metric result carries an optional ``MetricScale`` declared by
+the benchmark:
+
+```
+weak_value  → 0.0   (defence is ineffective)
+strong_value → 1.0  (defence is working well)
+```
+
+The scale is direction-agnostic — the same linear formula handles
+``HIGHER_BETTER`` / ``LOWER_BETTER`` / ``FALSE_BEST`` as long as the
+benchmark sets ``weak``/``strong`` consistently (e.g. for
+``LOWER_BETTER`` use ``weak=1.0``, ``strong=0.0``).
+
+The ``reporting/`` subpackage turns runs into text + PNG:
+
+| Module | Produces | Depends on |
+|---|---|---|
+| `reporting/text_formatter.py` | Human-readable measurement / diff summary | stdlib only |
+| `reporting/charts/measurement_chart.py` | Normalised per-metric bar PNG for a measurement | matplotlib |
+| `reporting/charts/diff_chart.py` | Coloured delta bars PNG vs a baseline | matplotlib |
+| `reporting/render_or_skip.py` | Fail-closed helper tools use to attach a PNG | stdlib only |
+
+Both `measure_defense` and `diff_defense_baseline` accept an
+`output_png` argument. When set and the `[viz]` extra is installed,
+the tool writes the chart at that path and returns it alongside the
+numeric output. When matplotlib is missing, `png_note` carries the
+install hint and the numeric result is unaffected.
+
+Install the chart backend:
+
+```bash
+cd mcp && py -3 -m pip install -e ".[viz]"
+```
 
 ## Tier model (MVP — two tiers)
 

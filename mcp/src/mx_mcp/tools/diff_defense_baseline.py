@@ -80,6 +80,16 @@ class DiffDefenseBaselineInput(BaseModel):
             "band are classified ``unchanged``."
         ),
     )
+    output_png: str | None = Field(
+        default=None,
+        description=(
+            "If set, render the diff as a PNG chart at this path. "
+            "Requires matplotlib — see measure_defense's ``output_png`` "
+            "for the install recipe. Independent of the measurement "
+            "chart — they produce distinct visuals (per-metric scores "
+            "vs. per-metric deltas)."
+        ),
+    )
 
 
 class DiffDefenseBaselineOutput(BaseModel):
@@ -90,6 +100,8 @@ class DiffDefenseBaselineOutput(BaseModel):
     duration_ms: int
     diff: BaselineDiff
     measure_notes: list[str] = Field(default_factory=list)
+    png_path: str | None = None
+    png_note: str | None = None
 
 
 # ============================================================================
@@ -169,7 +181,7 @@ class DiffDefenseBaselineTool(
             len(diff.unchanged), len(diff.skipped),
         )
 
-        return DiffDefenseBaselineOutput(
+        output = DiffDefenseBaselineOutput(
             baseline_name=args.baseline_name,
             baselines_root=str(baselines_root),
             corpus_size=measure_result.corpus_size,
@@ -178,6 +190,18 @@ class DiffDefenseBaselineTool(
             diff=diff,
             measure_notes=measure_result.notes,
         )
+
+        # Optional PNG rendering — delayed imports keep the tool free
+        # of a top-level matplotlib / reporting dependency.
+        if args.output_png is not None:
+            from mx_mcp.reporting.charts.diff_chart import DiffChartRenderer
+            from mx_mcp.reporting.render_or_skip import try_render_png
+
+            output.png_path, output.png_note = try_render_png(
+                DiffChartRenderer(), output, args.output_png,
+            )
+
+        return output
 
 
 # Type alias for the test-injectable store factory.

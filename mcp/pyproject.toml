@@ -40,11 +40,16 @@ unicorn = ["unicorn >= 2.0"]
 angr    = ["angr    >= 9.2"]
 # msynth / SiMBA are installed from GitHub — see README.md for exact URLs.
 unpack  = ["unipacker >= 1.0"]
+# Chart rendering — measure_defense / diff_defense_baseline save PNGs when
+# ``output_png=…`` is supplied AND this extra is installed. Absent = tools
+# skip the chart step and surface a readable note, no crash.
+viz     = ["matplotlib >= 3.8"]
 
 full = [
-    "unicorn   >= 2.0",
-    "angr      >= 9.2",
-    "unipacker >= 1.0",
+    "unicorn    >= 2.0",
+    "angr       >= 9.2",
+    "unipacker  >= 1.0",
+    "matplotlib >= 3.8",
 ]
 
 dev = [

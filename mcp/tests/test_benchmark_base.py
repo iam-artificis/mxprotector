@@ -14,6 +14,7 @@ from mx_mcp.common.benchmark_base import (
     MetricDirection,
     MetricResult,
     MetricSample,
+    MetricScale,
     _linear_percentile,
     aggregate_numeric,
     all_benchmarks,
@@ -202,9 +203,66 @@ def test_benchmark_result_serialises_and_round_trips():
                     p10=0.1, p50=0.1, p90=0.1, mean=0.1, stddev=None,
                     n_samples=2, n_errors=1,
                 ),
+                scale=MetricScale(weak_value=1.0, strong_value=0.0),
             )
         ],
     )
     as_json = result.model_dump_json()
     round_trip = BenchmarkResult.model_validate_json(as_json)
     assert round_trip == result
+
+
+# ============================================================================
+# MetricScale — normalisation
+# ============================================================================
+
+
+def test_metric_scale_higher_better_endpoints():
+    # ``weak < strong`` mode — values rising from weak to strong improve.
+    scale = MetricScale(weak_value=1.0, strong_value=30.0)
+    assert scale.normalize(1.0) == 0.0
+    assert scale.normalize(30.0) == 1.0
+    # Interior value — linear interpolation.
+    assert math.isclose(scale.normalize(15.5), 0.5, abs_tol=0.01)
+
+
+def test_metric_scale_lower_better_endpoints():
+    # ``weak > strong`` mode — values falling from weak to strong improve.
+    scale = MetricScale(weak_value=1.0, strong_value=0.0)
+    assert scale.normalize(1.0) == 0.0
+    assert scale.normalize(0.0) == 1.0
+    assert math.isclose(scale.normalize(0.5), 0.5, abs_tol=0.01)
+
+
+def test_metric_scale_false_best_inverts_boolean_rate():
+    # Classical FALSE_BEST case: mean of a bool sample.
+    scale = MetricScale(weak_value=1.0, strong_value=0.0)
+    assert scale.normalize(1.0) == 0.0   # always fails → worst
+    assert scale.normalize(0.0) == 1.0   # never fails → best
+    assert math.isclose(scale.normalize(0.3), 0.7, abs_tol=0.01)
+
+
+def test_metric_scale_clamps_out_of_range():
+    scale = MetricScale(weak_value=1.0, strong_value=30.0)
+    assert scale.normalize(-5.0) == 0.0
+    assert scale.normalize(100.0) == 1.0
+
+
+def test_metric_scale_zero_span_returns_neutral():
+    scale = MetricScale(weak_value=5.0, strong_value=5.0)
+    assert scale.normalize(5.0) == 0.5
+    assert scale.normalize(1.0) == 0.5
+    assert scale.normalize(100.0) == 0.5
+
+
+def test_metric_result_without_scale_defaults_to_none():
+    r = MetricResult(
+        name="m",
+        direction=MetricDirection.HIGHER_BETTER,
+        samples=[],
+        aggregate=AggregateStats(
+            p10=None, p50=None, p90=None, mean=None, stddev=None,
+            n_samples=0, n_errors=0,
+        ),
+    )
+    assert r.scale is None

@@ -49,6 +49,7 @@ from mx_mcp.common.benchmark_base import (
     MetricDirection,
     MetricResult,
     MetricSample,
+    MetricScale,
     aggregate_numeric,
     register_benchmark,
 )
@@ -74,13 +75,36 @@ SCRIPT_PATH = (
 )
 
 
-# Metric names + directions — declared once so test code can reference
-# the tuple without re-typing strings.
-_METRIC_DEFS: tuple[tuple[str, MetricDirection], ...] = (
-    ("mc_blocks",          MetricDirection.HIGHER_BETTER),
-    ("mc_gotos",           MetricDirection.HIGHER_BETTER),
-    ("mc_cyclomatic",      MetricDirection.HIGHER_BETTER),
-    ("mc_backedge_ratio",  MetricDirection.HIGHER_BETTER),
+# Metric declarations: (name, direction, scale).
+#
+# Scales were picked empirically against the seed corpus + common CFF
+# behaviour:
+#
+# * ``mc_blocks``         — 1 block is a trivially-deflattenable linear
+#                            function; ~30 blocks is a fully-flattened
+#                            dispatcher + all its state handlers.
+# * ``mc_gotos``          — 0 = no CFF artefacts; ~10 = dispatcher with
+#                            fallbacks.
+# * ``mc_cyclomatic``     — 1 = linear; ~20 = densely-interconnected CFG.
+# * ``mc_backedge_ratio`` — 0 = reducible CFG (trivial to normalise);
+#                            ~0.3 = substantial irreducibility.
+#
+# Tune as real baselines accumulate across the corpus. The value here is
+# a declarative contract between the benchmark and the reporting layer
+# — no runtime code branches on it.
+_METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
+    ("mc_blocks",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=1.0,  strong_value=30.0)),
+    ("mc_gotos",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=0.0,  strong_value=10.0)),
+    ("mc_cyclomatic",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=1.0,  strong_value=20.0)),
+    ("mc_backedge_ratio",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=0.0,  strong_value=0.3)),
 )
 
 
@@ -108,14 +132,17 @@ class CffMicrocodeBenchmark(IBenchmark):
                 category=self.category,
                 tier=self.tier,
                 duration_ms=int((time.monotonic() - t0) * 1000),
-                metrics=[_empty_metric(name, direction) for name, direction in _METRIC_DEFS],
+                metrics=[
+                    _empty_metric(name, direction, scale)
+                    for name, direction, scale in _METRIC_DEFS
+                ],
                 errors=["no corpus entries tagged 'cff'"],
             )
 
         builder_path = resolve_builder_path(session.workspace_root)
 
         samples_by_metric: dict[str, list[MetricSample]] = {
-            name: [] for name, _ in _METRIC_DEFS
+            name: [] for name, _, _ in _METRIC_DEFS
         }
         errors: list[str] = []
 
@@ -134,8 +161,8 @@ class CffMicrocodeBenchmark(IBenchmark):
                 errors.extend(entry_errors)
 
         metrics = [
-            _build_metric(name, direction, samples_by_metric[name])
-            for name, direction in _METRIC_DEFS
+            _build_metric(name, direction, scale, samples_by_metric[name])
+            for name, direction, scale in _METRIC_DEFS
         ]
         return BenchmarkResult(
             benchmark=self.name,
@@ -152,18 +179,22 @@ class CffMicrocodeBenchmark(IBenchmark):
 # ============================================================================
 
 
-def _empty_metric(name: str, direction: MetricDirection) -> MetricResult:
+def _empty_metric(
+    name: str, direction: MetricDirection, scale: MetricScale,
+) -> MetricResult:
     return MetricResult(
         name=name,
         direction=direction,
         samples=[],
         aggregate=aggregate_numeric([]),
+        scale=scale,
     )
 
 
 def _build_metric(
     name: str,
     direction: MetricDirection,
+    scale: MetricScale,
     samples: list[MetricSample],
 ) -> MetricResult:
     return MetricResult(
@@ -171,6 +202,7 @@ def _build_metric(
         direction=direction,
         samples=samples,
         aggregate=aggregate_numeric([s.value for s in samples]),
+        scale=scale,
     )
 
 
@@ -233,7 +265,7 @@ async def _process_entry(
             "fn_size": fn.get("size"),
             "mba_maturity": fn.get("mba_maturity"),
         }
-        for metric_name, _ in _METRIC_DEFS:
+        for metric_name, _direction, _scale in _METRIC_DEFS:
             samples_by_metric[metric_name].append(MetricSample(
                 sample_name=sample_name,
                 value=fn.get(metric_name),

@@ -99,13 +99,68 @@ class AggregateStats(BaseModel):
     n_errors: int
 
 
+class MetricScale(BaseModel):
+    """Linear normalisation bounds for visualisation / human scoring.
+
+    Maps ``weak_value`` → ``0.0`` (defence is ineffective for this
+    metric) and ``strong_value`` → ``1.0`` (defence is working well).
+    Values outside the range clamp to ``[0, 1]``. A zero-span scale
+    (weak == strong) returns ``0.5`` as a neutral fallback.
+
+    The same linear formula handles all three directions uniformly —
+    callers set the bounds consistently with the metric's direction:
+
+    * ``HIGHER_BETTER`` — ``weak < strong`` (e.g. ``weak=1``,
+      ``strong=30`` for microcode-block counts).
+    * ``LOWER_BETTER``  — ``weak > strong`` (e.g. ``weak=1.0``,
+      ``strong=0.0`` for an MBA-simplification rate).
+    * ``FALSE_BEST``    — ``weak=1.0`` (always fails) to
+      ``strong=0.0`` (never fails).
+
+    Normalisation is **opt-in per metric**: a benchmark that does not
+    declare scales emits ``scale=None`` on its ``MetricResult`` and
+    downstream renderers fall back to a raw-value presentation.
+    """
+
+    weak_value: float = Field(
+        description="Value that maps to 0.0 (weakest defence for this metric)."
+    )
+    strong_value: float = Field(
+        description="Value that maps to 1.0 (strongest defence for this metric)."
+    )
+
+    def normalize(self, v: float) -> float:
+        """Project ``v`` onto ``[0, 1]`` using the declared bounds.
+
+        Zero-span (``weak == strong``) returns ``0.5`` as a
+        well-defined neutral — callers usually treat this as "no
+        signal" rather than special-case the branch.
+        """
+        span = self.strong_value - self.weak_value
+        if span == 0:
+            return 0.5
+        ratio = (v - self.weak_value) / span
+        if ratio < 0.0:
+            return 0.0
+        if ratio > 1.0:
+            return 1.0
+        return ratio
+
+
 class MetricResult(BaseModel):
-    """Full result for one metric emitted by one benchmark."""
+    """Full result for one metric emitted by one benchmark.
+
+    ``scale`` is optional. When set, renderers present the metric on a
+    normalised ``[0, 1]`` axis via ``scale.normalize``. When ``None``,
+    renderers fall back to raw p10/p50/p90 bars (or skip the metric
+    entirely, per renderer policy).
+    """
 
     name: str
     direction: MetricDirection
     samples: list[MetricSample]
     aggregate: AggregateStats
+    scale: MetricScale | None = None
 
 
 class BenchmarkResult(BaseModel):

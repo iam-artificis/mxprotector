@@ -205,3 +205,63 @@ def test_benchmark_raising_is_fail_closed(tmp_path: Path):
     result = out.benchmarks[0]
     assert result.metrics == []
     assert any("RuntimeError" in e for e in result.errors)
+
+
+# ============================================================================
+# output_png — chart rendering at the tool boundary
+# ============================================================================
+
+
+def test_output_png_unset_leaves_chart_fields_none(tmp_path: Path):
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [])
+    args = MeasureDefenseInput(corpus_path=str(corpus_root))
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+    assert out.png_path is None
+    assert out.png_note is None
+
+
+def test_output_png_writes_chart_when_matplotlib_present(tmp_path: Path):
+    pytest.importorskip("matplotlib")
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    target = tmp_path / "chart.png"
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        output_png=str(target),
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    assert out.png_note is None
+    assert out.png_path is not None
+    assert Path(out.png_path).exists()
+    # PNG magic — proves the file is a real image, not a stub written
+    # by the helper before delegating to matplotlib.
+    assert Path(out.png_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_output_png_graceful_when_renderer_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    # Simulate missing matplotlib by patching the guard at the call
+    # site. ``measurement_chart`` imported the name into its own
+    # module namespace via ``from ... import matplotlib_available``;
+    # patching ``_mpl.matplotlib_available`` would leave the bound
+    # local alone.
+    from mx_mcp.reporting.charts import measurement_chart
+
+    monkeypatch.setattr(measurement_chart, "matplotlib_available", lambda: False)
+
+    corpus_root = _make_corpus(tmp_path)
+    tool = MeasureDefenseTool(benchmarks_source=lambda: [_OkBench])
+    target = tmp_path / "chart.png"
+    args = MeasureDefenseInput(
+        corpus_path=str(corpus_root),
+        output_png=str(target),
+    )
+    out = asyncio.run(tool.run(args, _fake_session(tmp_path)))
+
+    assert out.png_path is None
+    assert out.png_note is not None
+    assert "matplotlib" in out.png_note
+    assert not target.exists()

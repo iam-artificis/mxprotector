@@ -214,3 +214,51 @@ def test_diff_zero_benchmarks_on_both_sides(tmp_path: Path):
     assert out.diff.improvements == []
     assert out.diff.regressions == []
     assert out.diff.unchanged == []
+
+
+# ============================================================================
+# output_png — chart rendering at the tool boundary
+# ============================================================================
+
+
+def test_diff_output_png_unset_leaves_chart_fields_none(tmp_path: Path):
+    corpus_root = _make_corpus(tmp_path)
+    baselines_root = tmp_path / "baselines"
+    _record(tmp_path, corpus_root, baselines_root, "v1", value=1.0)
+
+    measure = MeasureDefenseTool(benchmarks_source=lambda: [_ParametrisedBench])
+    diff_tool = DiffDefenseBaselineTool(measure_tool=measure)
+    args = DiffDefenseBaselineInput(
+        baseline_name="v1",
+        baselines_root=str(baselines_root),
+        corpus_path=str(corpus_root),
+    )
+    out = asyncio.run(diff_tool.run(args, _fake_session(tmp_path)))
+    assert out.png_path is None
+    assert out.png_note is None
+
+
+def test_diff_output_png_writes_chart_when_matplotlib_present(tmp_path: Path):
+    pytest.importorskip("matplotlib")
+
+    corpus_root = _make_corpus(tmp_path)
+    baselines_root = tmp_path / "baselines"
+    _record(tmp_path, corpus_root, baselines_root, "v1", value=1.0)
+
+    # Make current value differ so the diff has at least one improvement.
+    _ParametrisedBench.fixed_value = 2.0
+    measure = MeasureDefenseTool(benchmarks_source=lambda: [_ParametrisedBench])
+    diff_tool = DiffDefenseBaselineTool(measure_tool=measure)
+    target = tmp_path / "diff.png"
+    args = DiffDefenseBaselineInput(
+        baseline_name="v1",
+        baselines_root=str(baselines_root),
+        corpus_path=str(corpus_root),
+        output_png=str(target),
+    )
+    out = asyncio.run(diff_tool.run(args, _fake_session(tmp_path)))
+
+    assert out.png_note is None
+    assert out.png_path is not None
+    assert Path(out.png_path).exists()
+    assert Path(out.png_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

@@ -104,6 +104,16 @@ class MeasureDefenseInput(BaseModel):
         default=DEFAULT_TIMEOUT_S,
         description="Total benchmark timeout (seconds). Acts as an outer cap on the aggregate.",
     )
+    output_png: str | None = Field(
+        default=None,
+        description=(
+            "If set, render the measurement as a PNG chart at this "
+            "path. Requires matplotlib — install with "
+            "``pip install -e \".[viz]\"`` in ``mcp/``. When matplotlib "
+            "is missing, the tool still returns the full numeric "
+            "result and surfaces an install hint in ``png_note``."
+        ),
+    )
 
 
 class MeasureDefenseOutput(BaseModel):
@@ -113,6 +123,8 @@ class MeasureDefenseOutput(BaseModel):
     duration_ms: int
     benchmarks: list[BenchmarkResult]
     notes: list[str] = Field(default_factory=list)
+    png_path: str | None = None
+    png_note: str | None = None
 
 
 # ============================================================================
@@ -156,10 +168,12 @@ class MeasureDefenseTool(ITool[MeasureDefenseInput, MeasureDefenseOutput]):
 
         corpus_path = _resolve_corpus_path(args.corpus_path, session.workspace_root)
 
-        # Empty-registry short-circuit: return before touching the
-        # filesystem so corpus absence does not mask the "nothing to
-        # do" state.
+        results: list[BenchmarkResult] = []
+        corpus_size = 0
+
         if not filtered:
+            # Empty-registry short-circuit: do not touch the filesystem
+            # so corpus absence does not mask the "nothing to do" state.
             if not all_bench:
                 notes.append("no benchmarks registered")
             else:
@@ -167,51 +181,51 @@ class MeasureDefenseTool(ITool[MeasureDefenseInput, MeasureDefenseOutput]):
                     f"no benchmarks match filter "
                     f"(categories={args.categories}, tier={args.tier})"
                 )
-            return MeasureDefenseOutput(
-                corpus_path=str(corpus_path),
-                corpus_size=0,
-                benchmark_count=0,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                benchmarks=[],
-                notes=notes,
-            )
+        else:
+            try:
+                corpus = Corpus.load(corpus_path)
+                corpus_size = len(corpus)
+            except CorpusLoadError as e:
+                _LOG.error("corpus load failed: %s", e)
+                notes.append(f"corpus load failed: {e}")
+            else:
+                # ``asyncio.wait_for`` wraps the full benchmark sequence
+                # so a runaway backend cannot exceed the outer timeout.
+                # Per-benchmark budgets live on the benchmark side.
+                try:
+                    results = await asyncio.wait_for(
+                        self._run_benchmarks(filtered, corpus, session),
+                        timeout=args.timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    notes.append(
+                        f"outer timeout of {args.timeout_s}s exceeded; "
+                        f"{len(results)} benchmark(s) completed before the cut"
+                    )
 
-        try:
-            corpus = Corpus.load(corpus_path)
-        except CorpusLoadError as e:
-            _LOG.error("corpus load failed: %s", e)
-            return MeasureDefenseOutput(
-                corpus_path=str(corpus_path),
-                corpus_size=0,
-                benchmark_count=0,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                benchmarks=[],
-                notes=[f"corpus load failed: {e}"],
-            )
-
-        results: list[BenchmarkResult] = []
-        # ``asyncio.wait_for`` wraps the full benchmark sequence so a
-        # runaway backend cannot exceed the outer timeout. Per-benchmark
-        # budgets live on the benchmark side in later phases.
-        try:
-            results = await asyncio.wait_for(
-                self._run_benchmarks(filtered, corpus, session),
-                timeout=args.timeout_s,
-            )
-        except asyncio.TimeoutError:
-            notes.append(
-                f"outer timeout of {args.timeout_s}s exceeded; "
-                f"{len(results)} benchmark(s) completed before the cut"
-            )
-
-        return MeasureDefenseOutput(
+        output = MeasureDefenseOutput(
             corpus_path=str(corpus_path),
-            corpus_size=len(corpus),
+            corpus_size=corpus_size,
             benchmark_count=len(results),
             duration_ms=int((time.monotonic() - t0) * 1000),
             benchmarks=results,
             notes=notes,
         )
+
+        # Optional PNG rendering — delayed imports keep the tool module
+        # free of the matplotlib dependency and avoid a top-level cycle
+        # with the reporting package.
+        if args.output_png is not None:
+            from mx_mcp.reporting.charts.measurement_chart import (
+                MeasurementChartRenderer,
+            )
+            from mx_mcp.reporting.render_or_skip import try_render_png
+
+            output.png_path, output.png_note = try_render_png(
+                MeasurementChartRenderer(), output, args.output_png,
+            )
+
+        return output
 
     @staticmethod
     async def _run_benchmarks(
