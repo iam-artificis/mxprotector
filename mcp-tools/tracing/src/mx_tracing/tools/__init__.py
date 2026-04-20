@@ -7,3 +7,4 @@ populate the registry before serving.
 
 from mx_tracing.tools import list_sections as _list_sections  # noqa: F401
 from mx_tracing.tools import protect_and_trace as _protect_and_trace  # noqa: F401
+from mx_tracing.tools import verify_protection_invariants as _verify  # noqa: F401
