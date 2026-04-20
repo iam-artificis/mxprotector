@@ -224,29 +224,46 @@ build cannot hide behind the mean.
 
 **Migration commit** (no behavioural change): relocate
 `mcp-tools/tracing/` → `mcp/`, rename namespace `mx_tracing` →
-`mx_mcp`, reorganise into taxonomy. Green gate: existing pytest
-discovers + passes after rebuild of the builder.
+`mx_mcp`, reorganise into taxonomy.
 
 Then one commit per phase, each ending at the green gate (pytest +
-C++ ctest + 15/15 stress on `test_vm_showcase`):
+C++ ctest + 15/15 stress on `test_vm_showcase`). The order is
+optimised for **signal-per-effort** rather than topic cohesion —
+cheap integral metrics come first, expensive scope-heavy ones last.
 
-- **P1** — Benchmark infra (`IBenchmark`, `corpus`, `tiers`, `baselines`,
-  three top-level MCP tools). Populate `fixtures/corpus/` with seed.
-- **P2** — Static IDA headless (runner + CFF microcode + back-edge
-  ratio → CFF benchmark).
-- **P3** — Emulation Unicorn (handler replay + OEP-reach → Packer
-  benchmark partial).
-- **P4** — Symbolic angr (VM handler summarizer + budget-to-crack →
-  VM benchmark partial + cross-cutting KPI).
-- **P5** — Deobf MBA (msynth + SiMBA ensemble + constant-recovery →
-  Mutation benchmark).
-- **P6** — Unpacking (pe-sieve + unipacker → Packer benchmark
-  complete).
-- **P7** — Anti-analysis coverage (detection coverage across
-  adversarial envs).
-- **P8** — Diffing-resistance (BinDiff between seeded builds).
-- **P9** — Tier runners + ship-gate wiring (fast / slow runners,
-  verdict aggregation).
+- **P1 — Foundation.** ``IBenchmark`` + corpus + baselines +
+  snapshot/history/reproducibility (frozen seeds, tool versions,
+  artifact preservation). Per-sample metric schema. The three
+  top-level MCP tools as skeletons with stubs. ✅ Complete.
+- **P2 — Static CFF.** IDA headless runner, HexRays microcode
+  metrics, back-edge ratio. Reference benchmark for the whole
+  static family. ✅ Complete.
+- **P3 — Packer (dynamic + unpacking).** pe-sieve attach-and-scan;
+  unipacker/public unpackers slot in here too (one attacker-tool
+  family, no reason to split). ✅ pe-sieve done; unipacker tbd.
+- **P4 — Diffing resistance (BinDiff).** Pair of builds from the
+  same seed → percent-matches. Single number, dead-cheap, maybe
+  the highest signal-per-effort metric in the whole plan. Moved
+  up from the original P8 slot.
+- **P5 — VM static + budget-to-crack.** angr symbolic on handlers;
+  score = fraction summarised within a fixed budget (wall clock +
+  SMT queries + path count). Core VM-strength signal.
+- **P6 — MBA resistance.** msynth + SiMBA on handler expressions.
+  Pairs tightly with P5 — weak MBA defeats strong VM, so they
+  land back-to-back and are reviewed as one story.
+- **P7 — Tier runners + ship-gate.** Fast / slow runners, verdict
+  aggregation. Wire it early while there are 5-6 metrics to reason
+  about; delaying until P9 buries it under a dozen gate policies
+  at once. Moved up from the original P9 slot.
+- **P8 — Emulation Unicorn.** Handler replay + OEP-reach.
+  Effectively writing a mini-deobfuscator — needs explicit scope
+  decision up front (replay-N-steps vs full engine). Moved down
+  from the original P3 slot because pe-sieve now covers the packer
+  signal P3 originally chased.
+- **P9 — Anti-analysis coverage.** Detection rate across adversarial
+  envs (x64dbg, Frida, Unicorn, pafish, al-khaser). The noisiest,
+  most infrastructure-heavy phase — allocate 2–3× its nominal
+  budget. Last on purpose.
 
 ## Risks
 
