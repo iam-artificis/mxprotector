@@ -17,6 +17,13 @@
 
 namespace {
 
+// ``__declspec(noinline)`` stops MSVC /O2 from inlining the callee and
+// reordering instructions across the MX_* markers. Without it the
+// begin-marker can be hoisted out of the function while the end-marker
+// stays behind — the builder's marker scanner then refuses to protect
+// the binary (unmatched end-marker).
+
+__declspec(noinline)
 std::uint32_t compute_vm(std::uint32_t x) {
     std::uint32_t r = 0;
     MX_VM_BEGIN
@@ -27,6 +34,7 @@ std::uint32_t compute_vm(std::uint32_t x) {
     return r;
 }
 
+__declspec(noinline)
 std::uint32_t compute_mutated(std::uint32_t x) {
     MX_MUTATE_BEGIN
     std::uint32_t r = x + 1u;

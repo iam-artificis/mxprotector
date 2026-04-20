@@ -17,9 +17,11 @@
 
 #include <mxprotector_sdk/api.hpp>
 
-int main() {
-    std::uint32_t acc = 0;
-
+// ``__declspec(noinline)`` prevents MSVC /O2 from reordering or
+// dropping the MX_VM markers relative to the body they bracket.
+__declspec(noinline)
+static std::uint32_t vm_core(std::uint32_t x) {
+    std::uint32_t acc = x;
     MX_VM_BEGIN
     for (int i = 1; i <= 16; ++i) {
         acc += static_cast<std::uint32_t>(i * i);
@@ -27,7 +29,10 @@ int main() {
     }
     acc ^= 0xDEADBEEFu;
     MX_VM_END
+    return acc;
+}
 
-    std::printf("pure_vm: %u\n", acc);
+int main() {
+    std::printf("pure_vm: %u\n", vm_core(0u));
     return 0;
 }

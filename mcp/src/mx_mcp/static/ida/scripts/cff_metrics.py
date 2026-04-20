@@ -57,6 +57,7 @@ try:
     import ida_auto
     import ida_funcs
     import ida_hexrays
+    import ida_range
     import idautils
     import idc
 except Exception as exc:  # pragma: no cover — runs only inside IDA
@@ -67,6 +68,51 @@ except Exception as exc:  # pragma: no cover — runs only inside IDA
 _SCHEMA_VERSION = 1
 
 
+def _get_best_mba(fn) -> tuple[object, str] | tuple[None, None]:
+    """Return the most attacker-relevant microcode for this function.
+
+    Strategy:
+
+    1. Prefer **MMAT_GLBOPT3** via ``gen_microcode`` — this is the
+       maturity level where public CFF deobfuscators (d810, msynth's
+       microcode passes) hook. Metrics taken here reflect what an
+       attacker operating at the microcode layer actually sees.
+    2. Fall back to ``cfunc.mba`` (the post-full-decompile MBA, which
+       runs through every downstream simplification). Still useful —
+       if strong CFF survives Hex-Rays's own optimizer, that's the
+       signal. The ``mba_maturity`` field on the per-function record
+       marks which path succeeded so downstream consumers can split
+       the distributions.
+
+    Returns ``(mba, maturity_label)`` or ``(None, None)`` on total
+    failure.
+    """
+    # Primary — explicit microcode generation at the d810-targeted layer.
+    try:
+        mbr = ida_hexrays.mba_ranges_t()
+        mbr.ranges.push_back(ida_range.range_t(fn.start_ea, fn.end_ea))
+        hf = ida_hexrays.hexrays_failure_t()
+        mba = ida_hexrays.gen_microcode(
+            mbr, hf, None, 0, ida_hexrays.MMAT_GLBOPT3,
+        )
+        if mba is not None and getattr(mba, "qty", 0) > 0:
+            return mba, "MMAT_GLBOPT3"
+    except Exception:
+        pass  # fall through to the decompile path
+
+    # Fallback — the decompile-driven MBA. Later in the pipeline, more
+    # optimised, but still a useful signal when gen_microcode fails
+    # (which happens on malformed prologues, SEH landing pads, …).
+    try:
+        cfunc = ida_hexrays.decompile(fn.start_ea)
+        if cfunc is not None and cfunc.mba is not None:
+            return cfunc.mba, "MMAT_GENERATED"
+    except Exception:
+        pass
+
+    return None, None
+
+
 def _collect_function_metrics(fn_ea: int) -> dict | None:
     """Return one per-function record or None if the function is
     unreachable by the decompiler (uncaught library code, stripped
@@ -75,15 +121,8 @@ def _collect_function_metrics(fn_ea: int) -> dict | None:
     if fn is None:
         return None
 
-    try:
-        cfunc = ida_hexrays.decompile(fn.start_ea)
-    except Exception:
-        return None
-    if cfunc is None:
-        return None
-
-    mba = cfunc.mba
-    if mba is None:
+    mba, maturity = _get_best_mba(fn)
+    if mba is None or maturity is None:
         return None
 
     n_blocks = mba.qty
@@ -133,6 +172,7 @@ def _collect_function_metrics(fn_ea: int) -> dict | None:
         "ea": int(fn_ea),
         "name": str(name),
         "size": int(fn.size()),
+        "mba_maturity": str(maturity),
         "mc_blocks": int(n_blocks),
         "mc_gotos": int(n_gotos),
         "mc_edges": int(n_edges),

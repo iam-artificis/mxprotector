@@ -74,6 +74,7 @@ def _fn_metrics(name: str, ea: int, **kwargs) -> dict:
         "ea": ea,
         "name": name,
         "size": 64,
+        "mba_maturity": "MMAT_GLBOPT3",
         "mc_blocks": 10,
         "mc_gotos": 2,
         "mc_edges": 15,
@@ -308,6 +309,7 @@ def test_metric_values_match_ida_output(tmp_path: Path, monkeypatch):
     assert by_name["mc_cyclomatic"].samples[0].value == 19
     assert abs(by_name["mc_backedge_ratio"].samples[0].value - 0.33) < 1e-9
 
-    # Evidence carries the EA + function size for post-mortem.
+    # Evidence carries the EA + function size + MBA maturity for post-mortem.
     ev = by_name["mc_blocks"].samples[0].evidence
     assert ev["ea"] == 0x1000
+    assert ev["mba_maturity"] == "MMAT_GLBOPT3"

@@ -35,6 +35,14 @@ MxProtector builder on each of these inputs at run time, so the
 protected binaries always reflect the current builder state — there
 is no stale "protected corpus" checked in.
 
+### Convenience: `build_auto.bat`
+
+For ad-hoc builds from a plain `cmd` / bash shell (without opening a
+Developer Command Prompt), run `build_auto.bat` — it loads the
+MSVC x64 environment via `vcvars64.bat` before dispatching to
+`build.bat`. The path to `vcvars64.bat` is hard-coded for VS 2022
+Community; edit `VCVARS` in that file for other editions.
+
 ## Manifest (`corpus.json`)
 
 Schema v1. Each entry declares:

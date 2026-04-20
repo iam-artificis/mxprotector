@@ -225,11 +225,19 @@ async def _process_entry(
     for fn in functions:
         fn_name = fn.get("name") or f"sub_{fn.get('ea', 0):X}"
         sample_name = f"{entry.name}::{fn_name}"
+        # ``mba_maturity`` surfaces whether MMAT_GLBOPT3 (what d810
+        # attacks) or the decompile-driven fallback produced the
+        # numbers. Absent on older script output → None.
+        evidence_base = {
+            "ea": fn.get("ea"),
+            "fn_size": fn.get("size"),
+            "mba_maturity": fn.get("mba_maturity"),
+        }
         for metric_name, _ in _METRIC_DEFS:
             samples_by_metric[metric_name].append(MetricSample(
                 sample_name=sample_name,
                 value=fn.get(metric_name),
-                evidence={"ea": fn.get("ea"), "fn_size": fn.get("size")},
+                evidence=evidence_base,
             ))
 
     for err in ida_out.get("errors", []):
