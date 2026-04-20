@@ -56,7 +56,7 @@ from mx_mcp.common.benchmark_base import (
 )
 from mx_mcp.common.builder import (
     BuilderError,
-    build_protected,
+    ensure_protected,
     resolve_builder_path,
 )
 from mx_mcp.common.sidecar import Sidecar, load_sidecar
@@ -237,12 +237,11 @@ async def _process_entry(
     appended in place to ``samples_by_metric``.
     """
     errors: list[str] = []
-    protected_path = output_dir / f"{entry.name}.mx.exe"
 
     try:
-        pb = await build_protected(
-            unprotected=entry.unprotected_binary,
-            output=protected_path,
+        pb = await ensure_protected(
+            entry,
+            output_dir=output_dir,
             builder_path=builder_path,
             # ``--no-packer`` keeps the CFF / VM / string sections
             # as plaintext in the on-disk file. Packed builds encrypt
@@ -250,7 +249,8 @@ async def _process_entry(
             # runtime by the stub), so IDA loads encrypted bytes and
             # cannot analyse dispatchers. Benchmarking CFF therefore
             # requires the non-packed variant — packer quality gets
-            # its own benchmark in a later phase.
+            # its own benchmark in a later phase. Ignored for
+            # pre-protected entries (no build).
             extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )

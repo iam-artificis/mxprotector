@@ -1,7 +1,7 @@
 """Unit tests for benchmarks.cff_benchmark.
 
 Tests instantiate ``CffMicrocodeBenchmark`` directly and monkey-patch
-``build_protected`` + ``run_ida_script`` at the benchmark module to
+``ensure_protected`` + ``run_ida_script`` at the benchmark module to
 bypass the real builder and IDA. The benchmark's registration with
 the global registry is a side effect of import and not under test
 here — the shared registry is covered in ``test_benchmark_base.py``.
@@ -185,12 +185,17 @@ def _install_mocks(
     build_calls: list[Path] = []
     ida_calls: list[Path] = []
 
-    async def fake_build(**kw):
-        unprotected: Path = kw["unprotected"]
-        output: Path = kw["output"]
-        build_calls.append(unprotected)
+    async def fake_ensure(entry, **kw):
+        """Fake ``ensure_protected`` — builds a stub protected file +
+        synthetic sidecar in the requested ``output_dir``, keyed off
+        the entry name so ``build_map`` injections line up with corpus
+        entries by identifier."""
+        output_dir: Path = kw["output_dir"]
+        output = output_dir / f"{entry.name}.mx.exe"
+        source_binary = entry.unprotected_binary or entry.pre_protected_binary
+        build_calls.append(source_binary)
 
-        behaviour = (build_map or {}).get(unprotected.stem)
+        behaviour = (build_map or {}).get(entry.name)
         if isinstance(behaviour, Exception):
             raise behaviour
         # Default: write a stub output file and return a ProtectedBuild.
@@ -211,7 +216,7 @@ def _install_mocks(
                 include_cff=sidecar_has_cff,
             )
         return ProtectedBuild(
-            unprotected_binary=unprotected,
+            unprotected_binary=source_binary,
             protected_binary=output,
             sidecar_path=sidecar_path,
             duration_ms=1,
@@ -248,7 +253,7 @@ def _install_mocks(
             error=None,
         )
 
-    monkeypatch.setattr(cb, "build_protected", fake_build)
+    monkeypatch.setattr(cb, "ensure_protected", fake_ensure)
     monkeypatch.setattr(cb, "run_ida_script", fake_ida)
     monkeypatch.setattr(cb, "resolve_builder_path", lambda root: root / "fake_builder.exe")
 

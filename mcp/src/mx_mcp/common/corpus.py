@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 _LOG = logging.getLogger(__name__)
@@ -71,14 +71,62 @@ class CorpusEntrySpec(BaseModel):
 
     Values are validated by pydantic at load time but not yet resolved
     to filesystem paths — that happens in ``CorpusEntry`` below.
+
+    A single entry is one of two kinds:
+
+    * **Buildable** — ``binary`` points to an *unprotected* input that
+      the benchmark will feed through the current ``mxprotector_builder``
+      to produce a fresh protected artefact. Classic flow.
+    * **Pre-protected** — ``pre_protected`` points to an already-built
+      protected binary (e.g. a legacy exe preserved from an older
+      builder version). Build step is skipped; benchmarks that do not
+      need a sidecar (pe-sieve, unicorn, OEP-reach) run directly.
+      Sidecar-dependent benchmarks (CFF / VM) skip such entries with a
+      "no sidecar" error — they cannot retrofit the role→section
+      mapping from a bare binary.
+
+    At least one of ``binary`` / ``pre_protected`` must be present.
+    Supplying both is also legal (the pre-protected path takes
+    precedence; the unprotected one stays for provenance).
     """
 
     name: str = Field(description="Stable identifier; used in metric evidence.")
-    binary: str = Field(description="Path to the unprotected binary, relative to corpus root.")
+    binary: str | None = Field(
+        default=None,
+        description=(
+            "Path to the unprotected binary, relative to the corpus "
+            "root. Feed into mxprotector_builder at benchmark time."
+        ),
+    )
+    pre_protected: str | None = Field(
+        default=None,
+        description=(
+            "Path to an already-protected binary, relative to the "
+            "corpus root. When set, the benchmark skips the build step "
+            "and analyses this file directly."
+        ),
+    )
+    pre_sidecar: str | None = Field(
+        default=None,
+        description=(
+            "Optional sidecar (.mxtrace.json) that accompanies "
+            "``pre_protected``. Sidecar-dependent benchmarks use it "
+            "instead of re-emitting one. Ignored when unset."
+        ),
+    )
     tags: list[str] = Field(
         default_factory=list,
         description="Protection-surface tags (vm, cff, mixed, tls, seh, dll, …).",
     )
+
+    @model_validator(mode="after")
+    def _require_source(self) -> "CorpusEntrySpec":
+        if self.binary is None and self.pre_protected is None:
+            raise ValueError(
+                f"corpus entry '{self.name}' has neither 'binary' nor "
+                f"'pre_protected' — at least one is required"
+            )
+        return self
 
 
 class CorpusManifest(BaseModel):
@@ -101,11 +149,28 @@ class CorpusManifest(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class CorpusEntry:
-    """Resolved corpus entry — binary path verified to exist at load time."""
+    """Resolved corpus entry — every present path is verified at load time.
+
+    Buildable entries carry ``unprotected_binary`` set,
+    ``pre_protected_binary=None``. Pre-protected entries carry
+    ``pre_protected_binary`` set (and optionally ``pre_sidecar``);
+    ``unprotected_binary`` may be ``None`` for purely legacy artefacts
+    whose original source is no longer available.
+
+    Invariant: at least one of ``unprotected_binary`` /
+    ``pre_protected_binary`` is non-``None`` (enforced in ``Corpus.load``).
+    """
 
     name: str
-    unprotected_binary: Path
+    unprotected_binary: Path | None
+    pre_protected_binary: Path | None
+    pre_sidecar: Path | None
     tags: frozenset[str]
+
+    @property
+    def is_pre_protected(self) -> bool:
+        """True when this entry skips the builder (legacy / preserved binary)."""
+        return self.pre_protected_binary is not None
 
 
 class CorpusLoadError(ValueError):
@@ -164,27 +229,80 @@ class Corpus:
                 )
             seen_names.add(spec.name)
 
-            binary_path = (root / spec.binary).resolve()
-            if not binary_path.exists():
-                missing.append(f"  {spec.name}: {binary_path}")
+            resolved = cls._resolve_entry_paths(root, spec, missing)
+            if resolved is None:
                 continue
-
-            entries.append(CorpusEntry(
-                name=spec.name,
-                unprotected_binary=binary_path,
-                tags=frozenset(spec.tags),
-            ))
+            entries.append(resolved)
 
         if missing:
             raise CorpusLoadError(
                 f"corpus binaries missing ({len(missing)} of "
                 f"{len(manifest.entries)}):\n"
                 + "\n".join(missing)
-                + f"\n\nRun {root / 'build.bat'} to produce them."
+                + f"\n\nRun {root / 'build.bat'} to produce buildable "
+                f"inputs, or fix the pre_protected path."
             )
 
         _LOG.info("loaded corpus '%s': %d entries", root, len(entries))
         return cls(root=root, entries=entries)
+
+    # ------------------------------------------------------------------
+    # Path resolution (per-entry)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_entry_paths(
+        root: Path, spec: CorpusEntrySpec, missing: list[str],
+    ) -> CorpusEntry | None:
+        """Verify every declared path exists and build a :class:`CorpusEntry`.
+
+        Missing paths are appended to ``missing`` (accumulated so the
+        error message lists every broken reference at once, not just
+        the first). On any missing path, ``None`` is returned and the
+        caller skips the entry.
+
+        Precondition (enforced by ``CorpusEntrySpec.model_validator``):
+        at least one of ``binary`` / ``pre_protected`` is set.
+        """
+        unprotected: Path | None = None
+        pre_protected: Path | None = None
+        pre_sidecar: Path | None = None
+        entry_missing = False
+
+        if spec.binary is not None:
+            p = (root / spec.binary).resolve()
+            if not p.exists():
+                missing.append(f"  {spec.name} (binary): {p}")
+                entry_missing = True
+            else:
+                unprotected = p
+
+        if spec.pre_protected is not None:
+            p = (root / spec.pre_protected).resolve()
+            if not p.exists():
+                missing.append(f"  {spec.name} (pre_protected): {p}")
+                entry_missing = True
+            else:
+                pre_protected = p
+
+        if spec.pre_sidecar is not None:
+            p = (root / spec.pre_sidecar).resolve()
+            if not p.exists():
+                missing.append(f"  {spec.name} (pre_sidecar): {p}")
+                entry_missing = True
+            else:
+                pre_sidecar = p
+
+        if entry_missing:
+            return None
+
+        return CorpusEntry(
+            name=spec.name,
+            unprotected_binary=unprotected,
+            pre_protected_binary=pre_protected,
+            pre_sidecar=pre_sidecar,
+            tags=frozenset(spec.tags),
+        )
 
     # ------------------------------------------------------------------
     # Accessors

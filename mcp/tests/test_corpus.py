@@ -141,3 +141,102 @@ def test_schema_version_constant_matches_manifest_acceptance(tmp_path: Path):
     ], version=CORPUS_SCHEMA_VERSION)
     corpus = Corpus.load(tmp_path)
     assert len(corpus) == 1
+
+
+# ============================================================================
+# Pre-protected entries — legacy binaries the current builder did not
+# produce. Benchmarks that do not need a sidecar (P3 pe-sieve and
+# later) use them for "then vs now" comparisons.
+# ============================================================================
+
+
+def test_pre_protected_only_entry_loads(tmp_path: Path):
+    _touch_binary(tmp_path, "legacy/old.exe.packed")
+    _write_manifest(tmp_path, [
+        {"name": "legacy", "pre_protected": "legacy/old.exe.packed",
+         "tags": ["packer", "exe"]},
+    ])
+    corpus = Corpus.load(tmp_path)
+    entry = corpus.by_name("legacy")
+    assert entry.unprotected_binary is None
+    assert entry.pre_protected_binary is not None
+    assert entry.pre_protected_binary.name == "old.exe.packed"
+    assert entry.pre_sidecar is None
+    assert entry.is_pre_protected is True
+
+
+def test_pre_protected_with_sidecar(tmp_path: Path):
+    _touch_binary(tmp_path, "legacy/old.exe")
+    _touch_binary(tmp_path, "legacy/old.exe.mxtrace.json")
+    _write_manifest(tmp_path, [
+        {"name": "legacy", "pre_protected": "legacy/old.exe",
+         "pre_sidecar": "legacy/old.exe.mxtrace.json", "tags": ["exe"]},
+    ])
+    corpus = Corpus.load(tmp_path)
+    entry = corpus.by_name("legacy")
+    assert entry.pre_sidecar is not None
+    assert entry.pre_sidecar.name == "old.exe.mxtrace.json"
+
+
+def test_mixed_buildable_plus_preprotected(tmp_path: Path):
+    _touch_binary(tmp_path, "bin/fresh.exe")
+    _touch_binary(tmp_path, "legacy/old.exe.packed")
+    _write_manifest(tmp_path, [
+        {"name": "fresh",  "binary": "bin/fresh.exe", "tags": ["vm"]},
+        {"name": "legacy", "pre_protected": "legacy/old.exe.packed",
+         "tags": ["packer"]},
+    ])
+    corpus = Corpus.load(tmp_path)
+    assert corpus.by_name("fresh").is_pre_protected is False
+    assert corpus.by_name("legacy").is_pre_protected is True
+
+
+def test_entry_with_both_binary_and_pre_protected(tmp_path: Path):
+    """Allowed: the unprotected path is kept for provenance, the
+    benchmark prefers the pre-protected one."""
+    _touch_binary(tmp_path, "bin/src.exe")
+    _touch_binary(tmp_path, "legacy/built.exe.packed")
+    _write_manifest(tmp_path, [
+        {"name": "both", "binary": "bin/src.exe",
+         "pre_protected": "legacy/built.exe.packed", "tags": []},
+    ])
+    corpus = Corpus.load(tmp_path)
+    entry = corpus.by_name("both")
+    assert entry.unprotected_binary is not None
+    assert entry.pre_protected_binary is not None
+    assert entry.is_pre_protected is True  # pre-protected wins routing.
+
+
+def test_entry_without_any_source_rejected(tmp_path: Path):
+    """CorpusEntrySpec.model_validator fires — neither binary nor
+    pre_protected → manifest is structurally invalid."""
+    (tmp_path / "corpus.json").write_text(
+        json.dumps({
+            "schema_version": CORPUS_SCHEMA_VERSION,
+            "entries": [{"name": "nothing", "tags": ["vm"]}],
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(CorpusLoadError):
+        Corpus.load(tmp_path)
+
+
+def test_missing_pre_protected_file_reported(tmp_path: Path):
+    """A non-existent pre_protected path must surface in the 'missing'
+    aggregate so fixing the manifest is actionable."""
+    _write_manifest(tmp_path, [
+        {"name": "gone", "pre_protected": "legacy/does_not_exist.exe",
+         "tags": []},
+    ])
+    with pytest.raises(CorpusLoadError, match="pre_protected"):
+        Corpus.load(tmp_path)
+
+
+def test_missing_pre_sidecar_reported(tmp_path: Path):
+    _touch_binary(tmp_path, "legacy/old.exe")
+    _write_manifest(tmp_path, [
+        {"name": "legacy", "pre_protected": "legacy/old.exe",
+         "pre_sidecar": "legacy/missing.mxtrace.json", "tags": []},
+    ])
+    with pytest.raises(CorpusLoadError, match="pre_sidecar"):
+        Corpus.load(tmp_path)

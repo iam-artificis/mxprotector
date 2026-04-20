@@ -137,12 +137,13 @@ def _install_mocks(
     build_calls: list[Path] = []
     byte_calls: list[tuple[Path, int, int]] = []
 
-    async def fake_build(**kw):
-        unprotected: Path = kw["unprotected"]
-        output: Path = kw["output"]
-        build_calls.append(unprotected)
+    async def fake_ensure(entry, **kw):
+        output_dir: Path = kw["output_dir"]
+        output = output_dir / f"{entry.name}.mx.exe"
+        source_binary = entry.unprotected_binary or entry.pre_protected_binary
+        build_calls.append(source_binary)
 
-        behaviour = (build_map or {}).get(unprotected.stem)
+        behaviour = (build_map or {}).get(entry.name)
         if isinstance(behaviour, Exception):
             raise behaviour
 
@@ -163,7 +164,7 @@ def _install_mocks(
                 include_vm=sidecar_has_vm,
             )
         return ProtectedBuild(
-            unprotected_binary=unprotected,
+            unprotected_binary=source_binary,
             protected_binary=output,
             sidecar_path=sidecar_path,
             duration_ms=1,
@@ -182,7 +183,7 @@ def _install_mocks(
         # metric is non-zero but reproducible.
         return bytes((i * 131 + 7) & 0xFF for i in range(size))
 
-    monkeypatch.setattr(vb, "build_protected", fake_build)
+    monkeypatch.setattr(vb, "ensure_protected", fake_ensure)
     monkeypatch.setattr(vb, "read_section_bytes", fake_read_section_bytes)
     monkeypatch.setattr(vb, "resolve_builder_path",
                         lambda root: root / "fake_builder.exe")

@@ -20,8 +20,10 @@ from mx_mcp.common.builder import (
     BuilderError,
     ProtectedBuild,
     build_protected,
+    ensure_protected,
     resolve_builder_path,
 )
+from mx_mcp.common.corpus import CorpusEntry
 
 
 # ============================================================================
@@ -243,4 +245,134 @@ def test_build_protected_timeout_raises(tmp_path: Path, monkeypatch):
         asyncio.run(build_protected(
             unprotected=unprotected, output=output, builder_path=builder,
             timeout_s=1.0,
+        ))
+
+
+# ============================================================================
+# ensure_protected — dispatcher across buildable + pre-protected entries.
+# ============================================================================
+
+
+def _buildable_entry(unprotected: Path, name: str = "alpha") -> CorpusEntry:
+    return CorpusEntry(
+        name=name,
+        unprotected_binary=unprotected,
+        pre_protected_binary=None,
+        pre_sidecar=None,
+        tags=frozenset(),
+    )
+
+
+def _preprotected_entry(
+    protected: Path, *, sidecar: Path | None = None,
+    unprotected: Path | None = None, name: str = "legacy",
+) -> CorpusEntry:
+    return CorpusEntry(
+        name=name,
+        unprotected_binary=unprotected,
+        pre_protected_binary=protected,
+        pre_sidecar=sidecar,
+        tags=frozenset(),
+    )
+
+
+def test_ensure_protected_forwards_buildable_to_subprocess(
+    tmp_path: Path, monkeypatch,
+):
+    """Buildable entries go through ``build_protected`` (subprocess).
+    The fake runner observes one invocation with the expected args."""
+    builder = _touch_builder(tmp_path)
+    unprotected = _touch_input(tmp_path)
+    output_dir = tmp_path / "out"
+
+    expected_output = output_dir / "alpha.mx.exe"
+    sidecar = output_dir / "alpha.mx.exe.mxtrace.json"
+    captured = _install_fake_runner(
+        monkeypatch, _ok_proc(),
+        output_path=expected_output, sidecar_path=sidecar,
+    )
+
+    result = asyncio.run(ensure_protected(
+        _buildable_entry(unprotected),
+        output_dir=output_dir, builder_path=builder,
+    ))
+
+    assert isinstance(result, ProtectedBuild)
+    assert result.protected_binary == expected_output
+    assert result.sidecar_path == sidecar
+    # Subprocess fired once with the entry's input.
+    assert len(captured) == 1
+    assert str(unprotected) in captured[0]
+
+
+def test_ensure_protected_returns_preserved_artifacts_without_subprocess(
+    tmp_path: Path, monkeypatch,
+):
+    """Pre-protected entries skip the builder entirely."""
+    protected = tmp_path / "legacy.exe.packed"
+    protected.write_bytes(b"\x4d\x5a")
+    sidecar = tmp_path / "legacy.mxtrace.json"
+    sidecar.write_text('{"schema_version": 1}', encoding="utf-8")
+
+    # Any subprocess invocation would be a test failure.
+    def not_called(*a, **kw):
+        raise AssertionError("ensure_protected called subprocess for a pre-protected entry")
+    monkeypatch.setattr(builder_mod, "_run_subprocess", not_called)
+
+    result = asyncio.run(ensure_protected(
+        _preprotected_entry(protected, sidecar=sidecar),
+        output_dir=tmp_path / "should_be_unused",
+        builder_path=tmp_path / "never_touched.exe",
+    ))
+
+    assert result.protected_binary == protected
+    assert result.sidecar_path == sidecar
+    assert result.duration_ms == 0
+    assert "pre-protected" in result.stdout_tail
+
+
+def test_ensure_protected_preprotected_without_sidecar(
+    tmp_path: Path, monkeypatch,
+):
+    """Legacy binaries without a sidecar are still usable — only
+    sidecar-dependent benchmarks care, and they will report a clear
+    per-entry error when they try to load it."""
+    protected = tmp_path / "old.exe.packed"
+    protected.write_bytes(b"\x4d\x5a")
+
+    monkeypatch.setattr(
+        builder_mod, "_run_subprocess",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+
+    result = asyncio.run(ensure_protected(
+        _preprotected_entry(protected),
+        output_dir=tmp_path, builder_path=tmp_path / "nope.exe",
+    ))
+    assert result.sidecar_path is None
+
+
+def test_ensure_protected_missing_preprotected_file_raises(tmp_path: Path):
+    """A pre-protected file that disappears between Corpus.load (which
+    verified it) and benchmark execution must raise a clear error."""
+    gone = tmp_path / "deleted.exe"  # never created
+    with pytest.raises(FileNotFoundError, match="pre-protected binary missing"):
+        asyncio.run(ensure_protected(
+            _preprotected_entry(gone),
+            output_dir=tmp_path, builder_path=tmp_path / "b.exe",
+        ))
+
+
+def test_ensure_protected_entry_with_neither_source_raises(tmp_path: Path):
+    """Defensive check — Corpus.load should block this shape but the
+    dispatcher asserts it too so callers see a clean BuilderError
+    rather than an AttributeError."""
+    empty = CorpusEntry(
+        name="broken", unprotected_binary=None,
+        pre_protected_binary=None, pre_sidecar=None, tags=frozenset(),
+    )
+    with pytest.raises(BuilderError, match="neither unprotected nor pre-protected"):
+        asyncio.run(ensure_protected(
+            empty,
+            output_dir=tmp_path, builder_path=tmp_path / "b.exe",
         ))

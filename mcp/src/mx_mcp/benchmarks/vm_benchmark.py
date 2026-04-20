@@ -57,7 +57,7 @@ from mx_mcp.common.benchmark_base import (
 )
 from mx_mcp.common.builder import (
     BuilderError,
-    build_protected,
+    ensure_protected,
     resolve_builder_path,
 )
 from mx_mcp.common.pe_reader import (
@@ -230,17 +230,16 @@ async def _process_entry(
     Returns accumulated error strings. On success, appends one sample
     per metric to ``samples_by_metric`` in place.
     """
-    protected_path = output_dir / f"{entry.name}.mx.exe"
-
     try:
-        pb = await build_protected(
-            unprotected=entry.unprotected_binary,
-            output=protected_path,
+        pb = await ensure_protected(
+            entry,
+            output_dir=output_dir,
             builder_path=builder_path,
             # Same reasoning as cff_benchmark: ``--no-packer`` keeps
             # the VM bytecode plaintext on disk. Packed builds would
             # hand us RC4 ciphertext — still high-entropy, but a
-            # dishonest inflation of the quality metrics.
+            # dishonest inflation of the quality metrics. Ignored for
+            # pre-protected entries (no build).
             extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )

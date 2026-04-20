@@ -36,6 +36,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mx_mcp.common.corpus import CorpusEntry
 
 
 _LOG = logging.getLogger(__name__)
@@ -205,4 +209,82 @@ async def build_protected(
         duration_ms=duration_ms,
         stdout_tail=_tail(proc.stdout),
         stderr_tail=_tail(proc.stderr),
+    )
+
+
+async def ensure_protected(
+    entry: "CorpusEntry",
+    *,
+    output_dir: Path,
+    builder_path: Path,
+    level: str = "strong",
+    extra_args: list[str] | None = None,
+    trace_hints: bool = True,
+    timeout_s: float = DEFAULT_BUILDER_TIMEOUT_S,
+    workspace_root: Path | None = None,
+) -> ProtectedBuild:
+    """Return a :class:`ProtectedBuild` for a corpus entry.
+
+    Dispatches on the entry kind:
+
+    * **Pre-protected** (``entry.pre_protected_binary`` set) — returns
+      a ``ProtectedBuild`` pointing directly at the preserved artefact.
+      No subprocess is invoked; the build-related timing fields report
+      ``0 ms`` / empty stdout tails so callers can still log uniform
+      timing reports.
+    * **Buildable** — forwards to :func:`build_protected`, picking an
+      output path of ``{output_dir}/{entry.name}.mx.exe``.
+
+    This is the single entry point benchmarks should call. Inline
+    dispatch in each benchmark was the alternative; centralising it
+    here keeps every benchmark oblivious to legacy-binary plumbing
+    and makes future additions (e.g. signed-build corpus entries)
+    one-file changes.
+
+    Raises:
+        FileNotFoundError: a declared input path does not exist
+            (``pre_protected_binary`` or ``unprotected_binary``).
+        BuilderError: fresh-build path failed (see :func:`build_protected`).
+    """
+    if entry.pre_protected_binary is not None:
+        if not entry.pre_protected_binary.exists():
+            raise FileNotFoundError(
+                f"pre-protected binary missing for '{entry.name}': "
+                f"{entry.pre_protected_binary}"
+            )
+        _LOG.info(
+            "use pre-protected %s → %s%s",
+            entry.name,
+            entry.pre_protected_binary.name,
+            " (+sidecar)" if entry.pre_sidecar else "",
+        )
+        return ProtectedBuild(
+            unprotected_binary=entry.unprotected_binary
+                or entry.pre_protected_binary,
+            protected_binary=entry.pre_protected_binary,
+            sidecar_path=entry.pre_sidecar,
+            duration_ms=0,
+            stdout_tail="(pre-protected entry — build step skipped)",
+            stderr_tail="",
+        )
+
+    if entry.unprotected_binary is None:
+        # Should be impossible by construction (Corpus.load enforces at
+        # least one source path), but guard explicitly — a clear error
+        # beats an opaque AttributeError downstream.
+        raise BuilderError(
+            f"corpus entry '{entry.name}' has neither unprotected nor "
+            f"pre-protected source"
+        )
+
+    output = output_dir / f"{entry.name}.mx.exe"
+    return await build_protected(
+        unprotected=entry.unprotected_binary,
+        output=output,
+        builder_path=builder_path,
+        level=level,
+        extra_args=extra_args,
+        trace_hints=trace_hints,
+        timeout_s=timeout_s,
+        workspace_root=workspace_root,
     )
