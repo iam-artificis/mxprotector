@@ -161,6 +161,7 @@ set(CFF_SOURCES
 set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/trace_hints.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/trace_hints_serialize.cpp
 )
 
 # CLI helpers needed by CLI-level unit tests (section name pool —

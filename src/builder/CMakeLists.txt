@@ -33,6 +33,7 @@ set(BUILDER_SOURCES
     analysis/cfg_builder.cpp
     analysis/marker_scanner.cpp
     analysis/trace_hints.cpp
+    analysis/trace_hints_serialize.cpp
 
     # Инфраструктура защиты
     protection/pass_manager.cpp

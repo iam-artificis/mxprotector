@@ -173,4 +173,166 @@ TEST(TraceHintsTest, JsonEndsWithNewline) {
     EXPECT_EQ(json.back(), '\n');
 }
 
+// ============================================================================
+// Phase 4A — CFF / VM / Guard / Strings / IAT
+// ============================================================================
+
+TEST(TraceHintsTest, CffDispatcherAndStatesSerialized) {
+    TraceHints h;
+    h.set_cff_dispatcher(0x4000, 0x5010);
+    h.add_cff_state(0, 0x4100, 0x1234, CffStateKind::original);
+    h.add_cff_state(1, 0x4140, 0x5678, CffStateKind::predicate);
+    h.add_cff_state(2, 0x4180, 0,      CffStateKind::bogus);
+    h.add_opaque_predicate(0, 0x4200, PredicateKind::opaque_hash);
+    h.add_opaque_predicate(1, 0x4220, PredicateKind::mba_transition);
+
+    EXPECT_FALSE(h.empty());
+    const auto json = h.to_json();
+
+    // Dispatcher + state_var RVAs
+    EXPECT_TRUE(contains(json, "\"dispatcher_rva\": 16384"));  // 0x4000
+    EXPECT_TRUE(contains(json, "\"state_var_rva\": 20496"));   // 0x5010
+
+    // States — ids + rvas + kinds
+    EXPECT_TRUE(contains(json, "\"dispatcher_entry_rva\": 16640"));  // 0x4100
+    EXPECT_TRUE(contains(json, "\"source_bb_rva\": 4660"));          // 0x1234
+    EXPECT_TRUE(contains(json, "\"kind\": \"original\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"predicate\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"bogus\""));
+
+    // Predicates — two with different kinds
+    EXPECT_TRUE(contains(json, "\"kind\": \"opaque_hash\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"mba_transition\""));
+
+    // Read-back API
+    EXPECT_EQ(h.cff().dispatcher_rva, 0x4000u);
+    EXPECT_EQ(h.cff().state_var_rva,  0x5010u);
+    ASSERT_EQ(h.cff().states.size(),     size_t{3});
+    ASSERT_EQ(h.cff().predicates.size(), size_t{2});
+    EXPECT_EQ(h.cff().states[2].kind, CffStateKind::bogus);
+}
+
+TEST(TraceHintsTest, VmDispatcherAndHandlersSerialized) {
+    TraceHints h;
+    h.set_vm_dispatcher(0x10000, 0x10800);
+    h.add_vm_handler(0, 0x10900, 64, "ADD_R64");
+    h.add_vm_handler(1, 0x10940, 48, "XOR_R64");
+
+    const auto json = h.to_json();
+    EXPECT_TRUE(contains(json, "\"dispatcher_rva\": 65536"));
+    EXPECT_TRUE(contains(json, "\"handler_table_rva\": 67584"));
+    EXPECT_TRUE(contains(json, "\"opcode\": \"ADD_R64\""));
+    EXPECT_TRUE(contains(json, "\"opcode\": \"XOR_R64\""));
+    EXPECT_TRUE(contains(json, "\"rva\": 67840"));   // 0x10900
+    EXPECT_TRUE(contains(json, "\"size\": 64"));
+
+    EXPECT_EQ(h.vm().handlers.size(), size_t{2});
+    EXPECT_EQ(h.vm().handlers.front().opcode, "ADD_R64");
+}
+
+TEST(TraceHintsTest, GuardRegionsSerialized) {
+    TraceHints h;
+    h.add_guard_region(0, 0x20000, 128);
+    h.add_guard_region(1, 0x20080, 256);
+
+    const auto json = h.to_json();
+    // Each region emits id, rva, size
+    EXPECT_TRUE(contains(json, "\"id\": 0"));
+    EXPECT_TRUE(contains(json, "\"id\": 1"));
+    EXPECT_TRUE(contains(json, "\"rva\": 131072"));  // 0x20000
+    EXPECT_TRUE(contains(json, "\"size\": 128"));
+    EXPECT_TRUE(contains(json, "\"size\": 256"));
+
+    EXPECT_EQ(h.guard().regions.size(), size_t{2});
+}
+
+TEST(TraceHintsTest, StringSlotsSerialized) {
+    TraceHints h;
+    h.add_string_slot(0, 0x30000, 16);
+    h.add_string_slot(1, 0x30020, 48);
+
+    const auto json = h.to_json();
+    EXPECT_TRUE(contains(json, "\"desc_rva\": 196608"));   // 0x30000
+    EXPECT_TRUE(contains(json, "\"plaintext_len\": 16"));
+    EXPECT_TRUE(contains(json, "\"plaintext_len\": 48"));
+
+    EXPECT_EQ(h.strings().slots.size(), size_t{2});
+}
+
+TEST(TraceHintsTest, IatSerialized) {
+    TraceHints h;
+    h.set_iat(0x2000, 0x400);
+
+    const auto json = h.to_json();
+    EXPECT_TRUE(contains(json, "\"iat\": { \"rva\": 8192, \"size\": 1024 }"));
+    EXPECT_EQ(h.iat().rva,  0x2000u);
+    EXPECT_EQ(h.iat().size, 0x400u);
+}
+
+TEST(TraceHintsTest, EmptyFlagsAllPhase4AFields) {
+    // Each Phase 4A mutation alone should break emptiness.
+    {
+        TraceHints h; h.set_cff_dispatcher(0x1000, 0);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_cff_state(0, 0, 0, CffStateKind::original);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_opaque_predicate(0, 0, PredicateKind::opaque_hash);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.set_vm_dispatcher(0x1000, 0);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_vm_handler(0, 0, 0, "NOP");
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_guard_region(0, 0, 0);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_string_slot(0, 0, 0);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.set_iat(0x1000, 0);
+        EXPECT_FALSE(h.empty());
+    }
+}
+
+TEST(TraceHintsTest, AllSectionsCoexistInOneJson) {
+    TraceHints h;
+    h.set_build_info("in.exe", "out.exe", "strong", "t");
+    h.add_section("packer", ".abc", 0x5000, 0x200, 0x60000020);
+    h.set_cff_dispatcher(0x4000, 0x5010);
+    h.add_cff_state(0, 0x4100, 0x1234, CffStateKind::original);
+    h.add_opaque_predicate(0, 0x4200, PredicateKind::opaque_hash);
+    h.set_vm_dispatcher(0x10000, 0x10800);
+    h.add_vm_handler(0, 0x10900, 64, "ADD_R64");
+    h.add_guard_region(0, 0x20000, 128);
+    h.add_string_slot(0, 0x30000, 16);
+    h.set_iat(0x2000, 0x400);
+
+    const auto json = h.to_json();
+
+    // Ensure the final document is still valid: schema_version first,
+    // every top-level key present, ends with '\n' + '}\n'.
+    EXPECT_TRUE(contains(json, "\"schema_version\": 1"));
+    for (std::string_view top : {"\"build\"", "\"sections\"", "\"cff\"",
+                                 "\"vm\"", "\"guard\"", "\"strings\"",
+                                 "\"iat\""})
+    {
+        EXPECT_TRUE(contains(json, top)) << "missing top-level key: " << top;
+    }
+    EXPECT_EQ(json.back(), '\n');
+    // Closing brace sits on its own line just before trailing newline.
+    ASSERT_GT(json.size(), size_t{2});
+    EXPECT_EQ(json[json.size() - 2], '}');
+}
+
 } // namespace mx::analysis
