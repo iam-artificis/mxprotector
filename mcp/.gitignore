@@ -9,3 +9,6 @@ build/
 dist/
 .venv/
 venv/
+
+# Dev smoke output — scripts/_smoke_* writes here; not a repo artifact.
+_smoke_*.png
