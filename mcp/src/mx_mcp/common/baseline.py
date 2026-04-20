@@ -63,15 +63,30 @@ class BaselineError(RuntimeError):
 class CfgBaseline:
     """Aggregate CFG + PE measurements for one unprotected binary.
 
-    CFG totals sum across every function the decompiler could lift in
-    per-function IDA mode. They are the denominator of amplification
-    ratios: ``protected_section_blocks / total_blocks`` tells us how
-    many microcode blocks the CFF pass emitted *per block of original
-    source code*.
+    CFG totals sum across every *matched* function. When a filter
+    was applied (see :meth:`CfgBaselineCache.get`), the totals reflect
+    only functions whose range covered at least one filter RVA — the
+    amplification denominator that pairs semantically with the
+    protected-side aggregate.
 
-    ``text_section_size`` is the virtual size of the unprotected
-    ``.text`` — serves as the denominator for VM bytecode density
-    (bytecode bytes per byte of original code).
+    Fields:
+
+    * ``function_count`` — number of functions whose metrics are
+      folded into the totals (filtered count when a filter was in
+      effect, total when unfiltered).
+    * ``total_blocks`` / ``total_cyclomatic`` / ``total_gotos`` —
+      summed across the matched functions.
+    * ``functions_total_bytes`` — sum of ``func.size()`` over matched
+      functions. Under a filter this is "unprotected source bytes of
+      exactly the functions we protected", the natural denominator for
+      VM bytecode density.
+    * ``text_section_size`` — raw virtual size of the ``.text``
+      section. Independent of any filter (PE header reading, not
+      function enumeration). Useful as a sanity check and as
+      fallback denominator for unfiltered measurements.
+    * ``filter_rvas`` — the filter that was in effect, or ``None``
+      for unfiltered measurements. Stored for provenance so evidence
+      payloads can self-describe.
     """
 
     binary_path: Path
@@ -79,14 +94,28 @@ class CfgBaseline:
     total_blocks: int
     total_cyclomatic: int
     total_gotos: int
+    functions_total_bytes: int
     text_section_size: int
+    filter_rvas: frozenset[int] | None = None
 
 
 class ICfgBaselineProvider(Protocol):
     """Computes a fresh :class:`CfgBaseline` for one unprotected binary."""
 
-    async def measure(self, binary: Path) -> CfgBaseline:
+    async def measure(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
         """Return the baseline measurements.
+
+        ``filter_rvas`` — optional set of input-PE RVAs. When set, the
+        provider only aggregates functions whose range covers at least
+        one listed RVA. This is how the normalised benchmarks pair
+        the baseline with the same set of functions the protector
+        defended (see ``sidecar.protected_functions``). ``None`` or
+        empty means "measure every function".
 
         Raises :class:`BaselineError` on any measurement failure the
         cache should not retain (IDA unavailable, PE unreadable,
@@ -105,11 +134,18 @@ class _Key:
     mtime intact still disagrees on size in virtually every real
     case, so the combined key invalidates where mtime alone would
     silently serve stale data.
+
+    ``filter_rvas`` distinguishes filtered from unfiltered
+    measurements of the same binary — two baselines with different
+    filters are legitimately distinct measurements and cannot share
+    a cache entry. ``None`` is the sentinel for the unfiltered
+    variant; it compares unequal to any explicit ``frozenset``.
     """
 
     path: str
     mtime_ns: int
     size: int
+    filter_rvas: frozenset[int] | None
 
 
 class CfgBaselineCache:
@@ -133,8 +169,18 @@ class CfgBaselineCache:
         self._store: dict[_Key, CfgBaseline] = {}
         self._lock = asyncio.Lock()
 
-    async def get(self, binary: Path) -> CfgBaseline:
+    async def get(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
         """Return the cached baseline for ``binary`` or compute fresh.
+
+        ``filter_rvas`` forwards to :meth:`ICfgBaselineProvider.measure`
+        and extends the cache key — filtered and unfiltered measurements
+        of the same binary share no storage and do not invalidate each
+        other.
 
         Raises:
             FileNotFoundError: ``binary`` missing on disk — distinct
@@ -145,17 +191,26 @@ class CfgBaselineCache:
         if not binary.exists():
             raise FileNotFoundError(f"baseline input missing: {binary}")
 
-        key = self._make_key(binary)
+        key = self._make_key(binary, filter_rvas)
         async with self._lock:
             cached = self._store.get(key)
             if cached is not None:
-                _LOG.debug("baseline cache hit: %s", binary.name)
+                _LOG.debug(
+                    "baseline cache hit: %s (filter=%s)",
+                    binary.name,
+                    "none" if filter_rvas is None
+                    else f"{len(filter_rvas)} rva(s)",
+                )
                 return cached
             _LOG.info(
-                "baseline cache miss: measuring %s via %s",
+                "baseline cache miss: measuring %s via %s (filter=%s)",
                 binary.name, type(self._provider).__name__,
+                "none" if filter_rvas is None
+                else f"{len(filter_rvas)} rva(s)",
             )
-            measurement = await self._provider.measure(binary)
+            measurement = await self._provider.measure(
+                binary, filter_rvas=filter_rvas,
+            )
             self._store[key] = measurement
             return measurement
 
@@ -163,10 +218,14 @@ class CfgBaselineCache:
         return len(self._store)
 
     @staticmethod
-    def _make_key(path: Path) -> _Key:
+    def _make_key(
+        path: Path,
+        filter_rvas: frozenset[int] | None,
+    ) -> _Key:
         stat = path.stat()
         return _Key(
             path=str(path.resolve()),
             mtime_ns=stat.st_mtime_ns,
             size=stat.st_size,
+            filter_rvas=filter_rvas,
         )

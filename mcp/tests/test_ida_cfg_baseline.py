@@ -98,9 +98,9 @@ def _ida_output(records: list[dict[str, Any]]) -> dict[str, Any]:
 def test_measure_aggregates_per_function_records(tmp_path: Path, monkeypatch):
     binary = _touch_binary(tmp_path)
     records = [
-        {"mc_blocks": 10, "mc_cyclomatic": 5, "mc_gotos": 1},
-        {"mc_blocks": 25, "mc_cyclomatic": 12, "mc_gotos": 3},
-        {"mc_blocks": 8, "mc_cyclomatic": 4, "mc_gotos": 0},
+        {"mc_blocks": 10, "mc_cyclomatic": 5,  "mc_gotos": 1, "size": 128},
+        {"mc_blocks": 25, "mc_cyclomatic": 12, "mc_gotos": 3, "size": 512},
+        {"mc_blocks": 8,  "mc_cyclomatic": 4,  "mc_gotos": 0, "size": 96},
     ]
     captured = _install_fake_ida(monkeypatch, output=_ida_output(records))
     _install_fake_text_size(monkeypatch, size=16384)
@@ -114,7 +114,9 @@ def test_measure_aggregates_per_function_records(tmp_path: Path, monkeypatch):
     assert baseline.total_blocks == 43          # 10 + 25 + 8
     assert baseline.total_cyclomatic == 21      # 5 + 12 + 4
     assert baseline.total_gotos == 4            # 1 + 3 + 0
+    assert baseline.functions_total_bytes == 736  # 128 + 512 + 96
     assert baseline.text_section_size == 16384
+    assert baseline.filter_rvas is None         # default unfiltered
 
     # IDA was invoked in per-function mode (no MX_MCP_IDA_REGIONS env)
     # — the provider must NOT pass extra_env that switches the script
@@ -122,6 +124,8 @@ def test_measure_aggregates_per_function_records(tmp_path: Path, monkeypatch):
     assert len(captured) == 1
     extra_env = captured[0].get("extra_env")
     assert extra_env is None or "MX_MCP_IDA_REGIONS" not in extra_env
+    # Unfiltered measurement must not send MX_MCP_IDA_FUNCTION_FILTER.
+    assert extra_env is None or "MX_MCP_IDA_FUNCTION_FILTER" not in extra_env
 
 
 def test_measure_with_no_functions_returns_zeros(tmp_path: Path, monkeypatch):
@@ -261,3 +265,68 @@ def test_default_script_path_points_to_cff_metrics():
     # update in lockstep.
     assert provider._script_path.name == "cff_metrics.py"  # type: ignore[attr-defined]
     assert provider._script_path.exists()  # type: ignore[attr-defined]
+
+
+# ============================================================================
+# Filter — MX_MCP_IDA_FUNCTION_FILTER env var serialisation
+# ============================================================================
+
+
+def test_filter_serialised_as_json_env_var(tmp_path: Path, monkeypatch):
+    """Filter set reaches IDA as a sorted JSON array in the env var."""
+    binary = _touch_binary(tmp_path)
+    captured = _install_fake_ida(monkeypatch, output=_ida_output([]))
+    _install_fake_text_size(monkeypatch)
+
+    provider = IdaCfgBaselineProvider()
+    asyncio.run(provider.measure(
+        binary, filter_rvas=frozenset({0x2000, 0x1000, 0x3000}),
+    ))
+
+    extra_env = captured[0].get("extra_env") or {}
+    assert "MX_MCP_IDA_FUNCTION_FILTER" in extra_env
+    import json as _json
+    payload = _json.loads(extra_env["MX_MCP_IDA_FUNCTION_FILTER"])
+    # Sorted for determinism — test pins exact order.
+    assert payload == [0x1000, 0x2000, 0x3000]
+
+
+def test_filter_preserved_on_returned_baseline(tmp_path: Path, monkeypatch):
+    binary = _touch_binary(tmp_path)
+    _install_fake_ida(monkeypatch, output=_ida_output([]))
+    _install_fake_text_size(monkeypatch)
+
+    flt = frozenset({0x1000, 0x2000})
+    provider = IdaCfgBaselineProvider()
+    baseline = asyncio.run(provider.measure(binary, filter_rvas=flt))
+    assert baseline.filter_rvas == flt
+
+
+def test_empty_filter_still_sets_env_var(tmp_path: Path, monkeypatch):
+    """An empty frozenset must reach the script as ``[]`` so the IDA
+    side reports zero matched functions — not "no filter → iterate
+    all". The latter would silently produce inflated baselines."""
+    binary = _touch_binary(tmp_path)
+    captured = _install_fake_ida(monkeypatch, output=_ida_output([]))
+    _install_fake_text_size(monkeypatch)
+
+    provider = IdaCfgBaselineProvider()
+    asyncio.run(provider.measure(binary, filter_rvas=frozenset()))
+
+    extra_env = captured[0].get("extra_env") or {}
+    assert extra_env.get("MX_MCP_IDA_FUNCTION_FILTER") == "[]"
+
+
+def test_no_filter_omits_env_var_entirely(tmp_path: Path, monkeypatch):
+    """``filter_rvas=None`` (default) must NOT set the env var — the
+    script falls back to unfiltered mode via env-absence, matching the
+    pre-filter behaviour."""
+    binary = _touch_binary(tmp_path)
+    captured = _install_fake_ida(monkeypatch, output=_ida_output([]))
+    _install_fake_text_size(monkeypatch)
+
+    provider = IdaCfgBaselineProvider()
+    asyncio.run(provider.measure(binary))
+
+    extra_env = captured[0].get("extra_env")
+    assert extra_env is None or "MX_MCP_IDA_FUNCTION_FILTER" not in extra_env

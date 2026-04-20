@@ -32,6 +32,15 @@ Activated when ``MX_MCP_IDA_REGIONS`` is not set. The script iterates
 every function the decompiler can lift and emits one record per
 function.
 
+**Function filter** (optional, applies only to per-function mode).
+
+``MX_MCP_IDA_FUNCTION_FILTER`` — JSON array of input-PE RVAs. When
+set, a function is emitted only if its byte range covers at least one
+listed RVA. Used by the normalised benchmarks so the baseline
+measurement on the unprotected binary sums exactly the same functions
+the protector defended on the protected side. Empty / invalid payload
+is silently ignored and the script falls back to unfiltered mode.
+
 Both modes emit the same record shape through the ``functions`` field.
 In region mode the ``name`` comes from the caller; in function mode
 it comes from ``idc.get_func_name``. Downstream code ignores the
@@ -257,6 +266,61 @@ def _record_for_region(region: dict, image_base: int) -> dict | None:
 # ============================================================================
 
 
+def _parse_function_filter_env() -> set[int] | None:
+    """Parse ``MX_MCP_IDA_FUNCTION_FILTER`` — JSON array of RVAs.
+
+    Returns:
+        * :class:`set[int]` — callers include only functions whose
+          byte range covers **at least one** listed RVA. Empty set
+          means "nothing matches" — callers produce zero records.
+        * ``None`` — env var absent / invalid; callers iterate every
+          function (unfiltered mode).
+
+    The filter is *range-inclusive*: a function with
+    ``[start_ea, end_ea)`` matches an RVA ``r`` when
+    ``start_ea <= image_base + r < end_ea``. This lets the caller
+    supply sidecar marker RVAs (which can point mid-function) and
+    still get a sensible "does this function contain the protected
+    region" test.
+    """
+    raw = os.environ.get("MX_MCP_IDA_FUNCTION_FILTER")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(
+            f"[mx_mcp] MX_MCP_IDA_FUNCTION_FILTER not valid JSON: {e}\n"
+        )
+        return None
+    if not isinstance(parsed, list):
+        sys.stderr.write(
+            "[mx_mcp] MX_MCP_IDA_FUNCTION_FILTER must be a JSON array\n"
+        )
+        return None
+    rvas: set[int] = set()
+    for item in parsed:
+        if isinstance(item, int) and item >= 0:
+            rvas.add(item)
+    return rvas
+
+
+def _function_matches_filter(fn: object, image_base: int,
+                              filter_rvas: set[int]) -> bool:
+    """True if any ``filter_rvas`` entry falls within ``fn``'s range.
+
+    Short-circuits on the first match — ``MX_MCP_IDA_FUNCTION_FILTER``
+    lists grow with the number of protected functions, so scanning
+    them per-function dominates the filter cost.
+    """
+    start = int(getattr(fn, "start_ea", 0)) - image_base
+    end   = int(getattr(fn, "end_ea",   0)) - image_base
+    for rva in filter_rvas:
+        if start <= rva < end:
+            return True
+    return False
+
+
 def _parse_regions_env() -> list[dict] | None:
     """Parse ``MX_MCP_IDA_REGIONS``. Returns a validated region list
     or ``None`` when the env var is absent / invalid.
@@ -314,6 +378,7 @@ def _main() -> None:
         image_base = 0
 
     regions = _parse_regions_env()
+    function_filter = _parse_function_filter_env()
     mode = "region" if regions is not None else "function"
 
     output = {
@@ -323,6 +388,11 @@ def _main() -> None:
         "image_base": image_base,
         "functions": [],   # name kept for backward compat; holds regions in region mode
         "errors": [],
+        # ``filter_stats`` surfaces how the filter affected enumeration
+        # so the caller can distinguish "filter matched nothing" (zero
+        # functions) from "hex-rays failure" (same result shape). Only
+        # populated in function mode when a filter is active.
+        "filter_stats": None,
     }
 
     if hexrays_ok:
@@ -344,7 +414,18 @@ def _main() -> None:
                     )
                     sys.stderr.write(traceback.format_exc())
         else:
+            scanned = 0
+            matched = 0
             for fn_ea in idautils.Functions():
+                scanned += 1
+                if function_filter is not None:
+                    fn = ida_funcs.get_func(fn_ea)
+                    if fn is None:
+                        continue
+                    if not _function_matches_filter(
+                            fn, image_base, function_filter):
+                        continue
+                matched += 1
                 try:
                     entry = _record_for_function(fn_ea, image_base)
                     if entry is not None:
@@ -354,6 +435,13 @@ def _main() -> None:
                         f"sub_{fn_ea:X}: {type(exc).__name__}: {exc}"
                     )
                     sys.stderr.write(traceback.format_exc())
+
+            if function_filter is not None:
+                output["filter_stats"] = {
+                    "requested_rvas": len(function_filter),
+                    "scanned_functions": scanned,
+                    "matched_functions": matched,
+                }
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:

@@ -43,19 +43,26 @@ class _StubProvider:
         blocks: int = 50,
         cyc: int = 30,
         gotos: int = 5,
+        fn_bytes: int = 2048,
         text_size: int = 4096,
         raise_error: bool = False,
     ) -> None:
-        self.calls: list[Path] = []
+        self.calls: list[tuple[Path, frozenset[int] | None]] = []
         self._fn_count = fn_count
         self._blocks = blocks
         self._cyc = cyc
         self._gotos = gotos
+        self._fn_bytes = fn_bytes
         self._text_size = text_size
         self._raise_error = raise_error
 
-    async def measure(self, binary: Path) -> CfgBaseline:
-        self.calls.append(binary)
+    async def measure(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
+        self.calls.append((binary, filter_rvas))
         await asyncio.sleep(0)
         if self._raise_error:
             raise BaselineError(f"stub error for {binary.name}")
@@ -65,7 +72,9 @@ class _StubProvider:
             total_blocks=self._blocks,
             total_cyclomatic=self._cyc,
             total_gotos=self._gotos,
+            functions_total_bytes=self._fn_bytes,
             text_section_size=self._text_size,
+            filter_rvas=filter_rvas,
         )
 
 
@@ -122,7 +131,7 @@ def test_different_binaries_measured_independently(tmp_path: Path):
 
     asyncio.run(_run())
 
-    assert [c for c in provider.calls] == [a, b]
+    assert [call[0] for call in provider.calls] == [a, b]
     assert len(cache) == 2
 
 
@@ -250,4 +259,79 @@ def test_concurrent_get_on_distinct_binaries_runs_provider_twice(tmp_path: Path)
 
     asyncio.run(_run())
     assert len(provider.calls) == 2
-    assert {c.name for c in provider.calls} == {"a.exe", "b.exe"}
+    assert {call[0].name for call in provider.calls} == {"a.exe", "b.exe"}
+
+
+# ============================================================================
+# Filter cache key — filtered and unfiltered live in separate slots
+# ============================================================================
+
+
+def test_filter_rvas_forwarded_to_provider(tmp_path: Path):
+    """Filter given to ``get`` reaches the provider unchanged."""
+    binary = _write_binary(tmp_path / "foo.exe")
+    provider = _StubProvider()
+    cache = CfgBaselineCache(provider)
+
+    flt = frozenset({0x1000, 0x2000})
+    baseline = asyncio.run(cache.get(binary, filter_rvas=flt))
+
+    assert baseline.filter_rvas == flt
+    assert provider.calls == [(binary, flt)]
+
+
+def test_filtered_and_unfiltered_live_in_separate_cache_slots(tmp_path: Path):
+    """Filtered and unfiltered measurements of the same binary are
+    legitimately distinct — the cache does not overwrite one with the
+    other."""
+    binary = _write_binary(tmp_path / "foo.exe")
+    provider = _StubProvider()
+    cache = CfgBaselineCache(provider)
+
+    async def _run() -> None:
+        await cache.get(binary)  # unfiltered
+        await cache.get(binary, filter_rvas=frozenset({0x1000}))
+        # Repeats — each hits its own cache slot.
+        await cache.get(binary)
+        await cache.get(binary, filter_rvas=frozenset({0x1000}))
+
+    asyncio.run(_run())
+    assert len(provider.calls) == 2
+    assert len(cache) == 2
+
+
+def test_different_filters_produce_different_cache_entries(tmp_path: Path):
+    """Two different filter sets on the same binary = two cache slots."""
+    binary = _write_binary(tmp_path / "foo.exe")
+    provider = _StubProvider()
+    cache = CfgBaselineCache(provider)
+
+    f1 = frozenset({0x1000})
+    f2 = frozenset({0x2000})
+
+    async def _run() -> None:
+        await cache.get(binary, filter_rvas=f1)
+        await cache.get(binary, filter_rvas=f2)
+        await cache.get(binary, filter_rvas=f1)  # cache hit
+        await cache.get(binary, filter_rvas=f2)  # cache hit
+
+    asyncio.run(_run())
+    assert len(provider.calls) == 2
+    filters_observed = {call[1] for call in provider.calls}
+    assert filters_observed == {f1, f2}
+
+
+def test_empty_filter_distinct_from_unfiltered(tmp_path: Path):
+    """An empty frozenset is a legitimate "filter matches nothing"
+    signal — it must not collapse into the unfiltered slot."""
+    binary = _write_binary(tmp_path / "foo.exe")
+    provider = _StubProvider()
+    cache = CfgBaselineCache(provider)
+
+    async def _run() -> None:
+        await cache.get(binary)                           # unfiltered
+        await cache.get(binary, filter_rvas=frozenset())  # empty filter
+
+    asyncio.run(_run())
+    assert len(provider.calls) == 2
+    assert len(cache) == 2

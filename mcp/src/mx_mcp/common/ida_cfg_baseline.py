@@ -15,6 +15,7 @@ the cache or the benchmarks that consume it (DIP + OCP).
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -82,15 +83,30 @@ class IdaCfgBaselineProvider:
         self._script_path = script_path
         self._ida_path = ida_path
 
-    async def measure(self, binary: Path) -> CfgBaseline:
+    async def measure(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
         """See :meth:`ICfgBaselineProvider.measure`."""
-        _LOG.info("baseline: IDA per-function on %s", binary.name)
+        filter_label = (
+            "none" if filter_rvas is None
+            else f"{len(filter_rvas)} rva(s)"
+        )
+        _LOG.info(
+            "baseline: IDA per-function on %s (filter=%s)",
+            binary.name, filter_label,
+        )
+
+        extra_env = self._build_extra_env(filter_rvas)
 
         try:
             ida_result = await run_ida_script(
                 binary=binary,
                 script=self._script_path,
                 ida_path=self._ida_path,
+                extra_env=extra_env,
             )
         except IdaNotFoundError as e:
             raise BaselineError(f"IDA missing: {e}") from e
@@ -113,6 +129,9 @@ class IdaCfgBaselineProvider:
         total_blocks = sum(int(r.get("mc_blocks", 0)) for r in records)
         total_cyc = sum(int(r.get("mc_cyclomatic", 0)) for r in records)
         total_gotos = sum(int(r.get("mc_gotos", 0)) for r in records)
+        functions_total_bytes = sum(
+            int(r.get("size", 0)) for r in records
+        )
 
         try:
             text_size = get_section_virtual_size(binary, _TEXT_SECTION_NAME)
@@ -126,9 +145,10 @@ class IdaCfgBaselineProvider:
             ) from e
 
         _LOG.info(
-            "baseline: %s — fns=%d blocks=%d cyc=%d gotos=%d .text=%dB",
+            "baseline: %s — fns=%d blocks=%d cyc=%d gotos=%d "
+            "fn_bytes=%dB .text=%dB filter=%s",
             binary.name, len(records), total_blocks, total_cyc,
-            total_gotos, text_size,
+            total_gotos, functions_total_bytes, text_size, filter_label,
         )
 
         return CfgBaseline(
@@ -137,5 +157,29 @@ class IdaCfgBaselineProvider:
             total_blocks=total_blocks,
             total_cyclomatic=total_cyc,
             total_gotos=total_gotos,
+            functions_total_bytes=functions_total_bytes,
             text_section_size=text_size,
+            filter_rvas=filter_rvas,
         )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_extra_env(
+        filter_rvas: frozenset[int] | None,
+    ) -> dict[str, str] | None:
+        """Serialise ``filter_rvas`` into the companion script's env var.
+
+        Empty filter collapses to ``None`` (no env) — the script then
+        runs unfiltered. An empty filter would produce zero matches,
+        which is a legitimate but degenerate state the caller can
+        achieve by supplying an explicit empty frozenset; the provider
+        passes the empty list through so the IDA side reports
+        ``matched_functions=0`` in its ``filter_stats``.
+        """
+        if filter_rvas is None:
+            return None
+        payload = json.dumps(sorted(filter_rvas))
+        return {"MX_MCP_IDA_FUNCTION_FILTER": payload}

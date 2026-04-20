@@ -78,6 +78,7 @@ _DEFAULT_BASELINE_BLOCKS = 200
 _DEFAULT_BASELINE_CYC = 100
 _DEFAULT_BASELINE_GOTOS = 20
 _DEFAULT_BASELINE_FNS = 30
+_DEFAULT_BASELINE_BYTES = 2048
 _DEFAULT_BASELINE_TEXT = 4096
 
 
@@ -96,19 +97,26 @@ class _StubBaselineProvider:
         cyc: int = _DEFAULT_BASELINE_CYC,
         gotos: int = _DEFAULT_BASELINE_GOTOS,
         fn_count: int = _DEFAULT_BASELINE_FNS,
+        fn_bytes: int = _DEFAULT_BASELINE_BYTES,
         text_size: int = _DEFAULT_BASELINE_TEXT,
         overrides: dict[str, CfgBaseline | Exception] | None = None,
     ) -> None:
-        self.calls: list[Path] = []
+        self.calls: list[tuple[Path, frozenset[int] | None]] = []
         self._blocks = blocks
         self._cyc = cyc
         self._gotos = gotos
         self._fn_count = fn_count
+        self._fn_bytes = fn_bytes
         self._text_size = text_size
         self._overrides = overrides or {}
 
-    async def measure(self, binary: Path) -> CfgBaseline:
-        self.calls.append(binary)
+    async def measure(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
+        self.calls.append((binary, filter_rvas))
         override = self._overrides.get(binary.stem)
         if isinstance(override, Exception):
             raise override
@@ -120,7 +128,9 @@ class _StubBaselineProvider:
             total_blocks=self._blocks,
             total_cyclomatic=self._cyc,
             total_gotos=self._gotos,
+            functions_total_bytes=self._fn_bytes,
             text_section_size=self._text_size,
+            filter_rvas=filter_rvas,
         )
 
 
@@ -715,7 +725,7 @@ def test_baseline_cache_reused_across_entries_in_one_run(tmp_path, monkeypatch):
 
     assert len(provider.calls) == 2
     # Each baseline is a distinct binary.
-    assert len({c.stem for c in provider.calls}) == 2
+    assert len({call[0].stem for call in provider.calls}) == 2
 
 
 def test_default_baseline_cache_created_when_none_injected():

@@ -85,14 +85,21 @@ class _StubBaselineProvider:
         self,
         *,
         text_size: int = _DEFAULT_BASELINE_TEXT,
+        fn_bytes: int = 2048,
         overrides: dict[str, CfgBaseline | Exception] | None = None,
     ) -> None:
-        self.calls: list[Path] = []
+        self.calls: list[tuple[Path, frozenset[int] | None]] = []
         self._text_size = text_size
+        self._fn_bytes = fn_bytes
         self._overrides = overrides or {}
 
-    async def measure(self, binary: Path) -> CfgBaseline:
-        self.calls.append(binary)
+    async def measure(
+        self,
+        binary: Path,
+        *,
+        filter_rvas: frozenset[int] | None = None,
+    ) -> CfgBaseline:
+        self.calls.append((binary, filter_rvas))
         override = self._overrides.get(binary.stem)
         if isinstance(override, Exception):
             raise override
@@ -104,7 +111,9 @@ class _StubBaselineProvider:
             total_blocks=100,
             total_cyclomatic=50,
             total_gotos=5,
+            functions_total_bytes=self._fn_bytes,
             text_section_size=self._text_size,
+            filter_rvas=filter_rvas,
         )
 
 
@@ -559,7 +568,7 @@ def test_baseline_cache_reused_across_entries_in_one_run(tmp_path, monkeypatch):
     asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     assert len(provider.calls) == 2
-    assert len({c.stem for c in provider.calls}) == 2
+    assert len({call[0].stem for call in provider.calls}) == 2
 
 
 def test_default_baseline_cache_created_when_none_injected():
