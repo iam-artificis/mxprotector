@@ -22,22 +22,22 @@
     {
       "name": "legacy_basic_maximum",
       "pre_protected": "../../../build_testapp/basic_maximum.exe.packed",
-      "tags": ["exe", "packer", "legacy"]
+      "tags": ["exe", "legacy"]
     },
     {
       "name": "legacy_basic_no_cff",
       "pre_protected": "../../../build_testapp/basic_no_cff.exe.packed",
-      "tags": ["exe", "packer", "legacy"]
+      "tags": ["exe", "legacy"]
     },
     {
       "name": "legacy_basic_no_vm",
       "pre_protected": "../../../build_testapp/basic_no_vm.exe.packed",
-      "tags": ["exe", "packer", "legacy"]
+      "tags": ["exe", "legacy"]
     },
     {
       "name": "legacy_vm_showcase",
       "pre_protected": "../../../build_testapp/test_vm_showcase.exe.packed",
-      "tags": ["exe", "packer", "legacy", "vm"]
+      "tags": ["exe", "legacy"]
     }
   ]
 }
