@@ -35,6 +35,15 @@ std::string_view predicate_kind_name(PredicateKind k) noexcept {
     return "unknown";
 }
 
+std::string_view mutation_site_kind_name(MutationSiteKind k) noexcept {
+    switch (k) {
+        case MutationSiteKind::substitution: return "substitution";
+        case MutationSiteKind::split:        return "split";
+        case MutationSiteKind::reassign:     return "reassign";
+    }
+    return "unknown";
+}
+
 // ============================================================================
 // Phase 1 — build info + sections
 // ============================================================================
@@ -143,6 +152,25 @@ void TraceHints::set_iat(std::uint32_t rva, std::uint32_t size) noexcept {
     iat_.size = size;
 }
 
+void TraceHints::add_mutation_site(std::uint32_t    rva,
+                                   std::uint32_t    original_size,
+                                   std::uint32_t    mutated_size,
+                                   MutationSiteKind kind)
+{
+    mutation_.sites.push_back(MutationSiteLabel{
+        .rva           = rva,
+        .original_size = original_size,
+        .mutated_size  = mutated_size,
+        .kind          = kind,
+    });
+}
+
+void TraceHints::add_junk_region(std::uint32_t rva, std::uint32_t size) {
+    mutation_.junk_regions.push_back(JunkRegionLabel{
+        .rva = rva, .size = size,
+    });
+}
+
 // ============================================================================
 // Query
 // ============================================================================
@@ -163,7 +191,9 @@ bool TraceHints::empty() const noexcept {
         && guard_.regions.empty()
         && strings_.slots.empty()
         && iat_.rva  == 0
-        && iat_.size == 0;
+        && iat_.size == 0
+        && mutation_.sites.empty()
+        && mutation_.junk_regions.empty();
 }
 
 } // namespace mx::analysis

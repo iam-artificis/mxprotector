@@ -110,6 +110,23 @@ class IatHints(BaseModel):
     size: Uint32 = 0
 
 
+class MutationSiteLabel(BaseModel):
+    rva: Uint32
+    original_size: Uint32
+    mutated_size: Uint32
+    kind: str  # "substitution" | "split" | "reassign"
+
+
+class JunkRegionLabel(BaseModel):
+    rva: Uint32
+    size: Uint32
+
+
+class MutationHints(BaseModel):
+    sites: list[MutationSiteLabel] = Field(default_factory=list)
+    junk_regions: list[JunkRegionLabel] = Field(default_factory=list)
+
+
 # ============================================================================
 # Top-level
 # ============================================================================
@@ -124,6 +141,9 @@ class Sidecar(BaseModel):
     guard: GuardHints
     strings: StringHints
     iat: IatHints
+    # Additive within schema v1 — pydantic defaults let older builders
+    # (pre Phase 4D) round-trip even though they never emit this key.
+    mutation: MutationHints = Field(default_factory=MutationHints)
 
     @field_validator("schema_version")
     @classmethod

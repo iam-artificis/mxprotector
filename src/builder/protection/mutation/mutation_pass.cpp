@@ -104,6 +104,20 @@ MxResult<uint32_t> MutationEngine::mutate_region(
 
         std::copy(replacement.begin(), replacement.end(), code.data() + offset);
         ++mutations_applied;
+
+        // Source-linked labels for the tracing MCP (flag-gated).
+        // `insn.address()` is a VA at the base_address it was decoded
+        // with, so subtracting image_base yields the RVA of the
+        // substituted instruction in the final PE.
+        if (ctx.config().emit_trace_hints) {
+            const auto rva = static_cast<std::uint32_t>(
+                insn.address() - ctx.pe_image().image_base());
+            ctx.trace_hints().add_mutation_site(
+                rva,
+                static_cast<std::uint32_t>(insn.length()),
+                static_cast<std::uint32_t>(replacement.size()),
+                analysis::MutationSiteKind::substitution);
+        }
     }
 
     total_substitutions_ += mutations_applied;

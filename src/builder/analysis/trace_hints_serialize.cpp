@@ -226,8 +226,50 @@ void write_strings(std::string& out, const StringHints& s) {
 
 void write_iat(std::string& out, const IatHints& i) {
     out.append(std::format(
-        "  \"iat\": {{ \"rva\": {}, \"size\": {} }}\n",
+        "  \"iat\": {{ \"rva\": {}, \"size\": {} }},\n",
         i.rva, i.size));
+}
+
+void write_mutation_site(std::string& out, const MutationSiteLabel& s, bool last) {
+    out.append("      {\n");
+    append_uint_field  (out, "        ", "rva",           s.rva,           true);
+    append_uint_field  (out, "        ", "original_size", s.original_size, true);
+    append_uint_field  (out, "        ", "mutated_size",  s.mutated_size,  true);
+    append_string_field(out, "        ", "kind", mutation_site_kind_name(s.kind), false);
+    out.append(last ? "      }\n" : "      },\n");
+}
+
+void write_mutation(std::string& out, const MutationHints& m) {
+    out.append("  \"mutation\": {\n");
+
+    out.append("    \"sites\": [");
+    if (m.sites.empty()) {
+        out.append("],\n");
+    } else {
+        out.push_back('\n');
+        for (std::size_t i = 0; i < m.sites.size(); ++i) {
+            write_mutation_site(out, m.sites[i], i + 1 == m.sites.size());
+        }
+        out.append("    ],\n");
+    }
+
+    out.append("    \"junk_regions\": [");
+    if (m.junk_regions.empty()) {
+        out.append("]\n");
+    } else {
+        out.push_back('\n');
+        for (std::size_t i = 0; i < m.junk_regions.size(); ++i) {
+            const auto& r = m.junk_regions[i];
+            const bool last = (i + 1 == m.junk_regions.size());
+            out.append("      {\n");
+            append_uint_field(out, "        ", "rva",  r.rva,  true);
+            append_uint_field(out, "        ", "size", r.size, false);
+            out.append(last ? "      }\n" : "      },\n");
+        }
+        out.append("    ]\n");
+    }
+
+    out.append("  }\n");
 }
 
 } // namespace
@@ -249,6 +291,7 @@ std::string TraceHints::to_json() const {
     write_guard   (out, guard_);
     write_strings (out, strings_);
     write_iat     (out, iat_);
+    write_mutation(out, mutation_);
     out.append("}\n");
     return out;
 }

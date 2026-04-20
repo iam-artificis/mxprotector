@@ -114,6 +114,18 @@ struct StringSlotLabel {
     std::uint32_t plaintext_len = 0;
 };
 
+struct MutationSiteLabel {
+    std::uint32_t    rva           = 0;
+    std::uint32_t    original_size = 0;
+    std::uint32_t    mutated_size  = 0;
+    MutationSiteKind kind          = MutationSiteKind::substitution;
+};
+
+struct JunkRegionLabel {
+    std::uint32_t rva  = 0;
+    std::uint32_t size = 0;
+};
+
 // ============================================================================
 // Grouped hint sections (mirror the JSON schema v1 top-level shape)
 // ============================================================================
@@ -142,6 +154,11 @@ struct StringHints {
 struct IatHints {
     std::uint32_t rva  = 0;
     std::uint32_t size = 0;
+};
+
+struct MutationHints {
+    std::vector<MutationSiteLabel> sites;
+    std::vector<JunkRegionLabel>   junk_regions;
 };
 
 // ============================================================================
@@ -221,6 +238,16 @@ public:
     /// Устанавливает диапазон IAT в защищённом PE.
     void set_iat(std::uint32_t rva, std::uint32_t size) noexcept;
 
+    /// Добавляет один in-place mutation site (substitution / split /
+    /// reassign). Для `substitution` обычно `original_size == mutated_size`.
+    void add_mutation_site(std::uint32_t    rva,
+                           std::uint32_t    original_size,
+                           std::uint32_t    mutated_size,
+                           MutationSiteKind kind);
+
+    /// Добавляет регион synthetic-junk байт (никогда не исполняется).
+    void add_junk_region(std::uint32_t rva, std::uint32_t size);
+
     // ------------------------------------------------------------------
     // Сериализация
     // ------------------------------------------------------------------
@@ -243,6 +270,7 @@ public:
     [[nodiscard]] const GuardHints&                  guard()    const noexcept { return guard_; }
     [[nodiscard]] const StringHints&                 strings()  const noexcept { return strings_; }
     [[nodiscard]] const IatHints&                    iat()      const noexcept { return iat_; }
+    [[nodiscard]] const MutationHints&               mutation() const noexcept { return mutation_; }
 
 private:
     TraceHintsBuild                 build_{};
@@ -252,6 +280,10 @@ private:
     GuardHints                      guard_{};
     StringHints                     strings_{};
     IatHints                        iat_{};
+    MutationHints                   mutation_{};
 };
+
+/// enum → JSON-string for MutationSiteKind (used by serializer).
+[[nodiscard]] std::string_view mutation_site_kind_name(MutationSiteKind k) noexcept;
 
 } // namespace mx::analysis

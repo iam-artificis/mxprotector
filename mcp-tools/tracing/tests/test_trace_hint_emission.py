@@ -206,3 +206,56 @@ def test_guard_slot_empty_without_markers(
     assert doc.guard.regions == [], (
         f"guard regions leaked: {doc.guard.regions}"
     )
+
+
+# ===========================================================================
+# Phase 4D — Mutation sites
+# ===========================================================================
+
+
+def test_mutation_sites_populated_when_mutation_enabled(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    """test_vm_showcase has non-trivial .text — mutation pass should
+    substitute a few instructions. At strong level we expect at least
+    one substitution site."""
+    output = tmp_path / "mut.exe"
+    _build(builder_exe, input_pe, output, level="strong")
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+
+    assert len(doc.mutation.sites) > 0, "no mutation sites emitted at strong"
+    # Every site's kind is one of the known enum values.
+    for site in doc.mutation.sites:
+        assert site.kind in ("substitution", "split", "reassign"), (
+            f"unexpected mutation kind: {site.kind}"
+        )
+        assert site.rva > 0
+        # Phase 4D wires substitution only (in-place). original ==
+        # mutated is the expected invariant for that kind.
+        if site.kind == "substitution":
+            assert site.original_size == site.mutated_size
+
+
+def test_mutation_sites_empty_when_mutation_off(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    output = tmp_path / "no_mut.exe"
+    _build(builder_exe, input_pe, output, level="strong",
+           extra=["--no-mutation"])
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    assert doc.mutation.sites == [], (
+        f"mutation sites leaked with --no-mutation: "
+        f"{len(doc.mutation.sites)} entries"
+    )
+
+
+def test_sidecar_mutation_section_has_both_lists(
+    tmp_path: Path, builder_exe: Path, input_pe: Path
+) -> None:
+    """Schema v1 contract: both `sites` and `junk_regions` must be
+    lists in the serialized JSON (pydantic would reject otherwise)."""
+    output = tmp_path / "mut_schema.exe"
+    _build(builder_exe, input_pe, output, level="strong")
+    doc = load_sidecar(Path(f"{output}.mxtrace.json"))
+    assert isinstance(doc.mutation.sites, list)
+    assert isinstance(doc.mutation.junk_regions, list)

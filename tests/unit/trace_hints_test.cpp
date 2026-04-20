@@ -317,6 +317,8 @@ TEST(TraceHintsTest, AllSectionsCoexistInOneJson) {
     h.add_guard_region(0, 0x20000, 128);
     h.add_string_slot(0, 0x30000, 16);
     h.set_iat(0x2000, 0x400);
+    h.add_mutation_site(0x1000, 3, 3, MutationSiteKind::substitution);
+    h.add_junk_region(0x1100, 12);
 
     const auto json = h.to_json();
 
@@ -325,7 +327,7 @@ TEST(TraceHintsTest, AllSectionsCoexistInOneJson) {
     EXPECT_TRUE(contains(json, "\"schema_version\": 1"));
     for (std::string_view top : {"\"build\"", "\"sections\"", "\"cff\"",
                                  "\"vm\"", "\"guard\"", "\"strings\"",
-                                 "\"iat\""})
+                                 "\"iat\"", "\"mutation\""})
     {
         EXPECT_TRUE(contains(json, top)) << "missing top-level key: " << top;
     }
@@ -333,6 +335,48 @@ TEST(TraceHintsTest, AllSectionsCoexistInOneJson) {
     // Closing brace sits on its own line just before trailing newline.
     ASSERT_GT(json.size(), size_t{2});
     EXPECT_EQ(json[json.size() - 2], '}');
+}
+
+// ============================================================================
+// Phase 4D — Mutation (sites + junk regions)
+// ============================================================================
+
+TEST(TraceHintsTest, MutationSitesAndJunkSerialized) {
+    TraceHints h;
+    h.add_mutation_site(0x2000, 5, 5, MutationSiteKind::substitution);
+    h.add_mutation_site(0x2010, 4, 7, MutationSiteKind::split);
+    h.add_mutation_site(0x2020, 3, 3, MutationSiteKind::reassign);
+    h.add_junk_region(0x3000, 16);
+    h.add_junk_region(0x3100, 8);
+
+    const auto json = h.to_json();
+    // All three kinds round-trip through the serializer.
+    EXPECT_TRUE(contains(json, "\"kind\": \"substitution\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"split\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"reassign\""));
+    // Site numerics
+    EXPECT_TRUE(contains(json, "\"rva\": 8192"));   // 0x2000
+    EXPECT_TRUE(contains(json, "\"original_size\": 4"));
+    EXPECT_TRUE(contains(json, "\"mutated_size\": 7"));
+    // Junk regions
+    EXPECT_TRUE(contains(json, "\"rva\": 12288"));  // 0x3000
+    EXPECT_TRUE(contains(json, "\"size\": 16"));
+
+    // Read-back API
+    ASSERT_EQ(h.mutation().sites.size(),         size_t{3});
+    ASSERT_EQ(h.mutation().junk_regions.size(), size_t{2});
+    EXPECT_EQ(h.mutation().sites[1].kind, MutationSiteKind::split);
+}
+
+TEST(TraceHintsTest, MutationBreaksEmpty) {
+    {
+        TraceHints h; h.add_mutation_site(0, 0, 0, MutationSiteKind::substitution);
+        EXPECT_FALSE(h.empty());
+    }
+    {
+        TraceHints h; h.add_junk_region(0, 0);
+        EXPECT_FALSE(h.empty());
+    }
 }
 
 } // namespace mx::analysis
