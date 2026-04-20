@@ -106,6 +106,7 @@ constexpr uint16_t IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE   = 0x0040;
 constexpr uint16_t IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY = 0x0080;
 constexpr uint16_t IMAGE_DLLCHARACTERISTICS_NX_COMPAT      = 0x0100;
 constexpr uint16_t IMAGE_DLLCHARACTERISTICS_NO_SEH         = 0x0400;
+constexpr uint16_t IMAGE_DLLCHARACTERISTICS_GUARD_CF       = 0x4000;  ///< Control Flow Guard
 /// @}
 
 /// @name Типы релокаций

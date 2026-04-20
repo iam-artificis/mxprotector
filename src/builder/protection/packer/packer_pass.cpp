@@ -58,6 +58,7 @@
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
 #include "mxprotector/protection/packer/cipher_body.hpp"
+#include "mxprotector/protection/packer/dll_characteristics_audit.hpp"
 #include "mxprotector/protection/packer/packer_section_encryptor.hpp"
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
@@ -91,6 +92,62 @@ using mx::packer::ExeStubEmitter;
 using mx::packer::DllFullStubEmitter;
 using mx::packer::DriverStubEmitter;
 
+
+/// Adjust `OptionalHeader.DllCharacteristics` so the protected output
+/// loads cleanly across the target shapes the packer supports.
+///
+///   * `GUARD_CF` is cleared unconditionally. The packer itself adds
+///     `.mxpack`; earlier passes may have added `.mxvm`, the CFF
+///     trampoline section, and `.mxstr`. None of those carry entries
+///     in the original Control Flow Guard bitmap, so a CFG-aware
+///     indirect call landing in any of them would be flagged as an
+///     invalid target and trip the loader's CFG dispatch into a
+///     fail-fast path. The protected binary as a whole can no
+///     longer claim CFG compliance — drop the bit so the loader
+///     does not enforce a guarantee we cannot keep.
+///
+///   * `FORCE_INTEGRITY` is cleared for kernel drivers. The kernel
+///     loader (and its bootmgr-level integrity check) refuses to
+///     load a `FORCE_INTEGRITY` image that is not embedded-signed
+///     by Microsoft. Our packer rewrites `.text` bytes which
+///     invalidates any pre-existing signature, so the bit must
+///     come off — otherwise the driver will not load even with
+///     test-signing or HVCI relaxations active.
+///
+/// User-mode targets keep `FORCE_INTEGRITY` untouched: it is rare
+/// enough on EXEs / DLLs that we are not currently concerned with
+/// it, and the packed binary is signed by whatever post-build step
+/// the user runs (or unsigned, in which case the loader does not
+/// enforce the bit).
+///
+/// The bit-level policy lives in `dll_characteristics_audit.hpp` as
+/// a pure `constexpr` function so every target-shape × bit-combo
+/// can be unit-tested in isolation. This orchestrator only wires
+/// the pure result into the PE header and emits log lines for the
+/// cleared bits.
+void apply_dll_characteristics_audit(ProtectionContext& ctx) {
+    uint16_t cleared = 0;
+    const bool is_driver = ctx.target().is_kernel_driver();
+    std::visit([&](auto& nt) {
+        const auto r = packer::audit_dll_characteristics(
+            nt.OptionalHeader.DllCharacteristics, is_driver);
+        nt.OptionalHeader.DllCharacteristics = r.output;
+        cleared = r.cleared;
+    }, ctx.pe_image().nt_headers());
+
+    if (cleared == 0) return;  // No-op path: input had none of the
+                                // relevant bits set. Stay silent.
+
+    if (cleared & pe::IMAGE_DLLCHARACTERISTICS_GUARD_CF) {
+        ctx.log("PackerPass: DllCharacteristics: GUARD_CF cleared "
+                "(injected sections lack CFG bitmap entries)");
+    }
+    if (cleared & pe::IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY) {
+        ctx.log("PackerPass: DllCharacteristics: FORCE_INTEGRITY cleared "
+                "(driver target — packed bytes invalidate any "
+                "Microsoft signature)");
+    }
+}
 
 /// Strip base relocations: clear the directory entry, set the file header's
 /// IMAGE_FILE_RELOCS_STRIPPED bit, clear DYNAMIC_BASE in DllCharacteristics,
@@ -173,6 +230,12 @@ struct OepStealResult {
 /// treat that as "skip the packer for this image".
 [[nodiscard]] std::optional<OepStealResult>
 prepare_oep_steal(ProtectionContext& ctx, std::string_view steal_label) {
+    // Adjust `OptionalHeader.DllCharacteristics` so the loader does
+    // not enforce guarantees the packed binary cannot keep (CFG over
+    // injected sections, embedded-signature integrity for drivers).
+    // No-op when the input had none of the relevant bits set.
+    apply_dll_characteristics_audit(ctx);
+
     // Decide how to handle `.reloc` based on target shape.
     //
     // 1. OS-loaded EXE / DLL (neither kernel driver nor manual-map):
@@ -578,6 +641,16 @@ private:
         // optional stub-private reloc blob, P4 TLS callback body +
         // directory + callback array + optional index slot) and
         // returns every recorded offset.
+        //
+        // `emit_tls` is forced off for kernel drivers — the kernel
+        // image loader ignores `DataDirectory[TLS]` entirely, and
+        // `step6_finalize_tls` is already a compile-time no-op for
+        // the driver shape. Skipping the emission avoids ~120 bytes
+        // of dead payload inside `.mxpack` and removes a misleading
+        // TLS artefact a future reverse engineer would otherwise
+        // trip over.
+        constexpr bool emit_tls =
+            !std::is_same_v<Emitter, DriverStubEmitter>;
         artifacts_ = packer::append_stub_artifacts(
             ctx_, stub_buf_, rng_,
             layer_keys_,
@@ -586,7 +659,8 @@ private:
             patches_.ksa_block_start_offset,
             patches_.ksa_block_end_offset,
             ByteView{stub_private_relocs_.data(),
-                     stub_private_relocs_.size()});
+                     stub_private_relocs_.size()},
+            emit_tls);
     }
 
     [[nodiscard]] MxStatus step5_inject_and_patch() {

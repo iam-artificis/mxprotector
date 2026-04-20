@@ -39,6 +39,7 @@ set(TEST_SOURCES
     reloc_applier_test.cpp
     driver_cipher_body_test.cpp
     reloc_partition_test.cpp
+    dll_characteristics_audit_test.cpp
 )
 
 # VM sources needed for VmStackLayout + x64 handler tests and for

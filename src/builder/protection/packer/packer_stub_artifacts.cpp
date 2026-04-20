@@ -30,7 +30,8 @@ StubArtifactsInfo append_stub_artifacts(
     size_t                          section_count,
     uint32_t                        ksa_block_start_offset,
     uint32_t                        ksa_block_end_offset,
-    ByteView                        stub_private_relocs)
+    ByteView                        stub_private_relocs,
+    bool                            emit_tls)
 {
     StubArtifactsInfo out{};
 
@@ -135,6 +136,16 @@ StubArtifactsInfo append_stub_artifacts(
     // `stub_rva + offset_in_stub_buf`. The TLS finalizer back-patches
     // these (along with the RC4-key rel32 inside the callback body)
     // after the .mxpack section has been placed.
+    //
+    // Skipped entirely when `emit_tls` is false. Kernel drivers do
+    // not run TLS callbacks (the kernel image loader ignores
+    // `DataDirectory[TLS]` outright), so emitting the plumbing
+    // would just waste ~120 bytes inside `.mxpack` and leave a
+    // misleading dead artefact for anyone analysing the output.
+    if (!emit_tls) {
+        return out;
+    }
+
     out.existing_tls_opt = read_existing_tls_directory(ctx.pe_image());
 
     // Align to 8 bytes before the callback body so every downstream

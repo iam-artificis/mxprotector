@@ -132,6 +132,22 @@ struct StubArtifactsInfo {
  *                               `{reloc_rva=0, reloc_size=0}`,
  *                               turning the applier's loop into
  *                               a no-op.
+ * @param emit_tls               When false, skip the entire TLS
+ *                               plumbing block — no callback body,
+ *                               no `IMAGE_TLS_DIRECTORY64` slot,
+ *                               no callback array, no scratch
+ *                               index slot. Used for kernel
+ *                               drivers, which do not run TLS
+ *                               callbacks (the kernel image
+ *                               loader ignores `DataDirectory[TLS]`
+ *                               entirely). The corresponding
+ *                               `StubArtifactsInfo` TLS fields
+ *                               stay at default zero, and the
+ *                               (if-constexpr-gated) TLS finaliser
+ *                               step in `PackerPipeline` keeps
+ *                               its no-op behaviour. Saves
+ *                               ~120 bytes of dead `.mxpack` for
+ *                               every driver build.
  */
 [[nodiscard]] StubArtifactsInfo append_stub_artifacts(
     mx::ProtectionContext&          ctx,
@@ -142,6 +158,7 @@ struct StubArtifactsInfo {
     size_t                          section_count,
     uint32_t                        ksa_block_start_offset,
     uint32_t                        ksa_block_end_offset,
-    ByteView                        stub_private_relocs = {});
+    ByteView                        stub_private_relocs = {},
+    bool                            emit_tls = true);
 
 } // namespace mx::packer
