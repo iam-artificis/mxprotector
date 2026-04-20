@@ -118,6 +118,15 @@ class CorpusEntrySpec(BaseModel):
         default_factory=list,
         description="Protection-surface tags (vm, cff, mixed, tls, seh, dll, …).",
     )
+    launch_args: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra CLI args forwarded to the protected binary when a "
+            "benchmark launches it as a child (pe-sieve runner, Unicorn "
+            "OEP-reach). Useful for '--hold' flags that keep a binary "
+            "alive long enough for a scanner to attach."
+        ),
+    )
 
     @model_validator(mode="after")
     def _require_source(self) -> "CorpusEntrySpec":
@@ -166,6 +175,7 @@ class CorpusEntry:
     pre_protected_binary: Path | None
     pre_sidecar: Path | None
     tags: frozenset[str]
+    launch_args: tuple[str, ...] = ()
 
     @property
     def is_pre_protected(self) -> bool:
@@ -302,6 +312,7 @@ class Corpus:
             pre_protected_binary=pre_protected,
             pre_sidecar=pre_sidecar,
             tags=frozenset(spec.tags),
+            launch_args=tuple(spec.launch_args),
         )
 
     # ------------------------------------------------------------------
