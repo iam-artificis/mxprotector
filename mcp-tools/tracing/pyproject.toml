@@ -1,0 +1,73 @@
+# mx-tracing — MCP tracer server for MxProtector.
+# See ../../MCP_TRACING.md for architecture and phase plan.
+
+[build-system]
+requires      = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "mx-tracing"
+version         = "0.0.0"
+description     = "Frida-based runtime tracer MCP server for MxProtector."
+readme          = "README.md"
+requires-python = ">=3.11"
+license         = { text = "proprietary" }
+authors         = [{ name = "MxProtector Authors" }]
+classifiers     = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+# Phase 0 ships no runtime deps — the scaffold only wires --version
+# and --help. Later phases pin these:
+#   mcp       (Phase 2)   — MCP stdio server
+#   frida     (Phase 2)   — DBI backend
+#   pydantic  (Phase 2)   — sidecar + tool I/O schemas
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest >= 8",
+    "ruff   >= 0.5",
+    "mypy   >= 1.10",
+]
+
+[project.scripts]
+mx-tracing = "mx_tracing.__main__:main"
+
+# ----------------------------------------------------------------------
+# Package discovery — src/ layout.
+# ----------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ----------------------------------------------------------------------
+# Lint & format — ruff.
+# ----------------------------------------------------------------------
+[tool.ruff]
+line-length    = 100
+target-version = "py311"
+src            = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------------
+# Types — mypy strict.
+# ----------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict         = true
+mypy_path      = "src"
+
+# ----------------------------------------------------------------------
+# Tests — pytest.
+# ----------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts    = ["-ra", "--strict-markers", "--strict-config"]
+testpaths  = ["tests"]

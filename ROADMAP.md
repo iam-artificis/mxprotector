@@ -31,6 +31,11 @@ flavoured section-name pools. See `git log` for per-stage detail.
   authors. Intentionally last — docs are more accurate once real-
   loader runs surface the operational edges.
 
+## Tooling
+- **MCP tracing** — Frida-based runtime tracer MCP server.
+  Architecture and phase plan in [`MCP_TRACING.md`](MCP_TRACING.md).
+  Status: Phase 0 scaffold.
+
 ## Deferred / Future
 - **`MX_GUARD` auto-selection:** Build-time heuristic to auto-wrap sensitive regions. QoL, low protection delta.
 - **`MX_GUARD` dynamic `.pdata`:** Synthesize RUNTIME_FUNCTION for guard pages → enables `throw` inside guard bodies. Medium-high complexity.
