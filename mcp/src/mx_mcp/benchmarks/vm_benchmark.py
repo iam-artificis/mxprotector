@@ -94,28 +94,34 @@ _LOG = logging.getLogger(__name__)
 
 # Metric declarations.
 #
-# Scale rationale (initial pass — retune in commit 4 calibration):
+# Scale calibration (empirical, post-smoke run against the seed
+# corpus at strong-level protection):
+#
+#   Observed p50 values — ``vm_bytecode_density`` 0.166,
+#   ``vm_bytecode_entropy`` 5.92, ``vm_bytecode_bigram_entropy`` 8.07.
+#
+# Anchors are set so the current output lands near score 0.5
+# (mid-scale), leaving runway in both directions.
 #
 # * ``vm_bytecode_density`` — weak 0.0 (pass ran but emitted nothing)
-#   / strong 2.0 (bytecode is 2× the original code footprint — heavy
-#   virtualisation). Typical measurements on the seed corpus land in
-#   the 0.05–0.5 band; the anchor leaves generous headroom for
-#   corpora with heavier VM coverage.
+#   / strong 0.35 (bytecode is 35% of the original code footprint —
+#   heavy virtualisation on the seed corpus). p50 0.166 → score ≈ 0.474.
+#   On a corpus with heavier VM coverage the measured p50 shifts
+#   upward; retune ``strong_value`` to track it.
 #
-# * ``vm_bytecode_entropy`` — unchanged scale from the pre-refactor
-#   revision. Shannon byte entropy with a hard upper bound of 8.0.
-#   Scale ``[4.0, 7.5]`` flags anything below 4 bits as trivially
-#   patterned (weak) and rewards near-uniform encodings (strong).
+# * ``vm_bytecode_entropy`` — unchanged. Shannon byte entropy with a
+#   hard upper bound of 8.0. Scale ``[4.0, 7.5]`` flags anything below
+#   4 bits as trivially patterned (weak) and rewards near-uniform
+#   encodings (strong). p50 5.92 → score ≈ 0.549.
 #
-# * ``vm_bytecode_bigram_entropy`` — unchanged scale. Max 16.0, but
-#   real encoded streams hit 8–11 because adjacent bytes are
-#   correlated (opcode then operand). Scale ``[6.0, 10.5]`` tracks
-#   the realistic band; strong=10.5 means the encoder has broken
-#   most short-range correlations.
+# * ``vm_bytecode_bigram_entropy`` — unchanged. Max 16.0, but real
+#   encoded streams hit 8–11 because adjacent bytes are correlated
+#   (opcode then operand). Scale ``[6.0, 10.5]`` tracks the realistic
+#   band. p50 8.07 → score ≈ 0.460.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("vm_bytecode_density",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=2.0)),
+     MetricScale(weak_value=0.0, strong_value=0.35)),
     ("vm_bytecode_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=4.0, strong_value=7.5)),

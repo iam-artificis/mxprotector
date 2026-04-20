@@ -126,36 +126,44 @@ SCRIPT_PATH = (
 
 # Metric declarations — all HIGHER_BETTER.
 #
-# Scale rationale (initial pass — retune in commit 4 after smoke):
+# Scale calibration (empirical, post-smoke run against the seed
+# corpus at strong-level protection):
 #
-# * ``mc_blocks_amplification`` — weak 0.1 represents "CFF section is
-#   a tenth of the source's microcode budget" (trivial CFF pass that
-#   barely emits dispatcher code); strong 5.0 represents "dispatcher
-#   is 5× the entire source's microcode budget" (aggressive flattening
-#   with many per-state transition blocks). Wide range because real
-#   builders can land anywhere between these poles.
+#   Observed p50 values — ``mc_blocks_amplification`` 0.0224,
+#   ``mc_cyclomatic_amplification`` 0.0196,
+#   ``mc_gotos_amplification`` 0.0703, ``mc_backedge_ratio`` 0.26.
 #
-# * ``mc_cyclomatic_amplification`` — same shape; cyclomatic tracks
-#   decision points and grows similarly to block count under CFF.
+# The amplification ratios are small because the CFF pass only
+# touches ``MX_CFF_BEGIN/END``-delimited regions — most of the
+# unprotected source's microcode is outside that scope, pulling the
+# denominator up. Anchors are set so the current strong-level output
+# lands around score 0.45–0.5 (mid-scale). This gives both an
+# upward runway for future CFF improvements and a visible drop
+# window if a regression reduces flattening strength.
 #
-# * ``mc_gotos_amplification`` — weak 0.1 / strong 10.0. Gotos
-#   amplify harder than blocks because every flattened state's tail
-#   is a goto; a dispatcher with N states contributes N gotos while
-#   the source contributed maybe a handful.
+# * ``mc_blocks_amplification`` — weak 0.0, strong 0.05. p50 0.0224
+#   → score ≈ 0.448.
+# * ``mc_cyclomatic_amplification`` — weak 0.0, strong 0.04. p50
+#   0.0196 → score ≈ 0.490.
+# * ``mc_gotos_amplification`` — weak 0.0, strong 0.15. Gotos amplify
+#   harder than blocks (each flattened state's tail is a goto) so the
+#   scale span is wider. p50 0.0703 → score ≈ 0.469.
+# * ``mc_backedge_ratio`` — weak 0.0, strong 0.6. Absolute ratio in
+#   ``[0, 1]``. p50 0.26 → score ≈ 0.433.
 #
-# * ``mc_backedge_ratio`` — weak 0.0 / strong 0.6. Edge-weighted
-#   average, absolute ratio, unchanged from the pre-normalisation
-#   revision.
+# When the CFF pass gets a material upgrade, re-run
+# ``scripts/_smoke_vm_and_chart.py`` and nudge the ``strong_value``
+# upward so the new p50 sits near 0.5 again.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("mc_blocks_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.1, strong_value=5.0)),
+     MetricScale(weak_value=0.0, strong_value=0.05)),
     ("mc_cyclomatic_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.1, strong_value=5.0)),
+     MetricScale(weak_value=0.0, strong_value=0.04)),
     ("mc_gotos_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.1, strong_value=10.0)),
+     MetricScale(weak_value=0.0, strong_value=0.15)),
     ("mc_backedge_ratio",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=0.0, strong_value=0.6)),
