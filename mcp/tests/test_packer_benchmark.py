@@ -19,9 +19,11 @@ from mx_mcp.common.builder import BuilderError, ProtectedBuild
 from mx_mcp.common.corpus import Corpus
 from mx_mcp.unpacking.pe_sieve.report import (
     DumpedCounts,
+    DumpReport,
     ModifiedCounts,
     PesieveReport,
     ScannedCounts,
+    ScanReport,
 )
 from mx_mcp.unpacking.pe_sieve.runner import PesieveRunResult
 
@@ -71,17 +73,23 @@ def _make_report(
     implanted_pe: int = 0, modified_total: int = 0,
 ) -> PesieveReport:
     return PesieveReport(
-        pid=pid,
-        main_image_path="C:\\t.exe",
-        output_dir=f"process_{pid}",
-        scanned=ScannedCounts(
-            total=10, skipped=0,
-            modified=ModifiedCounts(
-                total=modified_total, implanted_pe=implanted_pe,
+        scan_report=ScanReport(
+            pid=pid,
+            main_image_path="C:\\t.exe",
+            scanner_version="test",
+            scanned=ScannedCounts(
+                total=10, skipped=0,
+                modified=ModifiedCounts(
+                    total=modified_total, implanted_pe=implanted_pe,
+                ),
             ),
         ),
-        dumped=DumpedCounts(dir=f"process_{pid}", modules=dumped),
-        errors=[],
+        dump_report=DumpReport(
+            pid=pid,
+            output_dir=f"process_{pid}",
+            dumped=DumpedCounts(total=dumped, dumped=dumped),
+            dumps=[],
+        ),
     )
 
 

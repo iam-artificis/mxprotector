@@ -17,6 +17,8 @@
 
 #include <mxprotector_sdk/api.hpp>
 
+#include "bench_hold.hpp"
+
 // ``__declspec(noinline)`` prevents MSVC /O2 from reordering or
 // dropping the MX_VM markers relative to the body they bracket.
 __declspec(noinline)
@@ -32,7 +34,8 @@ static std::uint32_t vm_core(std::uint32_t x) {
     return acc;
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("pure_vm: %u\n", vm_core(0u));
+    bench_hold_from_argv(argc, argv);
     return 0;
 }

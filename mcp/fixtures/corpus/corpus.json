@@ -4,36 +4,39 @@
     {
       "name": "pure_vm",
       "binary": "bin/unprotected/pure_vm.exe",
-      "tags": ["vm", "pure", "exe", "packer"]
+      "tags": ["vm", "pure", "exe", "packer"],
+      "launch_args": ["--hold", "3"]
     },
     {
       "name": "pure_cff",
       "binary": "bin/unprotected/pure_cff.exe",
-      "tags": ["cff", "pure", "exe", "packer"]
+      "tags": ["cff", "pure", "exe", "packer"],
+      "launch_args": ["--hold", "3"]
     },
     {
       "name": "mixed",
       "binary": "bin/unprotected/mixed.exe",
-      "tags": ["vm", "cff", "mixed", "strings", "mutation", "exe", "packer"]
+      "tags": ["vm", "cff", "mixed", "strings", "mutation", "exe", "packer"],
+      "launch_args": ["--hold", "3"]
     },
     {
       "name": "legacy_basic_maximum",
-      "pre_protected": "../../build_testapp/basic_maximum.exe.packed",
+      "pre_protected": "../../../build_testapp/basic_maximum.exe.packed",
       "tags": ["exe", "packer", "legacy"]
     },
     {
       "name": "legacy_basic_no_cff",
-      "pre_protected": "../../build_testapp/basic_no_cff.exe.packed",
+      "pre_protected": "../../../build_testapp/basic_no_cff.exe.packed",
       "tags": ["exe", "packer", "legacy"]
     },
     {
       "name": "legacy_basic_no_vm",
-      "pre_protected": "../../build_testapp/basic_no_vm.exe.packed",
+      "pre_protected": "../../../build_testapp/basic_no_vm.exe.packed",
       "tags": ["exe", "packer", "legacy"]
     },
     {
       "name": "legacy_vm_showcase",
-      "pre_protected": "../../build_testapp/test_vm_showcase.exe.packed",
+      "pre_protected": "../../../build_testapp/test_vm_showcase.exe.packed",
       "tags": ["exe", "packer", "legacy", "vm"]
     }
   ]

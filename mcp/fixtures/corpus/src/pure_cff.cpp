@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstdint>
 
+#include "bench_hold.hpp"
+
 namespace {
 
 int leaf_a(int x) {
@@ -49,11 +51,12 @@ int core(int x) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int r = 0;
     for (int x = 1; x <= 10; ++x) {
         r ^= core(x);
     }
     std::printf("pure_cff: %d\n", r);
+    bench_hold_from_argv(argc, argv);
     return 0;
 }

@@ -73,6 +73,18 @@ DEFAULT_EXE_BASENAME = "pe-sieve64.exe"
 DEFAULT_DECRYPT_WAIT_MS = 1500
 DEFAULT_SCAN_TIMEOUT_S = 30.0
 
+# pe-sieve exit-code semantics (hasherezade/pe-sieve):
+#   0   — scan completed, no modifications found.
+#   1   — scan completed, some info-level findings.
+#   2   — scan completed, suspicious modifications detected (a dump
+#         was produced). This is *signal*, not error — the benchmark
+#         scores on it.
+#   negative / large values — scan actually failed (bad pid, missing
+#         privileges, internal error).
+#
+# The runner therefore treats 0 / 1 / 2 as "scan ran; parse report".
+_SCAN_OK_EXIT_CODES: frozenset[int] = frozenset({0, 1, 2})
+
 # pe-sieve dumps land in a subdirectory named ``process_<pid>``.
 # We also accept whatever pe-sieve reports in ``dumped.dir`` when
 # that field is populated.
@@ -291,10 +303,14 @@ async def _scan_child_then_terminate(
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    if proc.returncode != 0:
+    if proc.returncode not in _SCAN_OK_EXIT_CODES:
         return PesieveRunResult(
             ok=False, duration_ms=duration_ms, report=None,
-            error=f"pe-sieve exit={proc.returncode}",
+            error=(
+                f"pe-sieve exit={proc.returncode}"
+                + (f"; stderr={_tail(proc.stderr, 256)!r}" if proc.stderr.strip() else "")
+                + (f"; stdout={_tail(proc.stdout, 256)!r}" if proc.stdout.strip() else "")
+            ),
             stdout_tail=_tail(proc.stdout), stderr_tail=_tail(proc.stderr),
         )
 
@@ -384,13 +400,21 @@ def _collect_dump_files(workdir: Path, report: PesieveReport) -> list[Path]:
 
 
 def _resolve_dump_dir(workdir: Path, report: PesieveReport) -> Path:
-    if report.dumped.dir:
-        reported = Path(report.dumped.dir)
-        # pe-sieve's ``dumped.dir`` is usually relative; make absolute
-        # against ``workdir`` when so.
-        if not reported.is_absolute():
-            reported = workdir / reported
-        return reported
+    """Locate the directory pe-sieve dumped artefacts into.
+
+    Preferred source: ``dump_report.output_dir`` (flattened as
+    ``report.output_dir``). Fall back to the default
+    ``process_<pid>`` convention when that field is unset (older
+    pe-sieve versions / edge shapes).
+    """
+    reported = report.output_dir
+    if reported:
+        path = Path(reported)
+        # pe-sieve's ``output_dir`` is usually relative to the CWD
+        # (== ``workdir`` in our invocation); make absolute when so.
+        if not path.is_absolute():
+            path = workdir / path
+        return path
     return workdir / _DEFAULT_DUMP_DIRNAME_TEMPLATE.format(pid=report.pid)
 
 

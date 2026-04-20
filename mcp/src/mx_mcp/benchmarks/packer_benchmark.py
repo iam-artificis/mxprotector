@@ -92,20 +92,47 @@ _LOG = logging.getLogger(__name__)
 
 # Metric declarations.
 #
-# All three are LOWER_BETTER, so ``weak_value > strong_value`` on the
-# scale (strong = 0 hits, weak = "the packer is wide open"). Initial
-# ranges are best guesses without calibration; #7 will retune them
-# against real pe-sieve output on the seed corpus.
+# All three are LOWER_BETTER — ``weak_value > strong_value`` so the
+# same linear normaliser handles both directions uniformly. Scales
+# calibrated against real pe-sieve 0.4.1.1 output on the seed corpus
+# at the current ``strong`` defence level. Baseline observations:
+#
+# * ``dumped_modules`` = 1 per entry (pe-sieve always dumps the main
+#   image in REALIGNED mode — we do not yet run any anti-dump tricks
+#   that would foil /dfl).
+# * ``implanted_pe``   = 0 per entry (main image is patched, not
+#   hollowed — no implant classification triggers).
+# * ``modified_total`` = 1 per entry (the packer patches itself by
+#   design — one "patched" module is the steady-state surface).
+#
+# Scale endpoints chosen so the current baseline lands near the
+# centre of each scale. Regressions (e.g. a new anti-dump pass fails
+# and suddenly pe-sieve gets 0 dumps) move the score towards 1.0;
+# deteriorations (multiple modules dumped) move it towards 0.
+#
+# * ``pesieve_dumped_modules`` — weak=2 / strong=0. Current p90=1
+#   → score 0.50. If the packer ever drops to 0 dumps we score 1.0;
+#   if pe-sieve starts dumping 2+ modules (main + implants) we score 0.
+# * ``pesieve_implanted_pe``   — weak=3 / strong=0. Canary metric:
+#   stays saturated at 1.0 under normal operation and collapses
+#   dramatically on any regression that lets pe-sieve classify our
+#   output as an implanted PE.
+# * ``pesieve_modified_total`` — weak=3 / strong=0. Current p90=1 →
+#   score 0.67. Tracks how many distinct modules pe-sieve flags;
+#   going up means we grew our visible fingerprint.
+#
+# Retune when the corpus grows materially or the packer adds an
+# anti-dump pass that changes the baseline.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("pesieve_dumped_modules",
      MetricDirection.LOWER_BETTER,
-     MetricScale(weak_value=5.0, strong_value=0.0)),
+     MetricScale(weak_value=2.0, strong_value=0.0)),
     ("pesieve_implanted_pe",
      MetricDirection.LOWER_BETTER,
      MetricScale(weak_value=3.0, strong_value=0.0)),
     ("pesieve_modified_total",
      MetricDirection.LOWER_BETTER,
-     MetricScale(weak_value=10.0, strong_value=0.0)),
+     MetricScale(weak_value=3.0, strong_value=0.0)),
 )
 
 
@@ -255,9 +282,9 @@ def _record_samples(
     assert result.report is not None  # caller-validated
     report = result.report
 
-    dumped = report.dumped.modules
-    implanted_pe = report.scanned.modified.implanted_pe
-    modified_total = report.scanned.modified.total
+    dumped = report.dumped_count
+    implanted_pe = report.implanted_pe_count
+    modified_total = report.modified_total
 
     evidence = {
         "pid": report.pid,
@@ -265,7 +292,9 @@ def _record_samples(
         "pesieve_main_image": report.main_image_path,
         "pesieve_output_dir": report.output_dir,
         "dump_files": [str(p) for p in result.dump_files],
-        "pesieve_errors": list(report.errors),
+        "scanner_version": report.scan_report.scanner_version,
+        "modified_breakdown": report.scan_report.scanned.modified.model_dump(),
+        "dump_entries": [d.model_dump() for d in report.dump_report.dumps],
     }
 
     _LOG.info(

@@ -77,18 +77,24 @@ def test_resolve_env_var_to_nonexistent_exe(tmp_path: Path, monkeypatch):
 
 def _ok_report_stdout(pid: int = 1234, implanted_pe: int = 0, dumped: int = 0) -> str:
     return json.dumps({
-        "pid": pid,
-        "main_image_path": "C:\\t.exe",
-        "output_dir": f"process_{pid}",
-        "scanned": {
-            "total": 10, "skipped": 0,
-            "modified": {
-                "total": 1 if implanted_pe or dumped else 0,
-                "implanted_pe": implanted_pe,
+        "scan_report": {
+            "pid": pid,
+            "main_image_path": "C:\\t.exe",
+            "scanned": {
+                "total": 10, "skipped": 0,
+                "modified": {
+                    "total": 1 if implanted_pe or dumped else 0,
+                    "implanted_pe": implanted_pe,
+                },
+                "errors": 0,
             },
         },
-        "dumped": {"dir": f"process_{pid}", "modules": dumped},
-        "errors": [],
+        "dump_report": {
+            "pid": pid,
+            "output_dir": f"process_{pid}",
+            "dumped": {"total": dumped, "dumped": dumped},
+            "dumps": [],
+        },
     })
 
 
@@ -175,7 +181,7 @@ def test_run_pesieve_happy_path(tmp_path: Path, monkeypatch):
     assert result.ok is True
     assert result.report is not None
     assert result.report.pid == 1234
-    assert result.report.dumped.modules == 2
+    assert result.report.dumped_count == 2
     # Dump file collection finds .exe / .dll, ignores JSON.
     assert {p.name for p in result.dump_files} == {"a.exe", "b.dll"}
 
@@ -227,12 +233,15 @@ def test_run_pesieve_child_exits_before_scan(tmp_path: Path, monkeypatch):
     assert result.report is None
 
 
-def test_run_pesieve_nonzero_exit(tmp_path: Path, monkeypatch):
+def test_run_pesieve_nonzero_hard_error_exit(tmp_path: Path, monkeypatch):
+    """Exit codes > 2 (or negative) indicate a real scan failure — bad
+    PID, missing privileges, internal crash. The runner reports them
+    as failure and includes the stderr tail for diagnostics."""
     _install_pesieve_path(monkeypatch, tmp_path)
     _install_launch_mock(monkeypatch, alive=True)
     monkeypatch.setattr(
         runner_mod, "_run_subprocess",
-        lambda cmd, t, cwd: _ok_proc(rc=2, stdout="", stderr="boom"),
+        lambda cmd, t, cwd: _ok_proc(rc=5, stdout="", stderr="boom"),
     )
 
     binary = tmp_path / "t.exe"
@@ -242,8 +251,52 @@ def test_run_pesieve_nonzero_exit(tmp_path: Path, monkeypatch):
     ))
 
     assert result.ok is False
-    assert "exit=2" in (result.error or "")
+    assert "exit=5" in (result.error or "")
     assert "boom" in result.stderr_tail
+
+
+def test_run_pesieve_exit_2_is_findings_not_failure(tmp_path: Path, monkeypatch):
+    """pe-sieve returns exit=2 when it detected suspicious
+    modifications and produced a dump — that is *signal*, not error.
+    The runner must parse the report and report ok=True."""
+    _install_pesieve_path(monkeypatch, tmp_path)
+    _install_launch_mock(monkeypatch, alive=True, pid=1234)
+    monkeypatch.setattr(
+        runner_mod, "_run_subprocess",
+        lambda cmd, t, cwd: _ok_proc(
+            rc=2, stdout=_ok_report_stdout(pid=1234, dumped=1),
+        ),
+    )
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "process_1234").mkdir()
+
+    binary = tmp_path / "t.exe"
+    binary.write_bytes(b"MZ")
+    result = asyncio.run(run_pesieve(
+        binary=binary, workdir=tmp_path / "work", decrypt_wait_ms=1,
+    ))
+
+    assert result.ok is True
+    assert result.report is not None
+    assert result.report.dumped_count == 1
+
+
+def test_run_pesieve_exit_1_also_parses_report(tmp_path: Path, monkeypatch):
+    """Exit=1 (info-level findings) — also treated as success."""
+    _install_pesieve_path(monkeypatch, tmp_path)
+    _install_launch_mock(monkeypatch, alive=True, pid=1234)
+    monkeypatch.setattr(
+        runner_mod, "_run_subprocess",
+        lambda cmd, t, cwd: _ok_proc(rc=1, stdout=_ok_report_stdout(pid=1234)),
+    )
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "process_1234").mkdir()
+
+    result = asyncio.run(run_pesieve(
+        binary=tmp_path / "t.exe", workdir=tmp_path / "work",
+        decrypt_wait_ms=1,
+    ))
+    assert result.ok is True
 
 
 def test_run_pesieve_timeout(tmp_path: Path, monkeypatch):
@@ -339,8 +392,8 @@ def test_run_pesieve_child_launch_failure(tmp_path: Path, monkeypatch):
 def test_run_pesieve_terminates_child_on_scan_failure(
     tmp_path: Path, monkeypatch,
 ):
-    """Even when pe-sieve exits non-zero, the child must still be
-    killed — otherwise benchmark runs leak processes."""
+    """Even when pe-sieve exits with a hard error, the child must still
+    be killed — otherwise benchmark runs leak processes."""
     _install_pesieve_path(monkeypatch, tmp_path)
     _install_launch_mock(monkeypatch, alive=True)
 
@@ -351,7 +404,7 @@ def test_run_pesieve_terminates_child_on_scan_failure(
     )
     monkeypatch.setattr(
         runner_mod, "_run_subprocess",
-        lambda c, t, cwd: _ok_proc(rc=1, stderr="err"),
+        lambda c, t, cwd: _ok_proc(rc=5, stderr="err"),
     )
 
     binary = tmp_path / "t.exe"

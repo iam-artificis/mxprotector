@@ -1,33 +1,67 @@
 """Pydantic parser for pe-sieve's JSON summary.
 
-Zero I/O — the runner reads the file and hands its contents (bytes or
-str) to :func:`parse_report`. Keeping the parser side-effect-free
-lets the tests exercise every malformed / partial shape without
-touching disk.
+Zero I/O — the runner reads pe-sieve's stdout (or the ``scan_report.json``
+on disk) and hands it here. Keeping the parser side-effect-free lets
+tests exercise every malformed / partial shape without touching disk.
 
-## Schema scope
+## Observed schema (pe-sieve 0.4.1.1)
 
-pe-sieve emits a rich JSON document. We model only the fields the
-packer benchmark actually needs; ``extra='ignore'`` (pydantic default)
-means future pe-sieve versions that grow new fields do not regress
-callers. If a field the benchmark does score on later disappears,
-the default value (0 / empty / None) guarantees a safe low-noise
-result rather than crashing.
+Real output has two top-level blocks:
 
-## Fields modelled
+```
+{
+  "scan_report": {
+    "pid":  <int>,
+    "is_64_bit": 0|1,
+    "is_managed": 0|1,
+    "main_image_path": "...",
+    "used_reflection": 0|1,
+    "scanner_version": "...",
+    "scanned": {
+      "total": N,
+      "skipped": N,
+      "modified": {
+        "total": N,
+        "patched": N,
+        "iat_hooked": N,
+        "replaced": N,
+        "hdr_modified": N,
+        "implanted_pe": N,
+        "implanted_shc": N,
+        "unreachable_file": N,
+        "other": N
+      },
+      "errors": N
+    },
+    "scans": [ { "code_scan": { ... } }, ... ]
+  },
+  "dump_report": {
+    "pid": <int>,
+    "output_dir": "process_<pid>",
+    "dumped": { "total": N, "dumped": N },
+    "dumps": [ { "module":..., "dump_file":..., "status":1, ... }, ... ]
+  }
+}
+```
 
-* ``pid`` — scan target.
-* ``main_image_path`` — the image pe-sieve identified as the main
-  module (provenance).
-* ``output_dir`` — relative directory where pe-sieve wrote its
-  artefacts for this scan.
-* ``scanned.modified.*`` — counts pe-sieve assigns after analysis.
-  ``implanted_pe`` is the "clean dump possible" signal; ``patched``
-  / ``iat_hooks`` / ``replaced`` are finer-grained.
-* ``dumped.modules`` — how many PE images pe-sieve wrote to the
-  output dir. Nonzero = the attacker has a usable artefact.
-* ``errors`` — pe-sieve's own per-module error strings. Surface to
-  the caller verbatim.
+Scope of this module: model every field the packer benchmark scores on,
+ignore the rest (``extra='ignore'`` absorbs future fields). Counts
+read as zero when missing — conservative from the attacker's
+perspective (absence scores as "packer held").
+
+## Key attacker signals
+
+* ``dump_report.dumped.dumped`` — number of PE images pe-sieve
+  successfully wrote to disk. **The** primary "attacker won" signal:
+  non-zero means the packer failed to hide its payload.
+* ``scan_report.scanned.modified.implanted_pe`` — implant-PE
+  classifications; usually zero for a self-modifying packer but
+  flags real hollowing.
+* ``scan_report.scanned.modified.total`` — aggregate modification
+  count (patched / IAT-hooked / replaced / …). Our packer modifies
+  itself by design so non-zero is expected; it still tracks
+  "visibility": a bigger number = more fingerprints for the
+  attacker to lean on.
 """
 
 from __future__ import annotations
@@ -48,69 +82,144 @@ class PesieveParseError(ValueError):
 
 
 # ============================================================================
-# Nested count blocks
+# scan_report block
 # ============================================================================
 
 
 class ModifiedCounts(BaseModel):
     """Per-class modification counts under ``scanned.modified``.
 
-    Every field is optional at the JSON level; older pe-sieve versions
-    omit ones we care about. The default-zero policy means missing
-    fields read as "no modifications of this kind" — a conservative
-    stance from the attacker's point of view (absence is reported as
-    "packer held"), and the benchmark never branches on ``None``.
+    Fields below follow pe-sieve's actual naming (e.g. ``iat_hooked``
+    past tense, ``hdr_modified``). ``extra='ignore'`` absorbs any
+    future columns so a pe-sieve upgrade cannot regress parsing.
     """
 
     total: int = Field(default=0, ge=0)
     patched: int = Field(default=0, ge=0)
-    iat_hooks: int = Field(default=0, ge=0)
-    implanted: int = Field(default=0, ge=0)
+    iat_hooked: int = Field(default=0, ge=0)
+    replaced: int = Field(default=0, ge=0)
+    hdr_modified: int = Field(default=0, ge=0)
     implanted_pe: int = Field(default=0, ge=0)
     implanted_shc: int = Field(default=0, ge=0)
-    replaced: int = Field(default=0, ge=0)
     unreachable_file: int = Field(default=0, ge=0)
     other: int = Field(default=0, ge=0)
 
 
 class ScannedCounts(BaseModel):
-    """``scanned`` block — totals + the nested modification breakdown."""
+    """``scanned`` block inside ``scan_report``."""
 
     total: int = Field(default=0, ge=0)
     skipped: int = Field(default=0, ge=0)
     modified: ModifiedCounts = Field(default_factory=ModifiedCounts)
+    errors: int = Field(default=0, ge=0)
 
 
-class DumpedCounts(BaseModel):
-    """``dumped`` block — where pe-sieve wrote artefacts and how many.
+class ScanReport(BaseModel):
+    """The full ``scan_report`` block.
 
-    ``dir`` is *usually* a relative path (``process_<pid>``) but
-    pe-sieve sometimes fills in absolute — we accept both verbatim
-    and let the runner resolve against its workdir.
+    ``scans`` (the per-module detail list) is intentionally left
+    as ``list[dict]`` — its shape varies per-entry (code_scan vs
+    workingset_scan vs artefact_scan) and the benchmark does not yet
+    score on it. Evidence carries it verbatim.
     """
 
-    dir: str | None = None
-    modules: int = Field(default=0, ge=0)
+    pid: int = Field(ge=0)
+    is_64_bit: int = 0
+    is_managed: int = 0
+    main_image_path: str | None = None
+    used_reflection: int = 0
+    scanner_version: str | None = None
+    scanned: ScannedCounts = Field(default_factory=ScannedCounts)
+    scans: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ============================================================================
-# Top-level report
+# dump_report block
+# ============================================================================
+
+
+class DumpedCounts(BaseModel):
+    """``dumped`` summary inside ``dump_report``.
+
+    ``total`` is modules attempted, ``dumped`` is modules
+    successfully written. The benchmark scores on ``dumped``: a
+    non-zero value is the attacker's artefact count.
+    """
+
+    total: int = Field(default=0, ge=0)
+    dumped: int = Field(default=0, ge=0)
+
+
+class DumpEntry(BaseModel):
+    """One entry inside ``dumps[]``.
+
+    ``module`` / ``module_size`` are reported by pe-sieve as
+    hex strings (``"140000000"`` / ``"38000"``) — we preserve them
+    as strings, the benchmark does not yet arithmetic on them.
+    """
+
+    module: str | None = None
+    module_size: str | None = None
+    dump_file: str | None = None
+    tags_file: str | None = None
+    dump_mode: str | None = None
+    is_shellcode: int = 0
+    status: int = 0
+
+
+class DumpReport(BaseModel):
+    """The full ``dump_report`` block."""
+
+    pid: int = Field(default=0, ge=0)
+    output_dir: str | None = None
+    dumped: DumpedCounts = Field(default_factory=DumpedCounts)
+    dumps: list[DumpEntry] = Field(default_factory=list)
+
+
+# ============================================================================
+# Top-level
 # ============================================================================
 
 
 class PesieveReport(BaseModel):
-    """Parsed pe-sieve JSON summary.
+    """Parsed pe-sieve JSON document.
 
-    Only fields consumed by the benchmark or by human post-mortem are
-    modelled. See module docstring for the intentional-gaps list.
+    One field per top-level block. The ``dump_report`` default lets
+    tests / edge cases that omit it load cleanly — benchmarks read
+    ``dump_report.dumped.dumped`` which stays zero in that case.
     """
 
-    pid: int = Field(ge=0)
-    main_image_path: str | None = None
-    output_dir: str | None = None
-    scanned: ScannedCounts = Field(default_factory=ScannedCounts)
-    dumped: DumpedCounts = Field(default_factory=DumpedCounts)
-    errors: list[str] = Field(default_factory=list)
+    scan_report: ScanReport
+    dump_report: DumpReport = Field(default_factory=DumpReport)
+
+    # Convenience accessors — stable flat names the benchmark layer
+    # actually reads. Keeping them here means the benchmark does not
+    # need to know which nested block a given counter lives under.
+
+    @property
+    def pid(self) -> int:
+        return self.scan_report.pid
+
+    @property
+    def main_image_path(self) -> str | None:
+        return self.scan_report.main_image_path
+
+    @property
+    def output_dir(self) -> str | None:
+        return self.dump_report.output_dir
+
+    @property
+    def dumped_count(self) -> int:
+        """Number of PE images pe-sieve successfully wrote to disk."""
+        return self.dump_report.dumped.dumped
+
+    @property
+    def implanted_pe_count(self) -> int:
+        return self.scan_report.scanned.modified.implanted_pe
+
+    @property
+    def modified_total(self) -> int:
+        return self.scan_report.scanned.modified.total
 
 
 # ============================================================================
@@ -152,8 +261,5 @@ def parse_report(payload: str | bytes | dict[str, Any]) -> PesieveReport:
 
 
 def parse_report_file(path: Path) -> PesieveReport:
-    """Convenience wrapper — read ``path`` and parse its contents.
-
-    Raises ``FileNotFoundError`` or :class:`PesieveParseError`.
-    """
+    """Convenience wrapper — read ``path`` and parse its contents."""
     return parse_report(path.read_text(encoding="utf-8"))

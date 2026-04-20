@@ -15,6 +15,8 @@
 
 #include <mxprotector_sdk/api.hpp>
 
+#include "bench_hold.hpp"
+
 namespace {
 
 // ``__declspec(noinline)`` stops MSVC /O2 from inlining the callee and
@@ -47,7 +49,7 @@ std::uint32_t compute_mutated(std::uint32_t x) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     auto banner = MX_STR("corpus:mixed:v1");
     std::printf("%s\n", banner.c_str());
 
@@ -56,5 +58,6 @@ int main() {
         acc ^= compute_vm(i) + compute_mutated(i);
     }
     std::printf("mixed: %u\n", acc);
+    bench_hold_from_argv(argc, argv);
     return 0;
 }
