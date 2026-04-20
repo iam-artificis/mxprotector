@@ -1,39 +1,54 @@
-"""VM static benchmark — sidecar + on-disk bytecode entropy.
+"""VM static benchmark — bytecode density + entropy.
 
 Complements the CFF microcode benchmark. Where CFF measurement needs a
-full IDA + Hex-Rays round-trip, the VM benchmark is *static-only*:
+full IDA + Hex-Rays round-trip on the *protected* artefact, the VM
+benchmark is static-only on the numerator side:
 
-1. Build the corpus entry with ``--no-packer`` so the VM section lands
-   plaintext on disk (packed builds RC4-encrypt the section at build
-   time; the decryption stub unwraps it only at runtime).
-2. Parse the ``.mxtrace.json`` sidecar to learn the VM section's
+1. Measure the unprotected source's ``.text`` virtual size via the
+   shared baseline cache (trivial PE header read inside the baseline
+   provider; the companion IDA run is reused if another benchmark
+   primed the cache).
+2. Build the corpus entry with ``--no-packer`` so the VM section
+   lands plaintext on disk (packed builds RC4-encrypt the section at
+   build time; the decryption stub unwraps it only at runtime).
+3. Parse the ``.mxtrace.json`` sidecar to learn the VM section's
    ``(rva, size)`` window and the count of ``VirtualizationPass``-
    emitted region labels.
-3. Read the VM bytecode bytes from disk and compute two quality
-   metrics over them (byte + bigram Shannon entropy), plus a pair of
-   surface metrics (section size, region count).
+4. Read the VM bytecode bytes from disk and compute the quality
+   metrics over them.
 
-## Metrics emitted
+## Metrics
 
 | Name | Direction | Kind | Meaning |
 |---|---|---|---|
-| ``vm_bytecode_entropy``         | ↑ | quality | Byte-level Shannon entropy of the VM section. Low values mean repeating opcodes / fixed operand patterns — an attacker can cluster them trivially. |
-| ``vm_bytecode_bigram_entropy``  | ↑ | quality | 16-bit bigram Shannon entropy. Catches short-range repetition that single-byte entropy masks (e.g. a common two-byte opcode prefix). |
-| ``vm_bytecode_bytes``           | ↑ | surface | Raw VM section size. Zero means virtualization pass did not run or the corpus entry had no ``MX_VM_BEGIN/END`` markers. |
+| ``vm_bytecode_density``         | ↑ | ratio   | ``bytecode_bytes / unprotected_.text_virtual_size``. 1.0 = VM pass emitted bytecode equal in size to the whole original code; >1.0 = bytecode bigger than source. Corpus-independent — a 10 KB entry with 2 KB bytecode and a 100 KB entry with 20 KB both land at 0.2. |
+| ``vm_bytecode_entropy``         | ↑ | absolute | Byte-level Shannon entropy (bits / byte). Low values mean repeating opcodes / fixed operand patterns — trivial to cluster. Already unit-normalised by construction ([0, 8]); no per-binary baseline needed. |
+| ``vm_bytecode_bigram_entropy``  | ↑ | absolute | 16-bit bigram Shannon entropy. Catches short-range repetition that single-byte entropy masks (e.g. a common two-byte opcode prefix). Same unit-normalised rationale as the single-byte entropy. |
+
+``vm_bytecode_bytes`` (a previous metric) is no longer scored on its
+own. The density ratio captures "how much bytecode per byte of source"
+which is the useful signal; the raw count remains in per-sample
+evidence for post-mortem but aggregating it produced a corpus-size
+dependent number that the density metric supersedes.
+
+## Pre-protected entries
+
+Excluded. A legacy pre-protected binary has no unprotected source
+against which to measure ``.text`` — the density ratio is undefined.
+Mixing density samples with "no-signal" filler corrupts the aggregate.
 
 ## Failure modes
 
 Fail-closed: every failure lands in ``BenchmarkResult.errors`` and the
-benchmark still returns aggregated metrics from the healthy entries.
-The current error surface:
+benchmark still returns aggregated metrics from healthy entries.
+Terminal states the benchmark handles explicitly:
 
-* Build failure (``BuilderError``) — no samples for that entry.
-* Missing / empty VM section in the sidecar — entry skipped.
-* Sidecar missing — entry skipped (rebuild with ``--trace-hints``).
-* PE section lookup failure — bytes unreadable, entry skipped.
-
-No single-entry failure fails the whole benchmark; the caller gets
-partial data with an explicit ``errors`` list they can escalate.
+* Baseline measurement failure (IDA / PE inspection) → entry errored.
+* Pre-protected entry → entry errored (no baseline source).
+* Build failure → entry errored.
+* Missing / empty VM section in sidecar → entry errored.
+* Missing sidecar → entry errored (rebuild with ``--trace-hints``).
+* PE section lookup failure → entry errored.
 """
 
 from __future__ import annotations
@@ -45,6 +60,10 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from mx_mcp.common.baseline import (
+    BaselineError,
+    CfgBaselineCache,
+)
 from mx_mcp.common.benchmark_base import (
     BenchmarkResult,
     IBenchmark,
@@ -60,11 +79,13 @@ from mx_mcp.common.builder import (
     ensure_protected,
     resolve_builder_path,
 )
+from mx_mcp.common.ida_cfg_baseline import IdaCfgBaselineProvider
 from mx_mcp.common.pe_reader import (
     NotAPeError,
     SectionNotFoundError,
     read_section_bytes,
 )
+from mx_mcp.common.ratio import ratio_safe
 from mx_mcp.common.sidecar import Sidecar, load_sidecar
 
 
@@ -73,65 +94,64 @@ _LOG = logging.getLogger(__name__)
 
 # Metric declarations.
 #
-# Scales centre ≈0.5 on the current ``strong`` defence level against
-# the seed corpus (measured: byte entropy 5.93, bigram entropy 8.18,
-# 16.2 KB bytecode, 1 region). Rationale for each endpoint:
+# Scale rationale (initial pass — retune in commit 4 calibration):
 #
-# * ``vm_bytecode_entropy``        — Shannon byte entropy has a hard
-#   upper bound of 8.0 (uniform bytes). Structured opcode streams land
-#   in the 5–6 bit range on our encoder; a well-shuffled VM with
-#   varied operand sizes could approach ~7+. Scale ``[4.0, 7.5]`` flags
-#   anything below 4 bits as trivially patterned (weak) and rewards
-#   near-uniform encodings (strong). p90=5.93 → score≈0.55.
-# * ``vm_bytecode_bigram_entropy`` — Contiguous byte-pair entropy.
-#   Max 16.0 but real encoded streams hit ~8–11 because adjacent
-#   bytes are correlated (opcode then operand). Scale ``[6.0, 10.5]``
-#   tracks the realistic band; strong=10.5 means the encoder has
-#   broken most short-range correlations. p90=8.18 → score≈0.48.
-# * ``vm_bytecode_bytes``          — Surface metric: 0 means the VM
-#   pass ran but emitted nothing (or wasn't run at all). 32 KiB of
-#   virtualized code is a reasonable "strong deployment" target for
-#   the seed corpus; expand ``strong_value`` as the corpus grows into
-#   larger inputs. p90=16.2 KiB → score≈0.49.
+# * ``vm_bytecode_density`` — weak 0.0 (pass ran but emitted nothing)
+#   / strong 2.0 (bytecode is 2× the original code footprint — heavy
+#   virtualisation). Typical measurements on the seed corpus land in
+#   the 0.05–0.5 band; the anchor leaves generous headroom for
+#   corpora with heavier VM coverage.
 #
-# A previous revision exposed ``vm_region_count`` (count of
-# ``MX_VM_BEGIN/_END`` pairs). Removed: that count is source-code
-# dependent, not protector-controlled — an entry with ten markers
-# scores 10× higher than one with a single marker for reasons
-# unrelated to defence quality. Its only honest signal (pass ran at
-# all) is already covered by ``vm_bytecode_bytes=0`` as a regression
-# alarm.
+# * ``vm_bytecode_entropy`` — unchanged scale from the pre-refactor
+#   revision. Shannon byte entropy with a hard upper bound of 8.0.
+#   Scale ``[4.0, 7.5]`` flags anything below 4 bits as trivially
+#   patterned (weak) and rewards near-uniform encodings (strong).
 #
-# Retune after the corpus changes materially — these are declarative
-# contracts with the reporting layer and no runtime code branches on
-# them.
+# * ``vm_bytecode_bigram_entropy`` — unchanged scale. Max 16.0, but
+#   real encoded streams hit 8–11 because adjacent bytes are
+#   correlated (opcode then operand). Scale ``[6.0, 10.5]`` tracks
+#   the realistic band; strong=10.5 means the encoder has broken
+#   most short-range correlations.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
+    ("vm_bytecode_density",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=0.0, strong_value=2.0)),
     ("vm_bytecode_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=4.0, strong_value=7.5)),
     ("vm_bytecode_bigram_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=6.0, strong_value=10.5)),
-    ("vm_bytecode_bytes",
-     MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=32768.0)),
 )
 
 
 @register_benchmark
 class VmStaticBenchmark(IBenchmark):
-    """VM static-analysis benchmark — entropy + surface metrics."""
+    """VM static-analysis benchmark — bytecode density + entropy."""
 
     name = "vm_static"
     description = (
         "Static VM bytecode metrics on VM-tagged corpus entries. "
-        "Emits vm_bytecode_entropy / vm_bytecode_bigram_entropy as "
-        "quality signals and vm_bytecode_bytes as a surface indicator. "
-        "No emulation or decompilation required."
+        "Emits vm_bytecode_density as a corpus-independent amplification "
+        "ratio (bytecode bytes / unprotected .text virtual size) plus "
+        "byte + bigram Shannon entropies as absolute quality signals."
     )
     category = "vm"
     tier = "fast"
     corpus_tags = frozenset({"vm"})
+
+    def __init__(
+        self,
+        *,
+        baseline_cache: CfgBaselineCache | None = None,
+    ) -> None:
+        """Construct the benchmark.
+
+        ``baseline_cache`` is optional for testability. The registry
+        instantiates via ``cls()`` — the first ``run`` call lazy-creates
+        a default cache wrapping :class:`IdaCfgBaselineProvider`.
+        """
+        self._baseline_cache = baseline_cache
 
     async def run(self, corpus, session) -> BenchmarkResult:
         t0 = time.monotonic()
@@ -139,9 +159,7 @@ class VmStaticBenchmark(IBenchmark):
         entries = corpus.with_tags(*self.corpus_tags)
         if not entries:
             return BenchmarkResult(
-                benchmark=self.name,
-                category=self.category,
-                tier=self.tier,
+                benchmark=self.name, category=self.category, tier=self.tier,
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 metrics=[
                     _empty_metric(name, direction, scale)
@@ -151,14 +169,13 @@ class VmStaticBenchmark(IBenchmark):
             )
 
         builder_path = resolve_builder_path(session.workspace_root)
+        baseline_cache = self._resolve_baseline_cache()
 
         samples_by_metric: dict[str, list[MetricSample]] = {
             name: [] for name, _, _ in _METRIC_DEFS
         }
         errors: list[str] = []
 
-        # Protected binaries land in a temp dir that disappears at the
-        # end of the benchmark — we don't persist them between runs.
         with tempfile.TemporaryDirectory(prefix="mx_mcp_vm_bench_") as td:
             td_path = Path(td)
             for entry in entries:
@@ -167,6 +184,7 @@ class VmStaticBenchmark(IBenchmark):
                     output_dir=td_path,
                     builder_path=builder_path,
                     workspace_root=session.workspace_root,
+                    baseline_cache=baseline_cache,
                     samples_by_metric=samples_by_metric,
                 )
                 errors.extend(entry_errors)
@@ -176,13 +194,15 @@ class VmStaticBenchmark(IBenchmark):
             for name, direction, scale in _METRIC_DEFS
         ]
         return BenchmarkResult(
-            benchmark=self.name,
-            category=self.category,
-            tier=self.tier,
+            benchmark=self.name, category=self.category, tier=self.tier,
             duration_ms=int((time.monotonic() - t0) * 1000),
-            metrics=metrics,
-            errors=errors,
+            metrics=metrics, errors=errors,
         )
+
+    def _resolve_baseline_cache(self) -> CfgBaselineCache:
+        if self._baseline_cache is None:
+            self._baseline_cache = CfgBaselineCache(IdaCfgBaselineProvider())
+        return self._baseline_cache
 
 
 # ============================================================================
@@ -194,11 +214,8 @@ def _empty_metric(
     name: str, direction: MetricDirection, scale: MetricScale,
 ) -> MetricResult:
     return MetricResult(
-        name=name,
-        direction=direction,
-        samples=[],
-        aggregate=aggregate_numeric([]),
-        scale=scale,
+        name=name, direction=direction, samples=[],
+        aggregate=aggregate_numeric([]), scale=scale,
     )
 
 
@@ -209,9 +226,7 @@ def _build_metric(
     samples: list[MetricSample],
 ) -> MetricResult:
     return MetricResult(
-        name=name,
-        direction=direction,
-        samples=samples,
+        name=name, direction=direction, samples=samples,
         aggregate=aggregate_numeric([s.value for s in samples]),
         scale=scale,
     )
@@ -223,23 +238,43 @@ async def _process_entry(
     output_dir: Path,
     builder_path: Path,
     workspace_root: Path,
+    baseline_cache: CfgBaselineCache,
     samples_by_metric: dict[str, list[MetricSample]],
 ) -> list[str]:
-    """Build + sidecar + byte-scan for one corpus entry.
+    """Baseline + build + sidecar + byte-scan for one entry.
 
     Returns accumulated error strings. On success, appends one sample
     per metric to ``samples_by_metric`` in place.
     """
+    if entry.is_pre_protected:
+        return [
+            f"{entry.name}: pre-protected — no unprotected source to "
+            f"measure bytecode density against"
+        ]
+
+    if entry.unprotected_binary is None:
+        return [f"{entry.name}: corpus entry has no unprotected source"]
+
+    # 1. Baseline — only ``text_section_size`` is needed here, but the
+    #    cache stores the full CfgBaseline so another benchmark (cff)
+    #    can reuse the IDA pass. Requesting the baseline reuses any
+    #    pre-existing cache entry transparently.
+    try:
+        baseline = await baseline_cache.get(entry.unprotected_binary)
+    except BaselineError as e:
+        return [f"{entry.name}: baseline measurement failed: {e}"]
+    except FileNotFoundError as e:
+        return [f"{entry.name}: baseline input missing: {e}"]
+
+    # 2. Build protected + sidecar.
     try:
         pb = await ensure_protected(
             entry,
             output_dir=output_dir,
             builder_path=builder_path,
-            # Same reasoning as cff_benchmark: ``--no-packer`` keeps
-            # the VM bytecode plaintext on disk. Packed builds would
-            # hand us RC4 ciphertext — still high-entropy, but a
-            # dishonest inflation of the quality metrics. Ignored for
-            # pre-protected entries (no build).
+            # ``--no-packer`` so the VM section lands plaintext on
+            # disk. Packed builds would hand us RC4 ciphertext —
+            # still high-entropy, but dishonestly so.
             extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )
@@ -255,7 +290,8 @@ async def _process_entry(
     if vm_section is None or vm_section.size == 0:
         return [
             f"{entry.name}: sidecar has no (non-empty) 'vm' section — "
-            f"virtualization pass disabled or no MX_VM_BEGIN/END markers in source"
+            f"virtualization pass disabled or no MX_VM_BEGIN/END "
+            f"markers in source"
         ]
 
     try:
@@ -267,32 +303,37 @@ async def _process_entry(
     except OSError as e:
         return [f"{entry.name}: VM bytes IO error: {e}"]
 
+    # 3. Compute scored quantities.
     byte_entropy = _shannon_byte_entropy(bytecode)
     bigram_entropy = _shannon_bigram_entropy(bytecode)
     section_bytes = len(bytecode)
-
-    _LOG.info(
-        "%s: vm section [0x%X..0x%X) %d B — entropy=%.3f bigram=%.3f",
-        entry.name, vm_section.rva, vm_section.rva + vm_section.size,
-        section_bytes, byte_entropy, bigram_entropy,
+    density = ratio_safe(
+        float(section_bytes), float(baseline.text_section_size),
     )
 
-    # ``sidecar.vm.handlers`` is still read for evidence (helps post-
-    # mortem when a build misbehaves) but is no longer exposed as a
-    # metric — see the _METRIC_DEFS comment for the rationale.
+    _LOG.info(
+        "%s: vm section [0x%X..0x%X) %d B / baseline.text %d B → "
+        "density=%s entropy=%.3f bigram=%.3f",
+        entry.name, vm_section.rva, vm_section.rva + vm_section.size,
+        section_bytes, baseline.text_section_size,
+        f"{density:.4f}" if density is not None else "n/a",
+        byte_entropy, bigram_entropy,
+    )
+
     evidence = {
         "rva": vm_section.rva,
         "sidecar_size": vm_section.size,
-        "bytes_read": section_bytes,
+        "bytecode_bytes": section_bytes,
+        "baseline_text_size": baseline.text_section_size,
         "dispatcher_rva": sidecar.vm.dispatcher_rva,
         "virtualized_regions": len(sidecar.vm.handlers),
     }
     sample_name = entry.name
 
-    values: dict[str, float | int] = {
+    values: dict[str, float | int | None] = {
+        "vm_bytecode_density": density,
         "vm_bytecode_entropy": byte_entropy,
         "vm_bytecode_bigram_entropy": bigram_entropy,
-        "vm_bytecode_bytes": section_bytes,
     }
     for metric_name, value in values.items():
         samples_by_metric[metric_name].append(MetricSample(
@@ -305,12 +346,7 @@ async def _process_entry(
 def _load_sidecar_or_error(
     sidecar_path: Path | None, entry_name: str,
 ) -> Sidecar | str:
-    """Return the parsed sidecar or an error-string for the entry's
-    ``errors`` list.
-
-    Extracted so ``_process_entry`` reads top-to-bottom with one
-    success path and a labelled early-return per failure mode.
-    """
+    """Return the parsed sidecar or an entry-level error string."""
     if sidecar_path is None:
         return (
             f"{entry_name}: build produced no sidecar (trace-hints off?) "

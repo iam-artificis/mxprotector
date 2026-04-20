@@ -1,11 +1,16 @@
 """Unit tests for benchmarks.vm_benchmark.
 
-Patches ``build_protected`` and ``read_section_bytes`` at the
-benchmark module so tests neither invoke the real builder nor parse a
-real PE header. Mirrors ``test_cff_benchmark`` structurally — the
-helper sets up a synthetic sidecar + byte payload keyed by corpus
-entry name and returns a ``mocks`` dict so each test can assert on the
-calls that were made.
+Mocks the three backend dependencies:
+
+* ``ensure_protected`` — builds a protected artefact with sidecar.
+* ``read_section_bytes`` — returns synthetic VM bytecode.
+* baseline cache — injected via constructor; a stub provider yields
+  a configured ``CfgBaseline`` (of which only ``text_section_size``
+  is consumed by this benchmark).
+
+Tests mirror ``test_cff_benchmark`` structurally so the two benchmark
+test suites read the same: same corpus helper, same sidecar helper
+shape, same mock-injection pattern.
 """
 
 from __future__ import annotations
@@ -17,6 +22,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mx_mcp.benchmarks import vm_benchmark as vb
+from mx_mcp.common.baseline import (
+    BaselineError,
+    CfgBaseline,
+    CfgBaselineCache,
+)
 from mx_mcp.common.benchmark_base import BenchmarkResult, MetricDirection
 from mx_mcp.common.builder import BuilderError, ProtectedBuild
 from mx_mcp.common.corpus import Corpus
@@ -24,7 +34,7 @@ from mx_mcp.common.pe_reader import NotAPeError, SectionNotFoundError
 
 
 # ============================================================================
-# Corpus helper
+# Corpus + session helpers
 # ============================================================================
 
 
@@ -52,7 +62,61 @@ def _fake_session(workspace_root: Path) -> SimpleNamespace:
 
 
 # ============================================================================
-# Mock factories
+# Baseline stub
+# ============================================================================
+
+
+# Default baseline ``.text`` size. 8 KiB is in the ballpark of small
+# unprotected seed binaries — pairing with the default 2 KiB VM
+# section gives a density of 0.25 (2048 / 8192), i.e. "bytecode is a
+# quarter of the original code footprint".
+_DEFAULT_BASELINE_TEXT = 8192
+
+
+class _StubBaselineProvider:
+    """Returns the configured :class:`CfgBaseline` per binary.
+
+    ``overrides`` keys by the unprotected binary's stem. The VM
+    benchmark only reads ``text_section_size``; the other CfgBaseline
+    fields are filled with dummy values so the object is valid.
+    """
+
+    def __init__(
+        self,
+        *,
+        text_size: int = _DEFAULT_BASELINE_TEXT,
+        overrides: dict[str, CfgBaseline | Exception] | None = None,
+    ) -> None:
+        self.calls: list[Path] = []
+        self._text_size = text_size
+        self._overrides = overrides or {}
+
+    async def measure(self, binary: Path) -> CfgBaseline:
+        self.calls.append(binary)
+        override = self._overrides.get(binary.stem)
+        if isinstance(override, Exception):
+            raise override
+        if isinstance(override, CfgBaseline):
+            return override
+        return CfgBaseline(
+            binary_path=binary,
+            function_count=10,
+            total_blocks=100,
+            total_cyclomatic=50,
+            total_gotos=5,
+            text_section_size=self._text_size,
+        )
+
+
+def _build_stub_cache(
+    **kwargs,
+) -> tuple[CfgBaselineCache, _StubBaselineProvider]:
+    provider = _StubBaselineProvider(**kwargs)
+    return CfgBaselineCache(provider), provider
+
+
+# ============================================================================
+# Sidecar + build mocks
 # ============================================================================
 
 
@@ -69,17 +133,6 @@ def _write_synthetic_sidecar(
     handler_count: int = _DEFAULT_HANDLER_COUNT,
     include_vm: bool = True,
 ) -> None:
-    """Write a pydantic-valid sidecar next to a protected output.
-
-    Knobs:
-      * ``include_vm=False`` — omits the 'vm' entry from ``sections``.
-      * ``vm_size=0`` — section present but empty (virtualization pass
-        emitted nothing).
-      * ``handler_count`` — controls ``vm.handlers`` length. The
-        benchmark no longer exposes this as a metric but still reads
-        the list for post-mortem evidence; tests accept the knob so
-        sidecars stay realistic.
-    """
     sections: dict = {}
     handlers: list[dict] = []
     if include_vm:
@@ -127,13 +180,6 @@ def _install_mocks(
     sidecar_has_vm: bool = True,
     sidecar_omit: bool = False,
 ) -> dict:
-    """Install monkey-patches keyed by corpus-entry name.
-
-    ``bytes_map`` supplies the synthetic VM bytes per entry — exceptions
-    in the map propagate through ``read_section_bytes`` as if the PE
-    was malformed. Missing keys default to a high-entropy random-ish
-    payload sized to ``sidecar_vm_size``.
-    """
     build_calls: list[Path] = []
     byte_calls: list[tuple[Path, int, int]] = []
 
@@ -179,8 +225,6 @@ def _install_mocks(
             raise behaviour
         if isinstance(behaviour, (bytes, bytearray)):
             return bytes(behaviour)
-        # Default: deterministic high-entropy payload so the entropy
-        # metric is non-zero but reproducible.
         return bytes((i * 131 + 7) & 0xFF for i in range(size))
 
     monkeypatch.setattr(vb, "ensure_protected", fake_ensure)
@@ -192,14 +236,15 @@ def _install_mocks(
 
 
 # ============================================================================
-# Happy path + filter
+# Happy-path shape
 # ============================================================================
 
 
-def test_happy_path_emits_one_sample_per_entry(tmp_path: Path, monkeypatch):
+def test_happy_path_emits_one_sample_per_entry(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"]), ("beta", ["vm"])])
     _install_mocks(monkeypatch)
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
 
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
@@ -210,6 +255,12 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path: Path, monkeypatch):
     assert result.errors == []
 
     assert len(result.metrics) == 3
+    metric_names = {m.name for m in result.metrics}
+    assert metric_names == {
+        "vm_bytecode_density",
+        "vm_bytecode_entropy",
+        "vm_bytecode_bigram_entropy",
+    }
     for m in result.metrics:
         assert m.direction is MetricDirection.HIGHER_BETTER
         assert len(m.samples) == 2
@@ -217,46 +268,46 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path: Path, monkeypatch):
     sample_names = {s.sample_name for s in result.metrics[0].samples}
     assert sample_names == {"alpha", "beta"}
 
-    metric_names = {m.name for m in result.metrics}
-    assert metric_names == {
-        "vm_bytecode_entropy",
-        "vm_bytecode_bigram_entropy",
-        "vm_bytecode_bytes",
-    }
 
-
-def test_untagged_entry_skipped(tmp_path: Path, monkeypatch):
-    corpus = _make_corpus(tmp_path, [
-        ("alpha", ["vm"]),
-        ("gamma", ["cff"]),   # not vm-tagged → filtered out.
-    ])
-    mocks = _install_mocks(monkeypatch)
-    bench = vb.VmStaticBenchmark()
-    asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    assert len(mocks["build_calls"]) == 1
-    assert len(mocks["byte_calls"]) == 1
-
-
-def test_no_vm_tagged_entries_reports_error(tmp_path: Path, monkeypatch):
-    corpus = _make_corpus(tmp_path, [("gamma", ["cff"])])
-    _install_mocks(monkeypatch)
-    bench = vb.VmStaticBenchmark()
+def test_density_equals_bytecode_size_over_baseline_text(tmp_path, monkeypatch):
+    """Density value = bytecode size / baseline .text size."""
+    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
+    _install_mocks(
+        monkeypatch,
+        bytes_map={"alpha": b"\xAB" * 2048},
+        sidecar_vm_size=2048,
+    )
+    cache, _ = _build_stub_cache(text_size=8192)
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    assert any("no corpus entries tagged 'vm'" in e for e in result.errors)
-    for m in result.metrics:
-        assert m.samples == []
+
+    by_name = {m.name: m for m in result.metrics}
+    assert by_name["vm_bytecode_density"].samples[0].value == 0.25
 
 
-# ============================================================================
-# Metric values + correctness
-# ============================================================================
+def test_density_above_one_when_bytecode_exceeds_baseline_text(
+    tmp_path, monkeypatch,
+):
+    """A heavy VM pass can emit more bytecode than the original code
+    footprint — density >1.0 must be reported as-is, not clipped."""
+    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
+    _install_mocks(
+        monkeypatch,
+        bytes_map={"alpha": b"\x00" * 4000},
+        sidecar_vm_size=4000,
+    )
+    cache, _ = _build_stub_cache(text_size=1000)
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    by_name = {m.name: m for m in result.metrics}
+    assert by_name["vm_bytecode_density"].samples[0].value == 4.0
 
 
-def test_metric_values_match_inputs(tmp_path: Path, monkeypatch):
-    """Exact-value roundtrip: a uniform byte-distribution payload yields
-    maximal Shannon entropy; section size surfaces unchanged from the
-    synthetic sidecar / bytes."""
-    # 256 bytes each occurring exactly once → byte entropy = 8 bits.
+def test_entropy_metrics_independent_of_baseline(tmp_path, monkeypatch):
+    """Entropy metrics are absolute (Shannon entropy in bits) — a
+    uniform 256-byte payload yields exactly 8.0 regardless of baseline.
+    """
     uniform = bytes(range(256))
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
@@ -264,136 +315,256 @@ def test_metric_values_match_inputs(tmp_path: Path, monkeypatch):
         bytes_map={"alpha": uniform},
         sidecar_vm_size=len(uniform),
     )
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache(text_size=99999)  # any value
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     by_name = {m.name: m for m in result.metrics}
-    assert math.isclose(by_name["vm_bytecode_entropy"].samples[0].value, 8.0, abs_tol=1e-9)
-    assert by_name["vm_bytecode_bytes"].samples[0].value == 256
-    # Bigram entropy on a rotating-cycle payload like range(256) is
-    # non-zero but well under the theoretical 16 — sanity check only.
+    assert math.isclose(
+        by_name["vm_bytecode_entropy"].samples[0].value, 8.0, abs_tol=1e-9,
+    )
     assert by_name["vm_bytecode_bigram_entropy"].samples[0].value > 0.0
 
 
-def test_zero_entropy_flagged_at_scale_floor(tmp_path: Path, monkeypatch):
-    """An all-zeros payload produces entropy 0 — confirms our floor
-    handling (not NaN, not -inf)."""
+def test_zero_entropy_flagged_at_scale_floor(tmp_path, monkeypatch):
+    """All-zeros payload yields entropy 0 — confirms no NaN / -inf."""
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
         monkeypatch,
         bytes_map={"alpha": b"\x00" * 512},
         sidecar_vm_size=512,
     )
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
     by_name = {m.name: m for m in result.metrics}
     assert by_name["vm_bytecode_entropy"].samples[0].value == 0.0
     assert by_name["vm_bytecode_bigram_entropy"].samples[0].value == 0.0
 
 
+def test_evidence_carries_numerator_and_denominator(tmp_path, monkeypatch):
+    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
+    _install_mocks(
+        monkeypatch,
+        bytes_map={"alpha": b"\xFF" * 300},
+        sidecar_vm_size=300,
+        sidecar_handler_count=7,
+    )
+    cache, _ = _build_stub_cache(text_size=4500)
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    ev = result.metrics[0].samples[0].evidence
+    assert ev["bytecode_bytes"] == 300
+    assert ev["baseline_text_size"] == 4500
+    assert ev["virtualized_regions"] == 7
+
+
 # ============================================================================
-# Error paths (fail-closed)
+# Corpus filter
 # ============================================================================
 
 
-def test_build_failure_propagates_as_error(tmp_path: Path, monkeypatch):
+def test_untagged_entry_skipped(tmp_path, monkeypatch):
+    corpus = _make_corpus(tmp_path, [
+        ("alpha", ["vm"]),
+        ("gamma", ["cff"]),  # not vm-tagged → filtered out
+    ])
+    mocks = _install_mocks(monkeypatch)
+    cache, provider = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    assert len(mocks["build_calls"]) == 1
+    assert len(mocks["byte_calls"]) == 1
+    assert len(provider.calls) == 1
+
+
+def test_no_vm_tagged_entries_reports_error(tmp_path, monkeypatch):
+    corpus = _make_corpus(tmp_path, [("gamma", ["cff"])])
+    _install_mocks(monkeypatch)
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+    assert any("no corpus entries tagged 'vm'" in e for e in result.errors)
+    for m in result.metrics:
+        assert m.samples == []
+
+
+# ============================================================================
+# Failure modes
+# ============================================================================
+
+
+def test_build_failure_propagates_as_error(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"]), ("beta", ["vm"])])
     _install_mocks(
         monkeypatch,
         build_map={"alpha": BuilderError("exit=1: bad PE")},
     )
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
     assert any("alpha" in e and "build failed" in e for e in result.errors)
-    # beta still produced samples.
     sample_names = {s.sample_name for s in result.metrics[0].samples}
     assert "beta" in sample_names
     assert "alpha" not in sample_names
 
 
-def test_sidecar_missing_vm_section_errors_entry(tmp_path: Path, monkeypatch):
-    """Builder ran with ``--no-vm`` — no 'vm' entry in sidecar sections."""
+def test_sidecar_missing_vm_section_errors_entry(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(monkeypatch, sidecar_has_vm=False)
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     assert any(
-        "no (non-empty) 'vm' section" in e or "virtualization pass disabled" in e
+        "no (non-empty) 'vm' section" in e
+        or "virtualization pass disabled" in e
         for e in result.errors
     )
     for m in result.metrics:
         assert m.samples == []
 
 
-def test_zero_size_vm_section_errors_entry(tmp_path: Path, monkeypatch):
+def test_zero_size_vm_section_errors_entry(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(monkeypatch, sidecar_vm_size=0)
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    assert any("non-empty" in e or "virtualization pass disabled" in e
-               for e in result.errors)
+    assert any(
+        "non-empty" in e or "virtualization pass disabled" in e
+        for e in result.errors
+    )
 
 
-def test_missing_sidecar_errors_entry(tmp_path: Path, monkeypatch):
+def test_missing_sidecar_errors_entry(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(monkeypatch, sidecar_omit=True)
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
-    assert any("no sidecar" in e.lower() or "trace-hints" in e for e in result.errors)
+    assert any(
+        "no sidecar" in e.lower() or "trace-hints" in e
+        for e in result.errors
+    )
     for m in result.metrics:
         assert m.samples == []
 
 
-def test_pe_reader_failure_reports_entry_error(tmp_path: Path, monkeypatch):
+def test_pe_reader_failure_reports_entry_error(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
         monkeypatch,
         bytes_map={"alpha": NotAPeError("bad DOS magic")},
     )
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    assert any("VM bytes read failed" in e and "NotAPeError" in e
-               for e in result.errors)
+    assert any(
+        "VM bytes read failed" in e and "NotAPeError" in e
+        for e in result.errors
+    )
     for m in result.metrics:
         assert m.samples == []
 
 
-def test_section_not_found_reports_entry_error(tmp_path: Path, monkeypatch):
+def test_section_not_found_reports_entry_error(tmp_path, monkeypatch):
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
         monkeypatch,
         bytes_map={"alpha": SectionNotFoundError("no section covers RVA")},
     )
-    bench = vb.VmStaticBenchmark()
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
     assert any("SectionNotFoundError" in e for e in result.errors)
 
 
-# ============================================================================
-# Evidence — sidecar details surface in MetricSample.evidence for
-# post-mortem even though handler count is no longer a metric.
-# ============================================================================
-
-
-def test_evidence_carries_virtualized_region_count(tmp_path: Path, monkeypatch):
-    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
-    _install_mocks(monkeypatch, sidecar_handler_count=7)
-    bench = vb.VmStaticBenchmark()
+def test_baseline_measurement_failure_aborts_entry(tmp_path, monkeypatch):
+    """A baseline measurement failure cannot produce a density ratio —
+    the entry errors cleanly."""
+    corpus = _make_corpus(tmp_path, [
+        ("alpha", ["vm"]),
+        ("beta",  ["vm"]),
+    ])
+    _install_mocks(monkeypatch)
+    cache, _ = _build_stub_cache(overrides={
+        "alpha": BaselineError("IDA died on baseline"),
+    })
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    evidence = result.metrics[0].samples[0].evidence
-    assert evidence["virtualized_regions"] == 7
+
+    assert any(
+        "alpha" in e and "baseline measurement failed" in e
+        for e in result.errors
+    )
+    sample_names = {s.sample_name for s in result.metrics[0].samples}
+    assert sample_names == {"beta"}
 
 
-def test_zero_handlers_still_produces_quality_samples(tmp_path: Path, monkeypatch):
-    """Section present (so we still read bytes) but handler list empty —
-    covers the "sidecar partial" edge rather than dropping the entry.
-    Quality metrics still populate."""
-    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
-    _install_mocks(monkeypatch, sidecar_handler_count=0)
-    bench = vb.VmStaticBenchmark()
+def test_pre_protected_entry_errors_with_no_baseline_explanation(
+    tmp_path, monkeypatch,
+):
+    """Pre-protected entries have no unprotected source — the
+    benchmark refuses to score them rather than producing incomparable
+    absolute counts."""
+    corpus_root = tmp_path / "corpus"
+    bin_dir = corpus_root / "bin"
+    bin_dir.mkdir(parents=True)
+    pre = bin_dir / "legacy.exe"
+    pre.write_bytes(b"\x4d\x5a")
+
+    (corpus_root / "corpus.json").write_text(json.dumps({
+        "schema_version": 1,
+        "entries": [{
+            "name": "legacy",
+            "pre_protected": "bin/legacy.exe",
+            "tags": ["vm"],
+        }],
+    }), encoding="utf-8")
+
+    corpus = Corpus.load(corpus_root)
+    _install_mocks(monkeypatch)
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-    by_name = {m.name: m for m in result.metrics}
-    assert by_name["vm_bytecode_entropy"].samples[0].value > 0.0
-    assert by_name["vm_bytecode_entropy"].samples[0].evidence["virtualized_regions"] == 0
+
+    assert any(
+        "legacy" in e and "pre-protected" in e
+        for e in result.errors
+    )
+    for m in result.metrics:
+        assert m.samples == []
+
+
+# ============================================================================
+# Cache behaviour at the integration level
+# ============================================================================
+
+
+def test_baseline_cache_reused_across_entries_in_one_run(tmp_path, monkeypatch):
+    """Two distinct VM-tagged entries share one baseline cache —
+    provider sees each unprotected binary exactly once."""
+    corpus = _make_corpus(tmp_path, [
+        ("alpha", ["vm"]),
+        ("beta",  ["vm"]),
+    ])
+    _install_mocks(monkeypatch)
+    cache, provider = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    assert len(provider.calls) == 2
+    assert len({c.stem for c in provider.calls}) == 2
+
+
+def test_default_baseline_cache_created_when_none_injected():
+    """Registry calls ``cls()`` — a real cache must lazy-create on
+    first ``run`` without crashing."""
+    bench = vb.VmStaticBenchmark()
+    cache = bench._resolve_baseline_cache()
+    assert bench._resolve_baseline_cache() is cache
