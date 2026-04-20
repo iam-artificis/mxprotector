@@ -127,6 +127,24 @@ class MutationHints(BaseModel):
     junk_regions: list[JunkRegionLabel] = Field(default_factory=list)
 
 
+class ProtectedFunction(BaseModel):
+    """One entry of the top-level ``protected_functions`` list.
+
+    Emitted by the builder for every function that successfully made it
+    through a protection pass (CfgFlattening or Virtualization). The
+    ``rva`` / ``size`` pair locates the source function in the *input*
+    (unprotected) PE's address space — benchmarks use this as a filter
+    when measuring the baseline so they can compare "protected vs
+    unprotected" on the same set of functions.
+
+    ``kind`` values: ``"cff"`` | ``"vm"`` | ``"guard"``.
+    """
+
+    rva: Uint32
+    size: Uint32
+    kind: str
+
+
 # ============================================================================
 # Top-level
 # ============================================================================
@@ -144,6 +162,10 @@ class Sidecar(BaseModel):
     # Additive within schema v1 — pydantic defaults let older builders
     # (pre Phase 4D) round-trip even though they never emit this key.
     mutation: MutationHints = Field(default_factory=MutationHints)
+    # Additive — older builders (pre normalised-metrics) do not emit
+    # this list; benchmarks that depend on it must check for emptiness
+    # and fall back gracefully.
+    protected_functions: list[ProtectedFunction] = Field(default_factory=list)
 
     @field_validator("schema_version")
     @classmethod

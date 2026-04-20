@@ -379,4 +379,54 @@ TEST(TraceHintsTest, MutationBreaksEmpty) {
     }
 }
 
+// ============================================================================
+// protected_functions — top-level filter list for normalised benchmarks.
+// ============================================================================
+
+TEST(TraceHintsTest, ProtectedFunctionsBreakEmpty) {
+    TraceHints h;
+    h.add_protected_function(0x1000, 128, ProtectedFunctionKind::cff);
+    EXPECT_FALSE(h.empty());
+}
+
+TEST(TraceHintsTest, ProtectedFunctionsSerializedWithKindStrings) {
+    TraceHints h;
+    h.add_protected_function(0x1000, 128, ProtectedFunctionKind::cff);
+    h.add_protected_function(0x2000, 256, ProtectedFunctionKind::vm);
+    h.add_protected_function(0x3000, 512, ProtectedFunctionKind::guard);
+
+    const auto json = h.to_json();
+
+    EXPECT_TRUE(contains(json, "\"protected_functions\""));
+    // Decimal RVAs — 0x1000 / 0x2000 / 0x3000
+    EXPECT_TRUE(contains(json, "\"rva\": 4096"));
+    EXPECT_TRUE(contains(json, "\"rva\": 8192"));
+    EXPECT_TRUE(contains(json, "\"rva\": 12288"));
+    // Sizes
+    EXPECT_TRUE(contains(json, "\"size\": 128"));
+    EXPECT_TRUE(contains(json, "\"size\": 256"));
+    EXPECT_TRUE(contains(json, "\"size\": 512"));
+    // Kind strings — stable contract with the Python pydantic schema.
+    EXPECT_TRUE(contains(json, "\"kind\": \"cff\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"vm\""));
+    EXPECT_TRUE(contains(json, "\"kind\": \"guard\""));
+
+    ASSERT_EQ(h.protected_functions().size(), size_t{3});
+    EXPECT_EQ(h.protected_functions()[0].kind, ProtectedFunctionKind::cff);
+    EXPECT_EQ(h.protected_functions()[1].rva,  0x2000u);
+    EXPECT_EQ(h.protected_functions()[2].size, 512u);
+}
+
+TEST(TraceHintsTest, ProtectedFunctionsEmptyEmitsEmptyArray) {
+    TraceHints h;
+    const auto json = h.to_json();
+    EXPECT_TRUE(contains(json, "\"protected_functions\": []"));
+}
+
+TEST(TraceHintsTest, ProtectedFunctionKindNameMap) {
+    EXPECT_EQ(protected_function_kind_name(ProtectedFunctionKind::cff),   "cff");
+    EXPECT_EQ(protected_function_kind_name(ProtectedFunctionKind::vm),    "vm");
+    EXPECT_EQ(protected_function_kind_name(ProtectedFunctionKind::guard), "guard");
+}
+
 } // namespace mx::analysis

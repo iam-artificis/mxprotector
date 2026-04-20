@@ -67,6 +67,56 @@ def test_missing_sidecar_raises_named_error(tmp_path):
         load_sidecar(tmp_path / "does_not_exist.mxtrace.json")
 
 
+# ============================================================================
+# protected_functions — new top-level list used by normalised benchmarks.
+# ============================================================================
+
+
+def test_protected_functions_defaults_to_empty_list():
+    """Backward compatibility: sidecars produced before the builder
+    started emitting this list must still parse cleanly, with the new
+    field defaulting to ``[]``."""
+    doc = Sidecar.model_validate(_minimal_sidecar_dict())
+    assert doc.protected_functions == []
+
+
+def test_protected_functions_round_trip_all_kinds():
+    data = _minimal_sidecar_dict()
+    data["protected_functions"] = [
+        {"rva": 0x1000, "size": 64,  "kind": "cff"},
+        {"rva": 0x2000, "size": 128, "kind": "vm"},
+        {"rva": 0x3000, "size": 256, "kind": "guard"},
+    ]
+    doc = Sidecar.model_validate(data)
+    assert len(doc.protected_functions) == 3
+    kinds = {pf.kind for pf in doc.protected_functions}
+    assert kinds == {"cff", "vm", "guard"}
+    assert doc.protected_functions[0].rva == 0x1000
+    assert doc.protected_functions[1].size == 128
+
+
+def test_protected_functions_rva_bounds_enforced():
+    """RVA field uses Uint32 — negative or out-of-range values rejected."""
+    data = _minimal_sidecar_dict()
+    data["protected_functions"] = [
+        {"rva": -1, "size": 64, "kind": "cff"},
+    ]
+    with pytest.raises(ValidationError):
+        Sidecar.model_validate(data)
+
+
+def test_fixture_sidecar_has_protected_functions_list(traced_fixture):
+    """The fixture build runs strong-level protection (CFF + VM). The
+    sidecar must include a non-empty ``protected_functions`` list with
+    at least one ``cff`` or ``vm`` entry."""
+    doc = load_sidecar(traced_fixture.sidecar)
+    assert len(doc.protected_functions) > 0
+    kinds = {pf.kind for pf in doc.protected_functions}
+    assert kinds & {"cff", "vm"}, (
+        f"expected at least one cff/vm entry, got kinds={kinds}"
+    )
+
+
 def _minimal_sidecar_dict(*, schema_version: int = 1) -> dict:
     return {
         "schema_version": schema_version,

@@ -450,6 +450,18 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
                 std::format("region_{}", region_id));
             ++region_id;
         }
+
+        // Top-level protected_functions entry per virtualized region.
+        // RVA + size describe the source region in the input PE (begin
+        // marker → end marker inclusive); the benchmark uses these to
+        // filter the unprotected-baseline measurement to exactly the
+        // functions the VM pass touched.
+        for (const auto& p : pendings) {
+            hints.add_protected_function(
+                static_cast<std::uint32_t>(p.begin_marker_rva),
+                p.total_patch_size,
+                analysis::ProtectedFunctionKind::vm);
+        }
     }
 
     // ========================================================================

@@ -44,6 +44,17 @@ std::string_view mutation_site_kind_name(MutationSiteKind k) noexcept {
     return "unknown";
 }
 
+std::string_view protected_function_kind_name(
+    ProtectedFunctionKind k) noexcept
+{
+    switch (k) {
+        case ProtectedFunctionKind::cff:   return "cff";
+        case ProtectedFunctionKind::vm:    return "vm";
+        case ProtectedFunctionKind::guard: return "guard";
+    }
+    return "unknown";
+}
+
 // ============================================================================
 // Phase 1 — build info + sections
 // ============================================================================
@@ -171,6 +182,17 @@ void TraceHints::add_junk_region(std::uint32_t rva, std::uint32_t size) {
     });
 }
 
+void TraceHints::add_protected_function(std::uint32_t         rva,
+                                        std::uint32_t         size,
+                                        ProtectedFunctionKind kind)
+{
+    protected_functions_.push_back(ProtectedFunctionEntry{
+        .rva  = rva,
+        .size = size,
+        .kind = kind,
+    });
+}
+
 // ============================================================================
 // Query
 // ============================================================================
@@ -193,7 +215,8 @@ bool TraceHints::empty() const noexcept {
         && iat_.rva  == 0
         && iat_.size == 0
         && mutation_.sites.empty()
-        && mutation_.junk_regions.empty();
+        && mutation_.junk_regions.empty()
+        && protected_functions_.empty();
 }
 
 } // namespace mx::analysis

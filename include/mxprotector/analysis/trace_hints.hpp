@@ -59,9 +59,21 @@ enum class MutationSiteKind : std::uint8_t {
     reassign,
 };
 
+/// Какой пасс защитил функцию — сохраняется в top-level
+/// `protected_functions`, чтобы бенчмарки могли отфильтровать
+/// baseline-измерение (unprotected) ровно до тех функций, которые
+/// реально получили защиту соответствующего типа.
+enum class ProtectedFunctionKind : std::uint8_t {
+    cff,    ///< Функция прошла CfgFlatteningPass (in-place или trampolined).
+    vm,     ///< Регион MX_VM_BEGIN/END виртуализирован.
+    guard,  ///< Регион MX_GUARD_BEGIN/END перемещён в .mxguard.
+};
+
 /// String → JSON-строка для enum'ов (используется to_json).
 [[nodiscard]] std::string_view cff_state_kind_name(CffStateKind k) noexcept;
 [[nodiscard]] std::string_view predicate_kind_name(PredicateKind k) noexcept;
+[[nodiscard]] std::string_view protected_function_kind_name(
+    ProtectedFunctionKind k) noexcept;
 
 // ============================================================================
 // Leaf label structs
@@ -124,6 +136,17 @@ struct MutationSiteLabel {
 struct JunkRegionLabel {
     std::uint32_t rva  = 0;
     std::uint32_t size = 0;
+};
+
+/// Одна запись в top-level `protected_functions`. Хранит исходное
+/// расположение защищённой функции (RVA + размер в байтах input-PE)
+/// и тип пасса, который её защитил. Используется бенчмарком как
+/// фильтр для baseline-измерения: "измерить только эти регионы в
+/// unprotected-бинаре, а не всё подряд".
+struct ProtectedFunctionEntry {
+    std::uint32_t         rva  = 0;
+    std::uint32_t         size = 0;
+    ProtectedFunctionKind kind = ProtectedFunctionKind::cff;
 };
 
 // ============================================================================
@@ -248,6 +271,14 @@ public:
     /// Добавляет регион synthetic-junk байт (никогда не исполняется).
     void add_junk_region(std::uint32_t rva, std::uint32_t size);
 
+    /// Добавляет запись в top-level `protected_functions`. Пассы CFF
+    /// и VM вызывают этот метод при удачной защите функции, чтобы
+    /// benchmark'и могли извлечь список для фильтрации baseline-
+    /// измерения.
+    void add_protected_function(std::uint32_t         rva,
+                                std::uint32_t         size,
+                                ProtectedFunctionKind kind);
+
     // ------------------------------------------------------------------
     // Сериализация
     // ------------------------------------------------------------------
@@ -271,16 +302,20 @@ public:
     [[nodiscard]] const StringHints&                 strings()  const noexcept { return strings_; }
     [[nodiscard]] const IatHints&                    iat()      const noexcept { return iat_; }
     [[nodiscard]] const MutationHints&               mutation() const noexcept { return mutation_; }
+    [[nodiscard]] const std::vector<ProtectedFunctionEntry>& protected_functions() const noexcept {
+        return protected_functions_;
+    }
 
 private:
-    TraceHintsBuild                 build_{};
-    std::vector<TraceHintsSection>  sections_{};
-    CffHints                        cff_{};
-    VmHints                         vm_{};
-    GuardHints                      guard_{};
-    StringHints                     strings_{};
-    IatHints                        iat_{};
-    MutationHints                   mutation_{};
+    TraceHintsBuild                         build_{};
+    std::vector<TraceHintsSection>          sections_{};
+    CffHints                                cff_{};
+    VmHints                                 vm_{};
+    GuardHints                              guard_{};
+    StringHints                             strings_{};
+    IatHints                                iat_{};
+    MutationHints                           mutation_{};
+    std::vector<ProtectedFunctionEntry>     protected_functions_{};
 };
 
 /// enum → JSON-string for MutationSiteKind (used by serializer).

@@ -239,6 +239,29 @@ void write_mutation_site(std::string& out, const MutationSiteLabel& s, bool last
     out.append(last ? "      }\n" : "      },\n");
 }
 
+void write_protected_functions(
+    std::string& out,
+    const std::vector<ProtectedFunctionEntry>& entries)
+{
+    out.append("  \"protected_functions\": [");
+    if (entries.empty()) {
+        out.append("],\n");
+        return;
+    }
+    out.push_back('\n');
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        const bool  last = (i + 1 == entries.size());
+        out.append("    {\n");
+        append_uint_field  (out, "      ", "rva",  e.rva,  true);
+        append_uint_field  (out, "      ", "size", e.size, true);
+        append_string_field(out, "      ", "kind",
+                            protected_function_kind_name(e.kind), false);
+        out.append(last ? "    }\n" : "    },\n");
+    }
+    out.append("  ],\n");
+}
+
 void write_mutation(std::string& out, const MutationHints& m) {
     out.append("  \"mutation\": {\n");
 
@@ -290,8 +313,9 @@ std::string TraceHints::to_json() const {
     write_vm      (out, vm_);
     write_guard   (out, guard_);
     write_strings (out, strings_);
-    write_iat     (out, iat_);
-    write_mutation(out, mutation_);
+    write_iat                (out, iat_);
+    write_protected_functions(out, protected_functions_);
+    write_mutation           (out, mutation_);
     out.append("}\n");
     return out;
 }

@@ -26,6 +26,7 @@
 #include <unordered_set>
 
 #include "mxprotector/analysis/cfg.hpp"
+#include "mxprotector/analysis/trace_hints.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/protection/cfg/cff_function_source.hpp"
@@ -220,14 +221,30 @@ MxStatus CfgFlatteningPipeline::execute() {
     ctx_.log("CfgFlatteningPass: начало расплющивания потока управления");
 
     const auto candidates = gather_candidates(ctx_);
+    const bool emit_hints = ctx_.config().emit_trace_hints;
     for (const auto& c : candidates) {
         auto located = locate_function(ctx_.pe_image(), c.rva, c.size);
         if (!located.section) continue;
 
-        switch (try_flatten(*located.section, c)) {
+        const auto outcome = try_flatten(*located.section, c);
+        switch (outcome) {
         case Outcome::in_place:    ++flattened_inplace_; break;
         case Outcome::trampolined: ++trampolined_;       break;
         case Outcome::skipped:     ++skipped_;           break;
+        }
+        // Emit protected_function entry for every successfully defended
+        // candidate — both in-place and trampolined outcomes produce
+        // protection metadata the benchmark wants to filter against.
+        // Skipped candidates are not included: they still contain their
+        // original code and the baseline measurement should count them
+        // as "not protected".
+        if (emit_hints && (outcome == Outcome::in_place ||
+                           outcome == Outcome::trampolined))
+        {
+            ctx_.trace_hints().add_protected_function(
+                static_cast<std::uint32_t>(c.rva),
+                c.size,
+                analysis::ProtectedFunctionKind::cff);
         }
     }
 
