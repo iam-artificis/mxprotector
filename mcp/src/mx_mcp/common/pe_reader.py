@@ -1,6 +1,6 @@
 """Minimal PE header reader.
 
-Two surfaces:
+Three surfaces:
 
 * :func:`read_entry_point_rva` — ``AddressOfEntryPoint`` for static
   invariants (e.g. ``oep_is_stub``).
@@ -8,10 +8,15 @@ Two surfaces:
   a raw file slice. Benchmarks that measure sidecar-reported sections
   (CFF bytecode, VM bytecode, encrypted string blob) use it to pull
   exactly those bytes off disk without depending on a full PE library.
+* :func:`get_section_virtual_size` — section geometry by name (e.g.
+  ``".text"`` virtual size). Used as the denominator for
+  amplification-style benchmark metrics that compare a protected
+  artefact against its unprotected baseline's code footprint.
 
-Both helpers read only the headers (first ~64 KiB) plus the requested
-window — nothing else. Scope is intentionally narrow: anything more
-complex belongs behind a ``pefile`` dependency, not in this file.
+All three helpers read only the headers (first ~64 KiB) plus any
+requested window — nothing else. Scope is intentionally narrow:
+anything more complex belongs behind a ``pefile`` dependency, not in
+this file.
 
 Layout (PE32+/PE32, little-endian):
   DOS header at 0:
@@ -41,6 +46,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 
 _LOG = logging.getLogger(__name__)
@@ -71,7 +77,12 @@ class NotAPeError(ValueError):
 
 
 class SectionNotFoundError(LookupError):
-    """Raised when no PE section covers the requested RVA."""
+    """Raised when a PE lookup cannot locate the requested section.
+
+    Used by both the RVA-based and name-based lookups — the former
+    reports "no section covers RVA X", the latter reports "no
+    section named X".
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +174,39 @@ def read_section_bytes(
     return data
 
 
+def get_section_virtual_size(binary_path: Path, name: str) -> int:
+    """Return ``VirtualSize`` of the PE section named ``name``.
+
+    Baselines use this to pull the unprotected ``.text`` size as the
+    denominator of amplification-style metrics (e.g. VM bytecode
+    density = ``bytecode_bytes / unprotected_.text_virtual_size``).
+
+    ``name`` is matched literally against the null-padded ASCII
+    ``Name`` field of the section header (case-sensitive, since the
+    standard PE sections are lowercase and the protector emits its
+    own names verbatim). Returns ``VirtualSize`` — the in-memory
+    size, which includes any BSS-style tail the compiler reserved
+    beyond the raw-data bytes on disk.
+
+    Raises:
+        NotAPeError: header malformed or section table past the
+            header prefix we read.
+        SectionNotFoundError: no section in the table matches ``name``.
+    """
+    with binary_path.open("rb") as f:
+        header = f.read(_HEADER_PREFIX_BYTES)
+    _require_dos_magic(binary_path, header)
+    e_lfanew = _e_lfanew(header)
+    _require_pe_signature(binary_path, header, e_lfanew)
+
+    for row in _iter_section_rows(binary_path, header, e_lfanew):
+        if row.name == name:
+            return row.virtual_size
+    raise SectionNotFoundError(
+        f"{binary_path}: no section named '{name}' in section table"
+    )
+
+
 # ============================================================================
 # Private parsers
 # ============================================================================
@@ -196,6 +240,28 @@ def _find_section_for_rva(
     the section table lies past the header prefix we read (extremely
     unusual — would need a >64 KiB optional header).
     """
+    count = 0
+    for row in _iter_section_rows(path, header, e_lfanew):
+        count += 1
+        if row.contains_rva(rva):
+            return row
+    raise SectionNotFoundError(
+        f"{path}: no section covers RVA {rva:#x} "
+        f"(scanned {count} section(s))"
+    )
+
+
+def _iter_section_rows(
+    path: Path, header: bytes, e_lfanew: int,
+) -> Iterator[_SectionRow]:
+    """Yield every parsed :class:`_SectionRow` from the PE section table.
+
+    Centralises the offset arithmetic so both RVA-based and name-based
+    section lookups read the table exactly once through a single,
+    validated parse path. Raises :class:`NotAPeError` if the table
+    lies past the header prefix (same policy as
+    :func:`_find_section_for_rva` held previously).
+    """
     num_sections = int.from_bytes(
         header[e_lfanew + _FILE_HEADER_NUMBER_OF_SECTIONS_OFFSET:
                e_lfanew + _FILE_HEADER_NUMBER_OF_SECTIONS_OFFSET + 2],
@@ -219,14 +285,7 @@ def _find_section_for_rva(
             sect_table_off + i * _SECT_ENTRY_SIZE:
             sect_table_off + (i + 1) * _SECT_ENTRY_SIZE
         ]
-        row = _parse_section_row(entry)
-        if row.contains_rva(rva):
-            return row
-
-    raise SectionNotFoundError(
-        f"{path}: no section covers RVA {rva:#x} "
-        f"(scanned {num_sections} section(s))"
-    )
+        yield _parse_section_row(entry)
 
 
 def _parse_section_row(entry: bytes) -> _SectionRow:

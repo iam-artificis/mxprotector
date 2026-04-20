@@ -17,6 +17,7 @@ import pytest
 from mx_mcp.common.pe_reader import (
     NotAPeError,
     SectionNotFoundError,
+    get_section_virtual_size,
     read_entry_point_rva,
     read_section_bytes,
 )
@@ -192,3 +193,59 @@ def test_read_section_bytes_real_pe_roundtrip(traced_fixture):
     # Entry-point region is code — not all zeros, not all 0xCC.
     assert got != b"\x00" * 64
     assert got != b"\xCC" * 64
+
+
+# ============================================================================
+# get_section_virtual_size — baseline denominator source.
+# ============================================================================
+
+
+def test_section_virtual_size_happy_path(tmp_path):
+    payload = b"\x90" * 1024
+    pe = _build_fake_pe([(".text", payload, 0x1000)])
+    path = tmp_path / "vs.exe"
+    path.write_bytes(pe)
+
+    assert get_section_virtual_size(path, ".text") == 1024
+
+
+def test_section_virtual_size_multi_section_finds_by_name(tmp_path):
+    pe = _build_fake_pe([
+        (".text", b"\x11" * 512, 0x1000),
+        (".data", b"\x22" * 256, 0x2000),
+        (".vm",   b"\x33" * 2048, 0x3000),
+    ])
+    path = tmp_path / "multi_vs.exe"
+    path.write_bytes(pe)
+
+    assert get_section_virtual_size(path, ".text") == 512
+    assert get_section_virtual_size(path, ".data") == 256
+    assert get_section_virtual_size(path, ".vm") == 2048
+
+
+def test_section_virtual_size_unknown_name_raises(tmp_path):
+    pe = _build_fake_pe([(".text", b"\x00" * 16, 0x1000)])
+    path = tmp_path / "miss_vs.exe"
+    path.write_bytes(pe)
+
+    with pytest.raises(SectionNotFoundError, match="no section named"):
+        get_section_virtual_size(path, ".nosuch")
+
+
+def test_section_virtual_size_on_non_pe_raises(tmp_path):
+    junk = tmp_path / "junk.exe"
+    junk.write_bytes(b"definitely not a PE")
+    with pytest.raises(NotAPeError):
+        get_section_virtual_size(junk, ".text")
+
+
+def test_section_virtual_size_on_real_pe(traced_fixture):
+    """Real builder-produced PE must have a non-empty ``.text`` — this
+    mirrors the baseline provider's happy path in production."""
+    size = get_section_virtual_size(traced_fixture.binary, ".text")
+    assert size > 0
+    # Stubbed protected binary .text is typically a few hundred bytes
+    # of trampolines; baseline .text would be much larger. Either way,
+    # fit-to-PE max is 4 GiB — guard only the lower bound and
+    # reasonableness.
+    assert size < 0x40000000
