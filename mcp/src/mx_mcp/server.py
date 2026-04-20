@@ -28,11 +28,13 @@ from mx_mcp.common.tool_base import all_tools
 from mx_mcp.dynamic.frida.session import Session
 
 # Side-effect imports — each subpackage's ``__init__.py`` runs the
-# ``@register_tool`` decorators on its concrete tool modules. Adding a
-# new tools subpackage: add one line here. noqa: F401 throughout.
+# ``@register_tool`` / ``@register_benchmark`` decorators on its
+# concrete modules. Adding a new tools or benchmarks subpackage: add
+# one line here. noqa: F401 throughout.
 from mx_mcp import tools as _tools_pkg  # noqa: F401
 from mx_mcp.dynamic.frida import tools as _frida_tools_pkg  # noqa: F401
 from mx_mcp.static import sidecar_tools as _sidecar_tools_pkg  # noqa: F401
+from mx_mcp import benchmarks as _benchmarks_pkg  # noqa: F401
 
 
 _LOG = logging.getLogger(__name__)
