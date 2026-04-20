@@ -32,9 +32,11 @@ flavoured section-name pools. See `git log` for per-stage detail.
   loader runs surface the operational edges.
 
 ## Tooling
-- **MCP tracing** — Frida-based runtime tracer MCP server.
-  Architecture and phase plan in [`MCP_TRACING.md`](MCP_TRACING.md).
-  Status: Phase 0 scaffold.
+- **MCP defense measurement** — multi-backend MCP server measuring
+  protection strength against state-of-the-art reversing tools.
+  Architecture in [`MCP.md`](MCP.md), post-MVP backlog in
+  [`FUTURE.md`](FUTURE.md). Status: migration commit landed; MVP
+  phases P1–P9 pending.
 
 ## Deferred / Future
 - **`MX_GUARD` auto-selection:** Build-time heuristic to auto-wrap sensitive regions. QoL, low protection delta.

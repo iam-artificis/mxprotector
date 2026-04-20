@@ -1,0 +1,93 @@
+# mx-mcp — MCP defense measurement suite for MxProtector.
+# See ../MCP.md for architecture, ../FUTURE.md for deferred items.
+
+[build-system]
+requires      = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "mx-mcp"
+version         = "0.1.0"
+description     = "Multi-backend MCP server measuring MxProtector's protection strength."
+readme          = "README.md"
+requires-python = ">=3.11"
+license         = { text = "proprietary" }
+authors         = [{ name = "MxProtector Authors" }]
+classifiers     = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+# Core deps — always needed. ``frida`` is here (not in extras) because
+# the Frida-backed ``Session`` is the only runtime harness wired in the
+# migration commit. Later phases may split it out once non-Frida
+# dynamic backends arrive.
+dependencies = [
+    "mcp      >= 1.0",
+    "pydantic >= 2.0",
+    "frida    >= 17.0",
+]
+
+# ----------------------------------------------------------------------
+# Optional backends — installed per-category via ``pip install -e ".[…]"``.
+# Tools self-report when their backend is absent (see tool_base.ITool
+# contract + per-tool guards). External binaries (IDA, pe-sieve,
+# BinDiff, d810) are documented in README.md — not pip-installable.
+# ----------------------------------------------------------------------
+[project.optional-dependencies]
+unicorn = ["unicorn >= 2.0"]
+angr    = ["angr    >= 9.2"]
+# msynth / SiMBA are installed from GitHub — see README.md for exact URLs.
+unpack  = ["unipacker >= 1.0"]
+
+full = [
+    "unicorn   >= 2.0",
+    "angr      >= 9.2",
+    "unipacker >= 1.0",
+]
+
+dev = [
+    "pytest >= 8",
+    "ruff   >= 0.5",
+    "mypy   >= 1.10",
+]
+
+[project.scripts]
+mx-mcp = "mx_mcp.__main__:main"
+
+# ----------------------------------------------------------------------
+# Package discovery — src/ layout.
+# ----------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ----------------------------------------------------------------------
+# Lint & format — ruff.
+# ----------------------------------------------------------------------
+[tool.ruff]
+line-length    = 100
+target-version = "py311"
+src            = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------------
+# Types — mypy strict.
+# ----------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict         = true
+mypy_path      = "src"
+
+# ----------------------------------------------------------------------
+# Tests — pytest.
+# ----------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts    = ["-ra", "--strict-markers", "--strict-config"]
+testpaths  = ["tests"]

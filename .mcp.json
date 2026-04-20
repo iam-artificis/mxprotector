@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "mx-tracing": {
+    "mx-mcp": {
       "command": "py",
-      "args": ["-3", "-m", "mx_tracing"],
+      "args": ["-3", "-m", "mx_mcp"],
       "env": {
-        "PYTHONPATH": "mcp-tools/tracing/src"
+        "PYTHONPATH": "mcp/src"
       }
     }
   }
