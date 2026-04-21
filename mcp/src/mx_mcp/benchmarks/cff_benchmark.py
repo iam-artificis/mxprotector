@@ -114,10 +114,22 @@ SCRIPT_PATH = (
 )
 
 
-# Metric declarations — calibration values are *initial* guesses
-# reflecting the user's expectation that amplification lands in the
-# 2..20x band when measured against the matched baseline (commit 8
-# retunes empirically after the first smoke run).
+# Metric declarations — empirical calibration against the seed corpus
+# at strong-level protection (p50 observations from
+# ``scripts/_smoke_vm_and_chart.py``):
+#
+#   mc_blocks_amplification      5.66x  → strong=10.0   → score ≈ 0.52
+#   mc_cyclomatic_amplification  5.67x  → strong=10.0   → score ≈ 0.52
+#   mc_gotos_amplification       33.5x  → strong=60.0   → score ≈ 0.55
+#   mc_backedge_ratio            0.259  → strong=0.6    → score ≈ 0.43
+#   cff_coverage                 0.44%  → strong=0.01   → score ≈ 0.44
+#
+# Coverage anchors are tight against the seed corpus because these
+# test binaries are dominated by CRT / runtime bloat — only a small
+# fraction of total microcode is under ``MX_CFF_BEGIN/END`` markers.
+# On realistic production binaries where user code forms a larger
+# fraction of ``.text``, coverage will run higher and ``strong_value``
+# should be relaxed.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("mc_blocks_amplification",
      MetricDirection.HIGHER_BETTER,
@@ -127,13 +139,13 @@ _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
      MetricScale(weak_value=1.0, strong_value=10.0)),
     ("mc_gotos_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=1.0, strong_value=20.0)),
+     MetricScale(weak_value=1.0, strong_value=60.0)),
     ("mc_backedge_ratio",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=0.0, strong_value=0.6)),
     ("cff_coverage",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.5)),
+     MetricScale(weak_value=0.0, strong_value=0.01)),
 )
 
 

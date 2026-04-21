@@ -82,13 +82,26 @@ from mx_mcp.common.sidecar import Sidecar, load_sidecar
 _LOG = logging.getLogger(__name__)
 
 
-# Initial scale anchors. Retuned empirically in commit 8 after the
-# first smoke run; the values here assume the density ratio will land
-# in the 5-30x band (strong VM emits more bytecode per byte of source).
+# Empirical calibration against the seed corpus at strong-level
+# protection (p50 observations from ``scripts/_smoke_vm_and_chart.py``):
+#
+#   vm_bytecode_density          186x    → strong=350.0  → score ≈ 0.53
+#   vm_bytecode_entropy          5.90    → strong=7.5    → score ≈ 0.56
+#   vm_bytecode_bigram_entropy   8.08    → strong=10.5   → score ≈ 0.48
+#   vm_coverage                  0.089%  → strong=0.002  → score ≈ 0.45
+#
+# Density and coverage anchors are tight against the seed corpus
+# because user-written code being virtualised is a small fraction of
+# the binary's total .text (most of which is CRT / runtime bloat);
+# within that slice the VM pass emits ~186 bytes of bytecode per byte
+# of source. On real binaries with more user code, coverage scales
+# up and density may drift down — retune ``strong_value`` upward for
+# coverage, possibly downward for density if the bytecode encoder
+# gets tighter.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("vm_bytecode_density",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=1.0, strong_value=15.0)),
+     MetricScale(weak_value=1.0, strong_value=350.0)),
     ("vm_bytecode_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=4.0, strong_value=7.5)),
@@ -97,7 +110,7 @@ _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
      MetricScale(weak_value=6.0, strong_value=10.5)),
     ("vm_coverage",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.3)),
+     MetricScale(weak_value=0.0, strong_value=0.002)),
 )
 
 
