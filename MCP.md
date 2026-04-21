@@ -245,22 +245,33 @@ cheap integral metrics come first, expensive scope-heavy ones last.
   same seed → percent-matches. Single number, dead-cheap, maybe
   the highest signal-per-effort metric in the whole plan. Moved
   up from the original P8 slot.
-- **P5 — VM static + budget-to-crack.** angr symbolic on handlers;
+- **P5 — Metadata leakage scan (quick win).** Static regex sweep of
+  protected binaries for protector-internal literals that reveal
+  what's inside: pass names (``VirtualizationPass``, ``MutationPass``,
+  …), debug format strings, PDB paths, MSVC linker artefacts, RTTI
+  mentions of protector classes, literal ``MxProtector``. Two
+  surfaces: ``no_protector_metadata_leaked`` **invariant** with a
+  hard block on forbidden-list hits, plus a ``leakage_surface``
+  **benchmark** counting soft leaks as a regression signal. Cheap —
+  pure byte scan, no backend dependencies, reuses existing
+  ``invariants/`` plumbing. Lands after P4 as a clean gap-filler
+  before the heavier symbolic / emulation phases.
+- **P6 — VM static + budget-to-crack.** angr symbolic on handlers;
   score = fraction summarised within a fixed budget (wall clock +
   SMT queries + path count). Core VM-strength signal.
-- **P6 — MBA resistance.** msynth + SiMBA on handler expressions.
-  Pairs tightly with P5 — weak MBA defeats strong VM, so they
+- **P7 — MBA resistance.** msynth + SiMBA on handler expressions.
+  Pairs tightly with P6 — weak MBA defeats strong VM, so they
   land back-to-back and are reviewed as one story.
-- **P7 — Tier runners + ship-gate.** Fast / slow runners, verdict
+- **P8 — Tier runners + ship-gate.** Fast / slow runners, verdict
   aggregation. Wire it early while there are 5-6 metrics to reason
-  about; delaying until P9 buries it under a dozen gate policies
-  at once. Moved up from the original P9 slot.
-- **P8 — Emulation Unicorn.** Handler replay + OEP-reach.
+  about; delaying further buries it under a dozen gate policies at
+  once. Moved up from the original P9 slot.
+- **P9 — Emulation Unicorn.** Handler replay + OEP-reach.
   Effectively writing a mini-deobfuscator — needs explicit scope
   decision up front (replay-N-steps vs full engine). Moved down
   from the original P3 slot because pe-sieve now covers the packer
   signal P3 originally chased.
-- **P9 — Anti-analysis coverage.** Detection rate across adversarial
+- **P10 — Anti-analysis coverage.** Detection rate across adversarial
   envs (x64dbg, Frida, Unicorn, pafish, al-khaser). The noisiest,
   most infrastructure-heavy phase — allocate 2–3× its nominal
   budget. Last on purpose.

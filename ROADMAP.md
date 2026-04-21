@@ -36,9 +36,21 @@ flavoured section-name pools. See `git log` for per-stage detail.
   protection strength against state-of-the-art reversing tools.
   Architecture in [`MCP.md`](MCP.md), post-MVP backlog in
   [`FUTURE.md`](FUTURE.md). Status: migration commit landed; MVP
-  phases P1–P9 pending.
+  phases P1–P10 (P1/P2/P4 complete, P3 partial, rest pending).
 
 ## Deferred / Future
+- **UEFI binary support (`.efi`):** Targets like `bootmgfwx64.efi` and
+  other UEFI PE32+ images. Same PE/COFF layout as drivers but with a
+  distinct loader (UEFI firmware, not NT kernel), no ring0/ring3
+  split, and a different runtime-services surface (no `Nt*`/`Rtl*`,
+  `EFI_BOOT_SERVICES`/`EFI_RUNTIME_SERVICES` instead of ntdll). Will
+  reuse the existing `BinaryKind`/`LoadMode` plumbing as a starting
+  point; likely needs a new kind (e.g. `uefi_application`,
+  `uefi_driver`) with its own stub palette (no Hell's Gate, no PEB
+  access, no ntdll resolver — firmware-services call stubs instead).
+  Scope: after the ring0 `.sys` path stabilises, because the design
+  lessons there (strict-subset stub, no PEB, cipher body without
+  anti-debug) will inform the UEFI stub.
 - **`MX_GUARD` auto-selection:** Build-time heuristic to auto-wrap sensitive regions. QoL, low protection delta.
 - **`MX_GUARD` dynamic `.pdata`:** Synthesize RUNTIME_FUNCTION for guard pages → enables `throw` inside guard bodies. Medium-high complexity.
 - **`MX_GUARD` PROCESS_DETACH cleanup:** `RtlRemoveVectoredExceptionHandler` on DLL unload. Needed for dynamically-unloaded DLLs (rare in injection case).
