@@ -1,4 +1,4 @@
-"""VM static benchmark — filtered density + coverage + entropy.
+"""VM static benchmark — filtered footprint + coverage + entropy.
 
 Mirrors the CFF benchmark's normalisation pattern but over VM-protected
 regions.
@@ -16,26 +16,55 @@ For every VM-tagged buildable corpus entry:
 
    * ``baseline_filtered`` — per-function aggregates restricted to
      the VM'd functions. ``functions_total_bytes`` on this baseline
-     is the natural denominator for bytecode density.
+     is the natural denominator for the footprint ratio.
    * ``baseline_total`` — unrestricted. Its ``text_section_size``
      is the denominator for coverage.
 
 4. Read the ``.vm`` section bytes from disk, compute entropy metrics,
    and divide by ``baseline_filtered.functions_total_bytes`` for the
-   density ratio.
+   footprint ratio.
+
+## Numerator caveat — why this is *footprint*, not pure bytecode
+
+The ``.vm`` section contains everything the VM pass emits: the actual
+opcode-stream **bytecode** plus the **VM machine** that executes it
+(dispatcher, per-opcode handlers, handler table, key material). The
+VM machine is a fixed-ish cost *per region* (one blob per source
+region, each blob self-contained). On a corpus with tiny source
+functions the machine overhead dominates — e.g. a 70 B source
+function produces a ~16 KB ``.vm`` blob where only a fraction is the
+actual bytecode stream.
+
+Without backend support for emitting per-segment offsets
+(:issue:`x64_vm_backend phase 6`), we cannot cleanly separate
+bytecode from machine bytes in the sidecar. The metric therefore
+measures the *total VM footprint per byte of source code*, not the
+pure bytecode expansion factor. The name ``vm_footprint_density``
+reflects that honestly; a future ``vm_bytecode_density`` will land
+once the backend publishes sub-blob labels.
+
+Interpretation:
+
+* High ``vm_footprint_density`` — the VM pass emits a lot of binary
+  per byte of source. This includes legitimate bytecode growth **and**
+  per-region machine overhead. Useful signal for "how much .vm
+  footprint does the defender pay", **not** a direct measure of
+  bytecode verbosity.
+* Values in the hundreds are realistic for small source regions
+  because the per-region VM machine is a fixed ~10-20 KB.
 
 ## Metrics
 
 | Name | Direction | Kind |
 |---|---|---|
-| ``vm_bytecode_density``        | ↑ | ratio  | ``vm_bytes / baseline_filtered.functions_total_bytes``. Expected > 1 — VM bytecode per byte of source code the pass replaced. |
+| ``vm_footprint_density``       | ↑ | ratio    | ``vm_section_bytes / baseline_filtered.functions_total_bytes``. VM footprint (bytecode + dispatcher + handlers) per byte of source. |
 | ``vm_bytecode_entropy``        | ↑ | absolute | Byte-level Shannon entropy of the ``.vm`` section. |
 | ``vm_bytecode_bigram_entropy`` | ↑ | absolute | 16-bit bigram Shannon entropy. |
-| ``vm_coverage``                | ↑ | ratio  | ``baseline_filtered.functions_total_bytes / baseline_total.text_section_size``. Fraction of the unprotected ``.text`` footprint that got VM'd. |
+| ``vm_coverage``                | ↑ | ratio    | ``baseline_filtered.functions_total_bytes / baseline_total.text_section_size``. Fraction of the unprotected ``.text`` footprint that got VM'd. |
 
-Density and coverage are orthogonal: high density on a tiny coverage
-means "heavy VM on a few hot paths", high density + high coverage
-means "heavy VM across the whole binary".
+Footprint and coverage are orthogonal: high footprint on a tiny
+coverage means "heavy VM on a few hot paths", high footprint + high
+coverage means "heavy VM across the whole binary".
 
 Pre-protected entries are rejected — no unprotected baseline exists.
 """
@@ -85,21 +114,26 @@ _LOG = logging.getLogger(__name__)
 # Empirical calibration against the seed corpus at strong-level
 # protection (p50 observations from ``scripts/_smoke_vm_and_chart.py``):
 #
-#   vm_bytecode_density          186x    → strong=350.0  → score ≈ 0.53
+#   vm_footprint_density         186x    → strong=350.0  → score ≈ 0.53
 #   vm_bytecode_entropy          5.90    → strong=7.5    → score ≈ 0.56
 #   vm_bytecode_bigram_entropy   8.08    → strong=10.5   → score ≈ 0.48
 #   vm_coverage                  0.089%  → strong=0.002  → score ≈ 0.45
 #
-# Density and coverage anchors are tight against the seed corpus
-# because user-written code being virtualised is a small fraction of
-# the binary's total .text (most of which is CRT / runtime bloat);
-# within that slice the VM pass emits ~186 bytes of bytecode per byte
-# of source. On real binaries with more user code, coverage scales
-# up and density may drift down — retune ``strong_value`` upward for
-# coverage, possibly downward for density if the bytecode encoder
-# gets tighter.
+# Footprint values in the hundreds are dominated by per-region VM
+# machine overhead (dispatcher + handlers + tables ≈ 10-20 KB per
+# region, fixed-ish), not pure bytecode expansion. A 70 B source
+# function yields a ~16 KB VM blob because the machine ships with
+# every blob. On a corpus with larger source regions the per-region
+# overhead dilutes and the ratio approaches the true bytecode
+# expansion factor — retune ``strong_value`` downward as the corpus
+# grows, or split the metric once the x64_vm_backend exposes per-
+# segment offsets (see module docstring).
+#
+# Coverage anchors are tight because the seed corpus binaries are
+# CRT-dominated; user code under ``MX_VM_BEGIN/END`` is a small
+# fraction of the total ``.text``.
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
-    ("vm_bytecode_density",
+    ("vm_footprint_density",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=1.0, strong_value=350.0)),
     ("vm_bytecode_entropy",
@@ -121,10 +155,12 @@ class VmStaticBenchmark(IBenchmark):
     name = "vm_static"
     description = (
         "Static VM metrics on VM-tagged corpus entries. "
-        "vm_bytecode_density = bytecode bytes / sum of unprotected "
-        "source-function sizes the pass virtualised. vm_coverage = "
-        "same numerator against the whole unprotected .text. Plus "
-        "byte + bigram Shannon entropies on the bytecode."
+        "vm_footprint_density = .vm section bytes (bytecode + "
+        "dispatcher + handlers, not separable today) / sum of "
+        "unprotected source-function sizes the pass virtualised. "
+        "vm_coverage = function bytes over the whole unprotected "
+        ".text. Plus byte + bigram Shannon entropies on the .vm "
+        "bytes as a randomness signal independent of source size."
     )
     category = "vm"
     tier = "fast"
@@ -289,7 +325,12 @@ async def _process_entry(
     bigram_entropy = _shannon_bigram_entropy(bytecode)
     section_bytes = len(bytecode)
 
-    density = ratio_safe(
+    # Footprint = whole .vm section / source function bytes. This is
+    # biased upward by the per-region VM machine (dispatcher + handler
+    # table + handlers) that ships inside every blob — see module
+    # docstring. A pure-bytecode variant will land once x64_vm_backend
+    # publishes per-segment offsets.
+    footprint = ratio_safe(
         float(section_bytes),
         float(baseline_filtered.functions_total_bytes),
     )
@@ -300,17 +341,22 @@ async def _process_entry(
 
     _LOG.info(
         "%s: vm section [0x%X..0x%X) %dB / baseline_filtered "
-        "functions_total_bytes %dB → density=%s entropy=%.3f "
+        "functions_total_bytes %dB → footprint=%s entropy=%.3f "
         "bigram=%.3f coverage=%s",
         entry.name, vm_section.rva, vm_section.rva + vm_section.size,
         section_bytes, baseline_filtered.functions_total_bytes,
-        _fmt(density), byte_entropy, bigram_entropy, _fmt(coverage),
+        _fmt(footprint), byte_entropy, bigram_entropy, _fmt(coverage),
     )
 
     evidence = {
         "rva": vm_section.rva,
         "sidecar_size": vm_section.size,
-        "bytecode_bytes": section_bytes,
+        # ``vm_section_bytes`` is the raw numerator of footprint —
+        # ALL bytes in .vm, including VM machine overhead. Renamed
+        # from ``bytecode_bytes`` which was semantically misleading
+        # (the section is not pure bytecode, as noted in the module
+        # docstring).
+        "vm_section_bytes":               section_bytes,
         "baseline_filtered_functions":    baseline_filtered.function_count,
         "baseline_filtered_bytes":        baseline_filtered.functions_total_bytes,
         "baseline_total_text_size":       baseline_total.text_section_size,
@@ -323,7 +369,7 @@ async def _process_entry(
     sample_name = entry.name
 
     values: dict[str, float | int | None] = {
-        "vm_bytecode_density":        density,
+        "vm_footprint_density":       footprint,
         "vm_bytecode_entropy":        byte_entropy,
         "vm_bytecode_bigram_entropy": bigram_entropy,
         "vm_coverage":                coverage,

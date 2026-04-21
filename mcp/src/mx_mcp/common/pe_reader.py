@@ -179,7 +179,7 @@ def get_section_virtual_size(binary_path: Path, name: str) -> int:
 
     Baselines use this to pull the unprotected ``.text`` size as the
     denominator of amplification-style metrics (e.g. VM bytecode
-    density = ``bytecode_bytes / unprotected_.text_virtual_size``).
+    footprint = ``vm_section_bytes / unprotected_.text_virtual_size``).
 
     ``name`` is matched literally against the null-padded ASCII
     ``Name`` field of the section header (case-sensitive, since the

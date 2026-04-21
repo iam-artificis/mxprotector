@@ -279,7 +279,7 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path, monkeypatch):
     assert len(result.metrics) == 4
     metric_names = {m.name for m in result.metrics}
     assert metric_names == {
-        "vm_bytecode_density",
+        "vm_footprint_density",
         "vm_bytecode_entropy",
         "vm_bytecode_bigram_entropy",
         "vm_coverage",
@@ -292,10 +292,15 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path, monkeypatch):
     assert sample_names == {"alpha", "beta"}
 
 
-def test_density_equals_bytecode_over_baseline_filtered_fn_bytes(
+def test_footprint_equals_vm_section_over_baseline_filtered_fn_bytes(
     tmp_path, monkeypatch,
 ):
-    """Density = vm bytecode / baseline_filtered.functions_total_bytes."""
+    """Footprint = .vm section bytes / baseline_filtered.functions_total_bytes.
+
+    Numerator is the WHOLE .vm section (bytecode + dispatcher +
+    handlers — not separable today). This is honest per the module
+    docstring — the metric measures VM footprint, not pure bytecode
+    expansion."""
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
         monkeypatch,
@@ -303,14 +308,14 @@ def test_density_equals_bytecode_over_baseline_filtered_fn_bytes(
         sidecar_vm_size=2048,
     )
     # fn_bytes = sum of sizes of protected functions (the filtered
-    # baseline's denominator). 512 B of source → 2048 B bytecode =
-    # 4.0x density.
+    # baseline's denominator). 512 B of source → 2048 B .vm = 4.0x
+    # footprint.
     cache, _ = _build_stub_cache(fn_bytes=512)
     bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     by_name = {m.name: m for m in result.metrics}
-    assert by_name["vm_bytecode_density"].samples[0].value == 4.0
+    assert by_name["vm_footprint_density"].samples[0].value == 4.0
 
 
 def test_coverage_equals_filtered_bytes_over_total_text(tmp_path, monkeypatch):
@@ -383,7 +388,7 @@ def test_evidence_carries_numerator_and_denominator(tmp_path, monkeypatch):
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     ev = result.metrics[0].samples[0].evidence
-    assert ev["bytecode_bytes"] == 300
+    assert ev["vm_section_bytes"] == 300
     assert ev["baseline_filtered_bytes"] == 1200
     assert ev["baseline_total_text_size"] == 4500
     assert ev["virtualized_regions"] == 7
