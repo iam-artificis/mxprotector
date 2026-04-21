@@ -226,6 +226,7 @@ def _record_for_function(fn_ea: int, image_base: int) -> dict | None:
         "name": str(name),
         "size": int(fn.size()),
         "mba_maturity": str(maturity),
+        "record_type": "function",
         **_count_block_metrics(mba),
     }
 
@@ -257,6 +258,7 @@ def _record_for_region(region: dict, image_base: int) -> dict | None:
         "name": str(region.get("name", f"region_{rva:X}")),
         "size": size,
         "mba_maturity": str(maturity),
+        "record_type": "region",
         **_count_block_metrics(mba),
     }
 
@@ -379,24 +381,35 @@ def _main() -> None:
 
     regions = _parse_regions_env()
     function_filter = _parse_function_filter_env()
-    mode = "region" if regions is not None else "function"
+
+    # Mode selection: region mode iff regions env set; function mode
+    # runs whenever there's *either* no regions env OR a function
+    # filter is provided (i.e. the caller wants both the dispatcher
+    # region AND the per-function records to compute amplification
+    # against a filtered baseline).
+    run_region_mode   = regions is not None
+    run_function_mode = (regions is None) or (function_filter is not None)
+    mode_label = (
+        "both" if (run_region_mode and run_function_mode)
+        else ("region" if run_region_mode else "function")
+    )
 
     output = {
         "schema_version": _SCHEMA_VERSION,
-        "mode": mode,
+        "mode": mode_label,
         "hexrays_available": hexrays_ok,
         "image_base": image_base,
-        "functions": [],   # name kept for backward compat; holds regions in region mode
+        # Records of both kinds land here, each tagged with
+        # ``record_type: "function" | "region"``. Callers that need to
+        # split (e.g. "protected microcode in CFF section vs in text
+        # stubs") group by that field.
+        "functions": [],
         "errors": [],
-        # ``filter_stats`` surfaces how the filter affected enumeration
-        # so the caller can distinguish "filter matched nothing" (zero
-        # functions) from "hex-rays failure" (same result shape). Only
-        # populated in function mode when a filter is active.
         "filter_stats": None,
     }
 
     if hexrays_ok:
-        if mode == "region":
+        if run_region_mode:
             for region in regions or []:
                 try:
                     entry = _record_for_region(region, image_base)
@@ -413,7 +426,8 @@ def _main() -> None:
                         f"{type(exc).__name__}: {exc}"
                     )
                     sys.stderr.write(traceback.format_exc())
-        else:
+
+        if run_function_mode:
             scanned = 0
             matched = 0
             for fn_ea in idautils.Functions():

@@ -1,77 +1,71 @@
-"""CFF microcode benchmark — amplification ratios vs unprotected baseline.
+"""CFF microcode benchmark — filtered amplification + coverage.
 
 ## Method
 
-For every CFF-tagged *buildable* corpus entry:
+For every CFF-tagged buildable corpus entry:
 
-1. Measure the unprotected source via the shared baseline cache
-   (:class:`CfgBaselineCache`). The cache runs IDA in per-function
-   mode once per unique baseline binary within the benchmark run,
-   aggregating block / cyclomatic / goto totals across every
-   function it can lift.
-2. Build a protected version of the same source.
-3. Run IDA in **region** mode on the sidecar-reported ``.cff``
-   section. Region mode is required because IDA does not recognise
-   CFF dispatcher entries as functions — they're reachable only
-   through indirect jumps from small ``.text`` trampolines, so
-   "iterate all functions" misses them entirely.
-4. Aggregate the per-region records (``.cff`` is normally one region
-   = one record; multi-region support is preserved for future
-   pipelines that split dispatchers) and divide by the baseline
-   totals to produce amplification ratios.
+1. Build a protected version.
+2. Extract the list of CFF-protected functions from the sidecar's
+   ``protected_functions`` array (filtered by ``kind == "cff"``).
+   These RVAs are the **input PE** RVAs of functions the CFF pass
+   defended — the right denominator for amplification.
+3. Measure two baselines against the unprotected binary:
 
-## Pre-protected entries
+   * ``baseline_filtered`` — per-function totals restricted to the
+     functions matching the filter.
+   * ``baseline_total`` — unrestricted totals across every function.
 
-Excluded up front. A pre-protected binary has no unprotected source
-against which to measure a baseline, so the amplification ratios are
-undefined. Mixing normalised and non-normalised samples across a
-metric's distribution would corrupt the aggregate — better to surface
-"this entry has no baseline" as an error than to quietly degrade into
-incomparable numbers.
+   Both go through the shared :class:`CfgBaselineCache`; distinct
+   filter keys mean the two live in separate cache slots and both run
+   exactly once per session.
+
+4. Measure the protected side via one IDA invocation running in
+   **dual mode**: region mode on the ``.cff`` section captures the
+   dispatcher's microcode, and per-function mode (also filtered) picks
+   up whatever IDA finds at the original function RVAs — which in
+   protected builds is either the in-place flattened body or a
+   small trampoline jump to the dispatcher. Sum of both is the total
+   microcode budget the CFF pass produced for those functions.
 
 ## Metrics
 
-* ``mc_blocks_amplification``     — ↑ ``sum(protected .cff blocks) /
-                                      sum(baseline all-function blocks)``.
-                                      Values above 1.0 mean CFF emitted
-                                      more microcode blocks in the
-                                      dispatcher than existed in the
-                                      entire source.
-* ``mc_cyclomatic_amplification`` — ↑ same shape, cyclomatic complexity.
-* ``mc_gotos_amplification``      — ↑ same shape, goto / ijmp counts.
-                                      Tends higher than the block
-                                      amplification because the
-                                      dispatcher tail of every flattened
-                                      state is a goto.
-* ``mc_backedge_ratio``           — ↑ edge-weighted average across the
-                                      region records. Absolute ratio in
-                                      ``[0, 1]`` — already a ratio, so
-                                      no per-binary normalisation.
+All five are ``HIGHER_BETTER`` — stronger CFF inflates every quantity.
 
-All four are HIGHER_BETTER — a stronger CFF pass inflates every
-quantity. ``mc_blocks`` / ``mc_gotos`` / ``mc_cyclomatic`` were raw
-counts before this refactor; the amplification variants replace them
-and the scale anchors land around mid-scale against the current
-strong-level corpus (measured values drive commit 4 calibration).
+* ``mc_blocks_amplification``      — ↑ ``protected_total /
+                                       baseline_filtered``. Expected
+                                       > 1 because flattening emits
+                                       more blocks than the source
+                                       contained.
+* ``mc_cyclomatic_amplification``  — ↑ same shape, cyclomatic
+                                       complexity.
+* ``mc_gotos_amplification``       — ↑ same shape, goto / ijmp
+                                       counts. Amplifies harder than
+                                       blocks because every flattened
+                                       state's tail is a goto.
+* ``mc_backedge_ratio``            — ↑ edge-weighted back-edge
+                                       fraction across the region
+                                       records. Already a ratio in
+                                       ``[0, 1]``; no normalisation.
+* ``cff_coverage``                 — ↑ ``baseline_filtered.total_blocks
+                                       / baseline_total.total_blocks``.
+                                       Fraction of the unprotected
+                                       binary's microcode that got
+                                       CFF'd. Orthogonal to
+                                       amplification — a high
+                                       amplification on a tiny slice
+                                       of the binary scores high on
+                                       the former, low on this.
+
+## Pre-protected entries
+
+Excluded. A pre-protected artefact has no unprotected source to
+measure a baseline against, so the ratios are undefined.
 
 ## Failure modes
 
 Fail-closed: every per-entry failure surfaces in
-``BenchmarkResult.errors`` and the benchmark still aggregates
-whichever entries succeeded. The recognised terminal states:
-
-* ``baseline measurement failed`` — IDA / PE inspection of the
-  unprotected binary failed (reports underlying reason).
-* ``pre-protected — no baseline`` — entry is an archived artefact.
-* ``build failed`` — builder returned non-zero or didn't produce the
-  expected output.
-* ``sidecar missing`` / ``no 'cff' section`` — trace hints disabled
-  or build ran without CFG flattening.
-* ``IDA missing`` / ``IDA exit=N`` — region-mode IDA launch failed.
-* ``Hex-Rays not available`` — IDA ran but the decompiler plugin is
-  absent / disabled.
-* ``gen_microcode produced no blocks`` — the ``.cff`` bytes were
-  unreadable (packer on?) or the range was invalid.
+``BenchmarkResult.errors`` and the benchmark still aggregates the
+healthy entries.
 """
 
 from __future__ import annotations
@@ -115,73 +109,45 @@ from mx_mcp.static.ida.runner import (
 _LOG = logging.getLogger(__name__)
 
 
-# IDAPython companion script — shared with the baseline provider. The
-# CFF benchmark uses region mode (MX_MCP_IDA_REGIONS env var) to
-# point IDA at the .cff byte range; the baseline provider omits that
-# env var so the script walks every function.
 SCRIPT_PATH = (
     Path(_ida_pkg.__file__).parent / "scripts" / "cff_metrics.py"
 )
 
 
-# Metric declarations — all HIGHER_BETTER.
-#
-# Scale calibration (empirical, post-smoke run against the seed
-# corpus at strong-level protection):
-#
-#   Observed p50 values — ``mc_blocks_amplification`` 0.0224,
-#   ``mc_cyclomatic_amplification`` 0.0196,
-#   ``mc_gotos_amplification`` 0.0703, ``mc_backedge_ratio`` 0.26.
-#
-# The amplification ratios are small because the CFF pass only
-# touches ``MX_CFF_BEGIN/END``-delimited regions — most of the
-# unprotected source's microcode is outside that scope, pulling the
-# denominator up. Anchors are set so the current strong-level output
-# lands around score 0.45–0.5 (mid-scale). This gives both an
-# upward runway for future CFF improvements and a visible drop
-# window if a regression reduces flattening strength.
-#
-# * ``mc_blocks_amplification`` — weak 0.0, strong 0.05. p50 0.0224
-#   → score ≈ 0.448.
-# * ``mc_cyclomatic_amplification`` — weak 0.0, strong 0.04. p50
-#   0.0196 → score ≈ 0.490.
-# * ``mc_gotos_amplification`` — weak 0.0, strong 0.15. Gotos amplify
-#   harder than blocks (each flattened state's tail is a goto) so the
-#   scale span is wider. p50 0.0703 → score ≈ 0.469.
-# * ``mc_backedge_ratio`` — weak 0.0, strong 0.6. Absolute ratio in
-#   ``[0, 1]``. p50 0.26 → score ≈ 0.433.
-#
-# When the CFF pass gets a material upgrade, re-run
-# ``scripts/_smoke_vm_and_chart.py`` and nudge the ``strong_value``
-# upward so the new p50 sits near 0.5 again.
+# Metric declarations — calibration values are *initial* guesses
+# reflecting the user's expectation that amplification lands in the
+# 2..20x band when measured against the matched baseline (commit 8
+# retunes empirically after the first smoke run).
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("mc_blocks_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.05)),
+     MetricScale(weak_value=1.0, strong_value=10.0)),
     ("mc_cyclomatic_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.04)),
+     MetricScale(weak_value=1.0, strong_value=10.0)),
     ("mc_gotos_amplification",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.15)),
+     MetricScale(weak_value=1.0, strong_value=20.0)),
     ("mc_backedge_ratio",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=0.0, strong_value=0.6)),
+    ("cff_coverage",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=0.0, strong_value=0.5)),
 )
 
 
 @register_benchmark
 class CffMicrocodeBenchmark(IBenchmark):
-    """HexRays microcode CFF metrics — amplification vs unprotected."""
+    """CFF filtered-amplification + coverage benchmark."""
 
     name = "cff_microcode"
     description = (
-        "HexRays microcode complexity on CFF-tagged corpus entries. "
-        "Emits mc_{blocks,cyclomatic,gotos}_amplification as ratios "
-        "of protected .cff section totals over unprotected-baseline "
-        "totals (higher = more aggressive flattening), plus "
-        "mc_backedge_ratio as an absolute measure of CFG "
-        "irreducibility."
+        "Filtered amplification ratios (protected microcode / "
+        "unprotected-baseline microcode, restricted to functions the "
+        "CFF pass defended) plus cff_coverage (fraction of the "
+        "unprotected binary's CFG complexity that got CFF'd) and an "
+        "absolute backedge ratio on the dispatcher."
     )
     category = "cff"
     tier = "fast"
@@ -192,13 +158,6 @@ class CffMicrocodeBenchmark(IBenchmark):
         *,
         baseline_cache: CfgBaselineCache | None = None,
     ) -> None:
-        """Construct the benchmark.
-
-        ``baseline_cache`` is optional for testability — the registry
-        instantiates via ``cls()`` and the first ``run()`` lazily
-        creates a default cache wrapping :class:`IdaCfgBaselineProvider`.
-        Tests inject a stub-backed cache directly.
-        """
         self._baseline_cache = baseline_cache
 
     async def run(self, corpus, session) -> BenchmarkResult:
@@ -248,12 +207,6 @@ class CffMicrocodeBenchmark(IBenchmark):
         )
 
     def _resolve_baseline_cache(self) -> CfgBaselineCache:
-        """Lazy-create the baseline cache on first ``run`` call.
-
-        Kept as a one-liner method rather than inline in ``run`` so
-        tests that subclass the benchmark can override the default
-        without copy-pasting the rest of ``run``.
-        """
         if self._baseline_cache is None:
             self._baseline_cache = CfgBaselineCache(IdaCfgBaselineProvider())
         return self._baseline_cache
@@ -295,41 +248,21 @@ async def _process_entry(
     baseline_cache: CfgBaselineCache,
     samples_by_metric: dict[str, list[MetricSample]],
 ) -> list[str]:
-    """Baseline + build + region-IDA + amplification for one entry.
-
-    Returns the accumulated error strings for this entry (empty on
-    full success). Samples append in place to ``samples_by_metric``.
-    """
+    """Build → sidecar → baselines → protected IDA → samples."""
     if entry.is_pre_protected:
         return [
             f"{entry.name}: pre-protected — no unprotected source to "
             f"measure amplification against"
         ]
-
     if entry.unprotected_binary is None:
-        # Belt-and-braces — Corpus.load should have rejected this.
         return [f"{entry.name}: corpus entry has no unprotected source"]
 
-    # 1. Baseline measurement (cached across entries + benchmarks that
-    #    share this cache instance).
-    try:
-        baseline = await baseline_cache.get(entry.unprotected_binary)
-    except BaselineError as e:
-        return [f"{entry.name}: baseline measurement failed: {e}"]
-    except FileNotFoundError as e:
-        return [f"{entry.name}: baseline input missing: {e}"]
-
-    # 2. Build protected + sidecar.
+    # 1. Build protected + sidecar.
     try:
         pb = await ensure_protected(
             entry,
             output_dir=output_dir,
             builder_path=builder_path,
-            # ``--no-packer`` keeps .cff plaintext on disk so IDA can
-            # analyse the dispatcher bytes directly. A packed build
-            # would have the section RC4-encrypted on disk (decrypted
-            # only at runtime by the stub) and the benchmark would
-            # see ciphertext. Packer quality has its own benchmark.
             extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )
@@ -348,18 +281,44 @@ async def _process_entry(
             f"CFF disabled or --no-cfg-flattening in effect"
         ]
 
+    # 2. Protected-function filter from sidecar.
+    filter_rvas = _filter_rvas_from_sidecar(sidecar, kind="cff")
+    if not filter_rvas:
+        return [
+            f"{entry.name}: sidecar has no cff-kind entries in "
+            f"protected_functions — cannot filter baseline"
+        ]
+
+    # 3. Two baseline measurements — filtered (amplification
+    #    denominator) + total (coverage denominator). Shared cache
+    #    runs each unique (binary, filter) pair once per session.
+    try:
+        baseline_filtered = await baseline_cache.get(
+            entry.unprotected_binary, filter_rvas=filter_rvas,
+        )
+        baseline_total = await baseline_cache.get(
+            entry.unprotected_binary, filter_rvas=None,
+        )
+    except BaselineError as e:
+        return [f"{entry.name}: baseline measurement failed: {e}"]
+    except FileNotFoundError as e:
+        return [f"{entry.name}: baseline input missing: {e}"]
+
+    # 4. Protected-side IDA — dual mode.
     regions = [{
         "name": "cff_section",
         "rva": cff_section.rva,
         "size": cff_section.size,
     }]
-
-    # 3. Region-mode IDA on the protected .cff section.
     try:
         ida_result = await run_ida_script(
             binary=pb.protected_binary,
             script=SCRIPT_PATH,
-            extra_env={"MX_MCP_IDA_REGIONS": json.dumps(regions)},
+            extra_env={
+                "MX_MCP_IDA_REGIONS": json.dumps(regions),
+                "MX_MCP_IDA_FUNCTION_FILTER": json.dumps(
+                    sorted(filter_rvas)),
+            },
         )
     except IdaNotFoundError as e:
         return [f"{entry.name}: IDA missing: {e}"]
@@ -379,19 +338,26 @@ async def _process_entry(
         for e in ida_out.get("errors", [])
     ]
 
-    if not records:
+    function_records = [r for r in records
+                        if r.get("record_type") == "function"]
+    region_records = [r for r in records
+                      if r.get("record_type") == "region"]
+
+    if not region_records:
         errors.append(
             f"{entry.name}: gen_microcode produced no blocks for the "
-            f"cff section [0x{cff_section.rva:X}..{cff_section.rva + cff_section.size:X}) "
-            f"— bytes may be encrypted (packer on?) or invalid"
+            f"cff section [0x{cff_section.rva:X}"
+            f"..{cff_section.rva + cff_section.size:X}) — bytes may be "
+            f"encrypted (packer on?) or invalid"
         )
         return errors
 
-    # 4. Aggregate protected-side totals + amplification ratios.
     _record_amplification_samples(
         entry_name=entry.name,
-        baseline=baseline,
-        records=records,
+        baseline_filtered=baseline_filtered,
+        baseline_total=baseline_total,
+        function_records=function_records,
+        region_records=region_records,
         samples_by_metric=samples_by_metric,
     )
     return errors
@@ -402,72 +368,96 @@ async def _process_entry(
 # ============================================================================
 
 
+def _filter_rvas_from_sidecar(sidecar: Sidecar, *, kind: str) -> frozenset[int]:
+    return frozenset(
+        pf.rva for pf in sidecar.protected_functions if pf.kind == kind
+    )
+
+
+def _sum_records(records: list[dict], field: str) -> int:
+    return sum(int(r.get(field, 0)) for r in records)
+
+
 def _record_amplification_samples(
     *,
     entry_name: str,
-    baseline: CfgBaseline,
-    records: list[dict],
+    baseline_filtered: CfgBaseline,
+    baseline_total: CfgBaseline,
+    function_records: list[dict],
+    region_records: list[dict],
     samples_by_metric: dict[str, list[MetricSample]],
 ) -> None:
-    """Convert per-region records into four per-entry samples.
+    """Convert protected + baseline records into per-entry samples.
 
-    Multi-region aggregation semantics:
+    Totals summed across *both* record types:
 
-    * ``mc_blocks`` / ``mc_cyclomatic`` / ``mc_gotos`` are summed
-      across regions (per-region independence — each region contributes
-      its own microcode blocks to the CFF section).
-    * ``mc_backedge_ratio`` is computed from the summed edge and
-      back-edge counts, giving an edge-weighted average across regions
-      instead of an unweighted mean (a region with 100 edges should
-      pull the ratio harder than one with 5).
+    * Function records on protected side — in-place flattened bodies +
+      trampoline stubs that IDA picks up at the filter RVAs.
+    * Region records on protected side — the ``.cff`` dispatcher
+      microcode, independent of IDA function recognition.
+
+    These are disjoint (.text vs .cff sections) and together cover the
+    full microcode footprint of the CFF pass for the filtered
+    functions.
     """
-    total_blocks = sum(int(r.get("mc_blocks", 0)) for r in records)
-    total_cyc = sum(int(r.get("mc_cyclomatic", 0)) for r in records)
-    total_gotos = sum(int(r.get("mc_gotos", 0)) for r in records)
-    total_edges = sum(int(r.get("mc_edges", 0)) for r in records)
-    total_backedges = sum(int(r.get("mc_backedges", 0)) for r in records)
+    protected_blocks = (_sum_records(function_records, "mc_blocks")
+                        + _sum_records(region_records, "mc_blocks"))
+    protected_cyc = (_sum_records(function_records, "mc_cyclomatic")
+                     + _sum_records(region_records, "mc_cyclomatic"))
+    protected_gotos = (_sum_records(function_records, "mc_gotos")
+                       + _sum_records(region_records, "mc_gotos"))
 
-    blocks_amp = ratio_safe(float(total_blocks), float(baseline.total_blocks))
-    cyc_amp = ratio_safe(float(total_cyc), float(baseline.total_cyclomatic))
-    gotos_amp = ratio_safe(float(total_gotos), float(baseline.total_gotos))
+    blocks_amp = ratio_safe(float(protected_blocks),
+                            float(baseline_filtered.total_blocks))
+    cyc_amp = ratio_safe(float(protected_cyc),
+                         float(baseline_filtered.total_cyclomatic))
+    gotos_amp = ratio_safe(float(protected_gotos),
+                           float(baseline_filtered.total_gotos))
 
-    if total_edges > 0:
-        backedge_ratio: float | None = total_backedges / total_edges
-    else:
-        # No edges across any region — CFG is a single node or
-        # gen_microcode returned degenerate blocks. Report as error
-        # sample (None) rather than silent 0.0 so aggregation flags it.
-        backedge_ratio = None
+    # Backedge ratio — absolute, weighted across region records only.
+    # The dispatcher is the CFG that matters for CFF's irreducibility
+    # signal; function-level stubs are trivial and would dilute.
+    total_edges = _sum_records(region_records, "mc_edges")
+    total_backedges = _sum_records(region_records, "mc_backedges")
+    backedge_ratio: float | None = (
+        total_backedges / total_edges if total_edges > 0 else None
+    )
+
+    # Coverage — fraction of the unprotected binary's CFG budget that
+    # ended up in the filter. Denominator = whole-source total blocks.
+    coverage = ratio_safe(
+        float(baseline_filtered.total_blocks),
+        float(baseline_total.total_blocks),
+    )
 
     evidence = {
-        "protected_blocks": total_blocks,
-        "protected_cyclomatic": total_cyc,
-        "protected_gotos": total_gotos,
-        "protected_edges": total_edges,
-        "protected_backedges": total_backedges,
-        "baseline_blocks": baseline.total_blocks,
-        "baseline_cyclomatic": baseline.total_cyclomatic,
-        "baseline_gotos": baseline.total_gotos,
-        "baseline_function_count": baseline.function_count,
-        "region_count": len(records),
-        # Per-region peek — ea / rva / mba_maturity of the first
-        # region so post-mortem on a single-region entry (the typical
-        # case) does not require cross-referencing another tool.
-        "first_region_ea": records[0].get("ea"),
-        "first_region_rva": records[0].get("rva"),
-        "first_region_mba_maturity": records[0].get("mba_maturity"),
+        "protected_blocks_total":       protected_blocks,
+        "protected_blocks_in_cff":      _sum_records(region_records, "mc_blocks"),
+        "protected_blocks_in_text":     _sum_records(function_records, "mc_blocks"),
+        "protected_cyclomatic_total":   protected_cyc,
+        "protected_gotos_total":        protected_gotos,
+        "baseline_filtered_blocks":     baseline_filtered.total_blocks,
+        "baseline_filtered_cyclomatic": baseline_filtered.total_cyclomatic,
+        "baseline_filtered_gotos":      baseline_filtered.total_gotos,
+        "baseline_filtered_functions":  baseline_filtered.function_count,
+        "baseline_total_blocks":        baseline_total.total_blocks,
+        "baseline_total_functions":     baseline_total.function_count,
+        "protected_function_records":   len(function_records),
+        "protected_region_records":     len(region_records),
+        "filter_rva_count":             (
+            len(baseline_filtered.filter_rvas)
+            if baseline_filtered.filter_rvas is not None else 0
+        ),
     }
 
     _LOG.info(
-        "%s: cff — blocks %d/%d=%s cyc %d/%d=%s gotos %d/%d=%s ber=%s",
+        "%s: cff — blocks %d/%d=%s cyc %d/%d=%s gotos %d/%d=%s "
+        "ber=%s cov=%s",
         entry_name,
-        total_blocks, baseline.total_blocks,
-        _fmt_ratio(blocks_amp),
-        total_cyc, baseline.total_cyclomatic,
-        _fmt_ratio(cyc_amp),
-        total_gotos, baseline.total_gotos,
-        _fmt_ratio(gotos_amp),
-        _fmt_ratio(backedge_ratio),
+        protected_blocks, baseline_filtered.total_blocks, _fmt(blocks_amp),
+        protected_cyc, baseline_filtered.total_cyclomatic, _fmt(cyc_amp),
+        protected_gotos, baseline_filtered.total_gotos, _fmt(gotos_amp),
+        _fmt(backedge_ratio), _fmt(coverage),
     )
 
     samples_by_metric["mc_blocks_amplification"].append(MetricSample(
@@ -482,16 +472,18 @@ def _record_amplification_samples(
     samples_by_metric["mc_backedge_ratio"].append(MetricSample(
         sample_name=entry_name, value=backedge_ratio, evidence=evidence,
     ))
+    samples_by_metric["cff_coverage"].append(MetricSample(
+        sample_name=entry_name, value=coverage, evidence=evidence,
+    ))
 
 
-def _fmt_ratio(r: float | None) -> str:
+def _fmt(r: float | None) -> str:
     return f"{r:.3f}" if r is not None else "n/a"
 
 
 def _load_sidecar_or_error(
     sidecar_path: Path | None, entry_name: str,
 ) -> Sidecar | str:
-    """Return the parsed sidecar or an entry-level error string."""
     if sidecar_path is None:
         return (
             f"{entry_name}: build produced no sidecar (trace-hints off?) "
@@ -499,5 +491,5 @@ def _load_sidecar_or_error(
         )
     try:
         return load_sidecar(sidecar_path)
-    except Exception as e:  # noqa: BLE001 — fail-closed: one entry, not the whole run
+    except Exception as e:  # noqa: BLE001 — fail-closed: one entry
         return f"{entry_name}: sidecar load failed: {type(e).__name__}: {e}"

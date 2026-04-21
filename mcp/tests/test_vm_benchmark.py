@@ -133,6 +133,8 @@ _DEFAULT_VM_RVA = 0x30000
 _DEFAULT_VM_SIZE = 0x800
 _DEFAULT_HANDLER_COUNT = 3
 
+_DEFAULT_VM_PROTECTED_RVAS: tuple[int, ...] = (0x1500, 0x1800)
+
 
 def _write_synthetic_sidecar(
     sidecar_path: Path,
@@ -141,6 +143,7 @@ def _write_synthetic_sidecar(
     vm_size: int = _DEFAULT_VM_SIZE,
     handler_count: int = _DEFAULT_HANDLER_COUNT,
     include_vm: bool = True,
+    protected_rvas: tuple[int, ...] | list[int] | None = None,
 ) -> None:
     sections: dict = {}
     handlers: list[dict] = []
@@ -159,6 +162,13 @@ def _write_synthetic_sidecar(
                 "opcode": f"region_{i}",
             })
 
+    if protected_rvas is None:
+        protected_rvas = _DEFAULT_VM_PROTECTED_RVAS
+    protected_entries = [
+        {"rva": int(r), "size": 256, "kind": "vm"}
+        for r in protected_rvas
+    ]
+
     payload = {
         "schema_version": 1,
         "build": {
@@ -174,6 +184,7 @@ def _write_synthetic_sidecar(
         "guard":   {"regions": []},
         "strings": {"slots": []},
         "iat":     {"rva": 0, "size": 0},
+        "protected_functions": protected_entries,
     }
     sidecar_path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -188,6 +199,7 @@ def _install_mocks(
     sidecar_handler_count: int = _DEFAULT_HANDLER_COUNT,
     sidecar_has_vm: bool = True,
     sidecar_omit: bool = False,
+    sidecar_protected_rvas: tuple[int, ...] | list[int] | None = None,
 ) -> dict:
     build_calls: list[Path] = []
     byte_calls: list[tuple[Path, int, int]] = []
@@ -217,6 +229,7 @@ def _install_mocks(
                 vm_size=sidecar_vm_size,
                 handler_count=sidecar_handler_count,
                 include_vm=sidecar_has_vm,
+                protected_rvas=sidecar_protected_rvas,
             )
         return ProtectedBuild(
             unprotected_binary=source_binary,
@@ -263,12 +276,13 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path, monkeypatch):
     assert result.tier == "fast"
     assert result.errors == []
 
-    assert len(result.metrics) == 3
+    assert len(result.metrics) == 4
     metric_names = {m.name for m in result.metrics}
     assert metric_names == {
         "vm_bytecode_density",
         "vm_bytecode_entropy",
         "vm_bytecode_bigram_entropy",
+        "vm_coverage",
     }
     for m in result.metrics:
         assert m.direction is MetricDirection.HIGHER_BETTER
@@ -278,39 +292,44 @@ def test_happy_path_emits_one_sample_per_entry(tmp_path, monkeypatch):
     assert sample_names == {"alpha", "beta"}
 
 
-def test_density_equals_bytecode_size_over_baseline_text(tmp_path, monkeypatch):
-    """Density value = bytecode size / baseline .text size."""
+def test_density_equals_bytecode_over_baseline_filtered_fn_bytes(
+    tmp_path, monkeypatch,
+):
+    """Density = vm bytecode / baseline_filtered.functions_total_bytes."""
     corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
     _install_mocks(
         monkeypatch,
         bytes_map={"alpha": b"\xAB" * 2048},
         sidecar_vm_size=2048,
     )
-    cache, _ = _build_stub_cache(text_size=8192)
-    bench = vb.VmStaticBenchmark(baseline_cache=cache)
-    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
-
-    by_name = {m.name: m for m in result.metrics}
-    assert by_name["vm_bytecode_density"].samples[0].value == 0.25
-
-
-def test_density_above_one_when_bytecode_exceeds_baseline_text(
-    tmp_path, monkeypatch,
-):
-    """A heavy VM pass can emit more bytecode than the original code
-    footprint — density >1.0 must be reported as-is, not clipped."""
-    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
-    _install_mocks(
-        monkeypatch,
-        bytes_map={"alpha": b"\x00" * 4000},
-        sidecar_vm_size=4000,
-    )
-    cache, _ = _build_stub_cache(text_size=1000)
+    # fn_bytes = sum of sizes of protected functions (the filtered
+    # baseline's denominator). 512 B of source → 2048 B bytecode =
+    # 4.0x density.
+    cache, _ = _build_stub_cache(fn_bytes=512)
     bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     by_name = {m.name: m for m in result.metrics}
     assert by_name["vm_bytecode_density"].samples[0].value == 4.0
+
+
+def test_coverage_equals_filtered_bytes_over_total_text(tmp_path, monkeypatch):
+    """Coverage = baseline_filtered.functions_total_bytes /
+    baseline_total.text_section_size. Stub returns both values from
+    the SAME object (it doesn't discriminate by filter), so coverage =
+    fn_bytes / text_size."""
+    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
+    _install_mocks(
+        monkeypatch,
+        bytes_map={"alpha": b"\x00" * 1024},
+        sidecar_vm_size=1024,
+    )
+    cache, _ = _build_stub_cache(fn_bytes=2048, text_size=8192)
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    by_name = {m.name: m for m in result.metrics}
+    assert by_name["vm_coverage"].samples[0].value == 0.25  # 2048 / 8192
 
 
 def test_entropy_metrics_independent_of_baseline(tmp_path, monkeypatch):
@@ -359,14 +378,17 @@ def test_evidence_carries_numerator_and_denominator(tmp_path, monkeypatch):
         sidecar_vm_size=300,
         sidecar_handler_count=7,
     )
-    cache, _ = _build_stub_cache(text_size=4500)
+    cache, _ = _build_stub_cache(text_size=4500, fn_bytes=1200)
     bench = vb.VmStaticBenchmark(baseline_cache=cache)
     result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
     ev = result.metrics[0].samples[0].evidence
     assert ev["bytecode_bytes"] == 300
-    assert ev["baseline_text_size"] == 4500
+    assert ev["baseline_filtered_bytes"] == 1200
+    assert ev["baseline_total_text_size"] == 4500
     assert ev["virtualized_regions"] == 7
+    # filter_rva_count matches the default synthetic sidecar entries.
+    assert ev["filter_rva_count"] == 2
 
 
 # ============================================================================
@@ -386,7 +408,8 @@ def test_untagged_entry_skipped(tmp_path, monkeypatch):
 
     assert len(mocks["build_calls"]) == 1
     assert len(mocks["byte_calls"]) == 1
-    assert len(provider.calls) == 1
+    # Two baseline calls per processed entry (filtered + total).
+    assert len(provider.calls) == 2
 
 
 def test_no_vm_tagged_entries_reports_error(tmp_path, monkeypatch):
@@ -555,6 +578,24 @@ def test_pre_protected_entry_errors_with_no_baseline_explanation(
 # ============================================================================
 
 
+def test_empty_protected_functions_errors_entry(tmp_path, monkeypatch):
+    """A sidecar with no vm-kind entries in ``protected_functions``
+    means the filter is empty — benchmark cannot compute density
+    against unknowns. Errors cleanly."""
+    corpus = _make_corpus(tmp_path, [("alpha", ["vm"])])
+    _install_mocks(monkeypatch, sidecar_protected_rvas=())
+    cache, _ = _build_stub_cache()
+    bench = vb.VmStaticBenchmark(baseline_cache=cache)
+    result = asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
+
+    assert any(
+        "no vm-kind entries in protected_functions" in e
+        for e in result.errors
+    )
+    for m in result.metrics:
+        assert m.samples == []
+
+
 def test_baseline_cache_reused_across_entries_in_one_run(tmp_path, monkeypatch):
     """Two distinct VM-tagged entries share one baseline cache —
     provider sees each unprotected binary exactly once."""
@@ -567,7 +608,8 @@ def test_baseline_cache_reused_across_entries_in_one_run(tmp_path, monkeypatch):
     bench = vb.VmStaticBenchmark(baseline_cache=cache)
     asyncio.run(bench.run(corpus, _fake_session(tmp_path)))
 
-    assert len(provider.calls) == 2
+    # Two entries × two calls each (filtered + total) = 4 calls.
+    assert len(provider.calls) == 4
     assert len({call[0].stem for call in provider.calls}) == 2
 
 

@@ -1,54 +1,43 @@
-"""VM static benchmark — bytecode density + entropy.
+"""VM static benchmark — filtered density + coverage + entropy.
 
-Complements the CFF microcode benchmark. Where CFF measurement needs a
-full IDA + Hex-Rays round-trip on the *protected* artefact, the VM
-benchmark is static-only on the numerator side:
+Mirrors the CFF benchmark's normalisation pattern but over VM-protected
+regions.
 
-1. Measure the unprotected source's ``.text`` virtual size via the
-   shared baseline cache (trivial PE header read inside the baseline
-   provider; the companion IDA run is reused if another benchmark
-   primed the cache).
-2. Build the corpus entry with ``--no-packer`` so the VM section
-   lands plaintext on disk (packed builds RC4-encrypt the section at
-   build time; the decryption stub unwraps it only at runtime).
-3. Parse the ``.mxtrace.json`` sidecar to learn the VM section's
-   ``(rva, size)`` window and the count of ``VirtualizationPass``-
-   emitted region labels.
-4. Read the VM bytecode bytes from disk and compute the quality
-   metrics over them.
+## Method
+
+For every VM-tagged buildable corpus entry:
+
+1. Build a protected version.
+2. Extract the list of VM-protected function RVAs from the sidecar's
+   ``protected_functions`` array (``kind == "vm"``). These locate, in
+   the input PE's address space, the regions the VM pass replaced
+   with stubs.
+3. Measure two baselines against the unprotected binary:
+
+   * ``baseline_filtered`` — per-function aggregates restricted to
+     the VM'd functions. ``functions_total_bytes`` on this baseline
+     is the natural denominator for bytecode density.
+   * ``baseline_total`` — unrestricted. Its ``text_section_size``
+     is the denominator for coverage.
+
+4. Read the ``.vm`` section bytes from disk, compute entropy metrics,
+   and divide by ``baseline_filtered.functions_total_bytes`` for the
+   density ratio.
 
 ## Metrics
 
-| Name | Direction | Kind | Meaning |
-|---|---|---|---|
-| ``vm_bytecode_density``         | ↑ | ratio   | ``bytecode_bytes / unprotected_.text_virtual_size``. 1.0 = VM pass emitted bytecode equal in size to the whole original code; >1.0 = bytecode bigger than source. Corpus-independent — a 10 KB entry with 2 KB bytecode and a 100 KB entry with 20 KB both land at 0.2. |
-| ``vm_bytecode_entropy``         | ↑ | absolute | Byte-level Shannon entropy (bits / byte). Low values mean repeating opcodes / fixed operand patterns — trivial to cluster. Already unit-normalised by construction ([0, 8]); no per-binary baseline needed. |
-| ``vm_bytecode_bigram_entropy``  | ↑ | absolute | 16-bit bigram Shannon entropy. Catches short-range repetition that single-byte entropy masks (e.g. a common two-byte opcode prefix). Same unit-normalised rationale as the single-byte entropy. |
+| Name | Direction | Kind |
+|---|---|---|
+| ``vm_bytecode_density``        | ↑ | ratio  | ``vm_bytes / baseline_filtered.functions_total_bytes``. Expected > 1 — VM bytecode per byte of source code the pass replaced. |
+| ``vm_bytecode_entropy``        | ↑ | absolute | Byte-level Shannon entropy of the ``.vm`` section. |
+| ``vm_bytecode_bigram_entropy`` | ↑ | absolute | 16-bit bigram Shannon entropy. |
+| ``vm_coverage``                | ↑ | ratio  | ``baseline_filtered.functions_total_bytes / baseline_total.text_section_size``. Fraction of the unprotected ``.text`` footprint that got VM'd. |
 
-``vm_bytecode_bytes`` (a previous metric) is no longer scored on its
-own. The density ratio captures "how much bytecode per byte of source"
-which is the useful signal; the raw count remains in per-sample
-evidence for post-mortem but aggregating it produced a corpus-size
-dependent number that the density metric supersedes.
+Density and coverage are orthogonal: high density on a tiny coverage
+means "heavy VM on a few hot paths", high density + high coverage
+means "heavy VM across the whole binary".
 
-## Pre-protected entries
-
-Excluded. A legacy pre-protected binary has no unprotected source
-against which to measure ``.text`` — the density ratio is undefined.
-Mixing density samples with "no-signal" filler corrupts the aggregate.
-
-## Failure modes
-
-Fail-closed: every failure lands in ``BenchmarkResult.errors`` and the
-benchmark still returns aggregated metrics from healthy entries.
-Terminal states the benchmark handles explicitly:
-
-* Baseline measurement failure (IDA / PE inspection) → entry errored.
-* Pre-protected entry → entry errored (no baseline source).
-* Build failure → entry errored.
-* Missing / empty VM section in sidecar → entry errored.
-* Missing sidecar → entry errored (rebuild with ``--trace-hints``).
-* PE section lookup failure → entry errored.
+Pre-protected entries are rejected — no unprotected baseline exists.
 """
 
 from __future__ import annotations
@@ -62,6 +51,7 @@ from pathlib import Path
 
 from mx_mcp.common.baseline import (
     BaselineError,
+    CfgBaseline,
     CfgBaselineCache,
 )
 from mx_mcp.common.benchmark_base import (
@@ -92,55 +82,36 @@ from mx_mcp.common.sidecar import Sidecar, load_sidecar
 _LOG = logging.getLogger(__name__)
 
 
-# Metric declarations.
-#
-# Scale calibration (empirical, post-smoke run against the seed
-# corpus at strong-level protection):
-#
-#   Observed p50 values — ``vm_bytecode_density`` 0.166,
-#   ``vm_bytecode_entropy`` 5.92, ``vm_bytecode_bigram_entropy`` 8.07.
-#
-# Anchors are set so the current output lands near score 0.5
-# (mid-scale), leaving runway in both directions.
-#
-# * ``vm_bytecode_density`` — weak 0.0 (pass ran but emitted nothing)
-#   / strong 0.35 (bytecode is 35% of the original code footprint —
-#   heavy virtualisation on the seed corpus). p50 0.166 → score ≈ 0.474.
-#   On a corpus with heavier VM coverage the measured p50 shifts
-#   upward; retune ``strong_value`` to track it.
-#
-# * ``vm_bytecode_entropy`` — unchanged. Shannon byte entropy with a
-#   hard upper bound of 8.0. Scale ``[4.0, 7.5]`` flags anything below
-#   4 bits as trivially patterned (weak) and rewards near-uniform
-#   encodings (strong). p50 5.92 → score ≈ 0.549.
-#
-# * ``vm_bytecode_bigram_entropy`` — unchanged. Max 16.0, but real
-#   encoded streams hit 8–11 because adjacent bytes are correlated
-#   (opcode then operand). Scale ``[6.0, 10.5]`` tracks the realistic
-#   band. p50 8.07 → score ≈ 0.460.
+# Initial scale anchors. Retuned empirically in commit 8 after the
+# first smoke run; the values here assume the density ratio will land
+# in the 5-30x band (strong VM emits more bytecode per byte of source).
 _METRIC_DEFS: tuple[tuple[str, MetricDirection, MetricScale], ...] = (
     ("vm_bytecode_density",
      MetricDirection.HIGHER_BETTER,
-     MetricScale(weak_value=0.0, strong_value=0.35)),
+     MetricScale(weak_value=1.0, strong_value=15.0)),
     ("vm_bytecode_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=4.0, strong_value=7.5)),
     ("vm_bytecode_bigram_entropy",
      MetricDirection.HIGHER_BETTER,
      MetricScale(weak_value=6.0, strong_value=10.5)),
+    ("vm_coverage",
+     MetricDirection.HIGHER_BETTER,
+     MetricScale(weak_value=0.0, strong_value=0.3)),
 )
 
 
 @register_benchmark
 class VmStaticBenchmark(IBenchmark):
-    """VM static-analysis benchmark — bytecode density + entropy."""
+    """VM filtered density + coverage + entropy."""
 
     name = "vm_static"
     description = (
-        "Static VM bytecode metrics on VM-tagged corpus entries. "
-        "Emits vm_bytecode_density as a corpus-independent amplification "
-        "ratio (bytecode bytes / unprotected .text virtual size) plus "
-        "byte + bigram Shannon entropies as absolute quality signals."
+        "Static VM metrics on VM-tagged corpus entries. "
+        "vm_bytecode_density = bytecode bytes / sum of unprotected "
+        "source-function sizes the pass virtualised. vm_coverage = "
+        "same numerator against the whole unprotected .text. Plus "
+        "byte + bigram Shannon entropies on the bytecode."
     )
     category = "vm"
     tier = "fast"
@@ -151,12 +122,6 @@ class VmStaticBenchmark(IBenchmark):
         *,
         baseline_cache: CfgBaselineCache | None = None,
     ) -> None:
-        """Construct the benchmark.
-
-        ``baseline_cache`` is optional for testability. The registry
-        instantiates via ``cls()`` — the first ``run`` call lazy-creates
-        a default cache wrapping :class:`IdaCfgBaselineProvider`.
-        """
         self._baseline_cache = baseline_cache
 
     async def run(self, corpus, session) -> BenchmarkResult:
@@ -247,40 +212,20 @@ async def _process_entry(
     baseline_cache: CfgBaselineCache,
     samples_by_metric: dict[str, list[MetricSample]],
 ) -> list[str]:
-    """Baseline + build + sidecar + byte-scan for one entry.
-
-    Returns accumulated error strings. On success, appends one sample
-    per metric to ``samples_by_metric`` in place.
-    """
+    """Build → sidecar → baselines → protected bytes → samples."""
     if entry.is_pre_protected:
         return [
             f"{entry.name}: pre-protected — no unprotected source to "
             f"measure bytecode density against"
         ]
-
     if entry.unprotected_binary is None:
         return [f"{entry.name}: corpus entry has no unprotected source"]
 
-    # 1. Baseline — only ``text_section_size`` is needed here, but the
-    #    cache stores the full CfgBaseline so another benchmark (cff)
-    #    can reuse the IDA pass. Requesting the baseline reuses any
-    #    pre-existing cache entry transparently.
-    try:
-        baseline = await baseline_cache.get(entry.unprotected_binary)
-    except BaselineError as e:
-        return [f"{entry.name}: baseline measurement failed: {e}"]
-    except FileNotFoundError as e:
-        return [f"{entry.name}: baseline input missing: {e}"]
-
-    # 2. Build protected + sidecar.
     try:
         pb = await ensure_protected(
             entry,
             output_dir=output_dir,
             builder_path=builder_path,
-            # ``--no-packer`` so the VM section lands plaintext on
-            # disk. Packed builds would hand us RC4 ciphertext —
-            # still high-entropy, but dishonestly so.
             extra_args=["--no-packer"],
             workspace_root=workspace_root,
         )
@@ -296,9 +241,27 @@ async def _process_entry(
     if vm_section is None or vm_section.size == 0:
         return [
             f"{entry.name}: sidecar has no (non-empty) 'vm' section — "
-            f"virtualization pass disabled or no MX_VM_BEGIN/END "
-            f"markers in source"
+            f"virtualization pass disabled or no MX_VM_BEGIN/END markers"
         ]
+
+    filter_rvas = _filter_rvas_from_sidecar(sidecar, kind="vm")
+    if not filter_rvas:
+        return [
+            f"{entry.name}: sidecar has no vm-kind entries in "
+            f"protected_functions — cannot filter baseline"
+        ]
+
+    try:
+        baseline_filtered = await baseline_cache.get(
+            entry.unprotected_binary, filter_rvas=filter_rvas,
+        )
+        baseline_total = await baseline_cache.get(
+            entry.unprotected_binary, filter_rvas=None,
+        )
+    except BaselineError as e:
+        return [f"{entry.name}: baseline measurement failed: {e}"]
+    except FileNotFoundError as e:
+        return [f"{entry.name}: baseline input missing: {e}"]
 
     try:
         bytecode = read_section_bytes(
@@ -309,37 +272,48 @@ async def _process_entry(
     except OSError as e:
         return [f"{entry.name}: VM bytes IO error: {e}"]
 
-    # 3. Compute scored quantities.
     byte_entropy = _shannon_byte_entropy(bytecode)
     bigram_entropy = _shannon_bigram_entropy(bytecode)
     section_bytes = len(bytecode)
+
     density = ratio_safe(
-        float(section_bytes), float(baseline.text_section_size),
+        float(section_bytes),
+        float(baseline_filtered.functions_total_bytes),
+    )
+    coverage = ratio_safe(
+        float(baseline_filtered.functions_total_bytes),
+        float(baseline_total.text_section_size),
     )
 
     _LOG.info(
-        "%s: vm section [0x%X..0x%X) %d B / baseline.text %d B → "
-        "density=%s entropy=%.3f bigram=%.3f",
+        "%s: vm section [0x%X..0x%X) %dB / baseline_filtered "
+        "functions_total_bytes %dB → density=%s entropy=%.3f "
+        "bigram=%.3f coverage=%s",
         entry.name, vm_section.rva, vm_section.rva + vm_section.size,
-        section_bytes, baseline.text_section_size,
-        f"{density:.4f}" if density is not None else "n/a",
-        byte_entropy, bigram_entropy,
+        section_bytes, baseline_filtered.functions_total_bytes,
+        _fmt(density), byte_entropy, bigram_entropy, _fmt(coverage),
     )
 
     evidence = {
         "rva": vm_section.rva,
         "sidecar_size": vm_section.size,
         "bytecode_bytes": section_bytes,
-        "baseline_text_size": baseline.text_section_size,
-        "dispatcher_rva": sidecar.vm.dispatcher_rva,
-        "virtualized_regions": len(sidecar.vm.handlers),
+        "baseline_filtered_functions":    baseline_filtered.function_count,
+        "baseline_filtered_bytes":        baseline_filtered.functions_total_bytes,
+        "baseline_total_text_size":       baseline_total.text_section_size,
+        "baseline_total_functions":       baseline_total.function_count,
+        "baseline_total_bytes":           baseline_total.functions_total_bytes,
+        "dispatcher_rva":                 sidecar.vm.dispatcher_rva,
+        "virtualized_regions":            len(sidecar.vm.handlers),
+        "filter_rva_count":               len(filter_rvas),
     }
     sample_name = entry.name
 
     values: dict[str, float | int | None] = {
-        "vm_bytecode_density": density,
-        "vm_bytecode_entropy": byte_entropy,
+        "vm_bytecode_density":        density,
+        "vm_bytecode_entropy":        byte_entropy,
         "vm_bytecode_bigram_entropy": bigram_entropy,
+        "vm_coverage":                coverage,
     }
     for metric_name, value in values.items():
         samples_by_metric[metric_name].append(MetricSample(
@@ -349,10 +323,19 @@ async def _process_entry(
     return []
 
 
+def _filter_rvas_from_sidecar(sidecar: Sidecar, *, kind: str) -> frozenset[int]:
+    return frozenset(
+        pf.rva for pf in sidecar.protected_functions if pf.kind == kind
+    )
+
+
+def _fmt(r: float | None) -> str:
+    return f"{r:.4f}" if r is not None else "n/a"
+
+
 def _load_sidecar_or_error(
     sidecar_path: Path | None, entry_name: str,
 ) -> Sidecar | str:
-    """Return the parsed sidecar or an entry-level error string."""
     if sidecar_path is None:
         return (
             f"{entry_name}: build produced no sidecar (trace-hints off?) "
@@ -360,26 +343,16 @@ def _load_sidecar_or_error(
         )
     try:
         return load_sidecar(sidecar_path)
-    except Exception as e:  # noqa: BLE001 — fail-closed: one entry, not the whole run
+    except Exception as e:  # noqa: BLE001 — fail-closed: one entry
         return f"{entry_name}: sidecar load failed: {type(e).__name__}: {e}"
 
 
 # ============================================================================
-# Entropy helpers
-#
-# Kept private because they encode specific definitions tied to this
-# benchmark's interpretation (log₂-base Shannon over the full byte
-# population; bigrams as contiguous 16-bit windows). Anyone wanting a
-# more general facility should port these to ``common/`` deliberately.
+# Entropy helpers (unchanged from the pre-normalisation revision).
 # ============================================================================
 
 
 def _shannon_byte_entropy(data: bytes) -> float:
-    """Shannon entropy in bits over the byte population of ``data``.
-
-    Returns ``0.0`` for empty / single-byte input (no distribution to
-    measure — callers treat it as the weakest end of the scale).
-    """
     if len(data) < 2:
         return 0.0
     counts = Counter(data)
@@ -392,13 +365,6 @@ def _shannon_byte_entropy(data: bytes) -> float:
 
 
 def _shannon_bigram_entropy(data: bytes) -> float:
-    """Shannon entropy in bits over contiguous byte pairs.
-
-    Bigram view catches short-range structure (e.g. a common two-byte
-    opcode prefix) that single-byte entropy averages out. Returns
-    ``0.0`` for inputs shorter than 3 bytes — two bigrams is the
-    minimum where "distribution" is a meaningful word.
-    """
     if len(data) < 3:
         return 0.0
     pairs = Counter(
