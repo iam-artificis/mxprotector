@@ -7,5 +7,6 @@ every invariant module, populating the global registry used by
 line below.
 """
 
+from mx_mcp.invariants import no_protector_metadata_leaked as _no_protector_metadata_leaked  # noqa: F401
 from mx_mcp.invariants import oep_is_stub as _oep_is_stub  # noqa: F401
 from mx_mcp.invariants import packer_decrypted as _packer_decrypted  # noqa: F401

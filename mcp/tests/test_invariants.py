@@ -29,6 +29,9 @@ from mx_mcp.common.sidecar import (
     VmHints,
 )
 from mx_mcp.dynamic.frida.session import Session
+from mx_mcp.invariants.no_protector_metadata_leaked import (
+    NoProtectorMetadataLeakedInvariant,
+)
 from mx_mcp.invariants.oep_is_stub import OepIsStubInvariant
 from mx_mcp.invariants.packer_decrypted import PackerDecryptedInvariant
 from mx_mcp.tools.verify_protection_invariants import (
@@ -47,6 +50,11 @@ def test_registry_contains_phase3_invariants():
     names = [cls.name for cls in all_invariants()]
     assert "packer_decrypted" in names
     assert "oep_is_stub" in names
+
+
+def test_registry_contains_p5_invariant():
+    names = [cls.name for cls in all_invariants()]
+    assert "no_protector_metadata_leaked" in names
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +149,77 @@ def test_oep_is_stub_skips_when_no_packer_section():
         InvariantContext(events=[], sidecar=sc, binary_path=Path("/nonexistent"))
     )
     assert v.status is VerdictStatus.SKIP
+
+
+# ---------------------------------------------------------------------------
+# no_protector_metadata_leaked
+# ---------------------------------------------------------------------------
+
+
+def test_no_metadata_leaked_passes_on_clean_binary(tmp_path):
+    binary = tmp_path / "clean.exe"
+    binary.write_bytes(b"MZ" + b"\x00" * 64 + b"KERNEL32.DLL\x00")
+    sc = _minimal_sidecar()
+    v = NoProtectorMetadataLeakedInvariant().evaluate(
+        InvariantContext(events=[], sidecar=sc, binary_path=binary)
+    )
+    assert v.status is VerdictStatus.PASS
+    assert v.evidence["total_hits"] == 0
+
+
+def test_no_metadata_leaked_fails_on_mxprotector_hit(tmp_path):
+    binary = tmp_path / "leak.exe"
+    binary.write_bytes(b"\x00" * 32 + b"MxProtector" + b"\x00" * 32)
+    sc = _minimal_sidecar()
+    v = NoProtectorMetadataLeakedInvariant().evaluate(
+        InvariantContext(events=[], sidecar=sc, binary_path=binary)
+    )
+    assert v.status is VerdictStatus.FAIL
+    assert v.evidence["total_hits"] == 1
+    assert v.evidence["distinct_literals"] == 1
+    breakdown = v.evidence["breakdown"]
+    assert breakdown[0]["literal"] == "MxProtector"
+    assert breakdown[0]["first_offsets"][0]["offset"] == 32
+
+
+def test_no_metadata_leaked_fails_on_pass_name_leak(tmp_path):
+    binary = tmp_path / "passleak.exe"
+    binary.write_bytes(b"abc" + b"VirtualizationPass" + b"def")
+    sc = _minimal_sidecar()
+    v = NoProtectorMetadataLeakedInvariant().evaluate(
+        InvariantContext(events=[], sidecar=sc, binary_path=binary)
+    )
+    assert v.status is VerdictStatus.FAIL
+    literals = {b["literal"] for b in v.evidence["breakdown"]}
+    assert "VirtualizationPass" in literals
+
+
+def test_no_metadata_leaked_fails_on_utf16_hit(tmp_path):
+    binary = tmp_path / "utf16.exe"
+    binary.write_bytes(b"\x00" * 16 + "PackerPass".encode("utf-16le"))
+    sc = _minimal_sidecar()
+    v = NoProtectorMetadataLeakedInvariant().evaluate(
+        InvariantContext(events=[], sidecar=sc, binary_path=binary)
+    )
+    assert v.status is VerdictStatus.FAIL
+    encodings = {
+        off["encoding"]
+        for b in v.evidence["breakdown"]
+        for off in b["first_offsets"]
+    }
+    assert encodings == {"utf16le"}
+
+
+def test_no_metadata_leaked_handles_missing_file(tmp_path):
+    sc = _minimal_sidecar()
+    v = NoProtectorMetadataLeakedInvariant().evaluate(
+        InvariantContext(
+            events=[], sidecar=sc,
+            binary_path=tmp_path / "does_not_exist.exe",
+        )
+    )
+    assert v.status is VerdictStatus.FAIL
+    assert "could not read" in v.message
 
 
 # ---------------------------------------------------------------------------

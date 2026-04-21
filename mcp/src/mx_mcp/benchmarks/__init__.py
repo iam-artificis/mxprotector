@@ -9,5 +9,7 @@ imports this subpackage so the registry is populated before
 
 from mx_mcp.benchmarks import bindiff_benchmark as _bindiff_benchmark  # noqa: F401
 from mx_mcp.benchmarks import cff_benchmark as _cff_benchmark  # noqa: F401
+from mx_mcp.benchmarks import leakage_benchmark as _leakage_benchmark  # noqa: F401
 from mx_mcp.benchmarks import packer_benchmark as _packer_benchmark  # noqa: F401
 from mx_mcp.benchmarks import vm_benchmark as _vm_benchmark  # noqa: F401
+from mx_mcp.benchmarks import vm_symbolic_benchmark as _vm_symbolic_benchmark  # noqa: F401
