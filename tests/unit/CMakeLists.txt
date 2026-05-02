@@ -38,6 +38,7 @@ set(TEST_SOURCES
     pe_parser_pe_type_test.cpp
     section_intent_test.cpp
     layout_policy_test.cpp
+    chaos_layout_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
     relocation_injector_test.cpp
@@ -175,6 +176,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_injector.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/standard_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp

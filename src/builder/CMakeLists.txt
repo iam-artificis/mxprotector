@@ -34,6 +34,7 @@ set(BUILDER_SOURCES
     pe/section_emitter.cpp
     pe/relocation_injector.cpp
     pe/layout/standard_layout.cpp
+    pe/layout/chaos_layout.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp

@@ -184,6 +184,28 @@ struct ProtectionConfig {
     bool enable_veh_anti_tamper = false;
 
     /**
+     * @brief Feature B — `--chaos` layout mode.
+     *
+     * When true, `main()` swaps `ProtectionContext`'s active
+     * `ILayoutPolicy` from `pe::StandardLayout` to `pe::ChaosLayout`.
+     * Every emitted section's intent gets rewritten to
+     * `{mixed_code_data, rwx}` and a post-pass `finalize` sweep
+     * stamps every existing section's `characteristics` with the
+     * chaos bit-mask, so the resulting PE presents one unified
+     * read-write-execute region to any tool that walks the section
+     * table.
+     *
+     * MVP (B.1/B.2): characteristics rewrite only — no section
+     * merging or fragment shuffling. Future B.3 will replace the
+     * section table with a single unified section whose bytes are
+     * the original section bodies cut into chunks and shuffled
+     * randomly, with every RVA-bearing reference patched in lockstep.
+     *
+     * Default: false. Set via `--chaos` on the command line.
+     */
+    bool chaos_layout = false;
+
+    /**
      * @brief Emit the `<output>.mxtrace.json` sidecar for the tracing
      *        MCP (see MCP_TRACING.md).
      *

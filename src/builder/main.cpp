@@ -30,6 +30,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/pe/layout/chaos_layout.hpp"
 #include "mxprotector/pe/pe_builder.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_parser.hpp"
@@ -110,6 +111,16 @@ int main(int argc, char** argv) {
         pe_image->architecture());
 
     auto ctx = mx::ProtectionContext(std::move(pe_image), config, disasm);
+
+    // Feature B — swap the layout policy to `ChaosLayout` when
+    // `--chaos` was set. Default is `StandardLayout`, installed by
+    // the `ProtectionContext` constructor; the swap must happen
+    // before any pass executes so every emission seam sees the
+    // overridden intent.
+    if (config.chaos_layout) {
+        ctx.set_layout_policy(std::make_unique<mx::pe::ChaosLayout>());
+        std::cout << "[*] Layout policy: chaos (RWX / mixed code+data)\n";
+    }
 
     {
         const auto& img = ctx.pe_image();
