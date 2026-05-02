@@ -127,8 +127,9 @@ TEST(SectionNamePool, UnknownKindFallsBackToUserMode) {
 
 void check_all_distinct(const SectionNameMap& names) {
     std::set<std::string> s{
-        names.vm, names.cff, names.packer, names.str, names.guard};
-    EXPECT_EQ(s.size(), 5u) << "the 5 picked names must all differ";
+        names.vm, names.cff, names.packer,
+        names.str, names.guard, names.mut};
+    EXPECT_EQ(s.size(), 6u) << "the 6 picked names must all differ";
 }
 
 TEST(SectionNamePool, DebugFlagReturnsFixedSetForExecutable) {
@@ -141,6 +142,7 @@ TEST(SectionNamePool, DebugFlagReturnsFixedSetForExecutable) {
     EXPECT_EQ(names.packer, ".mxpack");
     EXPECT_EQ(names.str,    ".mxstr");
     EXPECT_EQ(names.guard,  ".mxguard");
+    EXPECT_EQ(names.mut,    ".mxmut");
 }
 
 TEST(SectionNamePool, DebugFlagIgnoresKind) {
@@ -156,6 +158,7 @@ TEST(SectionNamePool, DebugFlagIgnoresKind) {
     EXPECT_EQ(names.packer, ".mxpack");
     EXPECT_EQ(names.str,    ".mxstr");
     EXPECT_EQ(names.guard,  ".mxguard");
+    EXPECT_EQ(names.mut,    ".mxmut");
 }
 
 TEST(SectionNamePool, ExecutableDrawsFromUserModePool) {
@@ -172,6 +175,7 @@ TEST(SectionNamePool, ExecutableDrawsFromUserModePool) {
     EXPECT_NE(pool_set.count(names.packer), 0u) << names.packer;
     EXPECT_NE(pool_set.count(names.str),    0u) << names.str;
     EXPECT_NE(pool_set.count(names.guard),  0u) << names.guard;
+    EXPECT_NE(pool_set.count(names.mut),    0u) << names.mut;
 }
 
 TEST(SectionNamePool, DriverDrawsFromDriverPool) {
@@ -188,6 +192,7 @@ TEST(SectionNamePool, DriverDrawsFromDriverPool) {
     EXPECT_NE(pool_set.count(names.packer), 0u) << names.packer;
     EXPECT_NE(pool_set.count(names.str),    0u) << names.str;
     EXPECT_NE(pool_set.count(names.guard),  0u) << names.guard;
+    EXPECT_NE(pool_set.count(names.mut),    0u) << names.mut;
 
     // Cross-check: none of the picked names look like user-mode.
     const auto& user_pool = stealth_section_pool_for(BinaryKind::executable);
@@ -197,6 +202,7 @@ TEST(SectionNamePool, DriverDrawsFromDriverPool) {
     EXPECT_EQ(user_set.count(names.packer), 0u);
     EXPECT_EQ(user_set.count(names.str),    0u);
     EXPECT_EQ(user_set.count(names.guard),  0u);
+    EXPECT_EQ(user_set.count(names.mut),    0u);
 }
 
 TEST(SectionNamePool, DeterministicForSameSeed) {
@@ -212,12 +218,13 @@ TEST(SectionNamePool, DeterministicForSameSeed) {
     EXPECT_EQ(a.packer, b.packer);
     EXPECT_EQ(a.str,    b.str);
     EXPECT_EQ(a.guard,  b.guard);
+    EXPECT_EQ(a.mut,    b.mut);
 }
 
 TEST(SectionNamePool, DifferentSeedsUsuallyDifferentNames) {
     // Probabilistic sanity: distinct seeds should shuffle the
     // pool into distinct permutations often enough that at least
-    // one of the 5 slots differs. With a pool of ≥ 16 entries the
+    // one of the 6 slots differs. With a pool of ≥ 16 entries the
     // probability of full-match collision is < 1 in 16! — vanishing.
     Randomizer rng_a{0x1111ull};
     Randomizer rng_b{0x2222ull};
@@ -225,7 +232,7 @@ TEST(SectionNamePool, DifferentSeedsUsuallyDifferentNames) {
     auto b = pick_section_names(BinaryKind::kernel_driver, false, rng_b);
     const bool any_diff =
         a.vm != b.vm || a.cff != b.cff || a.packer != b.packer
-        || a.str != b.str || a.guard != b.guard;
+        || a.str != b.str || a.guard != b.guard || a.mut != b.mut;
     EXPECT_TRUE(any_diff) << "two distinct seeds produced byte-identical "
                              "section maps — bump the seeds or check the "
                              "Fisher-Yates shuffle";

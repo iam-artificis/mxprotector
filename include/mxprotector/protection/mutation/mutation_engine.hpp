@@ -27,6 +27,10 @@
 #include "mxprotector/protection/mutation/substitution_rules.hpp"
 #include "mxprotector/protection/mutation/junk_generator.hpp"
 
+namespace mx::mutation {
+class IExpansionSink;
+} // namespace mx::mutation
+
 namespace mx {
 
 class ProtectionContext;
@@ -77,13 +81,51 @@ public:
     /// @brief Количество вставленных junk-паттернов за всё время жизни.
     [[nodiscard]] uint32_t total_junk_insertions() const noexcept { return total_junk_insertions_; }
 
+    /// @brief Number of substitutions redirected via the expansion
+    /// sink (i.e. the rule produced longer bytes than the original
+    /// instruction's slot). Tracked separately from
+    /// `total_substitutions_` so callers can tell apart in-place
+    /// mutations from spilled ones in logs.
+    [[nodiscard]] uint32_t total_redirected_expansions() const noexcept {
+        return total_redirected_expansions_;
+    }
+
+    /**
+     * @brief Install (or clear) the expansion sink used when a rule
+     *        produces longer bytes than the substituted instruction.
+     *
+     * Default: `nullptr`, meaning the engine refuses size-changing
+     * substitutions (the current pre-A behaviour). When set, the
+     * engine inspects each oversize replacement: if the original
+     * instruction is at least 5 bytes (room for `JMP rel32`) and
+     * Zydis confirms the replacement is position-independent (no
+     * branches/calls/returns), the bytes are routed through the sink
+     * and a `JMP rel32` is patched in at the original site, padding
+     * the residual slot bytes with `0x90` NOPs.
+     *
+     * Construction-time injection is intentionally avoided so the
+     * common case (no sink) keeps the existing 3-argument constructor
+     * shape. Callers wire the sink up after constructing the engine.
+     *
+     * @param sink Borrowed pointer; lifetime must outlive the engine.
+     *             Pass `nullptr` to disable expansion handling.
+     */
+    void set_expansion_sink(mx::mutation::IExpansionSink* sink) noexcept {
+        expansion_sink_ = sink;
+    }
+
 private:
     SubstitutionRuleRegistry rules_;                ///< Реестр правил подстановки
     std::unique_ptr<JunkGenerator> junk_gen_;       ///< Генератор junk-кода
     Randomizer& rng_;                               ///< ГСЧ (внешняя ссылка)
 
-    uint32_t total_substitutions_ = 0;              ///< Счётчик подстановок
-    uint32_t total_junk_insertions_ = 0;            ///< Счётчик junk-вставок
+    uint32_t total_substitutions_         = 0;      ///< Счётчик подстановок
+    uint32_t total_junk_insertions_       = 0;      ///< Счётчик junk-вставок
+    uint32_t total_redirected_expansions_ = 0;      ///< Счётчик расширенных подстановок
+
+    /// Optional expansion sink — see `set_expansion_sink`. The engine
+    /// borrows the pointer; ownership stays with the caller.
+    mx::mutation::IExpansionSink* expansion_sink_ = nullptr;
 
     static constexpr double substitution_probability_ = 1.0;  ///< Вероятность подстановки
     static constexpr double junk_probability_ = 0.3;          ///< Вероятность вставки junk

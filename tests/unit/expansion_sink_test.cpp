@@ -36,6 +36,7 @@
 #include "mxprotector/pe/section_emitter.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/mutation/overflow/extend_in_place_sink.hpp"
+#include "mxprotector/protection/mutation/overflow/fallback_expansion_sink.hpp"
 #include "mxprotector/protection/mutation/overflow/grow_source_section_sink.hpp"
 #include "mxprotector/protection/mutation/overflow/jmp_emit.hpp"
 #include "mxprotector/protection/mutation/overflow/separate_overflow_sink.hpp"
@@ -49,6 +50,7 @@ using mx::mutation::ExpansionRequest;
 using mx::mutation::overflow::compute_rel32;
 using mx::mutation::overflow::encode_jmp_rel32;
 using mx::mutation::overflow::ExtendInPlaceSink;
+using mx::mutation::overflow::FallbackExpansionSink;
 using mx::mutation::overflow::GrowSourceSectionSink;
 using mx::mutation::overflow::kJmpRel32Size;
 using mx::mutation::overflow::kMaxSpillCount;
@@ -419,6 +421,158 @@ TEST(GrowSourceSectionSink, EmptyExpandedBytesIsRejected) {
         .expanded_bytes = mx::ByteView{},
     });
     EXPECT_FALSE(plan.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// FallbackExpansionSink
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Test double — always returns the configured error code without
+/// touching the image. Used to drive `FallbackExpansionSink`'s
+/// error-discrimination logic deterministically.
+class CannedErrorSink final
+    : public mx::mutation::IExpansionSink
+{
+public:
+    explicit CannedErrorSink(mx::PeErrorCode code,
+                             std::string_view label) noexcept
+        : code_(code), label_(label) {}
+
+    [[nodiscard]] mx::MxResult<mx::mutation::ExpansionPlan> plant(
+        const mx::mutation::ExpansionRequest&) override
+    {
+        ++calls_;
+        return std::unexpected(mx::error::pe(code_, std::string(label_)));
+    }
+
+    [[nodiscard]] std::string_view name() const noexcept override {
+        return "canned-error";
+    }
+
+    [[nodiscard]] std::uint32_t calls() const noexcept { return calls_; }
+
+private:
+    mx::PeErrorCode  code_;
+    std::string_view label_;
+    std::uint32_t    calls_ = 0;
+};
+
+/// Test double — always returns a fixed planned outcome and counts
+/// invocations.
+class CannedOkSink final : public mx::mutation::IExpansionSink {
+public:
+    explicit CannedOkSink(mx::Rva ovr_rva, std::uint32_t ovr_size) noexcept
+        : plan_{ovr_rva, ovr_size} {}
+
+    [[nodiscard]] mx::MxResult<mx::mutation::ExpansionPlan> plant(
+        const mx::mutation::ExpansionRequest&) override
+    {
+        ++calls_;
+        return plan_;
+    }
+
+    [[nodiscard]] std::string_view name() const noexcept override {
+        return "canned-ok";
+    }
+
+    [[nodiscard]] std::uint32_t calls() const noexcept { return calls_; }
+
+private:
+    mx::mutation::ExpansionPlan plan_;
+    std::uint32_t               calls_ = 0;
+};
+
+[[nodiscard]] mx::mutation::ExpansionRequest make_request() {
+    static const auto bytes_ = bytes({0x90, 0x90});
+    return mx::mutation::ExpansionRequest{
+        .site_rva       = 0x1000,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{bytes_.data(), bytes_.size()},
+    };
+}
+
+} // anonymous namespace
+
+TEST(FallbackExpansionSink, PrimarySuccessShortCircuits) {
+    CannedOkSink primary{0xAAAA, 7};
+    CannedOkSink fallback{0xBBBB, 9};
+    FallbackExpansionSink chain{primary, fallback};
+
+    auto plan = chain.plant(make_request());
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->overflow_rva, 0xAAAAu);
+    EXPECT_EQ(primary.calls(), 1u);
+    EXPECT_EQ(fallback.calls(), 0u);
+    EXPECT_EQ(chain.primary_plant_count(), 1u);
+    EXPECT_EQ(chain.fallback_plant_count(), 0u);
+}
+
+TEST(FallbackExpansionSink, SlackExhaustedFallsBack) {
+    CannedErrorSink primary{
+        mx::PeErrorCode::section_slack_exhausted, "slack out"};
+    CannedOkSink fallback{0xBBBB, 9};
+    FallbackExpansionSink chain{primary, fallback};
+
+    auto plan = chain.plant(make_request());
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->overflow_rva, 0xBBBBu);
+    EXPECT_EQ(primary.calls(), 1u);
+    EXPECT_EQ(fallback.calls(), 1u);
+    EXPECT_EQ(chain.primary_plant_count(), 0u);
+    EXPECT_EQ(chain.fallback_plant_count(), 1u);
+}
+
+TEST(FallbackExpansionSink, NonSlackErrorPropagates) {
+    // Genuine PE-format failure — must NOT trigger the fallback.
+    CannedErrorSink primary{
+        mx::PeErrorCode::invalid_rva, "bad rva"};
+    CannedOkSink fallback{0xBBBB, 9};
+    FallbackExpansionSink chain{primary, fallback};
+
+    auto plan = chain.plant(make_request());
+    ASSERT_FALSE(plan.has_value());
+    EXPECT_EQ(static_cast<std::uint16_t>(plan.error().code()),
+              static_cast<std::uint16_t>(mx::PeErrorCode::invalid_rva));
+    EXPECT_EQ(primary.calls(), 1u);
+    EXPECT_EQ(fallback.calls(), 0u) << "fallback must not be consulted "
+                                       "for non-slack errors";
+}
+
+TEST(FallbackExpansionSink, ChainOfRealSinksGrowsThenSpills) {
+    // Integration sanity — primary `GrowSourceSectionSink` succeeds
+    // until slack exhausts, then `ExtendInPlaceSink` takes over.
+    PeImage img = make_image_with_two_sections();
+    SectionManager mgr{img};
+    StandardLayout policy;
+    SectionEmitter emit{mgr, policy};
+
+    GrowSourceSectionSink primary{emit};
+    ExtendInPlaceSink     fallback{emit, ".mxmut"};
+    FallbackExpansionSink chain{primary, fallback};
+
+    // First plant fits in slack — primary handles it.
+    const auto small = std::vector<std::uint8_t>(0x80, 0x90);
+    auto plan_small = chain.plant(mx::mutation::ExpansionRequest{
+        .site_rva       = img.sections()[0].virtual_address + 0x10,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{small.data(), small.size()},
+    });
+    ASSERT_TRUE(plan_small.has_value());
+    EXPECT_EQ(chain.primary_plant_count(), 1u);
+    EXPECT_EQ(chain.fallback_plant_count(), 0u);
+
+    // Second plant — too large for remaining slack. Fallback engages.
+    const auto big = std::vector<std::uint8_t>(0xFFC, 0x90);
+    auto plan_big = chain.plant(mx::mutation::ExpansionRequest{
+        .site_rva       = img.sections()[0].virtual_address + 0x10,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{big.data(), big.size()},
+    });
+    ASSERT_TRUE(plan_big.has_value());
+    EXPECT_EQ(chain.primary_plant_count(), 1u);
+    EXPECT_EQ(chain.fallback_plant_count(), 1u);
 }
 
 } // namespace

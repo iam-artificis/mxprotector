@@ -147,8 +147,9 @@ int main(int argc, char** argv) {
             name_rng);
         std::cout << std::format(
             "[*] Секции: vm='{}' cff='{}' pack='{}' "
-            "str='{}' guard='{}'\n",
-            names.vm, names.cff, names.packer, names.str, names.guard);
+            "str='{}' guard='{}' mut='{}'\n",
+            names.vm, names.cff, names.packer,
+            names.str, names.guard, names.mut);
         ctx.set_section_names(std::move(names));
     }
 

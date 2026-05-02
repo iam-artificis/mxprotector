@@ -161,12 +161,13 @@ SectionNameMap pick_section_names(target::BinaryKind kind,
             .packer = ".mxpack",
             .str    = ".mxstr",
             .guard  = ".mxguard",
+            .mut    = ".mxmut",
         };
     }
 
-    // Draw five distinct names from the kind-specific pool.
+    // Draw six distinct names from the kind-specific pool.
     auto draws = sample_n(stealth_section_pool_for(kind),
-                          /*n=*/5, rng);
+                          /*n=*/6, rng);
 
     return SectionNameMap{
         .vm     = std::move(draws[0]),
@@ -174,6 +175,7 @@ SectionNameMap pick_section_names(target::BinaryKind kind,
         .packer = std::move(draws[2]),
         .str    = std::move(draws[3]),
         .guard  = std::move(draws[4]),
+        .mut    = std::move(draws[5]),
     };
 }
 

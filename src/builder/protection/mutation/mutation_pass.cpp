@@ -1,131 +1,39 @@
 /**
  * @file mutation_pass.cpp
- * @brief [BUILDER] Реализация MutationEngine и MutationPass.
+ * @brief [BUILDER] MutationPass — implements `IProtectionPass`.
  *
- * @details MutationEngine координирует подстановку инструкций и вставку junk-кода
- *          для одного региона кода. MutationPass реализует IProtectionPass:
- *          1. Находит все MX_MUTATE_BEGIN/END регионы (или все кодовые секции).
- *          2. Создаёт MutationEngine и мутирует каждый регион.
- *          3. Сканирует NOP/INT3 padding между функциями и заполняет его
- *             junk-кодом и opaque predicates.
+ * @details MutationPass orchestrates the mutation phase:
+ *          1. Locate every `MX_MUTATE_BEGIN/END` region (or fall back
+ *             to all code sections when no markers are present).
+ *          2. Build the expansion sink chain (Feature A — primary
+ *             grow-source, fallback shared overflow section).
+ *          3. Construct a `MutationEngine`, install the sink, and
+ *             mutate each region.
+ *          4. Scan NOP/INT3 padding between functions and fill it
+ *             with junk + opaque predicates.
  *
- * @note Мутация выполняется in-place: размер региона не изменяется.
- *       Подстановки заменяют инструкции байтами той же длины.
- *       Padding (мёртвый код) заменяется на junk + opaque predicates.
+ * `MutationEngine`'s impl lives in `mutation_engine.cpp`
+ * (extracted to keep this TU under the project's ~300 LOC cap and
+ * to give the engine a dedicated place to host the expansion-sink
+ * redirect logic introduced by Feature A).
  */
 
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
+#include "mxprotector/protection/mutation/overflow/extend_in_place_sink.hpp"
+#include "mxprotector/protection/mutation/overflow/fallback_expansion_sink.hpp"
+#include "mxprotector/protection/mutation/overflow/grow_source_section_sink.hpp"
 #include "mxprotector/protection/mutation/padding_filler.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_manager.hpp"
 
 #include <algorithm>
 #include <format>
 
 namespace mx {
-
-// ============================================================================
-// MutationEngine — конструктор и деструктор
-// ============================================================================
-
-MutationEngine::MutationEngine(SubstitutionRuleRegistry rules,
-                               std::unique_ptr<JunkGenerator> junk,
-                               Randomizer& rng)
-    : rules_(std::move(rules))
-    , junk_gen_(std::move(junk))
-    , rng_(rng)
-{}
-
-MutationEngine::~MutationEngine() = default;
-
-// ============================================================================
-// MutationEngine::mutate_region — мутация одного региона кода
-// ============================================================================
-
-MxResult<uint32_t> MutationEngine::mutate_region(
-    MutableByteView code,
-    Va base_address,
-    analysis::IDisassembler& disasm,
-    ProtectionContext& ctx)
-{
-    if (code.empty()) {
-        ctx.log("  MutationEngine: пустой регион, пропуск");
-        return uint32_t{0};
-    }
-
-    auto decode_result = disasm.decode_buffer(
-        ByteView{code.data(), code.size()}, base_address);
-
-    if (!decode_result) {
-        ctx.log_fmt("  MutationEngine: ошибка декодирования по VA 0x{:016X}: {}",
-            base_address, decode_result.error().message());
-        return std::unexpected(decode_result.error());
-    }
-
-    const auto& instructions = *decode_result;
-    if (instructions.empty()) {
-        ctx.log("  MutationEngine: декодировано 0 инструкций, пропуск");
-        return uint32_t{0};
-    }
-
-    uint32_t mutations_applied = 0;
-    uint32_t junk_inserted = 0;
-
-    for (const auto& insn : instructions) {
-        if (insn.is_branch() || insn.is_call() || insn.is_return()) {
-            continue;
-        }
-
-        auto matching_rules = rules_.find_matching(insn);
-        if (matching_rules.empty()) continue;
-
-        if (!rng_.next_bool(substitution_probability_)) continue;
-
-        const uint32_t rule_idx = rng_.next_range(0,
-            static_cast<uint32_t>(matching_rules.size() - 1));
-        const auto* rule = matching_rules[rule_idx];
-
-        auto replacement = rule->apply(insn, rng_);
-
-        if (replacement.size() != insn.length()) {
-            ctx.log_fmt("  MutationEngine: ВНИМАНИЕ: правило '{}' вернуло {} байт вместо {} для '{}' по VA 0x{:016X}",
-                rule->name(), replacement.size(), insn.length(),
-                insn.to_string(), insn.address());
-            continue;
-        }
-
-        const auto offset = static_cast<size_t>(insn.address() - base_address);
-        if (offset + replacement.size() > code.size()) {
-            ctx.log_fmt("  MutationEngine: запись за пределами буфера для '{}' по VA 0x{:016X}",
-                insn.to_string(), insn.address());
-            continue;
-        }
-
-        std::copy(replacement.begin(), replacement.end(), code.data() + offset);
-        ++mutations_applied;
-
-        // Source-linked labels for the tracing MCP (flag-gated).
-        // `insn.address()` is a VA at the base_address it was decoded
-        // with, so subtracting image_base yields the RVA of the
-        // substituted instruction in the final PE.
-        if (ctx.config().emit_trace_hints) {
-            const auto rva = static_cast<std::uint32_t>(
-                insn.address() - ctx.pe_image().image_base());
-            ctx.trace_hints().add_mutation_site(
-                rva,
-                static_cast<std::uint32_t>(insn.length()),
-                static_cast<std::uint32_t>(replacement.size()),
-                analysis::MutationSiteKind::substitution);
-        }
-    }
-
-    total_substitutions_ += mutations_applied;
-    total_junk_insertions_ += junk_inserted;
-
-    return mutations_applied;
-}
 
 // Padding detection + filling lives in `padding_filler.{hpp,cpp}`
 // (R3.3 split-out). The helpers used to live in this TU's anonymous
@@ -169,6 +77,21 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
     auto rules = SubstitutionRuleRegistry::create_default();
     auto junk = std::make_unique<JunkGenerator>(ctx.pe_image().architecture());
     MutationEngine engine(std::move(rules), std::move(junk), rng);
+
+    // Feature A — wire the expansion sink chain. The chain prefers
+    // growing the source section in place (no new section, no
+    // section-table noise), falling back to a shared MxProtector-
+    // owned overflow section when the source's section-alignment
+    // slack is exhausted. Lifetimes are scoped to this `execute`
+    // body — the engine borrows the sink pointer and never outlives
+    // these stack objects.
+    SectionManager     sec_mgr(ctx.pe_image());
+    pe::SectionEmitter emitter{sec_mgr, ctx.layout_policy()};
+    mutation::overflow::GrowSourceSectionSink primary{emitter};
+    mutation::overflow::ExtendInPlaceSink     fallback{
+        emitter, ctx.section_names().mut};
+    mutation::overflow::FallbackExpansionSink chain{primary, fallback};
+    engine.set_expansion_sink(&chain);
 
     uint32_t total_mutations = 0;
 
@@ -304,11 +227,22 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
         }
     }
 
-    ctx.log_fmt("MutationPass: завершено. Подстановок: {}, правил: {}, "
-                "padding→junk: {} ({} байт), opaque predicates: {}",
+    ctx.log_fmt("MutationPass: завершено. Подстановок: {} (in-place: {}, "
+                "redirected: {}), правил: {}, padding→junk: {} ({} байт), "
+                "opaque predicates: {}",
         total_mutations,
+        total_mutations - engine.total_redirected_expansions(),
+        engine.total_redirected_expansions(),
         SubstitutionRuleRegistry::create_default().rule_count(),
         total_padding_filled, total_junk_bytes, total_predicates);
+
+    if (engine.total_redirected_expansions() > 0) {
+        ctx.log_fmt("MutationPass: {} расширенных подстановок направлено в "
+                    "overflow chain (primary={} grow-source, fallback={} shared-section)",
+            engine.total_redirected_expansions(),
+            chain.primary_plant_count(),
+            chain.fallback_plant_count());
+    }
 
     return {};
 }
