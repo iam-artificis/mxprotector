@@ -13,6 +13,7 @@ cross-cutting metadata-leakage signals (any tier). Future gates land
 as new files; the runner never needs editing.
 """
 
+from mx_mcp.gates import anti_analysis_coverage_gate as _anti_analysis_coverage_gate  # noqa: F401
 from mx_mcp.gates import bindiff_similarity_gate as _bindiff_similarity_gate  # noqa: F401
 from mx_mcp.gates import budget_to_crack_oep_gate as _budget_to_crack_oep_gate  # noqa: F401
 from mx_mcp.gates import leakage_forbidden_literal_gate as _leakage_forbidden_literal_gate  # noqa: F401

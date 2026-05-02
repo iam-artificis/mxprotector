@@ -7,6 +7,7 @@ imports this subpackage so the registry is populated before
 ``measure_defense`` is called.
 """
 
+from mx_mcp.benchmarks import anti_analysis_benchmark as _anti_analysis_benchmark  # noqa: F401
 from mx_mcp.benchmarks import bindiff_benchmark as _bindiff_benchmark  # noqa: F401
 from mx_mcp.benchmarks import budget_to_crack_benchmark as _budget_to_crack_benchmark  # noqa: F401
 from mx_mcp.benchmarks import cff_benchmark as _cff_benchmark  # noqa: F401
