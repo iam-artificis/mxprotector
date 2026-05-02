@@ -93,8 +93,17 @@ void erase_marker(pe::SectionInfo& section, uint32_t offset_in_section, uint32_t
 } // anonymous namespace
 
 bool VirtualizationPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    if (!ctx.config().enable_vm) return false;
-    // Применим только если есть VM-маркеры
+    if (!ctx.config().enable_vm)           return false;
+    // The VM dispatcher, handlers, bytecode encoder and entry stub
+    // are all x64-only (see `vm/x64/`). Gate on `is_windows_pe_x64()`
+    // so non-PE / non-x64 targets bypass the pass without trying to
+    // emit handlers Zydis would not be able to assemble. Driver and
+    // EFI targets are accepted — the VM core is pure-integer ALU and
+    // anti-tamper / anti-emulation entry-stub checks are suppressed
+    // for them via `skip_user_mode_checks` in `execute()`.
+    if (!ctx.target().is_windows_pe_x64()) return false;
+    // VM kicks in only when the source carries explicit VM markers;
+    // an unmarked binary just keeps its plain code.
     for (const auto& m : ctx.markers()) {
         if (m.type == MarkerType::vm_begin) return true;
     }

@@ -271,7 +271,16 @@ PaddingFillStats fill_section_padding(
 // ============================================================================
 
 bool MutationPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    return ctx.config().enable_mutation;
+    if (!ctx.config().enable_mutation)     return false;
+    // Substitution rules + junk generator emit x86/x64 byte sequences;
+    // every other architecture would either reject the encodings or
+    // misinterpret them at runtime. Gate on the canonical
+    // "fully-supported target" predicate so non-PE / non-x64 inputs
+    // skip cleanly. EXE / DLL / SYS / EFI are all acceptable — the
+    // mutation works at the byte level and has no runtime infra
+    // dependency.
+    if (!ctx.target().is_windows_pe_x64()) return false;
+    return true;
 }
 
 // ============================================================================

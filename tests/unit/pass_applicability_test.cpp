@@ -33,13 +33,18 @@
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/target/target_info.hpp"
+#include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/guard/guard_pass.hpp"
+#include "mxprotector/protection/mutation/mutation_engine.hpp"
+#include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/protection/packer/packer_pass.hpp"
 #include "mxprotector/protection/string/string_protection_pass.hpp"
+#include "mxprotector/protection/vm/virtualization_pass.hpp"
 
 namespace {
 
 using mx::target::BinaryKind;
+using mx::target::binary_kind_name;
 using mx::target::LoadMode;
 
 mx::target::TargetInfo make_target(BinaryKind kind,
@@ -54,19 +59,26 @@ mx::target::TargetInfo make_target(BinaryKind kind,
 }
 
 mx::ProtectionContext make_ctx(BinaryKind kind,
-                                LoadMode mode = LoadMode::os_loaded)
+                                LoadMode mode = LoadMode::os_loaded,
+                                mx::Architecture arch = mx::Architecture::x64)
 {
     auto img = std::make_unique<mx::PeImage>();
-    img->set_architecture(mx::Architecture::x64);
+    img->set_architecture(arch);
 
     mx::ProtectionConfig cfg;
-    cfg.enable_packer      = true;
-    cfg.string_protection  = mx::StringProtectionMode::stub;
+    cfg.enable_packer          = true;
+    cfg.enable_mutation        = true;
+    cfg.enable_obfuscation     = true;
+    cfg.enable_vm              = true;
+    cfg.enable_cfg_flattening  = true;
+    cfg.string_protection      = mx::StringProtectionMode::stub;
 
     mx::ProtectionContext ctx(std::move(img), std::move(cfg), nullptr);
 
-    // Seed a guard marker so GuardPass's marker loop can return true
-    // when the target gate does not reject. No-op for the other passes.
+    // Seed both guard and VM markers so the marker-driven passes
+    // (GuardPass, VirtualizationPass) can return true when their
+    // target gate accepts. No-op for passes that don't filter by
+    // marker presence.
     ctx.markers().push_back(mx::MarkedRegion{
         .type              = mx::MarkerType::guard_begin,
         .start_rva         = 0,
@@ -75,8 +87,20 @@ mx::ProtectionContext make_ctx(BinaryKind kind,
         .begin_marker_size = 0,
         .end_marker_size   = 0,
     });
+    ctx.markers().push_back(mx::MarkedRegion{
+        .type              = mx::MarkerType::vm_begin,
+        .start_rva         = 0x100,
+        .end_rva           = 0x110,
+        .section_index     = 0,
+        .begin_marker_size = 0,
+        .end_marker_size   = 0,
+    });
 
-    ctx.set_target(make_target(kind, mode));
+    auto info = make_target(kind, mode);
+    info.arch = (arch == mx::Architecture::x64)
+                  ? mx::target::Arch::x64
+                  : mx::target::Arch::x86;
+    ctx.set_target(info);
     return ctx;
 }
 
@@ -201,6 +225,101 @@ TEST(PassApplicability, ManualMappedKernelDriverAccepted) {
     auto ctx = make_ctx(BinaryKind::kernel_driver, LoadMode::manual_mapped);
     mx::PackerPass pass;
     EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+// --------------------------------------------------------------------
+// MutationPass / ObfuscationPass / CfgFlatteningPass /
+// VirtualizationPass — all four are now gated on is_windows_pe_x64()
+// so non-x64 inputs (and non-PE in the future) skip cleanly without
+// engaging the x86/x64-only emitters.
+// --------------------------------------------------------------------
+
+TEST(PassApplicability, MutationPassAcceptsAllPeKinds) {
+    for (auto kind : {BinaryKind::executable,
+                      BinaryKind::dynamic_library,
+                      BinaryKind::kernel_driver,
+                      BinaryKind::efi_application}) {
+        auto ctx = make_ctx(kind);
+        mx::MutationPass pass;
+        EXPECT_TRUE(pass.is_applicable(ctx))
+            << "MutationPass must accept " << binary_kind_name(kind);
+    }
+}
+
+TEST(PassApplicability, MutationPassRejectsX86Architecture) {
+    auto ctx = make_ctx(BinaryKind::executable,
+                        LoadMode::os_loaded,
+                        mx::Architecture::x86);
+    mx::MutationPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, MutationPassRejectsWhenDisabled) {
+    auto ctx = make_ctx(BinaryKind::executable);
+    ctx.config().enable_mutation = false;
+    mx::MutationPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, ObfuscationPassAcceptsAllPeKinds) {
+    for (auto kind : {BinaryKind::executable,
+                      BinaryKind::dynamic_library,
+                      BinaryKind::kernel_driver,
+                      BinaryKind::efi_application}) {
+        auto ctx = make_ctx(kind);
+        mx::ObfuscationPass pass;
+        EXPECT_TRUE(pass.is_applicable(ctx))
+            << "ObfuscationPass must accept " << binary_kind_name(kind);
+    }
+}
+
+TEST(PassApplicability, ObfuscationPassRejectsX86Architecture) {
+    auto ctx = make_ctx(BinaryKind::executable,
+                        LoadMode::os_loaded,
+                        mx::Architecture::x86);
+    mx::ObfuscationPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, CfgFlatteningPassAcceptsAllPeKinds) {
+    for (auto kind : {BinaryKind::executable,
+                      BinaryKind::dynamic_library,
+                      BinaryKind::kernel_driver,
+                      BinaryKind::efi_application}) {
+        auto ctx = make_ctx(kind);
+        mx::CfgFlatteningPass pass;
+        EXPECT_TRUE(pass.is_applicable(ctx))
+            << "CfgFlatteningPass must accept " << binary_kind_name(kind);
+    }
+}
+
+TEST(PassApplicability, CfgFlatteningPassRejectsX86Architecture) {
+    auto ctx = make_ctx(BinaryKind::executable,
+                        LoadMode::os_loaded,
+                        mx::Architecture::x86);
+    mx::CfgFlatteningPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, VirtualizationPassAcceptsAllPeKindsWithMarker) {
+    for (auto kind : {BinaryKind::executable,
+                      BinaryKind::dynamic_library,
+                      BinaryKind::kernel_driver,
+                      BinaryKind::efi_application}) {
+        auto ctx = make_ctx(kind);
+        mx::VirtualizationPass pass;
+        EXPECT_TRUE(pass.is_applicable(ctx))
+            << "VirtualizationPass must accept " << binary_kind_name(kind)
+            << " when a vm_begin marker is present";
+    }
+}
+
+TEST(PassApplicability, VirtualizationPassRejectsX86Architecture) {
+    auto ctx = make_ctx(BinaryKind::executable,
+                        LoadMode::os_loaded,
+                        mx::Architecture::x86);
+    mx::VirtualizationPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
 }
 
 } // namespace

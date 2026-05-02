@@ -32,7 +32,15 @@ namespace mx {
 // ============================================================================
 
 bool ObfuscationPass::is_applicable(const ProtectionContext& ctx) const noexcept {
-    return ctx.config().enable_obfuscation;
+    if (!ctx.config().enable_obfuscation)  return false;
+    // Opaque predicates, MBA transforms and constant unfolding emit
+    // x86/x64 instruction sequences. Same target rationale as
+    // MutationPass: gate on `is_windows_pe_x64()` so non-PE / non-x64
+    // inputs do not engage the rewriter. EXE / DLL / SYS / EFI all
+    // work — the transforms are pure byte-level and have no runtime
+    // infra dependency.
+    if (!ctx.target().is_windows_pe_x64()) return false;
+    return true;
 }
 
 // ============================================================================

@@ -50,6 +50,7 @@ set(TEST_SOURCES
 # StringProtectionPass --strings=vm lift/generate symbols pulled in by
 # the S2c orchestrator.
 set(VM_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/virtualization_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_lifter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_runtime_gen.cpp
@@ -129,6 +130,7 @@ set(PACKER_SOURCES
 # ==============================================================================
 
 set(MUTATION_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mutation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_substitution.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/opcode_swap_rule.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/direction_flip_rule.cpp
@@ -139,6 +141,7 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/obfuscation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/opaque_predicates.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/mba_transform.cpp
@@ -154,7 +157,15 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/export_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattener.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cff_function_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cff_relocation_fixup.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cff_safety_filters.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cff_trampoline_section.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cff_trampoline_writer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/state_reg_picker.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/dispatcher_gen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/bogus_flow.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/map_parser.cpp
