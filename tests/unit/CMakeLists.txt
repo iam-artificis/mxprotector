@@ -55,6 +55,7 @@ set(TEST_SOURCES
 # the S2c orchestrator.
 set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/virtualization_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/virtualization_pipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_stack_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_lifter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/vm_runtime_gen.cpp

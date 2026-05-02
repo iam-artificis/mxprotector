@@ -89,6 +89,7 @@ set(BUILDER_SOURCES
     protection/vm/vm_stack_layout.cpp
     protection/vm/vm_runtime_gen.cpp
     protection/vm/virtualization_pass.cpp
+    protection/vm/virtualization_pipeline.cpp
 
     # Runtime guards — MX_GUARD_BEGIN/END relocation + VEH dispatcher
     protection/guard/guard_pass.cpp
