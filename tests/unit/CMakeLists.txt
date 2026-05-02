@@ -39,6 +39,7 @@ set(TEST_SOURCES
     section_intent_test.cpp
     layout_policy_test.cpp
     section_emitter_test.cpp
+    expansion_sink_test.cpp
     relocation_injector_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
@@ -148,6 +149,9 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/overflow/jmp_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/overflow/extend_in_place_sink.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/overflow/separate_overflow_sink.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/obfuscation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/opaque_predicates.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/obfuscation/constant_unfolding.cpp

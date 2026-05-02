@@ -78,6 +78,20 @@ public:
     SectionEmitter(const SectionEmitter&)            = delete;
     SectionEmitter& operator=(const SectionEmitter&) = delete;
 
+    /// @brief Read-only access to the bound image. Forwards to the
+    /// underlying `SectionManager::image()`. Sinks and pipeline
+    /// helpers (e.g. mutation overflow) read the image to predict
+    /// the next section's RVA or patch a section's bytes after
+    /// allocation; production callers should keep going through the
+    /// emit primitives.
+    [[nodiscard]] const PeImage& image() const noexcept { return mgr_.image(); }
+
+    /// @brief Mutable access to the bound image — same rationale as
+    /// the const overload. The mutation overflow sinks need to write
+    /// the JMP-back into the section's tail after `append_section`
+    /// has assigned its RVA.
+    [[nodiscard]] PeImage& image() noexcept { return mgr_.image(); }
+
     /**
      * @brief Append a fresh section to the image.
      *

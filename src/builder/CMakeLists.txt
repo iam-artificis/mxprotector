@@ -49,6 +49,9 @@ set(BUILDER_SOURCES
     protection/mutation/mutation_pass.cpp
     protection/mutation/instruction_substitution.cpp
     protection/mutation/padding_filler.cpp
+    protection/mutation/overflow/jmp_emit.cpp
+    protection/mutation/overflow/extend_in_place_sink.cpp
+    protection/mutation/overflow/separate_overflow_sink.cpp
     protection/mutation/rules/opcode_swap_rule.cpp
     protection/mutation/rules/direction_flip_rule.cpp
     protection/mutation/rules/imm8_negation_rule.cpp
