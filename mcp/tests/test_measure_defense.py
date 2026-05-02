@@ -321,7 +321,7 @@ def test_snapshot_disabled_skips_persistence(tmp_path: Path):
 
     assert out.snapshot_id is None
     assert out.snapshot_path is None
-    assert not (tmp_path / "mcp" / "snapshots").exists()
+    assert not (tmp_path / "mcp" / "reports" / "snapshots").exists()
 
 
 def test_snapshot_saved_when_enabled(

@@ -1,116 +1,89 @@
 # MxProtector MCP — Defense Measurement Suite
 
-Multi-backend MCP server measuring MxProtector's protection strength
-against state-of-the-art reversing tools. Supersedes the single-backend
-tracing MCP: backends are now organised by analysis mode (dynamic /
+Multi-backend MCP server. Backends organised by mode: dynamic /
 emulation / symbolic / static / deobfuscation / unpacking /
-anti-analysis / diffing) behind a benchmark façade.
+anti-analysis / diffing.
 
-Post-MVP backlog: [`FUTURE.md`](FUTURE.md).
-Install instructions: [`mcp/README.md`](mcp/README.md).
+Post-MVP: [`FUTURE.md`](FUTURE.md). Install: [`mcp/README.md`](mcp/README.md).
 
 ## Principles
+- SOLID/OCP: new backend/benchmark = new file + decorator, no edits elsewhere.
+- ~300 LOC cap per file. One-responsibility-per-file.
+- No global state. `ProtectionContext` (C++) / `Session` (Python).
+- Fail-closed: crash/timeout = worst-case metric. Silent PASS forbidden.
+- Corpus-based: distributions over ≥10 samples; gates use p90.
+- `--trace-hints` off by default, never in production (see `STABILITY.md`).
 
-- **SOLID / OCP.** New backend or benchmark = new file + decorator.
-  Zero edits to existing code.
-- **~300 LOC cap per file.** Nothing is "one-responsibility-per-class";
-  it's one-responsibility-per-file.
-- **No global state.** `ProtectionContext` (C++) / `Session` (Python).
-- **Fail-closed.** Backend crash or timeout = worst-case metric value;
-  silent PASS on exception is forbidden.
-- **Corpus-based.** Metrics are distributions over ≥10 samples; gates
-  use p90 (or worse percentile), not mean.
-- **Test-only builder flag.** `--trace-hints` is off by default and
-  never ships in production builds (see `STABILITY.md`).
-
-## Agent façade
-
-Top-level MCP tools — the only surface the agent sees. Backends,
-scripts, and raw metrics live below.
+## Agent façade (top-level MCP tools)
 
 | Tool | Purpose |
 |---|---|
-| `measure_defense` | Run benchmarks on a protected PE, return `{category: {metric: value}}`. |
-| `diff_defense_baseline` | Compare current metrics to a stored baseline. Verdicts: improved / regressed / unchanged / gate_failed. |
-| `record_baseline` | Snapshot current metrics as a named baseline (commits to `baselines/data/`). |
-| `list_sections` | Static read of a `.mxtrace.json` sidecar. |
-| `verify_protection_invariants` | Run registered invariants (`oep_is_stub`, `packer_decrypted`, …). |
-| `protect_and_trace` | Build one PE and trace it under Frida (diagnostic). |
+| `measure_defense` | Run benchmarks on protected PE → `{category: {metric: value}}`. |
+| `diff_defense_baseline` | Compare to baseline. Verdicts: improved / regressed / unchanged / gate_failed. |
+| `record_baseline` | Snapshot metrics to `baselines/data/`. |
+| `list_sections` | Static read of `.mxtrace.json` sidecar. |
+| `verify_protection_invariants` | Run invariants (`oep_is_stub`, `packer_decrypted`, …). |
+| `protect_and_trace` | Build one PE + Frida trace (diagnostic). |
 
 ## Taxonomy (MVP)
 
 ```
 mcp/
-├── pyproject.toml, README.md, .gitignore
+├── pyproject.toml, README.md
 ├── baselines/data/*.json
-├── fixtures/corpus/             ← curated mini-binaries (separate from build_testapp/)
+├── fixtures/corpus/
 ├── tests/
 └── src/mx_mcp/
     ├── __main__.py, server.py
-    ├── common/                  tool_base, invariant_base, benchmark_base,
-    │                            sidecar, events, pe_reader, corpus,
-    │                            tiers, baselines, logging_setup
-    ├── dynamic/frida/           session, probes/, tools/
-    ├── emulation/unicorn/       OEP-reach emulator, VM handler replay
-    ├── symbolic/angr/           VM summarizer, budget-to-crack
+    ├── common/           tool_base, invariant_base, benchmark_base,
+    │                     sidecar, events, pe_reader, corpus, tiers,
+    │                     baselines, logging_setup
+    ├── dynamic/frida/    session, probes/, tools/
+    ├── emulation/unicorn/  OEP-reach, VM handler replay
+    ├── symbolic/angr/    VM summarizer, budget-to-crack
     ├── static/
-    │   ├── sidecar_tools/       list_sections
-    │   └── ida/                 headless idat.exe + scripts/
-    ├── deobfuscation/mba/       msynth, simba, constant_recovery
-    ├── unpacking/               pe_sieve, unicorn_unpack, public/unipacker
-    ├── anti_analysis/           coverage.py + envs/
-    ├── diffing/bindiff/         two-build similarity
-    ├── benchmarks/              cff, vm, packer, mutation,
-    │                            anti_analysis, diffing, budget_to_crack
-    ├── invariants/              oep_is_stub, packer_decrypted
-    ├── reporting/               text_formatter + charts/ (matplotlib)
-    └── tools/                   measure_defense, diff_defense_baseline,
-                                 record_baseline, verify_protection_invariants
+    │   ├── sidecar_tools/  list_sections
+    │   └── ida/            headless idat.exe + scripts/
+    ├── deobfuscation/mba/  msynth, simba, constant_recovery
+    ├── unpacking/        pe_sieve, unicorn_unpack, public/unipacker
+    ├── anti_analysis/    coverage.py + envs/
+    ├── diffing/bindiff/  two-build similarity
+    ├── benchmarks/       cff, vm, packer, mutation, anti_analysis,
+    │                     diffing, budget_to_crack
+    ├── invariants/       oep_is_stub, packer_decrypted
+    ├── reporting/        text_formatter + charts/ (matplotlib)
+    └── tools/            measure_defense, diff_defense_baseline,
+                          record_baseline, verify_protection_invariants
 ```
 
-Empty slots kept in sync with `FUTURE.md`: `dynamic/{dynamorio,pin,qemu}`,
+Empty slots (see `FUTURE.md`): `dynamic/{dynamorio,pin,qemu}`,
 `emulation/qiling`, `symbolic/{triton,miasm,z3}`, `static/{ghidra,binja}`,
 `deobfuscation/{cff_deobf,devirt,qsynth}`, `unpacking/public/{vmattack,unlicense}`,
 `fuzzing/`.
 
 ## Benchmarks (MVP)
 
-Direction: `↑` = higher-is-better, `↓` = lower-is-better, `false-best` = bool where false is good.
+`↑` higher-better, `↓` lower-better, `false-best` bool (false good).
 
 ### CFF
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
-| d810 state recovery rate (per-fn p90) | ↓ | IDA+d810 | FAIL ≥50% |
+| d810 state recovery rate (p90) | ↓ | IDA+d810 | FAIL ≥50% |
 | Dispatcher transition entropy | ↑ | sidecar | warn Δ≥0.2 bit |
-| HexRays microcode blocks/goto/cyclomatic (section-aggregate) | ↑ | IDA | warn on ≥15% regression |
+| HexRays microcode blocks/goto/cyclomatic | ↑ | IDA | warn ≥15% regression |
 | Back-edge / irreducible-region ratio | ↑ | IDA | warn |
 
-**Population contract (implementation note).** The CFF benchmark
-measures ``sections["cff"]`` as a *single region* — not per-function.
-The CFF pass emits each source function's dispatcher + state handlers
-into that section; IDA's auto-analysis does not create functions at
-the dispatcher entries (they're reachable only through indirect
-jumps), so any "iterate IDA functions" population filter returns
-zero matches. The benchmark therefore hands IDA one explicit range
-via ``MX_MCP_IDA_REGIONS`` and runs
-``ida_hexrays.gen_microcode(..., MMAT_GLBOPT3)`` directly on the
-bytes — which requires the on-disk bytes to be *plaintext*, so the
-benchmark builds with ``--no-packer`` (packer encrypts the section
-at build time; it decrypts only at runtime). Packer quality gets its
-own benchmark later.
+CFF population: single region `sections["cff"]`, not per-function. Dispatchers reachable only via indirect jumps → IDA auto-analysis finds zero. Hand IDA an explicit range via `MX_MCP_IDA_REGIONS` + `ida_hexrays.gen_microcode(..., MMAT_GLBOPT3)`. Requires plaintext bytes → build with `--no-packer`.
 
 ### VM
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | angr handler-summarization rate | ↓ | angr | FAIL ≥70% |
 | Handler opcode histogram entropy | ↑ | sidecar | min threshold |
 | Bytecode entropy | ↑ | sidecar + raw dump | min threshold |
-| `|bytecode| / |original_code|` ratio | – | sidecar | baseline diff |
+| `|bytecode|/|original_code|` ratio | – | sidecar | baseline diff |
 
 ### Packer
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | pe-sieve dump success | false-best | pe-sieve | FAIL on clean dump |
@@ -120,169 +93,80 @@ own benchmark later.
 | Decryption window (ms) | ↓ | Frida | warn +20% |
 | Decrypted-at-once coverage `%.text` | ↓ | Frida | FAIL ≥80% |
 | IAT dynamic-resolve count | ↑ | Frida | — |
-| OEP discoverable via TLS / early | false-best | IDA | — |
+| OEP discoverable via TLS/early | false-best | IDA | — |
 
 ### Mutation / MBA
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | msynth simplification rate | ↓ | msynth | FAIL ≥80% |
 | SiMBA simplification rate | ↓ | SiMBA | FAIL ≥80% |
 | Constant recoverability | false-best | const-prop + msynth | FAIL on recover |
-| IDA pseudocode size delta vs. unprotected | ↑ | IDA | min ratio |
+| IDA pseudocode size delta vs unprotected | ↑ | IDA | min ratio |
 
 ### Anti-analysis (cross-cutting)
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
-| Detection coverage under {x64dbg, Frida, Unicorn, pafish-env, al-khaser-env} | ↑ | `anti_analysis/coverage` | FAIL < threshold |
+| Detection coverage {x64dbg, Frida, Unicorn, pafish, al-khaser} | ↑ | `anti_analysis/coverage` | FAIL < threshold |
 
 ### Diffing-resistance
-
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | BinDiff similarity between two seeded builds | ↓ | BinDiff | FAIL ≥70% |
 
-### Budget-to-crack (cross-cutting KPI)
-
+### Budget-to-crack
 | Metric | Dir | Backend | Gate |
 |---|---|---|---|
 | angr symbolic steps to reach OEP | ↑ | angr | warn on regression |
 
 ## Visualisation
 
-Each per-metric result carries an optional ``MetricScale`` declared by
-the benchmark:
+Per-metric `MetricScale{weak_value → 0.0, strong_value → 1.0}`. Direction-agnostic linear formula. For `LOWER_BETTER`: `weak=1.0, strong=0.0`.
 
-```
-weak_value  → 0.0   (defence is ineffective)
-strong_value → 1.0  (defence is working well)
-```
-
-The scale is direction-agnostic — the same linear formula handles
-``HIGHER_BETTER`` / ``LOWER_BETTER`` / ``FALSE_BEST`` as long as the
-benchmark sets ``weak``/``strong`` consistently (e.g. for
-``LOWER_BETTER`` use ``weak=1.0``, ``strong=0.0``).
-
-The ``reporting/`` subpackage turns runs into text + PNG:
-
-| Module | Produces | Depends on |
+`reporting/`:
+| Module | Produces | Deps |
 |---|---|---|
-| `reporting/text_formatter.py` | Human-readable measurement / diff summary | stdlib only |
-| `reporting/charts/measurement_chart.py` | Normalised per-metric bar PNG for a measurement | matplotlib |
-| `reporting/charts/diff_chart.py` | Coloured delta bars PNG vs a baseline | matplotlib |
-| `reporting/render_or_skip.py` | Fail-closed helper tools use to attach a PNG | stdlib only |
+| `text_formatter.py` | measurement/diff summary | stdlib |
+| `charts/measurement_chart.py` | per-metric bar PNG | matplotlib |
+| `charts/diff_chart.py` | delta bars PNG vs baseline | matplotlib |
+| `render_or_skip.py` | fail-closed PNG helper | stdlib |
 
-Both `measure_defense` and `diff_defense_baseline` accept an
-`output_png` argument. When set and the `[viz]` extra is installed,
-the tool writes the chart at that path and returns it alongside the
-numeric output. When matplotlib is missing, `png_note` carries the
-install hint and the numeric result is unaffected.
+`measure_defense` / `diff_defense_baseline` accept `output_png`. Missing matplotlib → `png_note` install hint, numeric result unaffected.
 
-Install the chart backend:
-
-```bash
-cd mcp && py -3 -m pip install -e ".[viz]"
-```
-
-## Tier model (MVP — two tiers)
+## Tier model (MVP)
 
 | Tier | Trigger | Budget | Contents |
 |---|---|---|---|
 | **fast** | every build | <5 min | sidecar statics, msynth, IDA microcode, pe-sieve, Unicorn OEP-reach, Frida smoke |
-| **slow** | pre-PR review | <30 min | angr handler-summarization, SiMBA ensemble, d810, diffing-resistance, anti-analysis coverage, constant-recovery, budget-to-crack |
+| **slow** | pre-PR | <30 min | angr handler-summarization, SiMBA, d810, diffing, anti-analysis coverage, constant-recovery, budget-to-crack |
 
-Gate policy: **fast FAIL → block commit. slow FAIL → block merge.**
+Gate: **fast FAIL → block commit. slow FAIL → block merge.** `nightly` in `FUTURE.md`.
 
-A third `nightly` tier (Z3 equivalence, full 100+ corpus, public
-unpackers) lives in [`FUTURE.md`](FUTURE.md).
-
-## Sidecar contract
-
-Schema v1. Source of truth: `include/mxprotector/analysis/trace_hints.hpp`.
-Pydantic mirror: `mcp/src/mx_mcp/common/sidecar.py`. `--trace-hints`
-CLI flag (gated by `config.emit_trace_hints`) is test-only per
-`STABILITY.md`.
-
-Additive changes within v1 require no bump (pydantic `extra='ignore'`).
-Breaking changes bump `schema_version`; pydantic then rejects the old
-major with a named error so the two sides do not drift.
+## Sidecar
+Schema v1. Source of truth: `include/mxprotector/analysis/trace_hints.hpp`. Pydantic mirror: `mcp/src/mx_mcp/common/sidecar.py`. `--trace-hints` gated by `config.emit_trace_hints` (test-only, `STABILITY.md`). Additive in v1 → no bump (`extra='ignore'`). Breaking → bump `schema_version`, pydantic rejects old major.
 
 ## Corpus
-
-MVP seed: curated mini-binaries in `mcp/fixtures/corpus/` (separate
-from `build_testapp/` — that dir is for functional stress testing, not
-for benchmark input population). Each entry covers a specific
-protection surface (pure VM, pure CFF, mixed, TLS-heavy, SEH,
-C++-exception-heavy, DLL variant). Initial population in **P1**.
-
-Metrics are computed over all corpus samples and reported as
-p10 / p50 / p90. Gates use p90 so a single broken hot-function in a
-build cannot hide behind the mean.
+Seed in `mcp/fixtures/corpus/` (not `build_testapp/`). Each entry covers one surface (pure VM, pure CFF, mixed, TLS-heavy, SEH, C++-exception-heavy, DLL). Initial population in **P1**. Metrics: p10/p50/p90. Gates on p90.
 
 ## Phases
 
-**Migration commit** (no behavioural change): relocate
-`mcp-tools/tracing/` → `mcp/`, rename namespace `mx_tracing` →
-`mx_mcp`, reorganise into taxonomy.
+Migration commit (no behaviour change): relocate `mcp-tools/tracing/` → `mcp/`, rename `mx_tracing` → `mx_mcp`.
 
-Then one commit per phase, each ending at the green gate (pytest +
-C++ ctest + 15/15 stress on `test_vm_showcase`). The order is
-optimised for **signal-per-effort** rather than topic cohesion —
-cheap integral metrics come first, expensive scope-heavy ones last.
+One commit per phase. Green gate = pytest + C++ ctest + 15/15 stress on `test_vm_showcase`. Order: signal-per-effort.
 
-- **P1 — Foundation.** ``IBenchmark`` + corpus + baselines +
-  snapshot/history/reproducibility (frozen seeds, tool versions,
-  artifact preservation). Per-sample metric schema. The three
-  top-level MCP tools as skeletons with stubs. ✅ Complete.
-- **P2 — Static CFF.** IDA headless runner, HexRays microcode
-  metrics, back-edge ratio. Reference benchmark for the whole
-  static family. ✅ Complete.
-- **P3 — Packer (dynamic + unpacking).** pe-sieve attach-and-scan;
-  unipacker/public unpackers slot in here too (one attacker-tool
-  family, no reason to split). ✅ pe-sieve done; unipacker tbd.
-- **P4 — Diffing resistance (BinDiff).** Pair of builds from the
-  same seed → percent-matches. Single number, dead-cheap, maybe
-  the highest signal-per-effort metric in the whole plan. Moved
-  up from the original P8 slot.
-- **P5 — Metadata leakage scan (quick win).** Static regex sweep of
-  protected binaries for protector-internal literals that reveal
-  what's inside: pass names (``VirtualizationPass``, ``MutationPass``,
-  …), debug format strings, PDB paths, MSVC linker artefacts, RTTI
-  mentions of protector classes, literal ``MxProtector``. Two
-  surfaces: ``no_protector_metadata_leaked`` **invariant** with a
-  hard block on forbidden-list hits, plus a ``leakage_surface``
-  **benchmark** counting soft leaks as a regression signal. Cheap —
-  pure byte scan, no backend dependencies, reuses existing
-  ``invariants/`` plumbing. Lands after P4 as a clean gap-filler
-  before the heavier symbolic / emulation phases.
-- **P6 — VM static + budget-to-crack.** angr symbolic on handlers;
-  score = fraction summarised within a fixed budget (wall clock +
-  SMT queries + path count). Core VM-strength signal.
+- **P5 — Metadata leakage scan.** Regex sweep for protector-internal literals (pass names, debug strings, PDB paths, MSVC linker artefacts, RTTI, `MxProtector`). Surfaces: `no_protector_metadata_leaked` invariant (hard block on forbidden list) + `leakage_surface` benchmark (soft regressions).
+- **P6 — VM static + budget-to-crack.** angr symbolic on handlers; score = fraction summarised within budget (wall clock + SMT queries + paths).
 - **P7 — MBA resistance.** msynth + SiMBA on handler expressions.
-  Pairs tightly with P6 — weak MBA defeats strong VM, so they
-  land back-to-back and are reviewed as one story.
-- **P8 — Tier runners + ship-gate.** Fast / slow runners, verdict
-  aggregation. Wire it early while there are 5-6 metrics to reason
-  about; delaying further buries it under a dozen gate policies at
-  once. Moved up from the original P9 slot.
-- **P9 — Emulation Unicorn.** Handler replay + OEP-reach.
-  Effectively writing a mini-deobfuscator — needs explicit scope
-  decision up front (replay-N-steps vs full engine). Moved down
-  from the original P3 slot because pe-sieve now covers the packer
-  signal P3 originally chased.
-- **P10 — Anti-analysis coverage.** Detection rate across adversarial
-  envs (x64dbg, Frida, Unicorn, pafish, al-khaser). The noisiest,
-  most infrastructure-heavy phase — allocate 2–3× its nominal
-  budget. Last on purpose.
+- **P8 — Tier runners + ship-gate.** Fast/slow runners, verdict aggregation.
+- **P9 — Emulation Unicorn.** Handler replay + OEP-reach. Scope decision: replay-N-steps vs full engine.
+- **P10 — Anti-analysis coverage.** Detection rate across x64dbg, Frida, Unicorn, pafish, al-khaser. Allocate 2–3× budget.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
 | Sidecar ships in production | `--trace-hints` off by default; `trace_hints_leak_test`; `STABILITY.md`. |
-| Install burden of backends | Each backend in its own subpackage with optional `pyproject` extras. Tools self-skip with a readable message when their backend is absent. |
-| Overfitting to one MBA solver | Ensemble gate (msynth ∨ SiMBA); qsynth peer in `FUTURE.md`. |
-| Statistical noise on single-sample gates | Corpus p90 everywhere; gate thresholds set with noise band in mind. |
-| Backend crash = silent PASS | Fail-closed: timeout / exception → worst-case metric value. |
-| Drift between C++ writer and Python schema | `schema_version` + fixture round-trip test in `tests/test_sidecar.py`. |
+| Install burden | Per-backend subpackage + optional `pyproject` extras; self-skip on missing. |
+| Overfitting to one MBA solver | Ensemble (msynth ∨ SiMBA); qsynth in `FUTURE.md`. |
+| Single-sample gate noise | Corpus p90 everywhere. |
+| Backend crash = silent PASS | Fail-closed: timeout/exception → worst-case metric. |
+| C++ writer ↔ Python schema drift | `schema_version` + fixture round-trip `tests/test_sidecar.py`. |

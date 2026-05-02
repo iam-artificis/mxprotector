@@ -71,7 +71,7 @@ class CompareSnapshotsInput(BaseModel):
     )
     snapshots_root: str | None = Field(
         default=None,
-        description="Override for the snapshot store root; default mcp/snapshots.",
+        description="Override for the snapshot store root; default mcp/reports/snapshots.",
     )
     output_png: str | None = Field(
         default=None,
@@ -118,10 +118,11 @@ class CompareSnapshotsTool(
 
     name = "compare_snapshots"
     description = (
-        "Load two snapshots from mcp/snapshots/, compute per-metric "
-        "improvements/regressions, and (optionally) render a grouped-"
-        "bar comparison PNG. Accepts 'latest' and 'previous' aliases "
-        "for the common 'did my last change help?' workflow."
+        "Load two snapshots from mcp/reports/snapshots/, compute "
+        "per-metric improvements/regressions, and (optionally) "
+        "render a grouped-bar comparison PNG. Accepts 'latest' and "
+        "'previous' aliases for the common 'did my last change help?' "
+        "workflow."
     )
     input_schema = CompareSnapshotsInput
     output_schema = CompareSnapshotsOutput

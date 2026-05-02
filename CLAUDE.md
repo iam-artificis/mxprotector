@@ -29,3 +29,60 @@ for i in $(seq 1 15); do ../build/.../mxprotector_builder.exe -i in.exe -o t.exe
 - Revive `EncryptionPass` or `stub_main` loader — packer owns encryption.
 - Hardcode `is_applicable()` without target/arch checks.
 - Commit dead/unused code.
+
+## MCP result storage layout
+
+All measurement artefacts live under `mcp/reports/` (git-ignored):
+```
+mcp/reports/
+├── charts/        — rendered PNGs (one per run / one per phase)
+├── runs/          — driver scripts + per-run logs
+└── snapshots/     — auto-captured measurement snapshots (was
+                     mcp/snapshots/ before consolidation)
+```
+Drivers compute `WORKSPACE = Path(__file__).resolve().parents[3]`
+and write into `mcp/reports/charts/`. `measure_defense` /
+`compare_snapshots` default `snapshots_root` to
+`mcp/reports/snapshots/`.
+
+## Strict code rules (HARD REQUIREMENTS)
+
+These rules are **non-negotiable** for every change. A patch that
+violates any of them must not be committed.
+
+1. **SOLID, OCP-first.** New behaviour = new file + decorator/registry,
+   never edits to existing pass/benchmark/tool registries. One
+   responsibility per class, one class per concern.
+2. **Language standard.** C++ is **C++20 minimum** (current project
+   tree compiles as C++23 — keep it; never downgrade). Python is
+   **3.10+** with `from __future__ import annotations`.
+3. **No monolithic files.** Hard cap **~300 LOC per file**, **~50 LOC
+   per function**. Split by responsibility — never by line count
+   alone. If a pass / benchmark / tool grows past the cap, factor
+   helpers into siblings under the same package.
+4. **Docstrings everywhere.** Every public class/function/free
+   function carries a docstring (or doxygen `///` for C++). Lead
+   with what + why; cover preconditions, raised errors, and any
+   non-obvious invariant. Headers explain the *module* in 5+ lines.
+5. **Tests, mandatory.** Every new module ships with unit tests in
+   `mcp/tests/` (Python) or `tests/` (C++/ctest). Mock external
+   backends (angr, IDA, Frida, builder subprocess); fail-closed
+   semantics tested explicitly. Bug fix → regression test first,
+   then fix.
+6. **Logs at every meaningful boundary.** `logging.getLogger(__name__)`
+   in Python, `MX_LOG_*` macros in C++. INFO for one-line per-entry
+   summaries; DEBUG for inner-loop detail; ERROR for fail-closed
+   exits. Never `print` / `std::cout` in shipped code.
+7. **No global state.** `ProtectionContext` (C++) / `Session` +
+   constructor injection (Python). Test seams via constructor args,
+   never module-level monkeypatching of production code paths.
+8. **Fail-closed, never silent.** Backend crash / timeout / missing
+   tool → error surfaced + worst-case metric. A `try/except: pass`
+   anywhere is a code-review blocker.
+9. **No dead / commented-out code.** No `// removed`, no `_unused`
+   shims, no backwards-compatibility leftovers. Delete it; `git`
+   keeps the history.
+10. **Match existing style exactly.** Pre-existing benchmarks /
+    passes are the reference: register-decorator pattern, file
+    headers, `_METRIC_DEFS` tables, helper sections. Do not invent
+    parallel idioms.

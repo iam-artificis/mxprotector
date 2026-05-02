@@ -51,7 +51,12 @@ _LOG = logging.getLogger(__name__)
 
 
 DEFAULT_CORPUS_REL = Path("mcp") / "fixtures" / "corpus"
-DEFAULT_SNAPSHOTS_REL = Path("mcp") / "snapshots"
+# All per-run measurement artifacts (charts, snapshots, driver logs)
+# converge under ``mcp/reports/``. Snapshots specifically land in
+# ``mcp/reports/snapshots/`` — the legacy ``mcp/snapshots/`` location
+# is no longer written; older clones can be migrated by moving the
+# directory into the new path before re-running the tool.
+DEFAULT_SNAPSHOTS_REL = Path("mcp") / "reports" / "snapshots"
 DEFAULT_TIMEOUT_S = 600.0
 
 
@@ -148,7 +153,8 @@ class MeasureDefenseInput(BaseModel):
         default=None,
         description=(
             "Override for the snapshot store root; default "
-            "``mcp/snapshots`` relative to the workspace. Git-ignored."
+            "``mcp/reports/snapshots`` relative to the workspace. "
+            "Git-ignored under the consolidated reports/ tree."
         ),
     )
 

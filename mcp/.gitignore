@@ -13,6 +13,13 @@ venv/
 # Dev smoke output — scripts/_smoke_* writes here; not a repo artifact.
 _smoke_*.png
 
-# Auto-captured measurement snapshots — volatile per-run archive.
-# Review historical runs with the `compare_snapshots` tool, not git.
+# Per-run measurement artifacts — all benchmark outputs land under
+# ``mcp/reports/`` (charts, runs, auto-captured snapshots). The
+# subtree is volatile; review historical runs with the
+# ``compare_snapshots`` tool, not git.
+#
+# Legacy location ``mcp/snapshots/`` kept ignored for backward
+# compatibility — older clones may still write there until they
+# rebase onto the consolidated layout.
+reports/
 snapshots/
