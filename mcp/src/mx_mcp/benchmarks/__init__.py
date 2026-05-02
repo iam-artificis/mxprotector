@@ -12,6 +12,8 @@ from mx_mcp.benchmarks import budget_to_crack_benchmark as _budget_to_crack_benc
 from mx_mcp.benchmarks import cff_benchmark as _cff_benchmark  # noqa: F401
 from mx_mcp.benchmarks import leakage_benchmark as _leakage_benchmark  # noqa: F401
 from mx_mcp.benchmarks import packer_benchmark as _packer_benchmark  # noqa: F401
+from mx_mcp.benchmarks import unicorn_oep_reach_benchmark as _unicorn_oep_reach_benchmark  # noqa: F401
 from mx_mcp.benchmarks import vm_benchmark as _vm_benchmark  # noqa: F401
+from mx_mcp.benchmarks import vm_handler_replay_benchmark as _vm_handler_replay_benchmark  # noqa: F401
 from mx_mcp.benchmarks import vm_mba_benchmark as _vm_mba_benchmark  # noqa: F401
 from mx_mcp.benchmarks import vm_symbolic_benchmark as _vm_symbolic_benchmark  # noqa: F401
