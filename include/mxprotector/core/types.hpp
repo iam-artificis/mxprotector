@@ -64,11 +64,18 @@ enum class Architecture : uint8_t {
 
 /**
  * @brief Тип PE-файла, определяемый по характеристикам и подсистеме.
+ *
+ * `efi_application` collapses all four UEFI subsystems
+ * (EFI_APPLICATION/BOOT_SERVICE_DRIVER/RUNTIME_DRIVER/ROM) into one
+ * variant — they share the "no Win32 user-mode infra" property
+ * (no PEB / IAT / VEH / TLS callbacks) which is the only distinction
+ * any pass cares about.
  */
 enum class PeType : uint8_t {
     executable      = 0,  ///< .exe — исполняемый файл
     dynamic_library = 1,  ///< .dll — динамическая библиотека
-    kernel_driver   = 2   ///< .sys — драйвер ядра (IMAGE_SUBSYSTEM_NATIVE)
+    kernel_driver   = 2,  ///< .sys — драйвер ядра (IMAGE_SUBSYSTEM_NATIVE)
+    efi_application = 3   ///< .efi — UEFI binary (subsystems 10..13)
 };
 
 /**

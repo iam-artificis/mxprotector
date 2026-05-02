@@ -54,6 +54,26 @@ public:
      */
     [[nodiscard]] static MxResult<PeImage> parse(ByteView raw_data);
 
+    /**
+     * @brief Pure mapping from raw PE header fields to a `PeType`.
+     *
+     * UEFI subsystems (10..13) outrank the DLL characteristics bit:
+     * a real-world EFI runtime driver typically sets both, and
+     * without this ordering it would silently parse as a user-mode
+     * dynamic library and engage Win32-only passes that have no
+     * business running on UEFI.
+     *
+     * @param characteristics  `IMAGE_FILE_HEADER.Characteristics`.
+     * @param subsystem        `IMAGE_OPTIONAL_HEADER.Subsystem`.
+     * @return                 `executable` / `dynamic_library` /
+     *                         `kernel_driver` / `efi_application`.
+     *
+     * Public so unit tests can pin the mapping without going through
+     * a full PE parse — the function is pure and deterministic, and
+     * exposing it keeps the test surface focused.
+     */
+    [[nodiscard]] static PeType detect_pe_type(uint16_t characteristics, uint16_t subsystem);
+
 private:
     /**
      * @brief Валидирует и читает DOS-заголовок.
@@ -68,14 +88,6 @@ private:
      * @return Архитектура или ошибка для неподдерживаемых типов.
      */
     [[nodiscard]] static MxResult<Architecture> detect_architecture(uint16_t machine);
-
-    /**
-     * @brief Определяет тип PE (exe/dll/sys) по заголовкам.
-     * @param characteristics Характеристики файла.
-     * @param subsystem Подсистема из Optional Header.
-     * @return Тип PE-файла.
-     */
-    [[nodiscard]] static PeType detect_pe_type(uint16_t characteristics, uint16_t subsystem);
 
     /**
      * @brief Разбирает таблицу секций.

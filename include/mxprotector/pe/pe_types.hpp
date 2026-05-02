@@ -78,12 +78,27 @@ constexpr uint16_t IMAGE_FILE_SYSTEM               = 0x1000;
 
 /// @name Подсистема (OptionalHeader.Subsystem)
 /// @{
-constexpr uint16_t IMAGE_SUBSYSTEM_UNKNOWN         = 0;
-constexpr uint16_t IMAGE_SUBSYSTEM_NATIVE          = 1;
-constexpr uint16_t IMAGE_SUBSYSTEM_WINDOWS_GUI     = 2;
-constexpr uint16_t IMAGE_SUBSYSTEM_WINDOWS_CUI     = 3;
-constexpr uint16_t IMAGE_SUBSYSTEM_EFI_APPLICATION = 10;
+constexpr uint16_t IMAGE_SUBSYSTEM_UNKNOWN                  = 0;
+constexpr uint16_t IMAGE_SUBSYSTEM_NATIVE                   = 1;
+constexpr uint16_t IMAGE_SUBSYSTEM_WINDOWS_GUI              = 2;
+constexpr uint16_t IMAGE_SUBSYSTEM_WINDOWS_CUI              = 3;
+constexpr uint16_t IMAGE_SUBSYSTEM_EFI_APPLICATION          = 10;
+constexpr uint16_t IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER  = 11;
+constexpr uint16_t IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER       = 12;
+constexpr uint16_t IMAGE_SUBSYSTEM_EFI_ROM                  = 13;
 /// @}
+
+/// @brief True iff @p subsystem is one of the four UEFI variants.
+///
+/// Covers `EFI_APPLICATION` (10), `EFI_BOOT_SERVICE_DRIVER` (11),
+/// `EFI_RUNTIME_DRIVER` (12) and `EFI_ROM` (13). All four share the
+/// "no Win32 user-mode infra" property — no PEB, no IAT, no VEH, no
+/// TLS callbacks — so MxProtector treats them as a single
+/// `BinaryKind::efi_application` for applicability purposes.
+[[nodiscard]] constexpr bool is_efi_subsystem(uint16_t subsystem) noexcept {
+    return subsystem >= IMAGE_SUBSYSTEM_EFI_APPLICATION
+        && subsystem <= IMAGE_SUBSYSTEM_EFI_ROM;
+}
 
 /// @name Характеристики секций (IMAGE_SECTION_HEADER.Characteristics)
 /// @{

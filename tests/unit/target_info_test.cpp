@@ -64,7 +64,35 @@ TEST(TargetInfoTest, UnknownKindMatchesNothing) {
     EXPECT_FALSE(t.is_executable());
     EXPECT_FALSE(t.is_dynamic_library());
     EXPECT_FALSE(t.is_kernel_driver());
+    EXPECT_FALSE(t.is_efi());
     EXPECT_FALSE(t.is_user_mode());
+}
+
+TEST(TargetInfoTest, EfiApplicationIsNotUserModeAndNotKernelDriver) {
+    // EFI binaries get is_efi() / is_efi_application() but must NOT
+    // match is_user_mode() (no Win32 PEB/IAT) or is_kernel_driver()
+    // (no ring0 dispatch). Every gate that today guards on
+    // !is_kernel_driver() must therefore *also* guard on !is_efi()
+    // — the dedicated predicate exists so that intent is explicit.
+    TargetInfo t = TargetInfo::windows_pe_x64();
+    t.kind = BinaryKind::efi_application;
+    EXPECT_TRUE(t.is_efi());
+    EXPECT_TRUE(t.is_efi_application());
+    EXPECT_FALSE(t.is_user_mode());
+    EXPECT_FALSE(t.is_executable());
+    EXPECT_FALSE(t.is_dynamic_library());
+    EXPECT_FALSE(t.is_kernel_driver());
+}
+
+TEST(TargetInfoTest, EfiPredicateIsFalseForOtherKinds) {
+    // is_efi() must NOT leak into the user-mode kinds; if it did,
+    // every existing user-mode gate would silently accept EFI.
+    TargetInfo t = TargetInfo::windows_pe_x64();
+    EXPECT_FALSE(t.is_efi());
+    t.kind = BinaryKind::dynamic_library;
+    EXPECT_FALSE(t.is_efi());
+    t.kind = BinaryKind::kernel_driver;
+    EXPECT_FALSE(t.is_efi());
 }
 
 TEST(TargetInfoTest, BinaryKindNames) {
@@ -74,6 +102,8 @@ TEST(TargetInfoTest, BinaryKindNames) {
                  "dynamic_library");
     EXPECT_STREQ(mx::target::binary_kind_name(BinaryKind::kernel_driver),
                  "kernel_driver");
+    EXPECT_STREQ(mx::target::binary_kind_name(BinaryKind::efi_application),
+                 "efi_application");
     EXPECT_STREQ(mx::target::binary_kind_name(BinaryKind::unknown),
                  "unknown");
 }

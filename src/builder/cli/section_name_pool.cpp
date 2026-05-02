@@ -127,6 +127,13 @@ const std::vector<std::string>& stealth_section_pool_for(
         case target::BinaryKind::dynamic_library:
             return user_mode_pool();
         case target::BinaryKind::kernel_driver:
+        case target::BinaryKind::efi_application:
+            // EFI binaries share the driver-style stealth pool: like
+            // .sys, they have no Win32-loader expectations on section
+            // naming, and reusing the driver pool keeps `.mxpack` /
+            // `.mxguard` style names out of UEFI builds. A dedicated
+            // EFI pool can be split out later if the inspectors used
+            // for UEFI start to flag these specific names.
             return driver_pool();
         case target::BinaryKind::unknown:
             break;

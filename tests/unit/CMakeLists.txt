@@ -35,6 +35,7 @@ set(TEST_SOURCES
     guard_decrypt_unit_test.cpp
     guard_tls_installer_test.cpp
     target_info_test.cpp
+    pe_parser_pe_type_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
     reloc_applier_test.cpp
@@ -149,6 +150,10 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_code_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/cfg_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/export_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattener.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/dispatcher_gen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/bogus_flow.cpp

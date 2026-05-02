@@ -67,15 +67,25 @@ enum class Arch : uint8_t {
 ///   `executable`      — Windows EXE / ELF executable / stand-alone binary.
 ///   `dynamic_library` — Windows DLL / ELF .so / Mach-O .dylib.
 ///   `kernel_driver`   — Windows .sys / Linux .ko / macOS .kext.
+///   `efi_application` — UEFI binary (subsystems 10..13). Shares no
+///                       runtime infrastructure with Win32 user-mode:
+///                       no PEB, no IAT, no VEH, no TLS callbacks.
+///                       Treat as fundamentally distinct from
+///                       `executable` — most user-mode passes
+///                       (Hell's Gate, anti-debug, VEH guard) MUST
+///                       be gated off for it.
 ///
 /// This is derived from the input binary at parse time (e.g. PE
-/// `Subsystem==NATIVE` → `kernel_driver`). Passes that are only valid
-/// for a subset of kinds (user-mode VEH, ntdll imports, ...) must gate
-/// on the predicate form — prefer `is_kernel_driver()` over raw enum.
+/// `Subsystem==NATIVE` → `kernel_driver`, `Subsystem ∈ 10..13` →
+/// `efi_application`). Passes that are only valid for a subset of
+/// kinds (user-mode VEH, ntdll imports, ...) must gate on the
+/// predicate form — prefer `is_user_mode()` / `is_kernel_driver()` /
+/// `is_efi_application()` over raw enum comparisons.
 enum class BinaryKind : uint8_t {
     executable      = 0,
     dynamic_library = 1,
     kernel_driver   = 2,
+    efi_application = 3,
     unknown         = 0xFF,
 };
 
@@ -164,11 +174,24 @@ struct TargetInfo {
     [[nodiscard]] constexpr bool is_executable()      const noexcept { return kind == BinaryKind::executable;      }
     [[nodiscard]] constexpr bool is_dynamic_library() const noexcept { return kind == BinaryKind::dynamic_library; }
     [[nodiscard]] constexpr bool is_kernel_driver()   const noexcept { return kind == BinaryKind::kernel_driver;   }
+    [[nodiscard]] constexpr bool is_efi_application() const noexcept { return kind == BinaryKind::efi_application; }
 
-    /// True for user-mode targets (EXE / DLL). False for drivers, false
-    /// for unknown. Intended for passes that assume the target runs with
-    /// a user-mode PEB / IAT / TLS-callback dispatcher (e.g. Hell's Gate,
-    /// VEH INT3 trap, the current packer stub).
+    /// True iff this binary lives in the UEFI environment.
+    ///
+    /// Today there is a single `efi_application` variant covering all
+    /// four UEFI subsystems (EFI_APPLICATION / BOOT_SERVICE_DRIVER /
+    /// RUNTIME_DRIVER / ROM); they share the "no Win32 infra" property
+    /// any pass actually cares about. If we ever need finer-grained
+    /// gating, split the enum and update this helper.
+    [[nodiscard]] constexpr bool is_efi() const noexcept {
+        return is_efi_application();
+    }
+
+    /// True for Win32 user-mode targets (EXE / DLL). False for
+    /// kernel drivers, UEFI binaries, and `unknown`. Intended for
+    /// passes that assume the target runs with a user-mode PEB /
+    /// IAT / VEH / TLS-callback dispatcher (Hell's Gate, anti-debug
+    /// probes, the VEH guard, the user-mode packer stub).
     [[nodiscard]] constexpr bool is_user_mode() const noexcept {
         return is_executable() || is_dynamic_library();
     }
@@ -223,6 +246,7 @@ struct TargetInfo {
         case BinaryKind::executable:      return "executable";
         case BinaryKind::dynamic_library: return "dynamic_library";
         case BinaryKind::kernel_driver:   return "kernel_driver";
+        case BinaryKind::efi_application: return "efi_application";
         case BinaryKind::unknown:         return "unknown";
     }
     return "?";

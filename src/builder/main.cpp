@@ -301,6 +301,7 @@ int main(int argc, char** argv) {
                 case mx::PeType::executable:      return mx::target::BinaryKind::executable;
                 case mx::PeType::dynamic_library: return mx::target::BinaryKind::dynamic_library;
                 case mx::PeType::kernel_driver:   return mx::target::BinaryKind::kernel_driver;
+                case mx::PeType::efi_application: return mx::target::BinaryKind::efi_application;
             }
             return mx::target::BinaryKind::unknown;
         }();

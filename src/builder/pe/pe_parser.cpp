@@ -258,6 +258,14 @@ MxResult<Architecture> PeParser::detect_architecture(uint16_t machine) {
 // ============================================================================
 
 PeType PeParser::detect_pe_type(uint16_t characteristics, uint16_t subsystem) {
+    // Subsystem-driven kinds outrank the DLL bit because UEFI runtime
+    // drivers and EFI ROMs carry their own subsystem id but the DLL
+    // characteristics bit is also commonly set on them — without this
+    // ordering they would silently parse as `dynamic_library` and
+    // engage user-mode passes that have no business running there.
+    if (pe::is_efi_subsystem(subsystem)) {
+        return PeType::efi_application;
+    }
     if (subsystem == pe::IMAGE_SUBSYSTEM_NATIVE) {
         return PeType::kernel_driver;
     }
