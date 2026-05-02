@@ -15,7 +15,7 @@ Build-time coverage complete: `BinaryKind` + `LoadMode` through every pass, kern
 - **Docs:** `CLAUDE.md` section for `.sys` surface (CLI flags, gated passes, ring0 limitations) + SDK note for driver authors. Last.
 
 ## Tooling
-- **MCP defense measurement.** See [`MCP.md`](MCP.md), backlog in [`FUTURE.md`](FUTURE.md). Status: migration landed; P1/P2/P4/P5/P6/P7 complete, P3 partial, P8–P10 pending.
+- **MCP defense measurement.** See [`MCP.md`](MCP.md), backlog in [`FUTURE.md`](FUTURE.md). Status: migration landed; P1/P2/P4/P5/P6/P7/P8/P9/P10 complete, P3 partial.
 
 ## Deferred
 - **UEFI `.efi`:** `bootmgfwx64.efi` et al. PE32+ layout, UEFI firmware loader, no ring0/ring3 split, `EFI_BOOT_SERVICES`/`EFI_RUNTIME_SERVICES` (no `Nt*`/`Rtl*`). Reuse `BinaryKind`/`LoadMode`; new kinds (`uefi_application`, `uefi_driver`), firmware-services stub palette (no Hell's Gate, no PEB, no ntdll). After `.sys` stabilises.
