@@ -29,14 +29,17 @@ namespace mx {
 
 bool GuardPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     // Runtime-guards emit a Vectored Exception Handler and a TLS installer
-    // thunk — both are user-mode Win32 facilities. Kernel drivers run in
-    // ring0 where `RtlAddVectoredExceptionHandler` does not exist and the
-    // dispatcher shape is entirely different (IDT / KiDispatchException),
-    // so we skip driver targets outright. The stub uses x64 encoding
-    // exclusively, so PE32 / ELF / Mach-O targets skip for the same reason
-    // as every other x64-specific emitter.
+    // thunk — both are Win32 *user-mode* facilities. Kernel drivers run in
+    // ring0 (no `RtlAddVectoredExceptionHandler`, dispatch is IDT /
+    // KiDispatchException) and UEFI binaries run before the OS user-mode
+    // loader is even alive (no PEB, no VEH, no TLS callbacks); both must
+    // be rejected. `is_user_mode()` is the single semantic predicate
+    // that captures "this binary lives in Win32 user-mode" and is the
+    // gate of record — see project memory note "VEH only for user-mode".
+    // The `is_windows_pe_x64()` filter still applies because the stub is
+    // emitted as x64 PE bytes and the rest of the pipeline assumes that.
     if (!ctx.target().is_windows_pe_x64()) return false;
-    if (ctx.target().is_kernel_driver())   return false;
+    if (!ctx.target().is_user_mode())      return false;
 
     for (const auto& m : ctx.markers()) {
         if (m.type == MarkerType::guard_begin) return true;

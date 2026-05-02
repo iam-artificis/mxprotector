@@ -146,12 +146,19 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     // these picks is sufficient — kernel drivers still get a fully
     // randomised, encrypted VM, just without the user-mode-only outer
     // probes.
-    const bool target_is_kernel = ctx.target().is_kernel_driver();
+    // Anti-tamper / anti-emulation entry-stub checks (gs:[0x60] PEB
+    // walk, Hell's Gate ntdll resolve, VirtualProtect probes) are
+    // strictly user-mode primitives. They corrupt or trap on any
+    // non-user-mode target — kernel drivers (gs:[0x60] is KPCR, not
+    // PEB) and UEFI binaries (no PEB or ntdll at all) — so the gate
+    // is "anything that is not user-mode", not "kernel-driver only".
+    // See project memory note "VEH only for user-mode".
+    const bool skip_user_mode_checks = !ctx.target().is_user_mode();
     const vm::VmGenOptions default_opts{
         .emit_exit_as_jmp        = false,
         .use_imagebase_key       = packer_will_run,
         .preferred_image_base    = static_cast<uint64_t>(ctx.pe_image().image_base()),
-        .skip_anti_tamper_checks = target_is_kernel,
+        .skip_anti_tamper_checks = skip_user_mode_checks,
     };
     if (default_opts.use_imagebase_key) {
         ctx.log_fmt("VirtualizationPass: ImageBase-derived table key enabled "
@@ -159,9 +166,10 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
             default_opts.preferred_image_base);
     }
     if (default_opts.skip_anti_tamper_checks) {
-        ctx.log("VirtualizationPass: kernel-driver target — anti-tamper / "
-                "anti-emulation entry-stub checks suppressed (no user-mode "
-                "PEB / Hell's Gate in ring0)");
+        ctx.log_fmt("VirtualizationPass: non-user-mode target ({}) — "
+                    "anti-tamper / anti-emulation entry-stub checks "
+                    "suppressed (no user-mode PEB / Hell's Gate available)",
+            mx::target::binary_kind_name(ctx.target().kind));
     }
 
     // Собираем все blobs и отмечаем точки замены

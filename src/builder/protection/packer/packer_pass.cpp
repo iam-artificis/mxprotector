@@ -810,9 +810,14 @@ bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     // need their own packer implementations.
     if (!ctx.config().enable_packer)        return false;
     if (!ctx.target().is_windows_pe_x64())  return false;
-    // Stage 3.C lifted the kernel-driver gate — `DriverStubEmitter`
-    // now provides a ring0-safe stub variant. EXE / DLL / SYS are all
-    // accepted; the per-shape dispatch happens in `execute()`.
+    // EXE / DLL / SYS are dispatched in `execute()` to dedicated stub
+    // emitters. UEFI has no equivalent emitter today (no PE loader,
+    // no IAT, no TLS callbacks, no Win32 syscalls — every assumption
+    // baked into the existing stubs is wrong for it). Reject EFI here
+    // so the dispatch never reaches the silent fallthrough below; an
+    // `EfiStubEmitter` can be slotted in later without touching this
+    // gate beyond removing the EFI rejection.
+    if (ctx.target().is_efi_application()) return false;
     return true;
 }
 

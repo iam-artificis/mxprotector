@@ -81,11 +81,20 @@ mx::ProtectionContext make_ctx(BinaryKind kind,
 }
 
 // --------------------------------------------------------------------
-// GuardPass
+// GuardPass — VEH is a user-mode-only Win32 facility.
 // --------------------------------------------------------------------
 
 TEST(PassApplicability, GuardPassSkipsKernelDriver) {
     auto ctx = make_ctx(BinaryKind::kernel_driver);
+    mx::GuardPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, GuardPassSkipsEfiApplication) {
+    // VEH does not exist in UEFI: no OS user-mode loader, no PEB,
+    // no `RtlAddVectoredExceptionHandler`. The pass MUST reject EFI
+    // before any guard markers are inspected.
+    auto ctx = make_ctx(BinaryKind::efi_application);
     mx::GuardPass pass;
     EXPECT_FALSE(pass.is_applicable(ctx));
 }
@@ -159,6 +168,17 @@ TEST(PassApplicability, PackerPassAcceptsDynamicLibrary) {
     auto ctx = make_ctx(BinaryKind::dynamic_library);
     mx::PackerPass pass;
     EXPECT_TRUE(pass.is_applicable(ctx));
+}
+
+TEST(PassApplicability, PackerPassSkipsEfiApplication) {
+    // No EfiStubEmitter exists yet — UEFI has no PE loader, IAT, TLS
+    // callbacks, or Win32 syscalls, so the existing stubs would emit
+    // bytes that the runtime cannot execute. Rejecting at the gate
+    // prevents the silent fallthrough in execute() from producing a
+    // half-protected binary that crashes at boot.
+    auto ctx = make_ctx(BinaryKind::efi_application);
+    mx::PackerPass pass;
+    EXPECT_FALSE(pass.is_applicable(ctx));
 }
 
 // --------------------------------------------------------------------
