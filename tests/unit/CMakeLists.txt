@@ -138,6 +138,7 @@ set(PACKER_SOURCES
 set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mutation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_substitution.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/padding_filler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/opcode_swap_rule.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/direction_flip_rule.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/imm8_negation_rule.cpp

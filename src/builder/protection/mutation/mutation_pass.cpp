@@ -15,6 +15,7 @@
  */
 
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
+#include "mxprotector/protection/mutation/padding_filler.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
@@ -126,145 +127,12 @@ MxResult<uint32_t> MutationEngine::mutate_region(
     return mutations_applied;
 }
 
-// ============================================================================
-// Padding detection and filling (anonymous namespace)
-// ============================================================================
-
-namespace {
-
-/**
- * @brief Проверяет, является ли инструкция padding-байтом (NOP или INT3).
- */
-bool is_padding_instruction(const analysis::Instruction& insn) {
-    return insn.mnemonic() == "nop" || insn.mnemonic() == "int3";
-}
-
-/**
- * @brief Проверяет, что padding-область — мёртвый код (безопасно для замены).
- *
- * @details Мёртвый padding определяется если:
- *          - Состоит из INT3 (линкерный padding между функциями)
- *          - Расположен сразу после RET или JMP (после возврата/перехода)
- *          - Находится в самом начале секции (pre-entry padding)
- */
-bool is_dead_padding(
-    const std::vector<analysis::Instruction>& insns,
-    size_t run_start_idx)
-{
-    if (insns[run_start_idx].mnemonic() == "int3") return true;
-    if (run_start_idx == 0) return true;
-
-    const auto& prev = insns[run_start_idx - 1];
-    return prev.is_return() || prev.is_unconditional_jump();
-}
-
-struct PaddingRun {
-    size_t byte_offset;
-    size_t byte_size;
-};
-
-/**
- * @brief Находит все мёртвые padding-области в потоке инструкций.
- */
-std::vector<PaddingRun> find_dead_padding(
-    const std::vector<analysis::Instruction>& instructions,
-    Va base_address,
-    size_t min_size = 2)
-{
-    std::vector<PaddingRun> runs;
-
-    for (size_t i = 0; i < instructions.size(); ) {
-        if (!is_padding_instruction(instructions[i])) {
-            ++i;
-            continue;
-        }
-
-        const size_t run_start = i;
-        const size_t byte_offset =
-            static_cast<size_t>(instructions[i].address() - base_address);
-        size_t byte_size = 0;
-
-        while (i < instructions.size() && is_padding_instruction(instructions[i])) {
-            byte_size += instructions[i].length();
-            ++i;
-        }
-
-        if (byte_size >= min_size && is_dead_padding(instructions, run_start)) {
-            runs.push_back({byte_offset, byte_size});
-        }
-    }
-
-    return runs;
-}
-
-struct PaddingFillStats {
-    uint32_t regions_filled = 0;
-    uint32_t predicates_inserted = 0;
-    uint32_t junk_bytes = 0;
-};
-
-/**
- * @brief Заполняет мёртвые padding-области junk-кодом и opaque predicates.
- *
- * @details Для больших областей (≥14 байт) с вероятностью 50% вставляет
- *          opaque predicate (always-true) + junk в мёртвой ветви.
- *          Остальные области заполняются junk-кодом.
- */
-PaddingFillStats fill_section_padding(
-    MutableByteView code,
-    Va base_address,
-    analysis::IDisassembler& disasm,
-    JunkGenerator& junk_gen,
-    OpaquePredicateGenerator& pred_gen,
-    Randomizer& rng)
-{
-    PaddingFillStats stats;
-
-    auto decode_result = disasm.decode_buffer(
-        ByteView{code.data(), code.size()}, base_address);
-    if (!decode_result || decode_result->empty()) return stats;
-
-    auto runs = find_dead_padding(*decode_result, base_address);
-
-    for (const auto& run : runs) {
-        if (run.byte_offset + run.byte_size > code.size()) continue;
-
-        uint8_t* dst = code.data() + run.byte_offset;
-
-        if (run.byte_size >= 14 && rng.next_bool(0.5)) {
-            auto predicate = pred_gen.generate_always_true(rng, 0);
-
-            if (!predicate.code.empty() &&
-                predicate.total_size < run.byte_size &&
-                (run.byte_size - predicate.total_size) <= 127)
-            {
-                const auto junk_size =
-                    static_cast<uint8_t>(run.byte_size - predicate.total_size);
-
-                predicate.code[predicate.true_branch_offset + 1] = junk_size;
-
-                std::copy(predicate.code.begin(), predicate.code.end(), dst);
-
-                auto junk = junk_gen.generate(junk_size, rng);
-                std::copy(junk.begin(), junk.end(), dst + predicate.total_size);
-
-                stats.junk_bytes += static_cast<uint32_t>(run.byte_size);
-                ++stats.regions_filled;
-                ++stats.predicates_inserted;
-                continue;
-            }
-        }
-
-        auto junk = junk_gen.generate(run.byte_size, rng);
-        std::copy(junk.begin(), junk.end(), dst);
-        stats.junk_bytes += static_cast<uint32_t>(run.byte_size);
-        ++stats.regions_filled;
-    }
-
-    return stats;
-}
-
-} // anonymous namespace
+// Padding detection + filling lives in `padding_filler.{hpp,cpp}`
+// (R3.3 split-out). The helpers used to live in this TU's anonymous
+// namespace; consolidating the logic in its own pair lets future
+// tightening (e.g. a finer "is this NOP run truly dead?" heuristic)
+// land in one place without touching the substitution-driven
+// `MutationEngine`.
 
 // ============================================================================
 // MutationPass::is_applicable
@@ -426,7 +294,7 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
             const Va section_va = ctx.pe_image().image_base() + sec.virtual_address;
             MutableByteView code_view(sec.data.data(), sec.data.size());
 
-            auto stats = fill_section_padding(
+            auto stats = mutation::fill_section_padding(
                 code_view, section_va, *ctx.disassembler(),
                 padding_gen, pred_gen, rng);
 

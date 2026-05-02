@@ -47,6 +47,7 @@ set(BUILDER_SOURCES
     # Фаза 2: Мутация
     protection/mutation/mutation_pass.cpp
     protection/mutation/instruction_substitution.cpp
+    protection/mutation/padding_filler.cpp
     protection/mutation/rules/opcode_swap_rule.cpp
     protection/mutation/rules/direction_flip_rule.cpp
     protection/mutation/rules/imm8_negation_rule.cpp
