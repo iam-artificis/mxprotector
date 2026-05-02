@@ -53,6 +53,8 @@
 #include "mxprotector/protection/packer/packer_pass.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_intent.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
@@ -358,16 +360,17 @@ struct PackerStubInjection {
 [[nodiscard]] MxResult<PackerStubInjection> finalize_packer_stub(
     ProtectionContext& ctx,
     ByteBuffer&&       stub_buf,
-    uint32_t           section_characteristics,
+    pe::SectionIntent  intent,
     const OepStealResult& steal,
     const CommonStubPatches& common)
 {
     SectionManager sec_mgr(ctx.pe_image());
+    pe::SectionEmitter emit{sec_mgr, ctx.layout_policy()};
     const std::string& packer_section_name = ctx.section_names().packer;
-    auto add_res = sec_mgr.add_section(
+    auto add_res = emit.append_section(
         packer_section_name,
         ByteView{stub_buf.data(), stub_buf.size()},
-        section_characteristics);
+        intent);
     if (!add_res) {
         return std::unexpected(add_res.error());
     }
@@ -665,18 +668,16 @@ private:
 
     [[nodiscard]] MxStatus step5_inject_and_patch() {
         // Inject the .mxpack section + apply the common rel32
-        // patches. Characteristics include MEM_WRITE because the RC4
-        // KSA rebuilds the S-box scratch area at runtime and the
-        // scratch lives inside the stub section itself.
-        constexpr uint32_t pack_characteristics =
-            pe::IMAGE_SCN_CNT_CODE |
-            pe::IMAGE_SCN_MEM_EXECUTE |
-            pe::IMAGE_SCN_MEM_READ |
-            pe::IMAGE_SCN_MEM_WRITE;
+        // patches. Section is RWX because the RC4 KSA rebuilds the
+        // S-box scratch area at runtime and the scratch lives inside
+        // the stub section itself.
+        constexpr pe::SectionIntent pack_intent{
+            pe::SectionContentType::code,
+            pe::SectionPermissions::rwx};
 
         auto inject = finalize_packer_stub(
             ctx_, std::move(stub_buf_),
-            pack_characteristics, steal_, patches_);
+            pack_intent, steal_, patches_);
         if (!inject) return std::unexpected(inject.error());
 
         pack_section_index_ = inject->pack_section_index;

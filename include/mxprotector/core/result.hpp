@@ -56,7 +56,8 @@ enum class PeErrorCode : uint16_t {
     unsupported_architecture     = 110, ///< Неподдерживаемая архитектура (не x86/x64)
     file_too_small               = 111, ///< Файл меньше минимального размера PE
     corrupted_data_directory     = 112, ///< Повреждён элемент DataDirectory
-    section_alignment_violation  = 113  ///< Нарушение выравнивания секции
+    section_alignment_violation  = 113, ///< Нарушение выравнивания секции
+    section_not_found            = 114  ///< Запрошенная по имени секция отсутствует в образе
 };
 
 /**

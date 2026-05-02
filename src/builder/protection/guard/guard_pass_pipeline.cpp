@@ -11,6 +11,8 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_intent.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/guard/guard_collector.hpp"
 #include "mxprotector/protection/guard/guard_descriptor.hpp"
@@ -63,18 +65,14 @@ MxStatus GuardPassPipeline::execute()
     // scratch slot — which itself needs a writable section. Baking W
     // into .mxguard at build time is simpler, matches .mxpack's R+W+X
     // layout, and avoids a second "small writable tail" fingerprint.
-    constexpr uint32_t kGuardCharacteristics =
-        pe::IMAGE_SCN_CNT_CODE     |
-        pe::IMAGE_SCN_MEM_EXECUTE  |
-        pe::IMAGE_SCN_MEM_READ     |
-        pe::IMAGE_SCN_MEM_WRITE;
-
     SectionManager sec_mgr(ctx_.pe_image());
+    pe::SectionEmitter emit{sec_mgr, ctx_.layout_policy()};
     const std::string& guard_section_name = ctx_.section_names().guard;
-    auto add_result = sec_mgr.add_section(
+    auto add_result = emit.append_section(
         guard_section_name,
         ByteView{assembly->section_data.data(), assembly->section_data.size()},
-        kGuardCharacteristics);
+        pe::SectionIntent{pe::SectionContentType::code,
+                          pe::SectionPermissions::rwx});
     if (!add_result) {
         return std::unexpected(add_result.error());
     }

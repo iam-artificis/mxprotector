@@ -41,6 +41,16 @@ public:
      */
     explicit SectionManager(PeImage& image) noexcept : image_(image) {}
 
+    /// @brief Read-only access to the bound image. Exposed so the
+    /// `SectionEmitter` facade (R2.3) can locate sections by name
+    /// without re-routing through the construction site.
+    [[nodiscard]] const PeImage& image() const noexcept { return image_; }
+
+    /// @brief Mutable access to the bound image. Same rationale as
+    /// the const overload — `SectionEmitter::append_to_section`
+    /// needs to reach the section's `data` buffer after a resize.
+    [[nodiscard]] PeImage& image() noexcept { return image_; }
+
     /**
      * @brief Добавляет новую секцию в конец таблицы секций.
      * @param name Имя секции (до 8 символов, например ".mxprot").

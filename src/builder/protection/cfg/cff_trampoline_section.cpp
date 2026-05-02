@@ -9,6 +9,8 @@
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_intent.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/cfg/cff_relocation_fixup.hpp"
 #include "mxprotector/protection/cfg/cff_trampoline_writer.hpp"
@@ -18,11 +20,6 @@ namespace mx::cff {
 namespace {
 
 constexpr uint32_t kFunctionAlignment = 16;
-
-constexpr uint32_t kCffSectionCharacteristics =
-    pe::IMAGE_SCN_CNT_CODE |
-    pe::IMAGE_SCN_MEM_EXECUTE |
-    pe::IMAGE_SCN_MEM_READ;
 
 /// Pad `buf` with `INT 3` until its size is a multiple of `kFunctionAlignment`.
 void pad_to_alignment(ByteBuffer& buf) {
@@ -143,11 +140,13 @@ void commit_trampoline_section(ProtectionContext&               ctx,
     auto section_data = lay_out_trampolines(entries);
 
     SectionManager sec_mgr(ctx.pe_image());
+    pe::SectionEmitter emit{sec_mgr, ctx.layout_policy()};
     const std::string& cff_section_name = ctx.section_names().cff;
-    auto add_result = sec_mgr.add_section(
+    auto add_result = emit.append_section(
         cff_section_name,
         ByteView{section_data.data(), section_data.size()},
-        kCffSectionCharacteristics);
+        pe::SectionIntent{pe::SectionContentType::code,
+                          pe::SectionPermissions::rx});
 
     if (!add_result) {
         ctx.log_fmt("CfgFlatteningPass: ошибка добавления секции: {}",

@@ -12,6 +12,8 @@
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_intent.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 
 namespace mx::string_protect {
@@ -92,18 +94,18 @@ MxStatus commit_string_section(
     // inside the descriptor. EXECUTE lets the trampolines and
     // mx_str_get run. READ is included for clarity even though
     // EXECUTE implies it on x64.
-    constexpr uint32_t str_section_characteristics =
-        pe::IMAGE_SCN_CNT_CODE     |
-        pe::IMAGE_SCN_MEM_EXECUTE  |
-        pe::IMAGE_SCN_MEM_READ     |
-        pe::IMAGE_SCN_MEM_WRITE;
-
     const std::string& str_section_name = ctx.section_names().str;
     SectionManager sec_mgr(image);
-    auto add_res = sec_mgr.add_section(
+    pe::SectionEmitter emit{sec_mgr, ctx.layout_policy()};
+    // Section holds mx_str_get + trampolines (code) and descriptor
+    // table + ciphertext (data). RWX because the decryptor does
+    // in-place XOR over the data pool on first call per string and
+    // flips the sticky flag inside the descriptor.
+    auto add_res = emit.append_section(
         str_section_name,
         ByteView{layout.section_buf.data(), layout.section_buf.size()},
-        str_section_characteristics);
+        pe::SectionIntent{pe::SectionContentType::code,
+                          pe::SectionPermissions::rwx});
     if (!add_res) {
         return std::unexpected(add_res.error());
     }

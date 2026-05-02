@@ -30,6 +30,7 @@ set(BUILDER_SOURCES
     pe/import_table.cpp
     pe/export_table.cpp
     pe/relocation_table.cpp
+    pe/section_emitter.cpp
     pe/layout/standard_layout.cpp
 
     # Модуль анализа

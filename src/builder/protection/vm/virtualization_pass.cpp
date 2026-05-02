@@ -40,6 +40,8 @@
 #include "mxprotector/core/asm_builder.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
+#include "mxprotector/pe/section_intent.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 
 #include <algorithm>
@@ -421,16 +423,14 @@ MxStatus VirtualizationPass::execute(ProtectionContext& ctx) {
     }
     while (section_data.size() % 16 != 0) section_data.push_back(asm64::kInt3);
 
-    constexpr uint32_t mxvm_characteristics =
-        pe::IMAGE_SCN_CNT_CODE |
-        pe::IMAGE_SCN_MEM_EXECUTE |
-        pe::IMAGE_SCN_MEM_READ;
-
     SectionManager sec_mgr(ctx.pe_image());
+    pe::SectionEmitter emit{sec_mgr, ctx.layout_policy()};
     const std::string& vm_section_name = ctx.section_names().vm;
-    auto add_result = sec_mgr.add_section(vm_section_name,
+    auto add_result = emit.append_section(
+        vm_section_name,
         ByteView{section_data.data(), section_data.size()},
-        mxvm_characteristics);
+        pe::SectionIntent{pe::SectionContentType::code,
+                          pe::SectionPermissions::rx});
     if (!add_result) {
         return std::unexpected(add_result.error());
     }
