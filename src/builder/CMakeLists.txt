@@ -18,6 +18,7 @@ set(BUILDER_SOURCES
 
     # CLI
     cli/cli_handler.cpp
+    cli/main_helpers.cpp
     cli/section_name_pool.cpp
 
     # Core (out-of-line context constructor — owns the layout policy)
