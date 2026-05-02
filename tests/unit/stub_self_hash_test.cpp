@@ -29,6 +29,7 @@
 #include <cstring>
 #include <vector>
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"
@@ -38,12 +39,12 @@ namespace {
 using mx::ByteView;
 using mx::MutableByteView;
 using mx::RawEmitter;
+using mx::hash::fnv1a_32;
+using mx::hash::kFnv1aOffsetBasis;
+using mx::hash::kFnv1aPrime;
 using mx::packer::derive_effective_key_in_place;
 using mx::packer::emit_key_derivation_loop;
 using mx::packer::emit_stub_self_hash;
-using mx::packer::fnv1a_32;
-using mx::packer::kFnv1aOffsetBasis;
-using mx::packer::kFnv1aPrime;
 
 [[nodiscard]] uint32_t read_u32_le(const std::vector<uint8_t>& buf, size_t offset) {
     uint32_t v = 0;

@@ -27,6 +27,7 @@
 
 #include "mxprotector/protection/guard/guard_veh_emitter.hpp"
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/asm_builder.hpp"
 
 #include <cstdint>
@@ -155,7 +156,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     //     jnz .hw                 75 rel8           (2)
     // =================================================================
     e.u8(0x41); e.u8(0xBB);
-    e.u32(0x811C9DC5u);
+    e.u32(mx::hash::kFnv1aOffsetBasis);
 
     e.u8(0x4C); e.u8(0x8D); e.u8(0x15);
     e.u8(0x00); e.u8(0x00); e.u8(0x00); e.u8(0x00);
@@ -173,7 +174,7 @@ GuardVehEmit emit_guard_veh_handler(RawEmitter& e, Randomizer& rng) {
     e.u32(0);
 
     e.u8(0x41); e.u8(0xB8);
-    e.u32(0x01000193u);
+    e.u32(mx::hash::kFnv1aPrime);
 
     const uint32_t hw_loop_start = static_cast<uint32_t>(e.size());
     e.u8(0x41); e.u8(0x0F); e.u8(0xB6); e.u8(0x02);   // movzx eax, [r10]

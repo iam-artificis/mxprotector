@@ -9,6 +9,7 @@
 
 #include "mxprotector/protection/packer/packer_section_encryptor.hpp"
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
@@ -41,7 +42,7 @@ MxStatus hash_derive_and_encrypt(
               static_cast<int32_t>(hash_range_end));
 
     // (2) Compute FNV-1a over the now-finalised hashed range.
-    const uint32_t stub_hash = fnv1a_32(
+    const uint32_t stub_hash = mx::hash::fnv1a_32(
         ByteView{pack_section_data.data(), hash_range_end});
 
     ctx.log_fmt("PackerPass: P6 stub self-hash = 0x{:08X} over [0, 0x{:X})",

@@ -28,6 +28,7 @@ set(TEST_SOURCES
     hash_opaque_predicate_test.cpp
     veh_int3_trap_test.cpp
     stub_self_hash_test.cpp
+    fnv1a_test.cpp
     marker_scanner_test.cpp
     guard_page_layout_test.cpp
     guard_veh_emitter_test.cpp

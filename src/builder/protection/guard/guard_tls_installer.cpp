@@ -8,6 +8,7 @@
 
 #include <cstring>
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/protection/anti_tamper/hells_gate_resolver.hpp"
 
 namespace mx::guard {
@@ -137,7 +138,7 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
     // and r8/r10/r11 are volatile under Win64 ABI.
     // =================================================================
     e.u8(0x41); e.u8(0xBA);
-    e.u32(0x811C9DC5u);  // FNV offset basis — same constant as P6 stub_self_hash
+    e.u32(mx::hash::kFnv1aOffsetBasis);
 
     e.u8(0x4C); e.u8(0x8D); e.u8(0x1D);
     out.crc_walk_rel32_offset = static_cast<uint32_t>(e.size() - start);
@@ -149,7 +150,7 @@ GuardTlsInstallerEmit emit_guard_tls_installer(
     e.u32(0);
 
     e.u8(0x41); e.u8(0xB8);
-    e.u32(0x01000193u);  // FNV prime
+    e.u32(mx::hash::kFnv1aPrime);
 
     const uint32_t crc_loop_label = static_cast<uint32_t>(e.size());
     e.u8(0x41); e.u8(0x0F); e.u8(0xB6); e.u8(0x03);   // movzx eax, byte [r11]

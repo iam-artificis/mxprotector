@@ -8,10 +8,10 @@
 #include <array>
 #include <cstring>
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/protection/guard/guard_descriptor.hpp"
-#include "mxprotector/protection/packer/stub_self_hash.hpp"  // fnv1a_32
 
 namespace mx::guard {
 
@@ -139,7 +139,7 @@ MxStatus back_patch_guard_handlers(
     // baked expected value. Any write to the handler range that
     // happens AFTER this point will shift the hash and break the
     // installer's registration path.
-    const uint32_t handler_crc = packer::fnv1a_32(
+    const uint32_t handler_crc = mx::hash::fnv1a_32(
         ByteView{
             guard_section.data.data() + a.veh_handler_offset,
             veh_handler_size});

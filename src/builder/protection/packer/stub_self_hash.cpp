@@ -14,7 +14,7 @@ void derive_effective_key_in_place(uint32_t hash, MutableByteView key) noexcept 
     uint32_t state = hash;
     for (auto& b : key) {
         state ^= static_cast<uint32_t>(b);
-        state *= kFnv1aPrime;
+        state *= mx::hash::kFnv1aPrime;
         b = static_cast<uint8_t>(state & 0xFFu);
     }
 }
@@ -28,7 +28,7 @@ StubSelfHashEmit emit_stub_self_hash(RawEmitter& e) {
     //   Initialise the running state with the FNV-1a offset basis.
     // ----------------------------------------------------------------
     e.u8(0xB8);
-    e.u32(kFnv1aOffsetBasis);
+    e.u32(mx::hash::kFnv1aOffsetBasis);
 
     // ----------------------------------------------------------------
     // lea rsi, [rip + disp32]            48 8D 35 rel32   (7 bytes)
@@ -68,7 +68,7 @@ StubSelfHashEmit emit_stub_self_hash(RawEmitter& e) {
     //   because nothing in the inner loop touches r8.
     // ----------------------------------------------------------------
     e.u8(0x41); e.u8(0xB8);
-    e.u32(kFnv1aPrime);
+    e.u32(mx::hash::kFnv1aPrime);
 
     // ----------------------------------------------------------------
     // .hash_loop:
@@ -155,7 +155,7 @@ void emit_key_derivation_loop(RawEmitter& e) {
     //   clobbering r9d here is invisible to every downstream user.
     // ----------------------------------------------------------------
     e.u8(0x41); e.u8(0xB9);
-    e.u32(kFnv1aPrime);
+    e.u32(mx::hash::kFnv1aPrime);
 
     // ----------------------------------------------------------------
     // .derive_loop:

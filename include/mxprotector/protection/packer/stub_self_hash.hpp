@@ -51,12 +51,15 @@
  *      beyond recognition, which is all we need for the
  *      derivation step to garble the effective keys.
  *
- *   3. **Compile-time reference implementation.** The C++ side
- *      of this module (`fnv1a_32`) is `constexpr` and bit-exact
+ *   3. **Compile-time reference implementation.** The build-side
+ *      reference (`mx::hash::fnv1a_32` in
+ *      `common/hash/fnv1a.hpp`) is `constexpr` and bit-exact
  *      against the emitted x64 loop, so unit tests can check
  *      "if I compute FNV-1a over some bytes in C++, do I get
  *      the same value the runtime loop produces for those
  *      bytes?" without actually executing the emitted code.
+ *      Constants are owned by that header so build-side and
+ *      runtime emission can never drift.
  *
  * ## Key derivation: FNV-1a-chain
  *
@@ -107,38 +110,11 @@
 
 #include <cstdint>
 
+#include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/raw_emitter.hpp"
 #include "mxprotector/core/types.hpp"
 
 namespace mx::packer {
-
-/// FNV-1a 32-bit offset basis (the canonical seed).
-constexpr uint32_t kFnv1aOffsetBasis = 0x811C9DC5u;
-
-/// FNV-1a 32-bit prime (the canonical multiplier).
-constexpr uint32_t kFnv1aPrime = 0x01000193u;
-
-/**
- * @brief Compile-time FNV-1a over an arbitrary byte range.
- *
- * Produces the same value the runtime self-hash loop would produce
- * if it ran over identical bytes. Used by the build-side code to
- * pre-compute the effective keys for every cipher layer.
- *
- * `bytes.size()` is the exact count the runtime loop must walk —
- * any mismatch (off-by-one, wrong start address) gives a different
- * hash and breaks decryption. The build-side caller gets the range
- * from `StubSelfHashEmit::hash_range_*` and must feed the same
- * slice here.
- */
-[[nodiscard]] constexpr uint32_t fnv1a_32(ByteView bytes) noexcept {
-    uint32_t hash = kFnv1aOffsetBasis;
-    for (const uint8_t b : bytes) {
-        hash ^= static_cast<uint32_t>(b);
-        hash *= kFnv1aPrime;
-    }
-    return hash;
-}
 
 /**
  * @brief Apply the FNV-1a-chain derivation to a base key in place.
