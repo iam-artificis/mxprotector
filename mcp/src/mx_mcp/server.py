@@ -35,6 +35,7 @@ from mx_mcp import tools as _tools_pkg  # noqa: F401
 from mx_mcp.dynamic.frida import tools as _frida_tools_pkg  # noqa: F401
 from mx_mcp.static import sidecar_tools as _sidecar_tools_pkg  # noqa: F401
 from mx_mcp import benchmarks as _benchmarks_pkg  # noqa: F401
+from mx_mcp import gates as _gates_pkg  # noqa: F401
 
 
 _LOG = logging.getLogger(__name__)

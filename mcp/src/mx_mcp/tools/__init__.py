@@ -15,4 +15,5 @@ from mx_mcp.tools import compare_snapshots as _compare_snapshots  # noqa: F401
 from mx_mcp.tools import diff_defense_baseline as _diff_defense_baseline  # noqa: F401
 from mx_mcp.tools import measure_defense as _measure_defense  # noqa: F401
 from mx_mcp.tools import record_baseline as _record_baseline  # noqa: F401
+from mx_mcp.tools import run_tier as _run_tier  # noqa: F401
 from mx_mcp.tools import verify_protection_invariants as _verify_protection_invariants  # noqa: F401
