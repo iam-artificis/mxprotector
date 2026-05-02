@@ -119,6 +119,7 @@ set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_stub_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_tls_finalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_section_encryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_setup.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/driver_cipher_body.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/reloc_applier.cpp
