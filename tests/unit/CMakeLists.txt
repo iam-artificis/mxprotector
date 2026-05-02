@@ -36,6 +36,7 @@ set(TEST_SOURCES
     guard_tls_installer_test.cpp
     target_info_test.cpp
     pe_parser_pe_type_test.cpp
+    section_intent_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
     reloc_applier_test.cpp
