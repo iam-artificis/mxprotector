@@ -90,6 +90,21 @@ struct DllFullStubPatches : CommonStubPatches, CipherBodyPatches {};
 struct DriverStubPatches : CommonStubPatches, CipherBodyPatches {};
 
 /**
+ * @brief UEFI stub patches.
+ *
+ * Structurally identical to `DriverStubPatches` — UEFI applications
+ * have the same calling convention (MS x64), no Win32 import table to
+ * wipe, no anti-debug user-mode tricks, no TLS, and the relocation
+ * partitioning + inline applier story is the same as the driver path.
+ *
+ * Kept as a *distinct* type so the templated post-inject dispatch in
+ * `packer_pass.cpp` can branch on `std::is_same_v<Emitter,
+ * EfiStubEmitter>` without confusing EFI bytes with driver bytes in
+ * future refactors that want to add EFI-specific logic.
+ */
+struct EfiStubPatches : CommonStubPatches, CipherBodyPatches {};
+
+/**
  * @brief Contract every StubEmitter policy must satisfy.
  *
  * A StubEmitter is a stateless (or cheaply copyable) type that turns
@@ -306,11 +321,62 @@ private:
     StubEmissionParams params_;
 };
 
+/**
+ * @brief Build the UEFI application stub code bytes (pre-patch).
+ *
+ * UEFI applications share the driver-stub byte layout exactly:
+ *
+ *   1. Save 8 nonvolatiles (rbx, rbp, rsi, rdi, r12-r15) plus the two
+ *      `_ModuleEntryPoint` argument registers (rcx = `EFI_HANDLE`,
+ *      rdx = `EFI_SYSTEM_TABLE*`). 10 pushes total.
+ *   2. Driver cipher body — multi-layer decrypt, optional inline
+ *      reloc applier (matched to `apply_relocs_inline`).
+ *   3. Pop nonvolatiles + entry args in reverse push order.
+ *   4. Stolen `_ModuleEntryPoint` prologue bytes inline.
+ *   5. `jmp rel32 → _ModuleEntryPoint + stolen_size`. The real
+ *      entry's `ret` returns `EFI_STATUS` to the firmware loader.
+ *
+ * No VEH (UEFI has no Win32 VEH facility), no IAT wipe (UEFI uses
+ * `EFI_SYSTEM_TABLE` for service dispatch, not a Win32 IAT), no
+ * TLS callbacks (UEFI has no TLS).
+ */
+[[nodiscard]] std::pair<ByteBuffer, EfiStubPatches>
+build_efi_stub_bytes(Randomizer& rng,
+                     ByteView    stolen_bytes,
+                     uint32_t    section_count,
+                     uint32_t    layer_count,
+                     bool        apply_relocs_inline);
+
+/**
+ * @brief StubEmitter policy for UEFI applications and runtime
+ *        drivers.
+ */
+class EfiStubEmitter {
+public:
+    using patches_type = EfiStubPatches;
+
+    explicit EfiStubEmitter(StubEmissionParams params) noexcept
+        : params_(params) {}
+
+    [[nodiscard]] std::pair<ByteBuffer, EfiStubPatches>
+    emit(Randomizer& rng, ByteView stolen_bytes) {
+        return build_efi_stub_bytes(rng, stolen_bytes,
+                                    params_.section_count,
+                                    params_.layer_count,
+                                    params_.apply_relocs_inline);
+    }
+
+private:
+    StubEmissionParams params_;
+};
+
 static_assert(StubEmitter<ExeStubEmitter>,
     "ExeStubEmitter must satisfy the StubEmitter concept");
 static_assert(StubEmitter<DllFullStubEmitter>,
     "DllFullStubEmitter must satisfy the StubEmitter concept");
 static_assert(StubEmitter<DriverStubEmitter>,
     "DriverStubEmitter must satisfy the StubEmitter concept");
+static_assert(StubEmitter<EfiStubEmitter>,
+    "EfiStubEmitter must satisfy the StubEmitter concept");
 
 } // namespace mx::packer

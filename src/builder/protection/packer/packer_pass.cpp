@@ -73,6 +73,7 @@ namespace {
 using mx::packer::CommonStubPatches;
 using mx::packer::DllFullStubEmitter;
 using mx::packer::DriverStubEmitter;
+using mx::packer::EfiStubEmitter;
 using mx::packer::ExeStubEmitter;
 using mx::packer::OepStealResult;
 using mx::packer::StubArtifactsInfo;
@@ -202,19 +203,22 @@ private:
         }
 
         // Stage 3 — post-decrypt base-relocation applier. Enabled
-        // for manual-mapped output OR kernel drivers (kernel loader
-        // / kdmapper relocate freely). For OS-loaded user-mode
-        // targets the OS loader already applied relocations.
+        // for manual-mapped output, kernel drivers, and UEFI
+        // applications. Drivers / mappers / firmware all relocate
+        // freely; for OS-loaded user-mode EXEs/DLLs the OS loader
+        // already applied relocations before the stub runs.
         apply_relocs_inline_ =
             ctx_.target().is_manually_mapped() ||
-            ctx_.target().is_kernel_driver();
+            ctx_.target().is_kernel_driver()   ||
+            ctx_.target().is_efi_application();
         if (apply_relocs_inline_) {
+            const char* reason =
+                ctx_.target().is_kernel_driver()    ? "kernel-driver target" :
+                ctx_.target().is_efi_application()  ? "UEFI application target" :
+                                                       "manual-map mode";
             ctx_.log_fmt(
                 "PackerPass: post-decrypt reloc applier enabled "
-                "(reason: {})",
-                ctx_.target().is_kernel_driver()
-                    ? "kernel-driver target"
-                    : "manual-map mode");
+                "(reason: {})", reason);
         }
     }
 
@@ -269,12 +273,14 @@ private:
     }
 
     void step4_append_artifacts() {
-        // `emit_tls` is forced off for kernel drivers — the kernel
-        // image loader ignores `DataDirectory[TLS]` entirely and
-        // `step6_finalize_tls` is already a compile-time no-op for
-        // the driver shape.
+        // `emit_tls` is forced off for kernel drivers and UEFI
+        // applications — neither image loader honours
+        // `DataDirectory[TLS]` (UEFI has no TLS facility at all),
+        // and `step6_finalize_tls` is already a compile-time no-op
+        // for both shapes.
         constexpr bool emit_tls =
-            !std::is_same_v<Emitter, DriverStubEmitter>;
+            !std::is_same_v<Emitter, DriverStubEmitter> &&
+            !std::is_same_v<Emitter, EfiStubEmitter>;
         artifacts_ = packer::append_stub_artifacts(
             ctx_, stub_buf_, rng_,
             layer_keys_,
@@ -310,9 +316,12 @@ private:
 
         // User-mode (EXE / DLL) version touches every user-mode-only
         // slot (reprotect table, IAT wipe, imagebase anchor); the
-        // driver version skips them because the driver cipher body
-        // never emits the corresponding code.
-        if constexpr (std::is_same_v<Emitter, DriverStubEmitter>) {
+        // driver and UEFI versions skip them because the driver
+        // cipher body (shared with the EFI stub) never emits the
+        // corresponding code.
+        if constexpr (std::is_same_v<Emitter, DriverStubEmitter> ||
+                      std::is_same_v<Emitter, EfiStubEmitter>)
+        {
             packer::apply_driver_post_inject_patches(
                 ctx_, pack_sec.data, stub_rva_,
                 layer_count_, patches_, artifacts_,
@@ -328,7 +337,9 @@ private:
     }
 
     void step6_finalize_tls() {
-        if constexpr (std::is_same_v<Emitter, DriverStubEmitter>) {
+        if constexpr (std::is_same_v<Emitter, DriverStubEmitter> ||
+                      std::is_same_v<Emitter, EfiStubEmitter>)
+        {
             return;
         }
         auto& pack_sec = ctx_.pe_image().sections()[pack_section_index_];
@@ -405,10 +416,9 @@ template <StubEmitter Emitter>
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     if (!ctx.config().enable_packer)        return false;
     if (!ctx.target().is_windows_pe_x64())  return false;
-    // EXE / DLL / SYS are dispatched in `execute()` to dedicated stub
-    // emitters. UEFI has no equivalent emitter today; reject EFI here
-    // so the dispatch never reaches the silent fallthrough below.
-    if (ctx.target().is_efi_application()) return false;
+    // EXE / DLL / SYS / EFI are all dispatched below — every kind
+    // has its own dedicated stub emitter. The Feature C EFI path
+    // shares the driver cipher body and post-inject patcher.
     return true;
 }
 
@@ -424,6 +434,9 @@ MxStatus PackerPass::execute(ProtectionContext& ctx) {
     }
     if (pe_type == PeType::kernel_driver) {
         return execute_encrypted_stub<DriverStubEmitter>(ctx, "DriverEntry");
+    }
+    if (pe_type == PeType::efi_application) {
+        return execute_encrypted_stub<EfiStubEmitter>(ctx, "_ModuleEntryPoint");
     }
     return {};
 }

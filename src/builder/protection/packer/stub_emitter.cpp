@@ -208,4 +208,28 @@ build_driver_stub_bytes(Randomizer& rng,
     return {std::move(e.buf), patches};
 }
 
+std::pair<ByteBuffer, EfiStubPatches>
+build_efi_stub_bytes(Randomizer& rng,
+                     ByteView    stolen_bytes,
+                     uint32_t    section_count,
+                     uint32_t    layer_count,
+                     bool        apply_relocs_inline)
+{
+    // UEFI applications share the driver-stub byte layout exactly —
+    // same calling convention (MS x64), same nonvolatile register
+    // saves, same cipher body, same JMP-back. The patches struct is
+    // a distinct type so `packer_pass`'s `if constexpr` dispatch can
+    // tell EFI from driver, but every field is populated identically.
+    auto [bytes, drv_patches] = build_driver_stub_bytes(
+        rng, stolen_bytes, section_count, layer_count,
+        apply_relocs_inline);
+
+    EfiStubPatches efi_patches{};
+    static_cast<CommonStubPatches&>(efi_patches) =
+        static_cast<const CommonStubPatches&>(drv_patches);
+    static_cast<CipherBodyPatches&>(efi_patches) =
+        static_cast<const CipherBodyPatches&>(drv_patches);
+    return {std::move(bytes), efi_patches};
+}
+
 } // namespace mx::packer

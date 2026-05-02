@@ -99,7 +99,9 @@ std::optional<OepStealResult> prepare_oep_steal(
     apply_dll_characteristics_audit(ctx);
 
     const bool is_driver   = ctx.target().is_kernel_driver();
-    const bool keep_relocs = is_driver || ctx.target().is_manually_mapped();
+    const bool is_efi      = ctx.target().is_efi_application();
+    const bool keep_relocs = is_driver || is_efi ||
+                             ctx.target().is_manually_mapped();
     if (!keep_relocs) {
         disable_relocations(ctx.pe_image());
         ctx.log("PackerPass: релокации отключены (IMAGE_FILE_RELOCS_STRIPPED)");
@@ -107,6 +109,10 @@ std::optional<OepStealResult> prepare_oep_steal(
         ctx.log("PackerPass: .reloc preserved, RELOCS_STRIPPED not forced "
                 "(driver stub emits no absolute VAs; mapper may load at "
                 "any base)");
+    } else if (is_efi) {
+        ctx.log("PackerPass: .reloc preserved, RELOCS_STRIPPED not forced "
+                "(UEFI firmware applies non-encrypted relocs at load; "
+                "encrypted-section relocs partitioned for inline applier)");
     } else {
         // User-mode manual-map. Force RELOCS_STRIPPED so a relocation-
         // respecting loader lands the image at the preferred base —

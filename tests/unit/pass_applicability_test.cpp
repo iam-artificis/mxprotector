@@ -194,15 +194,15 @@ TEST(PassApplicability, PackerPassAcceptsDynamicLibrary) {
     EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
-TEST(PassApplicability, PackerPassSkipsEfiApplication) {
-    // No EfiStubEmitter exists yet — UEFI has no PE loader, IAT, TLS
-    // callbacks, or Win32 syscalls, so the existing stubs would emit
-    // bytes that the runtime cannot execute. Rejecting at the gate
-    // prevents the silent fallthrough in execute() from producing a
-    // half-protected binary that crashes at boot.
+TEST(PassApplicability, PackerPassAcceptsEfiApplication) {
+    // Feature C — EFI now has a dedicated `EfiStubEmitter` that
+    // shares the driver cipher body (no Win32 IAT, no TLS, no VEH,
+    // no anti-debug user-mode tricks). UEFI applications should
+    // therefore pass the applicability gate; `execute()` dispatches
+    // them to the EFI emitter.
     auto ctx = make_ctx(BinaryKind::efi_application);
     mx::PackerPass pass;
-    EXPECT_FALSE(pass.is_applicable(ctx));
+    EXPECT_TRUE(pass.is_applicable(ctx));
 }
 
 // --------------------------------------------------------------------
