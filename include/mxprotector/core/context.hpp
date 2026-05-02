@@ -26,6 +26,7 @@
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/config/protection_config.hpp"
 #include "mxprotector/pe/pe_image.hpp"
+#include "mxprotector/pe/layout_policy.hpp"
 #include "mxprotector/analysis/cfg.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/trace_hints.hpp"
@@ -70,11 +71,7 @@ public:
      */
     ProtectionContext(std::unique_ptr<PeImage> image,
                       ProtectionConfig config,
-                      std::shared_ptr<analysis::IDisassembler> disasm)
-        : image_(std::move(image))
-        , config_(std::move(config))
-        , disasm_(std::move(disasm))
-    {}
+                      std::shared_ptr<analysis::IDisassembler> disasm);
 
     ~ProtectionContext() = default;
 
@@ -164,6 +161,40 @@ public:
 
     /// @brief Установить дескриптор target платформы.
     void set_target(target::TargetInfo info) noexcept { target_ = info; }
+
+    // ====================================================================
+    // Section layout policy (R2.2)
+    // ====================================================================
+
+    /**
+     * @brief Active layout policy controlling section emission semantics.
+     *
+     * Default is `pe::StandardLayout` — pass intents reach the PE
+     * writer unchanged and post-emission finalisation is a no-op.
+     * `main()` can swap the policy for `pe::ChaosLayout` (future) when
+     * `--chaos` is on. Every emission seam (R2.3) and the finalisation
+     * hook in `PeBuilder::build()` (R2.5) consult this single
+     * reference, so swapping it is the only knob needed to flip the
+     * whole pipeline into a different layout regime.
+     */
+    [[nodiscard]] const pe::ILayoutPolicy& layout_policy() const noexcept {
+        return *layout_policy_;
+    }
+
+    /**
+     * @brief Replace the active layout policy.
+     *
+     * The context takes ownership of the policy. Passing a null
+     * pointer is a programmer error — the context guarantees a live
+     * policy at all times so consumers can call
+     * `layout_policy().resolve(...)` without a null-check. Passing
+     * null asserts in debug builds; in release the next call to
+     * `layout_policy()` would dereference null and the build would
+     * crash visibly.
+     */
+    void set_layout_policy(std::unique_ptr<pe::ILayoutPolicy> policy) noexcept {
+        if (policy) layout_policy_ = std::move(policy);
+    }
 
     // ====================================================================
     // Имена добавляемых секций (рандомизированные per-build)
@@ -272,6 +303,10 @@ private:
     uint64_t                                         extra_tls_callback_va_ = 0;  ///< GuardPass → PackerPass TLS callback hand-off
     analysis::TraceHints                             trace_hints_;  ///< Source-linked labels for tracing MCP sidecar
     std::vector<std::string>                         log_messages_; ///< Журнал
+    /// Active layout policy. Constructed in the body of every
+    /// constructor so the header stays free of `<memory>` for the
+    /// concrete `StandardLayout` type — see `context.cpp`.
+    std::unique_ptr<pe::ILayoutPolicy>               layout_policy_;
 };
 
 } // namespace mx

@@ -20,6 +20,9 @@ set(BUILDER_SOURCES
     cli/cli_handler.cpp
     cli/section_name_pool.cpp
 
+    # Core (out-of-line context constructor — owns the layout policy)
+    core/context.cpp
+
     # PE-модуль
     pe/pe_parser.cpp
     pe/pe_builder.cpp
@@ -27,6 +30,7 @@ set(BUILDER_SOURCES
     pe/import_table.cpp
     pe/export_table.cpp
     pe/relocation_table.cpp
+    pe/layout/standard_layout.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp

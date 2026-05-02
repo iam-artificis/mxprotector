@@ -37,6 +37,7 @@ set(TEST_SOURCES
     target_info_test.cpp
     pe_parser_pe_type_test.cpp
     section_intent_test.cpp
+    layout_policy_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
     reloc_applier_test.cpp
@@ -158,6 +159,8 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/export_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/standard_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattener.cpp
