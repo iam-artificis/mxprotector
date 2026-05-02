@@ -7,29 +7,37 @@
  *
  * Feature B (`--chaos`) layered roll-out:
  *
- *   * B.1 — this file. `resolve()` rewrites every intent to
- *     `{mixed_code_data, rwx}`. `finalize()` walks the in-memory
- *     section list once after every pass has emitted, and stamps
- *     each existing section's `characteristics` to the same
- *     bit-mask, so passes that built sections via the legacy
- *     `SectionManager::add_section(name, data, mask)` path (no
- *     `SectionEmitter`-mediated `intent` plumbing) end up RWX
- *     anyway. No section merging or fragment shuffling yet — that
- *     is B.3.
+ *   * B.1 — `resolve()` rewrites every intent to
+ *     `{mixed_code_data, rwx}` and `finalize()` stamps every
+ *     existing section's `characteristics` with the chaos bit-mask
+ *     so legacy `SectionManager::add_section(name, data, mask)`
+ *     paths (no `SectionEmitter`/`intent` plumbing) still end up
+ *     RWX anyway.
  *
  *   * B.2 — CLI flag (`--chaos`) +
  *     `ProtectionConfig::chaos_layout`. `main()` swaps the active
  *     policy on `ProtectionContext` to a `ChaosLayout` when the
  *     flag is set.
  *
- *   * B.3 — fragment interleaver. `finalize()` cuts every section
- *     into small chunks and replaces the section table with a
- *     single unified RWX section whose bytes are the chunks
- *     shuffled into a random order. Reference patcher updates every
- *     RVA-bearing field (rel32 in code, RIP-relative LEAs,
- *     `DataDirectory` entries, `.reloc` page RVAs, `.pdata`
- *     RUNTIME_FUNCTION entries, …) so the binary still loads and
- *     runs.
+ *   * B.3 — `finalize()` additionally collapses the entire section
+ *     table into a single unified RWX/`mixed_code_data` section
+ *     covering `[min(va), max(va + virtual_size))`. Every original
+ *     section's bytes land at the *same RVA* they had before; gaps
+ *     between original section bodies (the natural section-alignment
+ *     padding) are filled with `0xCC` (INT3). Because RVAs are
+ *     preserved bit-for-bit, every internal RVA reference
+ *     (`DataDirectory` entries, `.reloc` page RVAs, `.pdata`
+ *     RUNTIME_FUNCTION fields, internal directory pointers)
+ *     resolves to the same byte after the merge — no reference
+ *     patcher needed.
+ *
+ *   * B.4 (future) — fragment-level shuffling. Slice the unified
+ *     section into chunks and reorder them at new RVAs, with a
+ *     reference patcher updating every RVA-bearing field
+ *     (`rel32` in code, RIP-relative LEAs, …) in lockstep. Strictly
+ *     more complex than B.3; gated behind a comprehensive
+ *     reference-tracker module so shuffled binaries still load and
+ *     run on every supported PE shape.
  *
  * Why a separate policy class rather than a `StandardLayout`
  * subclass: `StandardLayout` is `final` on purpose (the no-op
@@ -71,18 +79,30 @@ public:
         SectionIntent    requested) const noexcept override;
 
     /**
-     * @brief Stamp every existing section's `characteristics` field
-     *        to the chaos bit-mask.
+     * @brief Stamp every existing section with chaos bits, then
+     *        collapse the section table into a single unified RWX /
+     *        mixed section.
      *
-     * Catches sections built via the legacy `SectionManager::
-     * add_section(name, data, mask)` path that bypasses the
-     * `SectionEmitter`/`resolve()` seam — passes that compute their
-     * own `IMAGE_SCN_*` literal at the call site (e.g. legacy
-     * pre-R2.3 paths and any future opt-out callers) still end up
-     * RWX because finalize sweeps the entire section list.
+     * Two-step transform:
      *
-     * Returns empty status unconditionally — the per-section
-     * characteristics rewrite cannot fail at the format level.
+     *   1. OR the chaos bit-mask into every section's
+     *      `characteristics`. Catches sections built via the
+     *      legacy `SectionManager::add_section(name, data, mask)`
+     *      path that bypasses the `SectionEmitter`/`resolve()`
+     *      seam.
+     *   2. If the image has more than one section, replace the
+     *      whole table with a single section covering
+     *      `[min(va), max(va + virtual_size))`. Original section
+     *      bodies are copied into the merged buffer at their
+     *      original RVA offsets; the gaps between bodies are
+     *      filled with `0xCC` (INT3) so a disassembler walking the
+     *      unified region sees recognisable padding and any errant
+     *      jump into the gap traps. `NumberOfSections` in the
+     *      FileHeader is updated to 1.
+     *
+     * Returns empty status unconditionally — the merge cannot fail
+     * at the format level (every original byte's RVA is preserved
+     * verbatim, so no internal RVA reference can dangle).
      */
     [[nodiscard]] MxStatus finalize(PeImage& image) const override;
 
