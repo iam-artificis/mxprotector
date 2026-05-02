@@ -58,14 +58,17 @@ GateFactory = Callable[[], list[type[IGate]]]
 
 
 class VerdictSummary(BaseModel):
-    """Counts per :class:`GateLevel` — quick at-a-glance readout."""
+    """Counts per :class:`GateLevel` — quick at-a-glance readout.
 
-    pass_: int = Field(default=0, alias="pass")
+    Field name ``passed`` (rather than ``pass``) avoids the Python
+    reserved-word collision while keeping the JSON shape readable for
+    downstream consumers.
+    """
+
+    passed: int = 0
     warn: int = 0
     fail: int = 0
     skipped: int = 0
-
-    model_config = {"populate_by_name": True}
 
 
 class TierVerdict(BaseModel):
@@ -123,7 +126,7 @@ class GateEvaluator:
         gate_passed = summary.fail == 0
         _LOG.info(
             "shipgate %s — pass=%d warn=%d fail=%d skipped=%d (passed=%s)",
-            tier, summary.pass_, summary.warn, summary.fail,
+            tier, summary.passed, summary.warn, summary.fail,
             summary.skipped, gate_passed,
         )
         return TierVerdict(
@@ -194,7 +197,7 @@ def _summarise(outcomes: list[GateOutcome]) -> VerdictSummary:
     counts = VerdictSummary()
     for o in outcomes:
         if o.level is GateLevel.PASS:
-            counts.pass_ += 1
+            counts.passed += 1
         elif o.level is GateLevel.WARN:
             counts.warn += 1
         elif o.level is GateLevel.FAIL:

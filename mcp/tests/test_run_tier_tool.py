@@ -43,7 +43,7 @@ class _StubRunner:
         return TierRunResult(
             verdict=TierVerdict(
                 tier=tier, gate_passed=True,
-                summary={"pass": 0, "warn": 0, "fail": 0, "skipped": 0},
+                summary={"passed": 0, "warn": 0, "fail": 0, "skipped": 0},
                 outcomes=[], notes=[],
             ),
             measurement=MeasureDefenseOutput(

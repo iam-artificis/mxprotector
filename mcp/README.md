@@ -78,12 +78,25 @@ src/mx_mcp/
 
 ## Tests
 
+From inside `mcp/`:
+
 ```bash
 py -3 -m pytest --collect-only    # discovery smoke check
-py -3 -m pytest                    # full suite (requires built builder +
-                                   #  build_testapp/test_vm_showcase.exe)
+py -3 -m pytest                    # full suite (~750 tests, ~9 s)
+py -3 -m pytest -k vm_mba          # subset by name
+py -3 -m pytest tests/test_x.py    # one file
 ```
 
-The `traced_fixture` session fixture invokes `mxprotector_builder.exe`
-from `../build/src/builder/Release/`. If the builder is not built, those
-tests are skipped rather than failed.
+From anywhere in the repo (auto-CDs into `mcp/`):
+
+```bat
+mcp\run_tests.bat                  REM cmd / explorer
+```
+
+```powershell
+.\mcp\run_tests.ps1                # PowerShell — same args forward
+```
+
+External backends (angr, IDA, pe-sieve, BinDiff, msynth) self-skip
+when missing — the suite stays green on a fresh clone with only the
+`[dev]` extra installed.

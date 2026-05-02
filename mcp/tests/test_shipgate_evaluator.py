@@ -128,7 +128,7 @@ def test_summarise_counts_each_level():
         _outcome(level=GateLevel.PASS, scope=GateScope.FAST),
     ]
     summary = _summarise(outcomes)
-    assert summary.pass_ == 2
+    assert summary.passed == 2
     assert summary.warn == 1
     assert summary.fail == 1
     assert summary.skipped == 1
@@ -181,7 +181,7 @@ def test_evaluator_pass_when_no_fails():
     benches = [_bench("B", [_metric("m", p90=0.1)])]
     verdict = GateEvaluator(lambda: [g]).evaluate("fast", benches)
     assert verdict.gate_passed is True
-    assert verdict.summary.pass_ == 1
+    assert verdict.summary.passed == 1
     assert verdict.summary.fail == 0
 
 
