@@ -433,3 +433,16 @@ def test_category_and_tier_are_slow_vm():
     assert bench.category == "vm"
     assert bench.tier == "slow"
     assert "vm" in bench.corpus_tags
+
+
+def test_default_simplifier_list_includes_claripy_and_pattern():
+    """The default ensemble must contain both always-on backends.
+
+    Pinning this ordering protects the metric-row contract: callers
+    that diff baselines across runs assume the registered backends
+    do not silently change. Any reorder is a deliberate, reviewable
+    edit to this assertion.
+    """
+    bench = vmba.VmMbaBenchmark()
+    backend_names = [s.name for s in bench._simplifiers]
+    assert backend_names == ["claripy", "pattern"]

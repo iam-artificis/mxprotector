@@ -6,13 +6,23 @@ registered backend. A handler whose expression shrinks ≥50 %
 counts as *simplified* for that backend; the fraction of
 simplified-per-total handlers is the scored metric.
 
+## Backends
+
+* :class:`ClaripySimplifier` — always-available baseline. Wraps
+  claripy's static rewrite pass; fast, conservative, not MBA-aware.
+* :class:`PatternSimplifier` — always-available second peer. Drives
+  a curated catalog of MBA identities through the bottom-up engine
+  in :mod:`.pattern_engine`; aware of classical linear-MBA rewrites
+  (``(a|b) - (a&b) → a^b`` …) that claripy alone misses.
+* :class:`MsynthSimplifier` — optional, currently self-skips on
+  Windows where miasm does not build. Reserved for future Linux
+  / cross-platform support.
+
 Public surface:
 
 * :class:`MbaExpression` — canonical extractor result.
 * :class:`SimplificationResult` — per-backend outcome record.
 * :class:`IMbaSimplifier` — backend contract.
-* :class:`ClaripySimplifier` — always-available baseline
-  (claripy native simplify, bundled with angr).
 * :func:`extract_handler_expression` — the angr-backed extractor
   the benchmark drives per handler.
 
@@ -32,6 +42,12 @@ from mx_mcp.deobfuscation.mba.extractor import (
     ExtractorUnavailableError,
     extract_handler_expression,
 )
+from mx_mcp.deobfuscation.mba.pattern_engine import (
+    PatternEngineBudget,
+    RewriteResult,
+    rewrite as pattern_rewrite,
+)
+from mx_mcp.deobfuscation.mba.pattern_rules import ALL_RULES, MbaIdentity
 from mx_mcp.deobfuscation.mba.simplifier import (
     BackendUnavailableError,
     ClaripySimplifier,
@@ -39,8 +55,13 @@ from mx_mcp.deobfuscation.mba.simplifier import (
     MsynthSimplifier,
     SimplificationResult,
 )
+from mx_mcp.deobfuscation.mba.simplifier_pattern import (
+    PatternSimplifier,
+    PatternSimplifierConfig,
+)
 
 __all__ = [
+    "ALL_RULES",
     "AST_NODE_CAP",
     "BackendUnavailableError",
     "ClaripySimplifier",
@@ -49,8 +70,14 @@ __all__ = [
     "ExtractorUnavailableError",
     "IMbaSimplifier",
     "MbaExpression",
+    "MbaIdentity",
     "MsynthSimplifier",
+    "PatternEngineBudget",
+    "PatternSimplifier",
+    "PatternSimplifierConfig",
+    "RewriteResult",
     "SimplificationResult",
     "count_ast_nodes",
     "extract_handler_expression",
+    "pattern_rewrite",
 ]

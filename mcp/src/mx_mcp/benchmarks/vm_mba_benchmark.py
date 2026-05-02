@@ -82,6 +82,7 @@ from mx_mcp.deobfuscation.mba import (
     ExtractorUnavailableError,
     IMbaSimplifier,
     MbaExpression,
+    PatternSimplifier,
     SimplificationResult,
     extract_handler_expression,
 )
@@ -143,13 +144,18 @@ class VmMbaBenchmark(IBenchmark):
         extract_fn=extract_handler_expression,
     ) -> None:
         self._budget = extractor_budget or ExpressionBudget()
-        # Default simplifier line-up: claripy (always-on baseline).
-        # msynth is registered as a second backend but self-skips
-        # today; once the claripy→miasm conversion lands it will
-        # light up automatically. Future SiMBA wrapper appends here.
+        # Default simplifier line-up:
+        #   * ClaripySimplifier — always-on baseline (claripy native
+        #     rewrite pipeline; conservative, not MBA-aware).
+        #   * PatternSimplifier — always-on MBA-aware peer that
+        #     applies the curated identity catalog from
+        #     :mod:`.deobfuscation.mba.pattern_rules`.
+        # msynth registers separately and self-skips on Windows; the
+        # benchmark will pick it up automatically once a host can
+        # import it. Future SiMBA wrapper appends here.
         self._simplifiers: list[IMbaSimplifier] = (
             simplifiers if simplifiers is not None
-            else [ClaripySimplifier()]
+            else [ClaripySimplifier(), PatternSimplifier()]
         )
         self._max_handlers = max_handlers_per_entry
         self._extract_fn = extract_fn
