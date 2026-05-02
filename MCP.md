@@ -147,18 +147,20 @@ Schema v1. Source of truth: `include/mxprotector/analysis/trace_hints.hpp`. Pyda
 ## Corpus
 Seed in `mcp/fixtures/corpus/` (not `build_testapp/`). Each entry covers one surface (pure VM, pure CFF, mixed, TLS-heavy, SEH, C++-exception-heavy, DLL). Initial population in **P1**. Metrics: p10/p50/p90. Gates on p90.
 
-## Phases
+## Phase log (landed)
 
-Migration commit (no behaviour change): relocate `mcp-tools/tracing/` → `mcp/`, rename `mx_tracing` → `mx_mcp`.
+The original migration plan ran one commit per phase against a green gate of `pytest + C++ ctest + 15/15 stress on test_vm_showcase`. All MVP phases are landed; this log is the canonical pointer for code comments that cite a phase identifier.
 
-One commit per phase. Green gate = pytest + C++ ctest + 15/15 stress on `test_vm_showcase`. Order: signal-per-effort.
-
-- **P5 — Metadata leakage scan.** Regex sweep for protector-internal literals (pass names, debug strings, PDB paths, MSVC linker artefacts, RTTI, `MxProtector`). Surfaces: `no_protector_metadata_leaked` invariant (hard block on forbidden list) + `leakage_surface` benchmark (soft regressions).
-- **P6 — VM static + budget-to-crack.** angr symbolic on handlers; score = fraction summarised within budget (wall clock + SMT queries + paths).
-- **P7 — MBA resistance.** msynth + SiMBA on handler expressions.
-- **P8 — Tier runners + ship-gate.** Fast/slow runners, verdict aggregation.
-- **P9 — Emulation Unicorn.** Handler replay + OEP-reach. Scope decision: replay-N-steps vs full engine.
-- **P10 — Anti-analysis coverage.** Detection rate across x64dbg, Frida, Unicorn, pafish, al-khaser. Allocate 2–3× budget.
+| Phase | What landed |
+|---|---|
+| P1 / P2 / P4 | Migration (`mcp-tools/tracing/` → `mcp/`, rename `mx_tracing` → `mx_mcp`), sidecar schema v1, corpus loader, `measure_defense` / `record_baseline` / `diff_defense_baseline` tool surface, charts, snapshot store. |
+| P3 (partial) | pe-sieve runner + `packer_pesieve` benchmark + `packer_decrypted` invariant. Full Frida anti-debug instrumentation deferred — see `FUTURE.md`. |
+| P5 | Metadata-leakage scan: `no_protector_metadata_leaked` invariant (hard block on forbidden list) + `leakage_surface` benchmark (PDB / Rich-header / forbidden-literal). |
+| P6 | VM symbolic + budget-to-crack: `analyse_handler` summarisation rate + `analyse_oep_reach` step count, both via angr under a wall-clock / step / path budget. |
+| P7 | MBA resistance: `ClaripySimplifier` + `PatternSimplifier` ensemble over angr-extracted handler output ASTs, with a curated catalog of 8 hand-verified MBA identities. |
+| P8 | Tier runners + ship-gate: `IGate` registry, 9 gates wired to the threshold tables above, `GateEvaluator` + `TierRunner` aggregation, `run_tier` MCP tool returning a single `gate_passed` bool. |
+| P9 | Emulation Unicorn: PE → Unicorn loader (no PEB/TEB/ntdll synthesis — crashes on missing infra are the defence signal), `run_oep_reach` + `run_handler_replay` runners, two benchmarks. |
+| P10 | Anti-analysis detection coverage: `IDetector` registry + 5 detectors (x64dbg, Frida, Unicorn, pafish, al-khaser), coverage benchmark + slow-tier gate. |
 
 ## Risks
 
