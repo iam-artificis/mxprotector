@@ -36,6 +36,7 @@
 #include "mxprotector/pe/section_emitter.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/mutation/overflow/extend_in_place_sink.hpp"
+#include "mxprotector/protection/mutation/overflow/grow_source_section_sink.hpp"
 #include "mxprotector/protection/mutation/overflow/jmp_emit.hpp"
 #include "mxprotector/protection/mutation/overflow/separate_overflow_sink.hpp"
 
@@ -48,6 +49,7 @@ using mx::mutation::ExpansionRequest;
 using mx::mutation::overflow::compute_rel32;
 using mx::mutation::overflow::encode_jmp_rel32;
 using mx::mutation::overflow::ExtendInPlaceSink;
+using mx::mutation::overflow::GrowSourceSectionSink;
 using mx::mutation::overflow::kJmpRel32Size;
 using mx::mutation::overflow::kMaxSpillCount;
 using mx::mutation::overflow::SeparateOverflowSink;
@@ -277,6 +279,146 @@ TEST(SeparateOverflowSink, EmptyExpandedBytesIsRejected) {
     EXPECT_FALSE(plan.has_value());
     EXPECT_EQ(img.sections().size(), 0u);
     EXPECT_EQ(sink.spill_count(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// GrowSourceSectionSink
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Construct an image with two pre-existing sections so the sink has
+/// a "source" containing the site RVA, and a "next" section whose RVA
+/// must stay stable across the in-place growth.
+[[nodiscard]] PeImage make_image_with_two_sections() {
+    PeImage img = make_empty_image();
+
+    const auto src_data = std::vector<std::uint8_t>(0x100, 0x90);
+    auto src_added = SectionManager{img}.add_section(
+        ".text",
+        mx::ByteView{src_data.data(), src_data.size()},
+        mx::pe::IMAGE_SCN_CNT_CODE | mx::pe::IMAGE_SCN_MEM_READ |
+        mx::pe::IMAGE_SCN_MEM_EXECUTE);
+    EXPECT_TRUE(src_added.has_value());
+
+    const auto next_data = std::vector<std::uint8_t>(0x80, 0xAA);
+    auto next_added = SectionManager{img}.add_section(
+        ".rdata",
+        mx::ByteView{next_data.data(), next_data.size()},
+        mx::pe::IMAGE_SCN_CNT_INITIALIZED_DATA |
+        mx::pe::IMAGE_SCN_MEM_READ);
+    EXPECT_TRUE(next_added.has_value());
+
+    return img;
+}
+
+} // anonymous namespace
+
+TEST(GrowSourceSectionSink, InPlaceGrowthKeepsNextSectionRvaStable) {
+    PeImage img = make_image_with_two_sections();
+    const auto src_va_before  = img.sections()[0].virtual_address;
+    const auto src_size_before = img.sections()[0].virtual_size;
+    const auto next_va_before = img.sections()[1].virtual_address;
+
+    SectionManager mgr{img};
+    StandardLayout policy;
+    SectionEmitter emit{mgr, policy};
+
+    GrowSourceSectionSink sink{emit};
+
+    const auto expanded = bytes({0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90});
+    const Rva site_rva = src_va_before + 0x10; // inside .text
+
+    auto plan = sink.plant(ExpansionRequest{
+        .site_rva       = site_rva,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{expanded.data(), expanded.size()},
+    });
+    ASSERT_TRUE(plan.has_value()) << "expected slack growth to succeed";
+
+    EXPECT_EQ(img.sections().size(), 2u) << "no new section should appear";
+
+    const auto& src_after  = img.sections()[0];
+    const auto& next_after = img.sections()[1];
+
+    // Source section's RVA didn't move (only its virtual_size grew).
+    EXPECT_EQ(src_after.virtual_address, src_va_before);
+    EXPECT_GT(src_after.virtual_size, src_size_before);
+
+    // Next section's RVA stayed put — this is the slack-growth invariant.
+    EXPECT_EQ(next_after.virtual_address, next_va_before);
+
+    // Plant landed at the section's old tail.
+    EXPECT_EQ(plan->overflow_rva, src_va_before + src_size_before);
+    EXPECT_EQ(plan->overflow_size, expanded.size() + kJmpRel32Size);
+
+    // Body bytes preserved at offset.
+    const auto offset = src_size_before;
+    for (std::size_t i = 0; i < expanded.size(); ++i) {
+        EXPECT_EQ(src_after.data[offset + i], expanded[i]);
+    }
+    // Trailing JMP rel32 → return_rva = site_rva + site_size = site_rva+5.
+    EXPECT_EQ(src_after.data[offset + expanded.size()], 0xE9u);
+    const Rva tail_rva = static_cast<Rva>(
+        src_va_before + offset + expanded.size());
+    EXPECT_EQ(read_le_i32(&src_after.data[offset + expanded.size() + 1]),
+              compute_rel32(tail_rva, site_rva + 5));
+}
+
+TEST(GrowSourceSectionSink, ExceedingSlackReturnsSlackExhausted) {
+    PeImage img = make_image_with_two_sections();
+    SectionManager mgr{img};
+    StandardLayout policy;
+    SectionEmitter emit{mgr, policy};
+
+    // .text has virtual_size = 0x100 → slack = 0x1000 - 0x100 = 0xF00.
+    // Ask for an expanded body that needs payload > 0xF00 to fail.
+    GrowSourceSectionSink sink{emit};
+    const auto expanded = std::vector<std::uint8_t>(0xFFC, 0x90);
+    auto plan = sink.plant(ExpansionRequest{
+        .site_rva       = img.sections()[0].virtual_address + 0x10,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{expanded.data(), expanded.size()},
+    });
+    ASSERT_FALSE(plan.has_value());
+    EXPECT_EQ(static_cast<std::uint16_t>(plan.error().code()),
+              static_cast<std::uint16_t>(
+                  mx::PeErrorCode::section_slack_exhausted));
+    // Source section's data was not mutated.
+    EXPECT_EQ(img.sections()[0].virtual_size, 0x100u);
+}
+
+TEST(GrowSourceSectionSink, RvaOutsideAnySectionFailsClosed) {
+    PeImage img = make_image_with_two_sections();
+    SectionManager mgr{img};
+    StandardLayout policy;
+    SectionEmitter emit{mgr, policy};
+
+    GrowSourceSectionSink sink{emit};
+    const auto expanded = bytes({0x90});
+    auto plan = sink.plant(ExpansionRequest{
+        .site_rva       = 0xDEADBEEF,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{expanded.data(), expanded.size()},
+    });
+    ASSERT_FALSE(plan.has_value());
+    EXPECT_EQ(static_cast<std::uint16_t>(plan.error().code()),
+              static_cast<std::uint16_t>(mx::PeErrorCode::invalid_rva));
+}
+
+TEST(GrowSourceSectionSink, EmptyExpandedBytesIsRejected) {
+    PeImage img = make_image_with_two_sections();
+    SectionManager mgr{img};
+    StandardLayout policy;
+    SectionEmitter emit{mgr, policy};
+
+    GrowSourceSectionSink sink{emit};
+    auto plan = sink.plant(ExpansionRequest{
+        .site_rva       = img.sections()[0].virtual_address,
+        .site_size      = 5,
+        .expanded_bytes = mx::ByteView{},
+    });
+    EXPECT_FALSE(plan.has_value());
 }
 
 } // namespace
