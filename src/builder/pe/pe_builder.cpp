@@ -25,7 +25,18 @@ namespace mx {
 // PeBuilder::build
 // ============================================================================
 
-MxResult<ByteBuffer> PeBuilder::build(const PeImage& image) {
+MxResult<ByteBuffer> PeBuilder::build(
+    PeImage&                 image,
+    const pe::ILayoutPolicy& policy)
+{
+    // Run the layout-policy finalize hook BEFORE any size /
+    // alignment calculations — a chaos-style policy can reorder or
+    // merge sections, which changes both the count and the per-
+    // section RVAs that the writer below consumes.
+    if (auto status = policy.finalize(image); !status) {
+        return std::unexpected(status.error());
+    }
+
     const auto& sections = image.sections();
     const uint32_t file_alignment = image.file_alignment();
     const uint32_t section_alignment = image.section_alignment();

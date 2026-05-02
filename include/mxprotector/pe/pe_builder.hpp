@@ -21,6 +21,7 @@
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
+#include "mxprotector/pe/layout_policy.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 
@@ -45,11 +46,25 @@ public:
     PeBuilder() = delete;
 
     /**
-     * @brief Собирает PE-файл из PeImage.
-     * @param image Константная ссылка на исходный PeImage.
-     * @return ByteBuffer с готовым PE-файлом или ошибка.
+     * @brief Собирает PE-файл из PeImage с применением layout policy.
+     *
+     * R2.5 introduced the layout-policy seam: before serialisation
+     * the active `ILayoutPolicy::finalize` runs against the image so
+     * a chaos / merge / interleave policy can rewrite the section
+     * table in one place. `StandardLayout::finalize` is a no-op so
+     * existing builds keep producing byte-identical output.
+     *
+     * @param image  Mutable PeImage — `policy.finalize` may rewrite
+     *               sections / order / characteristics in place.
+     * @param policy Active layout policy. The caller (typically
+     *               `main.cpp` via `ProtectionContext::layout_policy`)
+     *               owns it.
+     * @return       Serialised PE bytes or an `MxError` from the
+     *               finalize hook / writer.
      */
-    [[nodiscard]] static MxResult<ByteBuffer> build(const PeImage& image);
+    [[nodiscard]] static MxResult<ByteBuffer> build(
+        PeImage&             image,
+        const pe::ILayoutPolicy& policy);
 
     /**
      * @brief Генерирует путь выходного файла: input.exe → input.mx.exe.

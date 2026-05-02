@@ -383,7 +383,8 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[*] Сборка выходного PE-файла...\n";
-    auto build_result = mx::PeBuilder::build(ctx.pe_image());
+    auto build_result = mx::PeBuilder::build(
+        ctx.pe_image(), ctx.layout_policy());
     if (!build_result) {
         std::cerr << std::format("[ОШИБКА] Сборка PE: {}\n", build_result.error().format());
         return 1;
