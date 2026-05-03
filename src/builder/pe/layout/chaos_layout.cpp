@@ -13,6 +13,7 @@
 #include "mxprotector/pe/chaos/delay_import_atom_source.hpp"
 #include "mxprotector/pe/chaos/function_atom_source.hpp"
 #include "mxprotector/pe/chaos/import_atom_source.hpp"
+#include "mxprotector/pe/chaos/self_crc_refinalizer.hpp"
 #include "mxprotector/pe/chaos/load_config_atom_source.hpp"
 #include "mxprotector/pe/chaos/pdata_atom_source.hpp"
 #include "mxprotector/pe/chaos/reloc_atom_source.hpp"
@@ -387,6 +388,15 @@ void apply_fragment_shuffle(PeImage& image) {
     refmap::RelocRebuilder reloc_rebuilder;
     [[maybe_unused]] const auto reloc_stats =
         reloc_rebuilder.rebuild(image, remapper);
+
+    // Step 7 — re-finalise every self-CRC anti-tamper check whose
+    // covered byte range overlapped a chunk that the patcher just
+    // rewrote. The expected-CRC placeholder was last computed BEFORE
+    // chaos shuffle, so any rel32 the patcher updated inside that
+    // range invalidates the stored CRC. The refinaliser walks the
+    // image once more, recomputes the CRC over the post-shuffle
+    // bytes, and patches the `cmp eax, imm32` slot in place.
+    chaos::SelfCrcRefinalizer{}.refinalize(image);
 }
 
 } // anonymous namespace
