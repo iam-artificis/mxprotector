@@ -8,14 +8,21 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/chaos/chaos_shuffler.hpp"
 #include "mxprotector/pe/chaos/chunk_planner.hpp"
+#include "mxprotector/pe/chaos/load_config_pin_helper.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/pe/refmap/code_reference_scanner.hpp"
+#include "mxprotector/pe/refmap/delay_import_descriptor_scanner.hpp"
+#include "mxprotector/pe/refmap/export_directory_scanner.hpp"
+#include "mxprotector/pe/refmap/import_descriptor_scanner.hpp"
+#include "mxprotector/pe/refmap/load_config_directory_scanner.hpp"
 #include "mxprotector/pe/refmap/reference.hpp"
 #include "mxprotector/pe/refmap/reference_patcher.hpp"
 #include "mxprotector/pe/refmap/reloc_absolute_va_scanner.hpp"
+#include "mxprotector/pe/refmap/resource_directory_scanner.hpp"
 #include "mxprotector/pe/refmap/rva_remapper.hpp"
 #include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
+#include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
 #include "mxprotector/pe/section_intent.hpp"
 
 #include <algorithm>
@@ -195,17 +202,22 @@ void merge_into_unified_section(PeImage& image) {
     install_unified_section(image, extent, std::move(merged));
 }
 
-/// Walk the image with all three scanners and accumulate every
-/// reference into one table.
+/// Walk the image with every refmap scanner and accumulate every
+/// emitted reference into one table.
+///
+/// The scanner ordering is irrelevant — each scanner only appends —
+/// but we run code before structure before deep-directory before
+/// reloc, so logs (when enabled) read in increasing-detail order.
 [[nodiscard]] refmap::ReferenceTable scan_all_references(const PeImage& image) {
     refmap::ReferenceTable table;
-    table.reserve(2048);
+    table.reserve(8192);
 
+    // 1. Code-side references: rel32 / rel8 branches + RIP-relative
+    //    operands. Emit per-section, ignoring per-section decode-error
+    //    counts (chaos is best-effort, not a verifier).
     refmap::CodeReferenceScanner code;
     for (const auto& sec : image.sections()) {
         if (!sec.is_code() || sec.data.empty()) continue;
-        // Discard the per-section decode-error count — chaos is a
-        // best-effort shuffle, not a verifier.
         [[maybe_unused]] const auto errors = code.scan(
             ByteView{sec.data.data(),
                      std::min(sec.data.size(),
@@ -213,7 +225,24 @@ void merge_into_unified_section(PeImage& image) {
             sec.virtual_address,
             table);
     }
+
+    // 2. Top-level PE structure: entry point, DataDirectory pointers,
+    //    .pdata RUNTIME_FUNCTION entries.
     refmap::StructureReferenceScanner{}.scan(image, table);
+
+    // 3. Deep-directory scanners — IMPORT / EXPORT / DELAY_IMPORT /
+    //    TLS / LOAD_CONFIG / RESOURCE. Each module pulls every
+    //    RVA-bearing slot inside its directory into the table.
+    refmap::ImportDescriptorScanner{}.scan(image, table);
+    refmap::ExportDirectoryScanner{}.scan(image, table);
+    refmap::DelayImportDescriptorScanner{}.scan(image, table);
+    refmap::TlsDirectoryScanner{}.scan(image, table);
+    refmap::LoadConfigDirectoryScanner{}.scan(image, table);
+    refmap::ResourceDirectoryScanner{}.scan(image, table);
+
+    // 4. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
+    //    emitted. Catches any absolute-VA slot the targeted scanners
+    //    missed (defence in depth).
     refmap::RelocAbsoluteVaScanner{}.scan(image, table);
 
     return table;
@@ -231,10 +260,14 @@ void apply_fragment_shuffle(PeImage& image) {
 
     // Phase 2 — plan chunks. Pinned set computed from pre-merge
     // sections + DataDirectory layout so .text + dir bodies are
-    // anchored.
+    // anchored. LOAD_CONFIG-pointed table sections are pinned via
+    // `compute_load_config_target_pins` — the CFG / SEH / IAT-taken /
+    // longjmp / EH-cont tables must stay contiguous post-shuffle, so
+    // we cannot let chunks slice through them.
     Randomizer rng;
     chaos::ChunkPlanner planner;
-    auto remapper = planner.plan(image, rng);
+    const auto extra_pins = chaos::compute_load_config_target_pins(image);
+    auto remapper = planner.plan(image, rng, extra_pins);
 
     // Phase 3 — merge sections into the unified .mxchaos section.
     merge_into_unified_section(image);
@@ -267,22 +300,32 @@ SectionIntent ChaosLayout::resolve(
 }
 
 MxStatus ChaosLayout::finalize(PeImage& image) const {
-    // Step 1 — stamp every section's characteristics with the chaos
-    // bits, so legacy paths that bypassed `SectionEmitter`/`resolve`
-    // still end up RWX/mixed.
-    stamp_chaos_characteristics(image);
-
-    // Step 2 — collapse + (optionally) shuffle. The fragment shuffle
-    // is opt-in because deep internal-directory references (IMPORT
-    // descriptor pointers, EXPORT name table, LOAD_CONFIG CFG
-    // tables, TLS callback array) are not yet scanned by the
-    // refmap pipeline. With shuffle disabled, RVAs of every byte
-    // stay identical and the binary loads unchanged.
+    // Step 1 — collapse + (optionally) shuffle FIRST. Both paths end
+    // up overwriting the section table with a single unified section
+    // whose `characteristics` are already chaos-stamped (see
+    // `install_unified_section`). The `apply_fragment_shuffle` path
+    // additionally scans references, plans chunks, shuffles bytes,
+    // and patches references — all of which read the *original*
+    // per-section characteristics (e.g. `is_code()` on .text vs
+    // .rdata).
+    //
+    // The fragment shuffle is opt-in because deep internal-directory
+    // references that B.4.8 added (IMPORT descriptor pointers, EXPORT
+    // name table, LOAD_CONFIG CFG tables, TLS callback array, etc.)
+    // are now scanned, but the policy is conservative — flip on via
+    // `--chaos-shuffle` and stress-test before defaulting on.
     if (enable_fragment_shuffle_) {
         apply_fragment_shuffle(image);
     } else {
         merge_into_unified_section(image);
     }
+
+    // Step 2 — stamp the chaos bit-mask onto the now-unified section.
+    // The merge already sets `unified.characteristics =
+    // kChaosCharacteristics`, so this is normally a no-op; the loop
+    // exists as defence in depth for any external code that bypasses
+    // the merge path.
+    stamp_chaos_characteristics(image);
 
     return {};
 }

@@ -204,6 +204,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp

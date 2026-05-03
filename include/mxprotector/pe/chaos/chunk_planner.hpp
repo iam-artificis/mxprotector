@@ -39,6 +39,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "mxprotector/core/types.hpp"
@@ -109,12 +110,17 @@ public:
      * remapper indicates either zero free space or a pinned set
      * that already fills the image — both are valid no-op outcomes.
      *
-     * @param image  Source image. Read-only.
-     * @param rng    Source of randomness for the permutation.
+     * @param image       Source image. Read-only.
+     * @param rng         Source of randomness for the permutation.
+     * @param extra_pins  Additional pin ranges from external sources
+     *                    (e.g. LOAD_CONFIG target sections). Coalesced
+     *                    with the planner's standard pins via
+     *                    `merge_overlapping`. Empty by default.
      */
     [[nodiscard]] refmap::RvaRemapper plan(
-        const PeImage& image,
-        Randomizer&    rng) const;
+        const PeImage&                image,
+        Randomizer&                   rng,
+        std::span<const PinnedRange>  extra_pins = {}) const;
 
 private:
     std::uint32_t chunk_size_;

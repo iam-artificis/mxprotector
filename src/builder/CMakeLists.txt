@@ -49,6 +49,7 @@ set(BUILDER_SOURCES
     pe/refmap/reference_patcher.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
+    pe/chaos/load_config_pin_helper.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp

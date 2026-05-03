@@ -199,19 +199,25 @@ std::vector<PinnedRange> ChunkPlanner::compute_pinned_ranges(
 }
 
 refmap::RvaRemapper ChunkPlanner::plan(
-    const PeImage& image,
-    Randomizer&    rng) const
+    const PeImage&               image,
+    Randomizer&                  rng,
+    std::span<const PinnedRange> extra_pins) const
 {
     refmap::RvaRemapper remapper;
 
-    const auto span = compute_image_span(image);
-    if (span.size == 0) {
+    const auto img_span = compute_image_span(image);
+    if (img_span.size == 0) {
         (void)remapper.finalize();
         return remapper;
     }
 
-    const auto pinned = compute_pinned_ranges(image);
-    const auto frees  = compute_free_ranges(span, pinned);
+    auto pinned = compute_pinned_ranges(image);
+    if (!extra_pins.empty()) {
+        pinned.insert(pinned.end(),
+                      extra_pins.begin(), extra_pins.end());
+        merge_overlapping(pinned);
+    }
+    const auto frees = compute_free_ranges(img_span, pinned);
 
     // Carve chunks across all free ranges.
     std::vector<PinnedRange> chunks;
