@@ -38,9 +38,27 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
             "Не указаны аргументы. Используйте --help для справки."));
     }
 
-    ProtectionConfig config = ProtectionConfig::from_level(ProtectionLevel::standard);
+    // Pass 1 — find `-l <level>`. The level seeds the per-pass
+    // defaults, so it must be resolved before any flag is applied.
+    // Multiple `-l` arguments: the last one wins (matches earlier
+    // implicit behaviour where a later `-l` reset the config).
+    ProtectionLevel level = ProtectionLevel::standard;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a(argv[i]);
+        if ((a == "--level" || a == "-l") && i + 1 < argc) {
+            auto r = parse_level(argv[i + 1]);
+            if (!r) return std::unexpected(r.error());
+            level = *r;
+            ++i;
+        }
+    }
+
+    ProtectionConfig config = ProtectionConfig::from_level(level);
     bool has_input = false;
 
+    // Pass 2 — apply every flag on top of the level defaults. This
+    // makes flag/level ordering irrelevant: `--chaos-shuffle -l strong`
+    // and `-l strong --chaos-shuffle` produce the same config.
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
 
@@ -72,28 +90,8 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         }
 
         if ((arg == "--level" || arg == "-l") && i + 1 < argc) {
-            auto level_result = parse_level(argv[++i]);
-            if (!level_result) {
-                return std::unexpected(level_result.error());
-            }
-            config = ProtectionConfig::from_level(*level_result);
-            config.input_path.clear();
-            config.output_path.clear();
-            has_input = false;
-
-            for (int j = 1; j < i; ++j) {
-                const std::string_view prev_arg(argv[j]);
-                if ((prev_arg == "--input" || prev_arg == "-i") && j + 1 < argc) {
-                    config.input_path = argv[j + 1];
-                    has_input = true;
-                }
-                if ((prev_arg == "--output" || prev_arg == "-o") && j + 1 < argc) {
-                    config.output_path = argv[j + 1];
-                }
-                if ((prev_arg == "--map" || prev_arg == "-m") && j + 1 < argc) {
-                    config.map_file_path = argv[j + 1];
-                }
-            }
+            // Already resolved in pass 1; skip the value.
+            ++i;
             continue;
         }
 
