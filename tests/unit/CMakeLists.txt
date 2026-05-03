@@ -44,6 +44,7 @@ set(TEST_SOURCES
     chaos_atom_test.cpp
     chaos_instruction_atom_source_test.cpp
     chaos_string_atom_source_test.cpp
+    chaos_pe_atom_sources_test.cpp
     refmap_reference_test.cpp
     refmap_code_reference_scanner_test.cpp
     refmap_structure_reference_scanner_test.cpp
@@ -211,6 +212,9 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atom.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/instruction_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/string_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/import_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/pdata_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/reloc_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp
