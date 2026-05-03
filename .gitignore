@@ -77,3 +77,36 @@ Desktop.ini
 
 # Additional build directories
 build_test/
+
+# Claude Code session state
+.claude/
+.claude-trace/
+
+# build_testapp scratch artifacts
+build_testapp/*.exe.packed
+build_testapp/*.protected.*
+build_testapp/*.protected_dump.*
+build_testapp/*.protected_dumpX.*
+build_testapp/*.dll.packed
+build_testapp/*.efi
+!build_testapp/fake_efi.efi
+build_testapp/*.bat
+build_testapp/_*.txt
+build_testapp/o.txt
+build_testapp/out.txt
+build_testapp/out_*.txt
+build_testapp/err.txt
+build_testapp/exc_out.txt
+build_testapp/str_out.txt
+build_testapp/disasm_full.txt
+build_testapp/vmonly.txt
+build_testapp/t_*.exe
+build_testapp/t_*.sys
+build_testapp/t_*.efi
+build_testapp/t_*.dll
+build_testapp/t_p4.packed
+build_testapp/test_simple_cpp.cpp
+build_testapp/test_tls.cpp
+build_testapp/fake_driver.*.sys
+build_testapp/fake_efi.chaos.efi
+build_testapp/fake_efi.protected.efi
