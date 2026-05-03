@@ -430,6 +430,33 @@ struct IMAGE_TLS_DIRECTORY64 {
 };
 
 // ============================================================================
+// Структуры delay-load импортов
+// ============================================================================
+
+/**
+ * @brief Delay-load импорт-дескриптор (PE delay loading version 2).
+ *
+ * Все семь *RVA полей являются 32-битными RVA когда `Attributes` бит 0
+ * (`RvaBased`) установлен — современный формат, который используют
+ * MSVC/clang на x64. Когда `RvaBased=0` (legacy формат), это
+ * абсолютные 32-битные VA, и их нельзя ремапить через
+ * `RvaRemapper` — chaos сканер пропускает такие записи.
+ */
+struct IMAGE_DELAYLOAD_DESCRIPTOR {
+    uint32_t Attributes;                  ///< Бит 0 = RvaBased (1 = RVA, 0 = VA)
+    uint32_t DllNameRVA;                  ///< RVA имени DLL (ASCIIZ)
+    uint32_t ModuleHandleRVA;             ///< RVA на ячейку HMODULE
+    uint32_t ImportAddressTableRVA;       ///< RVA таблицы IAT
+    uint32_t ImportNameTableRVA;          ///< RVA таблицы INT
+    uint32_t BoundImportAddressTableRVA;  ///< RVA опциональной bound IAT (может быть 0)
+    uint32_t UnloadInformationTableRVA;   ///< RVA опциональной unload-info таблицы (может быть 0)
+    uint32_t TimeDateStamp;
+};
+
+static_assert(sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) == 32,
+              "IMAGE_DELAYLOAD_DESCRIPTOR должен быть 32 байта");
+
+// ============================================================================
 // Структура Debug Directory
 // ============================================================================
 
