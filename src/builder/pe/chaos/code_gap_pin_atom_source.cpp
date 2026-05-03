@@ -106,34 +106,56 @@ void emit_pin(Rva start, Rva end, AtomTable& out) {
     });
 }
 
-/// True when every byte at `[start, end)` reads as `0xCC` (`INT 3`)
-/// inside `sec.data`. Used to identify pure-padding gaps that
-/// `FunctionAtomSource` will absorb into the adjacent function
-/// atom; we skip pinning them so the function atom stays movable.
-[[nodiscard]] bool is_int3_only(
+/// Walk `[start, end)` byte-by-byte and emit a pin atom for every
+/// maximal sub-run of non-`0xCC` bytes. Pure-`INT 3` runs are left
+/// unpinned so they become passthrough — a chunk can land on top
+/// of them without breaking anything (`INT 3` is unreachable code
+/// by definition).
+///
+/// Splitting the gap byte-by-byte (instead of pinning the whole
+/// gap whenever any byte is non-`0xCC`) is what lets the planner's
+/// free ranges actually span multiple functions: a single 5-byte
+/// `JMP rel32` thunk between two functions used to anchor a 256-
+/// byte gap as one giant pin, which fragmented `.text` into 92
+/// tiny free ranges with one chunk each — no permutation possible.
+void pin_non_int3_subranges(
     const pe::SectionInfo& sec,
     Rva                    start,
-    Rva                    end) noexcept
+    Rva                    end,
+    AtomTable&             out)
 {
-    if (end <= start) return true;
-    if (start < sec.virtual_address) return false;
+    if (end <= start) return;
+    if (start < sec.virtual_address) return;
     const auto off = start - sec.virtual_address;
     const auto count = static_cast<std::size_t>(end - start);
-    if (off + count > sec.data.size()) return false;
+    if (off + count > sec.data.size()) return;
+
     const std::uint8_t* p = sec.data.data() + off;
-    for (std::size_t k = 0; k < count; ++k) {
-        if (p[k] != 0xCC) return false;
+    Rva cursor = start;
+    Rva run_start = cursor;
+    bool in_run = false;
+    for (std::size_t k = 0; k < count; ++k, ++cursor) {
+        if (p[k] != 0xCC) {
+            if (!in_run) { run_start = cursor; in_run = true; }
+        } else {
+            if (in_run) {
+                emit_pin(run_start, cursor, out);
+                in_run = false;
+            }
+        }
     }
-    return true;
+    if (in_run) {
+        emit_pin(run_start, cursor, out);
+    }
 }
 
 /// For one code section, emit pinned atoms covering every byte
 /// that does NOT fall inside any `.pdata`-listed function range
-/// AND that contains real (non-`0xCC`) content. Pure-`INT 3`
-/// padding is left unpinned: `FunctionAtomSource` extends the
-/// adjacent function's atom over that padding so the function
-/// becomes 8-aligned at the boundary and can participate in the
-/// shuffle as a movable chunk.
+/// AND that contains real (non-`0xCC`) content. `INT 3` filler is
+/// always left unpinned — `FunctionAtomSource` absorbs the bytes
+/// adjacent to a function up to the next 4-aligned boundary, and
+/// the rest become harmless passthrough that any movable chunk
+/// can overlay without affecting executable behaviour.
 void pin_gaps_in_code_section(
     const pe::SectionInfo&        sec,
     const std::vector<FuncRange>& funcs,
@@ -151,16 +173,12 @@ void pin_gaps_in_code_section(
         const Rva fn_start = std::max(f.start, sec_start);
         const Rva fn_end   = std::min(f.end,   sec_end);
         if (cursor < fn_start) {
-            if (!is_int3_only(sec, cursor, fn_start)) {
-                emit_pin(cursor, fn_start, out);
-            }
+            pin_non_int3_subranges(sec, cursor, fn_start, out);
         }
         if (fn_end > cursor) cursor = fn_end;
     }
     if (cursor < sec_end) {
-        if (!is_int3_only(sec, cursor, sec_end)) {
-            emit_pin(cursor, sec_end, out);
-        }
+        pin_non_int3_subranges(sec, cursor, sec_end, out);
     }
 }
 
