@@ -68,6 +68,7 @@ struct Range {
     return {first, static_cast<std::uint32_t>(last_end - first)};
 }
 
+
 [[nodiscard]] AtomTable collect_atoms(
     const PeImage&                                    image,
     const std::vector<std::unique_ptr<IAtomSource>>&  sources)
@@ -136,24 +137,50 @@ struct Range {
     return frees;
 }
 
-/// Pick the next loose-chunk size from `[min, max]`. When the range
-/// is degenerate (`min == max`) the bound itself is returned without
-/// touching the RNG, so callers that pass a fixed size do not perturb
-/// the Fisher-Yates stream of an outer caller's RNG.
-[[nodiscard]] std::uint32_t pick_loose_chunk_size(
+/// Boundary alignment for every chunk emitted into the remapper.
+/// 8-byte alignment guarantees that no naturally-aligned 64-bit
+/// value is split across a chunk boundary — the most common
+/// failure mode of the byte-granular shuffle.
+constexpr std::uint32_t kChunkAlignment = 8;
+
+[[nodiscard]] constexpr Rva align_down_rva(
+    Rva value, std::uint32_t alignment) noexcept
+{
+    return static_cast<Rva>(value & ~(alignment - 1u));
+}
+
+[[nodiscard]] constexpr Rva align_up_rva(
+    Rva value, std::uint32_t alignment) noexcept
+{
+    return static_cast<Rva>((value + alignment - 1u) & ~(alignment - 1u));
+}
+
+/// Pick the next loose-chunk size from `[min, max]`, then round
+/// the result DOWN to the nearest multiple of `kChunkAlignment`
+/// so the chunk boundary lands on an 8-aligned RVA.
+///
+/// When the rounded value would underflow (size < alignment), we
+/// clamp to `kChunkAlignment` so the carver still makes progress.
+[[nodiscard]] std::uint32_t pick_aligned_loose_size(
     std::uint32_t min_size,
     std::uint32_t max_size,
     Randomizer&   rng) noexcept
 {
-    if (max_size <= min_size) return min_size;
-    return rng.next_range(min_size, max_size);
+    if (min_size == 0) min_size = kChunkAlignment;
+    if (max_size < min_size) max_size = min_size;
+    const std::uint32_t raw = max_size <= min_size
+        ? min_size
+        : rng.next_range(min_size, max_size);
+    std::uint32_t aligned = raw & ~(kChunkAlignment - 1u);
+    if (aligned < kChunkAlignment) aligned = kChunkAlignment;
+    return aligned;
 }
 
-/// Append loose chunks covering [start, end). Each chunk's size is
-/// sampled from `[min_size, max_size]` (degenerate range → fixed).
-/// The trailing chunk is clamped to `remaining` so total bytes
-/// always equal `end - start`.
-void carve_loose_chunks(
+/// Append loose chunks covering [start, end). Pre-condition: both
+/// `start` and `end` are multiples of `kChunkAlignment`. Each
+/// emitted chunk's size is also a multiple of `kChunkAlignment`,
+/// so chunk boundaries always land on 8-aligned RVAs.
+void carve_aligned_loose_chunks(
     Rva                     start,
     Rva                     end,
     std::uint32_t           min_size,
@@ -161,22 +188,46 @@ void carve_loose_chunks(
     Randomizer&             rng,
     std::vector<PlanChunk>& out)
 {
-    if (min_size == 0) return;
+    if (start >= end) return;
     Rva pos = start;
     while (pos < end) {
         const auto remaining = static_cast<std::uint32_t>(end - pos);
-        std::uint32_t sz = pick_loose_chunk_size(min_size, max_size, rng);
-        sz = std::min(sz, remaining);
+        std::uint32_t sz = pick_aligned_loose_size(min_size, max_size, rng);
+        if (sz > remaining) sz = remaining;
         out.push_back(PlanChunk{pos, sz});
         pos = static_cast<Rva>(pos + sz);
     }
 }
 
-/// Build the chunk list for a single free range: every movable atom
-/// that falls inside the range becomes one chunk; gaps between
-/// atoms are carved into loose chunks sized in `[min_loose,
-/// max_loose]`. The invariant `sum(chunks.size) == range.size`
-/// holds by construction.
+/// `true` when both `start` and `size` give a chunk whose
+/// boundaries land on `kChunkAlignment`-multiple RVAs.
+[[nodiscard]] constexpr bool atom_boundaries_aligned(
+    const Atom& a) noexcept
+{
+    return (a.start_rva % kChunkAlignment) == 0 &&
+           (a.end_rva() % kChunkAlignment) == 0;
+}
+
+/// Build the chunk list for a single free range under alignment-
+/// aware semantics:
+///
+///   * Bytes in `[range.start, aligned_inner_start)` and
+///     `[aligned_inner_end, range.end)` are passthrough — they
+///     stay at their original RVA in the unified buffer because
+///     no `add_chunk` call lands them in the remapper.
+///
+///   * Inside `[aligned_inner_start, aligned_inner_end)`, every
+///     movable atom whose start AND end are 8-aligned becomes one
+///     chunk. Movable atoms with non-aligned boundaries are
+///     skipped (their bytes stay at original RVA — passthrough).
+///
+///   * Gaps between aligned movable atoms (and the inner range
+///     ends) are carved into 8-aligned loose chunks via
+///     `carve_aligned_loose_chunks`.
+///
+/// The invariant `sum(chunks.size) ≤ aligned_inner_end -
+/// aligned_inner_start` holds; the difference is exactly the
+/// passthrough bytes of skipped non-aligned atoms.
 [[nodiscard]] std::vector<PlanChunk> chunks_in_free_range(
     const Range&     range,
     const AtomTable& atoms,
@@ -187,31 +238,50 @@ void carve_loose_chunks(
     std::vector<PlanChunk> chunks;
     chunks.reserve(64);
 
-    Rva cursor = range.start;
+    const Rva inner_start = align_up_rva(range.start, kChunkAlignment);
+    const Rva inner_end   = align_down_rva(range.end(), kChunkAlignment);
+    if (inner_start >= inner_end) return chunks;
+
+    Rva cursor = inner_start;
     for (const auto& a : atoms.atoms()) {
         if (a.is_pinned()) continue;
         if (a.size == 0)   continue;
-        if (a.end_rva() <= range.start) continue;
-        if (a.start_rva  >= range.end()) break;
+        if (a.end_rva() <= inner_start) continue;
+        if (a.start_rva  >= inner_end)  break;
+        if (a.start_rva  < inner_start) continue;
+        if (a.end_rva()  > inner_end)   continue;
 
-        // Skip atoms that straddle the range boundary — defence in
-        // depth; `normalize()` keeps pinned ranges disjoint, so a
-        // movable atom should never partially overlap a pinned one,
-        // but the planner remains correct if it ever does.
-        if (a.start_rva  < range.start) continue;
-        if (a.end_rva()  > range.end()) continue;
+        if (!atom_boundaries_aligned(a)) {
+            // Atom can't become a chunk without splitting an
+            // adjacent 8-aligned value. Carve loose up to the
+            // 8-aligned RVA below the atom, then jump cursor past
+            // the atom + any trailing unaligned bytes so the next
+            // chunk boundary lands on 8-aligned again. Atom bytes
+            // remain at their original RVA via passthrough.
+            const Rva carve_end = align_down_rva(a.start_rva,
+                                                 kChunkAlignment);
+            if (cursor < carve_end) {
+                carve_aligned_loose_chunks(
+                    cursor, carve_end, min_loose, max_loose, rng,
+                    chunks);
+            }
+            cursor = align_up_rva(a.end_rva(), kChunkAlignment);
+            if (cursor > inner_end) cursor = inner_end;
+            continue;
+        }
 
         if (cursor < a.start_rva) {
-            carve_loose_chunks(cursor, a.start_rva,
-                               min_loose, max_loose, rng, chunks);
+            carve_aligned_loose_chunks(
+                cursor, a.start_rva, min_loose, max_loose, rng,
+                chunks);
         }
         chunks.push_back(PlanChunk{a.start_rva, a.size});
         cursor = a.end_rva();
     }
 
-    if (cursor < range.end()) {
-        carve_loose_chunks(cursor, range.end(),
-                           min_loose, max_loose, rng, chunks);
+    if (cursor < inner_end) {
+        carve_aligned_loose_chunks(
+            cursor, inner_end, min_loose, max_loose, rng, chunks);
     }
     return chunks;
 }

@@ -60,8 +60,15 @@ namespace mx::pe::chaos {
  * max_loose_chunk_size]` range. When the two bounds are equal the
  * planner emits fixed-size chunks (legacy behaviour). When they
  * differ each loose chunk's size is sampled uniformly from the
- * range — gives 50-100 B chunks for the chaos shuffle's mixed
- * data area while keeping carving deterministic per RNG seed.
+ * range and rounded DOWN to the nearest multiple of 8 — gives
+ * variable 8-aligned chunks while guaranteeing every chunk
+ * boundary lands on an 8-aligned RVA, which in turn ensures no
+ * naturally-aligned 64-bit value is split across the boundary.
+ *
+ * Movable atoms are kept as chunks only when their start and end
+ * are already 8-aligned. Atoms with non-aligned boundaries are
+ * left at their original RVA (passthrough) — splitting them would
+ * also split the 8-aligned values they sit next to.
  */
 class AtomicChunkPlanner final {
 public:
