@@ -112,6 +112,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--debug-sections")      { config.debug_section_names = true; continue; }
         if (arg == "--anti-tamper-veh")     { config.enable_veh_anti_tamper = true; continue; }
         if (arg == "--chaos")               { config.chaos_layout = true; continue; }
+        if (arg == "--chaos-shuffle")       { config.chaos_layout = true; config.chaos_shuffle = true; continue; }
         if (arg == "--trace-hints")         { config.emit_trace_hints = true; continue; }
 
         if (arg.starts_with("--load-mode=") && arg.size() > 12) {
@@ -236,6 +237,11 @@ void CliHandler::print_usage() {
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
         "  --anti-tamper-veh           Install VEH INT3 trap in packer stub (EXE-only, G3 Phase 2)\n"
         "  --chaos                     Force every section to RWX / mixed code+data (Feature B)\n"
+        "                                 + collapse the section table into one unified section.\n"
+        "  --chaos-shuffle             --chaos + byte-level fragment shuffle inside the unified\n"
+        "                                 section (test-only — deep import/export/TLS/CFG\n"
+        "                                 directory scanners not yet implemented; will break\n"
+        "                                 binaries that use those structures).\n"
         "  --trace-hints               Emit <output>.mxtrace.json sidecar for the tracing MCP\n"
         "                                (test-only — must not ship in production builds)\n"
         "  --strings=<режим>           Защита строк в .rdata:\n"

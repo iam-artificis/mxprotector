@@ -189,21 +189,40 @@ struct ProtectionConfig {
      * When true, `main()` swaps `ProtectionContext`'s active
      * `ILayoutPolicy` from `pe::StandardLayout` to `pe::ChaosLayout`.
      * Every emitted section's intent gets rewritten to
-     * `{mixed_code_data, rwx}` and a post-pass `finalize` sweep
+     * `{mixed_code_data, rwx}`, and a post-pass `finalize` sweep
      * stamps every existing section's `characteristics` with the
-     * chaos bit-mask, so the resulting PE presents one unified
-     * read-write-execute region to any tool that walks the section
-     * table.
-     *
-     * MVP (B.1/B.2): characteristics rewrite only — no section
-     * merging or fragment shuffling. Future B.3 will replace the
-     * section table with a single unified section whose bytes are
-     * the original section bodies cut into chunks and shuffled
-     * randomly, with every RVA-bearing reference patched in lockstep.
+     * chaos bit-mask plus collapses the entire section table into
+     * one unified RWX/mixed section spanning the image's RVA range.
+     * RVAs of every byte stay identical, so the binary still loads
+     * and runs.
      *
      * Default: false. Set via `--chaos` on the command line.
      */
     bool chaos_layout = false;
+
+    /**
+     * @brief Feature B.4 — opt-in byte-level fragment shuffle inside
+     *        the unified chaos section.
+     *
+     * When true (and `chaos_layout` is also true), `ChaosLayout::
+     * finalize` additionally cuts free RVA ranges into chunks and
+     * randomly permutes their positions inside the merged section.
+     * Every reference in the rebuilt reference table (code rel32 /
+     * RIP-relative, `.pdata` RUNTIME_FUNCTION fields, `.reloc`-applied
+     * absolute VAs, `DataDirectory` entries) is patched to point at
+     * the post-shuffle target.
+     *
+     * Coverage caveat: deep internal directory references — IMPORT
+     * descriptor `Name`/`OriginalFirstThunk`/`FirstThunk`,
+     * EXPORT name table, `LOAD_CONFIG_DIRECTORY` CFG function table,
+     * resource-tree internals, TLS callback array — are *not yet*
+     * scanned. Enabling this flag on a binary that uses any of those
+     * structures will produce a non-loadable image. Treat as a
+     * test-only knob until the deep scanners land.
+     *
+     * Default: false. Set via `--chaos-shuffle` on the command line.
+     */
+    bool chaos_shuffle = false;
 
     /**
      * @brief Emit the `<output>.mxtrace.json` sidecar for the tracing

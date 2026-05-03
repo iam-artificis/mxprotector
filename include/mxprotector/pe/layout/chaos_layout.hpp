@@ -65,6 +65,22 @@ namespace mx::pe {
 class ChaosLayout final : public ILayoutPolicy {
 public:
     /**
+     * @brief Construct with the byte-level shuffle pass enabled or
+     *        disabled.
+     *
+     * `enable_fragment_shuffle = false` (default) keeps `finalize`'s
+     * behaviour at the B.3 contract: characteristics rewrite +
+     * single unified section with RVAs preserved bit-for-bit.
+     *
+     * `enable_fragment_shuffle = true` activates the B.4 chunk
+     * shuffler — free RVA ranges get randomly permuted and every
+     * scanned reference is patched in lockstep. See file header for
+     * the (current) deep-directory coverage caveat.
+     */
+    explicit ChaosLayout(bool enable_fragment_shuffle = false) noexcept
+        : enable_fragment_shuffle_(enable_fragment_shuffle) {}
+
+    /**
      * @brief Rewrite every emitted section's intent to RWX / mixed.
      *
      * Independent of the requested intent. The `section_name`
@@ -108,6 +124,9 @@ public:
 
     /// @brief Returns the literal `"chaos"` for log/sidecar correlation.
     [[nodiscard]] std::string_view name() const noexcept override;
+
+private:
+    bool enable_fragment_shuffle_ = false;
 };
 
 } // namespace mx::pe

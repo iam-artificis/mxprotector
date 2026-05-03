@@ -5,8 +5,17 @@
 
 #include "mxprotector/pe/layout/chaos_layout.hpp"
 
+#include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/pe/chaos/chaos_shuffler.hpp"
+#include "mxprotector/pe/chaos/chunk_planner.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/refmap/code_reference_scanner.hpp"
+#include "mxprotector/pe/refmap/reference.hpp"
+#include "mxprotector/pe/refmap/reference_patcher.hpp"
+#include "mxprotector/pe/refmap/reloc_absolute_va_scanner.hpp"
+#include "mxprotector/pe/refmap/rva_remapper.hpp"
+#include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
 #include "mxprotector/pe/section_intent.hpp"
 
 #include <algorithm>
@@ -186,6 +195,68 @@ void merge_into_unified_section(PeImage& image) {
     install_unified_section(image, extent, std::move(merged));
 }
 
+/// Walk the image with all three scanners and accumulate every
+/// reference into one table.
+[[nodiscard]] refmap::ReferenceTable scan_all_references(const PeImage& image) {
+    refmap::ReferenceTable table;
+    table.reserve(2048);
+
+    refmap::CodeReferenceScanner code;
+    for (const auto& sec : image.sections()) {
+        if (!sec.is_code() || sec.data.empty()) continue;
+        // Discard the per-section decode-error count — chaos is a
+        // best-effort shuffle, not a verifier.
+        [[maybe_unused]] const auto errors = code.scan(
+            ByteView{sec.data.data(),
+                     std::min(sec.data.size(),
+                              static_cast<std::size_t>(sec.virtual_size))},
+            sec.virtual_address,
+            table);
+    }
+    refmap::StructureReferenceScanner{}.scan(image, table);
+    refmap::RelocAbsoluteVaScanner{}.scan(image, table);
+
+    return table;
+}
+
+/// Run the post-merge fragment shuffle: plan chunks (uses the
+/// PRE-merge image's section info), merge into the unified section,
+/// shuffle bytes inside the unified section, then patch every
+/// reference in the table to point at its post-shuffle target.
+void apply_fragment_shuffle(PeImage& image) {
+    if (image.sections().size() < 2) return;
+
+    // Phase 1 — scan references (consumes the pre-merge layout).
+    auto refs = scan_all_references(image);
+
+    // Phase 2 — plan chunks. Pinned set computed from pre-merge
+    // sections + DataDirectory layout so .text + dir bodies are
+    // anchored.
+    Randomizer rng;
+    chaos::ChunkPlanner planner;
+    auto remapper = planner.plan(image, rng);
+
+    // Phase 3 — merge sections into the unified .mxchaos section.
+    merge_into_unified_section(image);
+
+    // Phase 4 — shuffle bytes inside the unified section per the
+    // remapper's chunk plan.
+    if (!image.sections().empty()) {
+        auto& unified = image.sections()[0];
+        chaos::apply_chunk_shuffle(
+            unified.data, unified.virtual_address, remapper);
+    }
+
+    // Phase 5 — patch every reference's slot at its post-shuffle
+    // location to point at its post-shuffle target. The returned
+    // `PatchStats` is intentionally discarded — the fragment
+    // shuffler does not log per build, and unresolvable slots are
+    // already fail-soft inside the patcher.
+    refmap::ReferencePatcher patcher;
+    [[maybe_unused]] const auto stats =
+        patcher.apply(image, refs, remapper);
+}
+
 } // anonymous namespace
 
 SectionIntent ChaosLayout::resolve(
@@ -201,13 +272,17 @@ MxStatus ChaosLayout::finalize(PeImage& image) const {
     // still end up RWX/mixed.
     stamp_chaos_characteristics(image);
 
-    // Step 2 — collapse the section table into a single unified
-    // RWX/mixed section. RVAs of every byte stay identical, so no
-    // reference patching is required: DataDirectory entries, .reloc
-    // page RVAs, .pdata RUNTIME_FUNCTION fields, internal directory
-    // pointers — everything keeps resolving to the right byte
-    // because the byte itself never moved.
-    merge_into_unified_section(image);
+    // Step 2 — collapse + (optionally) shuffle. The fragment shuffle
+    // is opt-in because deep internal-directory references (IMPORT
+    // descriptor pointers, EXPORT name table, LOAD_CONFIG CFG
+    // tables, TLS callback array) are not yet scanned by the
+    // refmap pipeline. With shuffle disabled, RVAs of every byte
+    // stay identical and the binary loads unchanged.
+    if (enable_fragment_shuffle_) {
+        apply_fragment_shuffle(image);
+    } else {
+        merge_into_unified_section(image);
+    }
 
     return {};
 }

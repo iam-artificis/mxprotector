@@ -118,8 +118,11 @@ int main(int argc, char** argv) {
     // before any pass executes so every emission seam sees the
     // overridden intent.
     if (config.chaos_layout) {
-        ctx.set_layout_policy(std::make_unique<mx::pe::ChaosLayout>());
-        std::cout << "[*] Layout policy: chaos (RWX / mixed code+data)\n";
+        ctx.set_layout_policy(std::make_unique<mx::pe::ChaosLayout>(
+            /*enable_fragment_shuffle=*/config.chaos_shuffle));
+        std::cout << std::format(
+            "[*] Layout policy: chaos (RWX / mixed code+data{})\n",
+            config.chaos_shuffle ? " + fragment shuffle" : "");
     }
 
     {

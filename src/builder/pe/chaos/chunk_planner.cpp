@@ -61,7 +61,15 @@ void merge_overlapping(std::vector<PinnedRange>& ranges) {
     return result;
 }
 
-/// Append every non-empty DataDirectory entry's body range to `out`.
+/// Append the **whole section** that contains each non-empty
+/// DataDirectory entry. Pinning only `[VirtualAddress, VirtualAddress
+/// + Size)` is too narrow: most directories carry pointers *out* of
+/// their immediate body to siblings in the same section (e.g.
+/// `IMAGE_IMPORT_DESCRIPTOR.Name` → DLL-name string elsewhere in
+/// `.rdata`; `OriginalFirstThunk` → IAT entries; `IMAGE_IMPORT_BY_
+/// NAME` records — all in `.rdata`). Tracking those internal RVAs
+/// requires per-directory deep scanners (B.4.8 follow-up). Until
+/// those land, the safe pin granularity is the whole section.
 void append_data_directory_pins(
     const PeImage&            image,
     std::vector<PinnedRange>& out)
@@ -74,7 +82,15 @@ void append_data_directory_pins(
                 pe::IMAGE_NUMBEROF_DIRECTORY_ENTRIES);
             for (std::uint32_t i = 0; i < limit; ++i) {
                 const auto& dir = nt.OptionalHeader.DataDirectory[i];
-                append_pin(out, dir.VirtualAddress, dir.Size);
+                if (dir.VirtualAddress == 0) continue;
+                const auto* sec = image.section_by_rva(dir.VirtualAddress);
+                if (sec != nullptr) {
+                    append_pin(out, sec->virtual_address, sec->virtual_size);
+                } else {
+                    // Directory points outside any section — pin its
+                    // own body as a defensive minimum.
+                    append_pin(out, dir.VirtualAddress, dir.Size);
+                }
             }
         }
     }, image.nt_headers());

@@ -41,6 +41,7 @@ set(BUILDER_SOURCES
     pe/refmap/reloc_absolute_va_scanner.cpp
     pe/refmap/reference_patcher.cpp
     pe/chaos/chunk_planner.cpp
+    pe/chaos/chaos_shuffler.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp
