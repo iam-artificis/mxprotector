@@ -77,6 +77,21 @@ int main(int argc, char** argv) {
         config.string_protection = mx::StringProtectionMode::stub;
     }
 
+    // Auto-disable: --chaos-shuffle and the self-unpacking packer are
+    // structurally incompatible. The packer encrypts whole sections
+    // and re-applies relocations on unpack; the chaos shuffle's
+    // unified RWX section + post-shuffle reloc rebuild contradict
+    // both assumptions. Run-time symptoms range from "fails to
+    // unpack" to silent slot corruption. The user is explicitly
+    // expected to favour shuffle over packer when both are
+    // requested (B.4.10.5).
+    if (config.chaos_shuffle && config.enable_packer) {
+        std::cout <<
+            "[!] --chaos-shuffle несовместим с self-unpacking packer — "
+            "packer отключён\n";
+        config.enable_packer = false;
+    }
+
     const auto pipeline_start = std::chrono::high_resolution_clock::now();
 
     std::cout << std::format("[*] Чтение файла: {}\n", config.input_path.string());
