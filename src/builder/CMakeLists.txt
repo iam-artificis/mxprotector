@@ -50,6 +50,7 @@ set(BUILDER_SOURCES
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
+    pe/chaos/atom.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp
