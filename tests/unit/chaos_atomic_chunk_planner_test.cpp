@@ -225,4 +225,92 @@ TEST(AtomicChunkPlanner, SameSeedProducesSameLayout) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B.4.10.1 — alignment-aware: pinned atoms stay at their original RVA,
+//             movable bytes shuffle among themselves in the gaps.
+// ---------------------------------------------------------------------------
+
+TEST(AtomicChunkPlanner, PinnedAtomKeepsOriginalRvaPassthrough) {
+    PeImage img = make_pe32plus_image();
+    const auto sec1 = add_section(img, ".s1", 64);
+
+    // One pinned 8-byte atom at sec+24 (alignment 8 from origin policy).
+    std::vector<Atom> atoms = {
+        Atom{static_cast<Rva>(sec1 + 24), 8, AtomOrigin::tls_directory},
+    };
+
+    AtomicChunkPlanner planner{/*loose_chunk_size=*/1};
+    planner.add_source(std::make_unique<StubAtomSource>(atoms));
+    Randomizer rng;
+    const auto remapper = planner.plan(img, rng);
+
+    // Pinned atom is NOT a chunk in the remapper — it's a passthrough.
+    // Span = 64 B; 8 B are pinned → 56 B movable carved into 56 loose
+    // chunks (loose_chunk_size = 1).
+    EXPECT_EQ(remapper.total_bytes(), 56u);
+    EXPECT_EQ(remapper.chunk_count(), 56u);
+
+    // Pinned slot RVA must remap to itself.
+    for (std::uint32_t off = 0; off < 8; ++off) {
+        const Rva rva = static_cast<Rva>(sec1 + 24 + off);
+        EXPECT_EQ(remapper.remap(rva), rva)
+            << "pinned byte must passthrough at off=" << off;
+    }
+}
+
+TEST(AtomicChunkPlanner, MultiplePinnedAtomsCreateMultipleFreeRanges) {
+    PeImage img = make_pe32plus_image();
+    const auto sec1 = add_section(img, ".s1", 96);
+
+    // Two pinned atoms at sec+32 and sec+64, splitting the section
+    // into three free ranges.
+    std::vector<Atom> atoms = {
+        Atom{static_cast<Rva>(sec1 + 32), 8, AtomOrigin::tls_directory},
+        Atom{static_cast<Rva>(sec1 + 64), 8, AtomOrigin::import_thunk},
+    };
+
+    AtomicChunkPlanner planner{/*loose_chunk_size=*/1};
+    planner.add_source(std::make_unique<StubAtomSource>(atoms));
+    Randomizer rng;
+    const auto remapper = planner.plan(img, rng);
+
+    // Movable bytes = 96 - 16 = 80; loose_chunk_size = 1 → 80 chunks.
+    EXPECT_EQ(remapper.total_bytes(), 80u);
+    EXPECT_EQ(remapper.chunk_count(), 80u);
+
+    // Both pinned atoms must passthrough.
+    EXPECT_EQ(remapper.remap(static_cast<Rva>(sec1 + 32)),
+              static_cast<Rva>(sec1 + 32));
+    EXPECT_EQ(remapper.remap(static_cast<Rva>(sec1 + 64)),
+              static_cast<Rva>(sec1 + 64));
+}
+
+TEST(AtomicChunkPlanner, MovableAtomShuffledAroundPinnedNeighbour) {
+    PeImage img = make_pe32plus_image();
+    const auto sec1 = add_section(img, ".s1", 64);
+
+    // Pinned atom at sec+32; one movable instruction atom at sec+0.
+    std::vector<Atom> atoms = {
+        Atom{static_cast<Rva>(sec1 +  0), 16, AtomOrigin::instruction},
+        Atom{static_cast<Rva>(sec1 + 32),  8, AtomOrigin::tls_directory},
+    };
+
+    AtomicChunkPlanner planner{/*loose_chunk_size=*/1};
+    planner.add_source(std::make_unique<StubAtomSource>(atoms));
+    Randomizer rng{0x1234};
+    const auto remapper = planner.plan(img, rng);
+
+    // Movable bytes = 64 - 8 = 56; movable atom = 16 B + loose 16+24 = 40 B.
+    // Free range A = [sec, sec+32) = 32 B → atom 16 B + 16 loose = 17 chunks.
+    // Free range B = [sec+40, sec+64) = 24 B → 24 loose chunks.
+    EXPECT_EQ(remapper.total_bytes(), 56u);
+    EXPECT_EQ(remapper.chunk_count(), 17u + 24u);
+
+    // Pinned atom passthrough.
+    for (std::uint32_t off = 0; off < 8; ++off) {
+        const Rva rva = static_cast<Rva>(sec1 + 32 + off);
+        EXPECT_EQ(remapper.remap(rva), rva);
+    }
+}
+
 } // namespace

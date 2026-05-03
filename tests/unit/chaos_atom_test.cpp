@@ -151,4 +151,73 @@ TEST(AtomOriginName, AllVariantsHaveDistinctNames) {
                                                                 "rsrc-data");
 }
 
+// ---------------------------------------------------------------------------
+// B.4.10.1 — alignment policy
+// ---------------------------------------------------------------------------
+
+TEST(AtomAlignment, MovableOriginsHaveAlignmentOne) {
+    using mx::pe::chaos::default_alignment_for;
+    EXPECT_EQ(default_alignment_for(AtomOrigin::instruction),           1);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::instruction_undecoded), 1);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::ascii_string),          1);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::import_by_name),        1);
+}
+
+TEST(AtomAlignment, PinnedStructuresHaveAlignmentEight) {
+    using mx::pe::chaos::default_alignment_for;
+    EXPECT_EQ(default_alignment_for(AtomOrigin::tls_directory),        8);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::tls_callback_array),   8);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::import_thunk),         8);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::reloc_pointer_slot),   8);
+    EXPECT_EQ(default_alignment_for(AtomOrigin::load_config_directory), 8);
+}
+
+TEST(AtomAlignment, IsPinnedReturnsTrueForAlignmentAboveOne) {
+    Atom a{0x1000, 8, AtomOrigin::tls_directory, /*alignment=*/8};
+    Atom b{0x2000, 8, AtomOrigin::instruction,   /*alignment=*/1};
+    EXPECT_TRUE(a.is_pinned());
+    EXPECT_FALSE(b.is_pinned());
+}
+
+TEST(AtomTableNormalize, OriginPolicyAlignmentApplied) {
+    // Source emits atoms without setting alignment — normalize must
+    // raise each to the origin's policy default.
+    AtomTable t;
+    t.add(Atom{0x1000, 16, AtomOrigin::instruction});
+    t.add(Atom{0x2000,  8, AtomOrigin::tls_directory});
+    t.add(Atom{0x3000,  8, AtomOrigin::import_thunk});
+    t.normalize();
+
+    ASSERT_EQ(t.size(), 3u);
+    EXPECT_EQ(t.atoms()[0].alignment, 1u) << "instruction → movable";
+    EXPECT_EQ(t.atoms()[1].alignment, 8u) << "tls_directory → pinned";
+    EXPECT_EQ(t.atoms()[2].alignment, 8u) << "import_thunk → pinned";
+}
+
+TEST(AtomTableNormalize, MergedAlignmentTakesMaximumOfInputs) {
+    // Movable + pinned that overlap → merged atom must stay pinned
+    // (alignment = max of inputs after policy floor applied).
+    AtomTable t;
+    t.add(Atom{0x1000, 16, AtomOrigin::instruction});
+    t.add(Atom{0x1008,  8, AtomOrigin::tls_directory});  // overlaps
+    t.normalize();
+
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_TRUE(t.atoms()[0].is_pinned())
+        << "movable + pinned overlap → pinned";
+    EXPECT_EQ(t.atoms()[0].alignment, 8u);
+}
+
+TEST(AtomTableNormalize, ExplicitAlignmentNotLoweredByPolicyFloor) {
+    // Source explicitly raises alignment past the origin's default —
+    // normalize() must not lower it.
+    AtomTable t;
+    Atom big_aligned{0x1000, 16, AtomOrigin::instruction, /*alignment=*/16};
+    t.add(big_aligned);
+    t.normalize();
+
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t.atoms()[0].alignment, 16u);
+}
+
 } // namespace

@@ -72,6 +72,59 @@ enum class AtomOrigin : std::uint8_t {
     delay_import_descriptor,     ///< `IMAGE_DELAYLOAD_DESCRIPTOR` (32B)
 };
 
+/**
+ * @brief Default alignment requirement keyed by `AtomOrigin`.
+ *
+ * Used by atom sources as a single source of truth: every atom's
+ * alignment derives from its origin tag, so adding a new origin
+ * means defining the right alignment in exactly one place. The
+ * planner pins every atom whose alignment is > 1.
+ *
+ * Categories:
+ *   * `1` — instructions, strings, import_by_name records, header
+ *     bytes (handled separately by the planner). Movable.
+ *   * `2` — UTF-16 codeunits, export ordinal table.
+ *   * `4` — PE-format records walked linearly (descriptors, reloc
+ *     blocks, RUNTIME_FUNCTION entries, debug directory, resource
+ *     nodes, …).
+ *   * `8` — slots the loader reads as 64-bit values: IAT thunks,
+ *     LOAD_CONFIG body, TLS directory + callback array, DIR64 reloc
+ *     target slots.
+ */
+[[nodiscard]] constexpr std::uint16_t default_alignment_for(
+    AtomOrigin o) noexcept
+{
+    switch (o) {
+        case AtomOrigin::pe_header:                 return 1;
+        case AtomOrigin::instruction:               return 1;
+        case AtomOrigin::instruction_undecoded:     return 1;
+        case AtomOrigin::ascii_string:              return 1;
+        case AtomOrigin::utf16_string:              return 2;
+        case AtomOrigin::import_by_name:            return 1;
+
+        case AtomOrigin::export_ordinal_table:      return 2;
+
+        case AtomOrigin::import_descriptor:         return 4;
+        case AtomOrigin::pdata_runtime_function:    return 4;
+        case AtomOrigin::reloc_block:               return 4;
+        case AtomOrigin::load_config_table:         return 4;
+        case AtomOrigin::export_directory:          return 4;
+        case AtomOrigin::export_address_table:      return 4;
+        case AtomOrigin::export_name_table:         return 4;
+        case AtomOrigin::resource_directory_node:   return 4;
+        case AtomOrigin::resource_data_entry:       return 4;
+        case AtomOrigin::debug_directory_entry:     return 4;
+        case AtomOrigin::delay_import_descriptor:   return 4;
+
+        case AtomOrigin::import_thunk:              return 8;
+        case AtomOrigin::reloc_pointer_slot:        return 8;
+        case AtomOrigin::load_config_directory:     return 8;
+        case AtomOrigin::tls_directory:             return 8;
+        case AtomOrigin::tls_callback_array:        return 8;
+    }
+    return 1;
+}
+
 [[nodiscard]] constexpr std::string_view atom_origin_name(
     AtomOrigin o) noexcept
 {
@@ -105,15 +158,39 @@ enum class AtomOrigin : std::uint8_t {
 
 /**
  * @brief One indivisible byte range with a diagnostic origin tag.
+ *
+ * The `alignment` field controls planner behaviour:
+ *
+ *   * `alignment == 1` — the default for instructions, strings, and
+ *     loose data: the atom may be placed at any RVA after shuffle.
+ *
+ *   * `alignment > 1` — the atom is **PINNED** at its original RVA.
+ *     Used for PE structures that the Windows loader reads with
+ *     alignment requirements (LOAD_CONFIG, TLS dir, IAT thunks,
+ *     CFG/XFG function-pointer tables, .pdata RUNTIME_FUNCTION
+ *     entries, etc). The planner does not attempt to find a new
+ *     aligned RVA — it simply leaves these atoms in place and
+ *     shuffles the bytes between them.
+ *
+ * The pin-on-alignment policy is a deliberate simplification: it
+ * keeps the planner free of new-RVA alignment-search logic, yet
+ * still permits up to ~85% of typical image bytes (instructions +
+ * strings + plain data) to be permuted.
  */
 struct Atom {
     Rva           start_rva;
     std::uint32_t size;
     AtomOrigin    origin;
+    std::uint16_t alignment{1};
 
     /// Half-open end — the first byte *after* this atom.
     [[nodiscard]] constexpr Rva end_rva() const noexcept {
         return static_cast<Rva>(start_rva + size);
+    }
+
+    /// `true` when the planner must keep this atom at its original RVA.
+    [[nodiscard]] constexpr bool is_pinned() const noexcept {
+        return alignment > 1;
     }
 
     /// Strict-less ordering by `start_rva`.
@@ -137,6 +214,9 @@ struct Atom {
  * surviving as the merged atom's origin. Earlier-origin (lower enum
  * value) wins ties — purely for diagnostic clarity, the planner
  * does not depend on it.
+ *
+ * The merged atom's `alignment` is `max` of the inputs', so a
+ * pinned atom merged with a movable one stays pinned.
  *
  * Move-only: an atom table is owned by exactly one pipeline run.
  */
