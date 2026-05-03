@@ -87,6 +87,18 @@ enum class ReferenceEncoding : std::uint8_t {
     rel,
     rva,
     absolute_va,
+    /// `rel32` whose anchor is **4 bytes before** the slot, not
+    /// `slot + width` — used by the VM `CallPop` trampoline shape:
+    ///
+    ///   call $+5                E8 00 00 00 00
+    ///   add  qword [rsp], imm32 48 81 04 24 imm32
+    ///   ret                     C3
+    ///
+    /// `imm32` encodes `target_rva - (call_after_rva)` where
+    /// `call_after_rva = slot_rva - 4`. The patcher rewrites the
+    /// `imm32` slot bytes; the surrounding `call`/`ret` opcodes
+    /// stay verbatim.
+    rel32_call_pop_anchored,
 };
 
 /**
@@ -117,6 +129,7 @@ enum class ReferenceOrigin : std::uint8_t {
     unwind_exception_handler, ///< UNWIND_INFO.ExceptionHandler (RVA, .reloc-free)
     unwind_chain_info,        ///< UNWIND_INFO.ChainInfo RUNTIME_FUNCTION RVAs (.reloc-free)
     switch_jump_table_entry,  ///< MSVC x64 switch JT entry (4-byte RVA, .reloc-free)
+    vm_call_pop_trampoline,   ///< imm32 in `add qword [rsp], imm32` of CallPop trampoline
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -144,6 +157,7 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::unwind_exception_handler: return "unwind-eh";
         case ReferenceOrigin::unwind_chain_info:      return "unwind-chain";
         case ReferenceOrigin::switch_jump_table_entry: return "switch-jt";
+        case ReferenceOrigin::vm_call_pop_trampoline:  return "vm-callpop";
     }
     return "unknown";
 }

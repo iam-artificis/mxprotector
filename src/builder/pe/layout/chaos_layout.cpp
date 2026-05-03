@@ -35,6 +35,7 @@
 #include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/switch_jump_table_scanner.hpp"
 #include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
+#include "mxprotector/pe/refmap/vm_call_pop_trampoline_scanner.hpp"
 #include "mxprotector/pe/section_intent.hpp"
 
 #include <algorithm>
@@ -268,7 +269,14 @@ void merge_into_unified_section(PeImage& image) {
     //    every C/C++ binary).
     refmap::SwitchJumpTableScanner{}.scan(image, table);
 
-    // 6. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
+    // 6. MxProtector VM `CallPop` trampolines —
+    //    `call $+5; add qword [rsp], imm32; ret` whose imm32 is a
+    //    rel32 anchored at `slot - 4` (call_after_rva). Zydis sees
+    //    the imm32 as a non-relative immediate so
+    //    `CodeReferenceScanner` does not produce a slot for it.
+    refmap::VmCallPopTrampolineScanner{}.scan(image, table);
+
+    // 7. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
     //    emitted. Catches any absolute-VA slot the targeted scanners
     //    missed (defence in depth).
     refmap::RelocAbsoluteVaScanner{}.scan(image, table);

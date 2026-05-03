@@ -57,6 +57,20 @@ namespace {
             std::memcpy(out.data(), &v, 8);
             break;
         }
+        case ReferenceEncoding::rel32_call_pop_anchored: {
+            // Anchor sits 4 bytes BEFORE the slot, not after — the
+            // slot lives inside `add qword [rsp], imm32` whose `add`
+            // RVA equals `slot_rva - 4`. That `add_rva` also equals
+            // the byte right after the preceding `call $+5`, which
+            // is the value the call pushed and the value the loader
+            // sees as the rel anchor.
+            const std::int64_t disp =
+                static_cast<std::int64_t>(new_target) -
+                (static_cast<std::int64_t>(new_location) - 4);
+            const auto v = static_cast<std::int32_t>(disp);
+            std::memcpy(out.data(), &v, 4);
+            break;
+        }
     }
     return out;
 }
