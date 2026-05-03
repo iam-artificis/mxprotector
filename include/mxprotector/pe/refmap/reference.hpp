@@ -99,6 +99,22 @@ enum class ReferenceEncoding : std::uint8_t {
     /// `imm32` slot bytes; the surrounding `call`/`ret` opcodes
     /// stay verbatim.
     rel32_call_pop_anchored,
+    /// `rel32` whose effective displacement is `(target - slot - 4) - K`,
+    /// for a build-time-known signed `K` carried in `aux`. Used by
+    /// indirect-call stubs whose first byte sequence is
+    ///
+    ///   lea rax, [rip + encoded_disp32]    ; rax = RIP + encoded
+    ///   <one or more ops that fold into adding K to rax>
+    ///   jmp rax                            ; rax = RIP + encoded + K = target
+    ///
+    /// `encoded_disp32` lives at `location_rva` (the LEA's disp32
+    /// slot). The patcher recomputes `encoded` whenever the target
+    /// moves so the chain still resolves to the right address. `K`
+    /// can be a single immediate or the algebraic sum of a chain of
+    /// `ADD`/`SUB`/`XOR-with-constant` operations — the encoder is
+    /// responsible for collapsing its chain into the single `K`
+    /// value that gets stored in `aux`.
+    rel32_with_imm_offset,
     /// 4-byte signed delta XORed with a per-dispatcher 32-bit
     /// build-time key — used by the obfuscated tail-dispatch jump
     /// table (CFG-flattening / VM tail dispatch):
@@ -149,6 +165,7 @@ enum class ReferenceOrigin : std::uint8_t {
     switch_jump_table_entry,  ///< MSVC x64 switch JT entry (4-byte RVA, .reloc-free)
     vm_call_pop_trampoline,   ///< imm32 in `add qword [rsp], imm32` of CallPop trampoline
     obfuscated_jt_entry,      ///< 4-byte XOR-encrypted signed delta in tail-dispatch JT
+    indirect_call_stub_lea,   ///< LEA disp32 inside a per-call-site indirect dispatch stub
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -178,6 +195,7 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::switch_jump_table_entry: return "switch-jt";
         case ReferenceOrigin::vm_call_pop_trampoline:  return "vm-callpop";
         case ReferenceOrigin::obfuscated_jt_entry:     return "obf-jt";
+        case ReferenceOrigin::indirect_call_stub_lea:  return "icall-stub";
     }
     return "unknown";
 }

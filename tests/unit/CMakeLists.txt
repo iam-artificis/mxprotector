@@ -69,6 +69,7 @@ set(TEST_SOURCES
     refmap_obfuscated_jt_scanner_test.cpp
     chaos_handler_table_integrity_refinalizer_test.cpp
     chaos_fall_through_jmp_filler_test.cpp
+    anti_static_encoder_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
     relocation_injector_test.cpp
@@ -228,6 +229,10 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/self_crc_refinalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/handler_table_integrity_refinalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/fall_through_jmp_filler.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoder_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/add_offset_encoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/xor_chain_encoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/sub_neg_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atom.cpp

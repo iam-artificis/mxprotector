@@ -56,6 +56,10 @@ set(BUILDER_SOURCES
     pe/chaos/self_crc_refinalizer.cpp
     pe/chaos/handler_table_integrity_refinalizer.cpp
     pe/chaos/fall_through_jmp_filler.cpp
+    protection/anti_static/encoder_registry.cpp
+    protection/anti_static/encoders/add_offset_encoder.cpp
+    protection/anti_static/encoders/xor_chain_encoder.cpp
+    protection/anti_static/encoders/sub_neg_encoder.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
     pe/chaos/atom.cpp
