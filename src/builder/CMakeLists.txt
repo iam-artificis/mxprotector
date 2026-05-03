@@ -64,6 +64,7 @@ set(BUILDER_SOURCES
     pe/chaos/resource_atom_source.cpp
     pe/chaos/debug_atom_source.cpp
     pe/chaos/delay_import_atom_source.cpp
+    pe/chaos/volatile_metadata_atom_source.cpp
     pe/chaos/atomic_chunk_planner.cpp
 
     # Модуль анализа

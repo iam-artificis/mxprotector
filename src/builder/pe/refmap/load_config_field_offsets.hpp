@@ -35,4 +35,9 @@ constexpr std::uint32_t kOffGuardLongJumpTargetCount        = 184;
 constexpr std::uint32_t kOffGuardEHContinuationTable        = 264;
 constexpr std::uint32_t kOffGuardEHContinuationCount        = 272;
 
+constexpr std::uint32_t kOffDynamicValueRelocTable          = 192;
+constexpr std::uint32_t kOffCHPEMetadataPointer             = 200;
+constexpr std::uint32_t kOffEnclaveConfigurationPointer     = 248;
+constexpr std::uint32_t kOffVolatileMetadataPointer         = 256;
+
 } // namespace mx::pe::refmap::lcfg
