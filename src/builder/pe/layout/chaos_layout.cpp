@@ -248,10 +248,37 @@ void merge_into_unified_section(PeImage& image) {
     return table;
 }
 
-/// Run the post-merge fragment shuffle: plan chunks (uses the
-/// PRE-merge image's section info), merge into the unified section,
-/// shuffle bytes inside the unified section, then patch every
-/// reference in the table to point at its post-shuffle target.
+/// Run the post-merge fragment shuffle. Uses the fixed-256B
+/// `ChunkPlanner` (B.4.7) which pins entire sections containing
+/// DataDirectory entries plus LOAD_CONFIG-pointed table sections.
+///
+/// The B.4.9 atom-based planner (`chaos::AtomicChunkPlanner` plus
+/// 13 atom sources) is implemented and unit-tested but NOT yet
+/// wired here. Replacing the production planner with the atomic
+/// one requires solving three sub-problems first:
+///
+///   1. **Alignment** — atoms get packed back-to-back regardless
+///      of alignment. CFG/XFG function-pointer slots inside
+///      LOAD_CONFIG and other 8-byte aligned PE structures get
+///      placed at unaligned RVAs after shuffle, which the Windows
+///      loader rejects on module load.
+///
+///   2. **`.reloc` rebuild** — every relocatable slot moves to a
+///      new RVA, but the existing `.reloc` page-RVA + offset
+///      entries still point at the OLD positions. Stripping
+///      relocs sacrifices ASLR; rebuilding `.reloc` post-shuffle
+///      is the proper fix.
+///
+///   3. **Sub-directory atom coverage** — LOAD_CONFIG carries
+///      pointers to volatile-metadata blocks, XFG dispatch
+///      tables, and similar substructures whose targets aren't
+///      yet covered by a dedicated atom source. Without coverage
+///      those bytes shuffle freely and break the runtime.
+///
+/// The atomic infrastructure (B.4.9.1-6) is shipped as foundation
+/// for that follow-up. For production, `--chaos-shuffle` continues
+/// to use the fixed-chunk planner — verified end-to-end on
+/// `test_vm_showcase` across all four protection levels in B.4.8.7.
 void apply_fragment_shuffle(PeImage& image) {
     if (image.sections().size() < 2) return;
 
@@ -261,9 +288,7 @@ void apply_fragment_shuffle(PeImage& image) {
     // Phase 2 — plan chunks. Pinned set computed from pre-merge
     // sections + DataDirectory layout so .text + dir bodies are
     // anchored. LOAD_CONFIG-pointed table sections are pinned via
-    // `compute_load_config_target_pins` — the CFG / SEH / IAT-taken /
-    // longjmp / EH-cont tables must stay contiguous post-shuffle, so
-    // we cannot let chunks slice through them.
+    // `compute_load_config_target_pins`.
     Randomizer rng;
     chaos::ChunkPlanner planner;
     const auto extra_pins = chaos::compute_load_config_target_pins(image);
@@ -281,10 +306,7 @@ void apply_fragment_shuffle(PeImage& image) {
     }
 
     // Phase 5 — patch every reference's slot at its post-shuffle
-    // location to point at its post-shuffle target. The returned
-    // `PatchStats` is intentionally discarded — the fragment
-    // shuffler does not log per build, and unresolvable slots are
-    // already fail-soft inside the patcher.
+    // location to point at its post-shuffle target.
     refmap::ReferencePatcher patcher;
     [[maybe_unused]] const auto stats =
         patcher.apply(image, refs, remapper);

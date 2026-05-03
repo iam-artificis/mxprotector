@@ -275,7 +275,7 @@ TEST(DelayImportAtomSource, NoOpWhenDirectoryEmpty) {
     EXPECT_EQ(t.size(), 0u);
 }
 
-TEST(DelayImportAtomSource, EmitsAtomPerDescriptorPlusTerminator) {
+TEST(DelayImportAtomSource, EmitsArrayAsSingleAtom) {
     PeImage img = make_pe32plus_image();
     std::vector<std::uint8_t> bytes(64, 0);
     // descriptor[0] at off 0: Attributes=1.
@@ -292,8 +292,9 @@ TEST(DelayImportAtomSource, EmitsAtomPerDescriptorPlusTerminator) {
     AtomTable t;
     s.emit_atoms(img, t);
 
-    EXPECT_GE(count_origin(t, AtomOrigin::delay_import_descriptor), 2)
-        << "one for the populated descriptor + one for the terminator";
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t.atoms()[0].size, 64u)
+        << "one populated descriptor + terminator = 2 × 32B";
 }
 
 } // namespace

@@ -115,7 +115,7 @@ TEST(ImportAtomSource, NoOpWhenImportEmpty) {
     EXPECT_EQ(t.size(), 0u);
 }
 
-TEST(ImportAtomSource, DescriptorAndTerminatorEmitted) {
+TEST(ImportAtomSource, DescriptorArrayEmittedAsOneAtom) {
     PeImage img = make_pe32plus_image();
 
     std::vector<std::uint8_t> bytes;
@@ -134,8 +134,18 @@ TEST(ImportAtomSource, DescriptorAndTerminatorEmitted) {
     AtomTable t;
     s.emit_atoms(img, t);
 
-    EXPECT_EQ(count_origin(t, AtomOrigin::import_descriptor), 1)
-        << "all-zero descriptor at offset 0 = terminator only";
+    // ONE atom covers all descriptors (here just the terminator,
+    // counted as 1 descriptor = 20 bytes).
+    EXPECT_EQ(count_origin(t, AtomOrigin::import_descriptor), 1);
+    bool found = false;
+    for (const auto& a : t.atoms()) {
+        if (a.origin == AtomOrigin::import_descriptor) {
+            EXPECT_EQ(a.start_rva, sec);
+            EXPECT_EQ(a.size,      20u);
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found);
 }
 
 TEST(ImportAtomSource, ThunksAndByNameRecordsEmitted) {
@@ -179,8 +189,14 @@ TEST(ImportAtomSource, ThunksAndByNameRecordsEmitted) {
     AtomTable t;
     s.emit_atoms(img, t);
 
-    EXPECT_GE(count_origin(t, AtomOrigin::import_descriptor), 2);
-    EXPECT_GE(count_origin(t, AtomOrigin::import_thunk),      2);
+    // ONE descriptor-array atom (covers desc[0] + terminator = 40B).
+    EXPECT_EQ(count_origin(t, AtomOrigin::import_descriptor), 1);
+    // import_thunk: OFT + FT alias the same array, each scan emits
+    // one atom — duplicates get merged at planner time via
+    // AtomTable::normalize().
+    EXPECT_GE(count_origin(t, AtomOrigin::import_thunk),      1);
+    // import_by_name: same alias situation; >= 1 is the contract,
+    // duplicates collapse during normalize().
     EXPECT_GE(count_origin(t, AtomOrigin::import_by_name),    1);
 
     bool found_by_name = false;
@@ -209,7 +225,7 @@ TEST(PdataAtomSource, NoOpOnPe32) {
     EXPECT_EQ(t.size(), 0u);
 }
 
-TEST(PdataAtomSource, OneAtomPerRuntimeFunction) {
+TEST(PdataAtomSource, WholeArrayEmittedAsOneAtom) {
     PeImage img = make_pe32plus_image();
 
     std::vector<std::uint8_t> bytes;
@@ -226,13 +242,11 @@ TEST(PdataAtomSource, OneAtomPerRuntimeFunction) {
     AtomTable t;
     s.emit_atoms(img, t);
 
-    ASSERT_EQ(t.size(), 3u);
-    for (std::size_t i = 0; i < 3; ++i) {
-        EXPECT_EQ(t.atoms()[i].start_rva, sec + i * 12);
-        EXPECT_EQ(t.atoms()[i].size,      12u);
-        EXPECT_EQ(t.atoms()[i].origin,
-                  AtomOrigin::pdata_runtime_function);
-    }
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t.atoms()[0].start_rva, sec);
+    EXPECT_EQ(t.atoms()[0].size,      36u) << "3 entries × 12 B";
+    EXPECT_EQ(t.atoms()[0].origin,
+              AtomOrigin::pdata_runtime_function);
 }
 
 // ---------------------------------------------------------------------------

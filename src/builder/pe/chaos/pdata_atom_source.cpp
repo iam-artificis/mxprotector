@@ -65,15 +65,16 @@ void PdataAtomSource::emit_atoms(
 
     const std::uint32_t entry_count =
         static_cast<std::uint32_t>(walk_size / kRuntimeFunctionSize);
+    if (entry_count == 0) return;
 
-    for (std::uint32_t i = 0; i < entry_count; ++i) {
-        out.add(Atom{
-            .start_rva = static_cast<Rva>(
-                loc.rva + i * kRuntimeFunctionSize),
-            .size      = kRuntimeFunctionSize,
-            .origin    = AtomOrigin::pdata_runtime_function,
-        });
-    }
+    // ONE atom for the whole .pdata array. The runtime unwinder
+    // walks RUNTIME_FUNCTION entries linearly, sorted by
+    // BeginAddress, so the array bytes must stay contiguous.
+    out.add(Atom{
+        .start_rva = loc.rva,
+        .size      = entry_count * kRuntimeFunctionSize,
+        .origin    = AtomOrigin::pdata_runtime_function,
+    });
 }
 
 } // namespace mx::pe::chaos

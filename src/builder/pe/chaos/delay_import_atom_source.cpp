@@ -83,19 +83,26 @@ void DelayImportAtomSource::emit_atoms(
         ? loc.size / kDescriptorSize + 1
         : 1024;
 
-    Rva cursor = loc.rva;
+    // Count descriptors (including the all-zero terminator), then
+    // emit ONE atom for the whole array. Loader walks descriptors
+    // linearly until the terminator, so array bytes must stay
+    // contiguous.
+    Rva           cursor = loc.rva;
+    std::uint32_t count  = 0;
     for (std::uint32_t i = 0; i < max_entries; ++i) {
         const auto desc = read_descriptor(image, cursor);
         if (!desc) break;
-
-        out.add(Atom{
-            .start_rva = cursor,
-            .size      = kDescriptorSize,
-            .origin    = AtomOrigin::delay_import_descriptor,
-        });
-
+        ++count;
         if (is_terminator(*desc)) break;
         cursor = static_cast<Rva>(cursor + kDescriptorSize);
+    }
+
+    if (count > 0) {
+        out.add(Atom{
+            .start_rva = loc.rva,
+            .size      = count * kDescriptorSize,
+            .origin    = AtomOrigin::delay_import_descriptor,
+        });
     }
 }
 
