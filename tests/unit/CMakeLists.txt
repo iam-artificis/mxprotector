@@ -49,6 +49,7 @@ set(TEST_SOURCES
     refmap_export_directory_scanner_test.cpp
     refmap_delay_import_descriptor_scanner_test.cpp
     refmap_tls_directory_scanner_test.cpp
+    refmap_load_config_directory_scanner_test.cpp
     refmap_reference_patcher_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
@@ -196,6 +197,8 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/export_directory_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/delay_import_descriptor_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/tls_directory_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/load_config_directory_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/load_config_table_walker.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
