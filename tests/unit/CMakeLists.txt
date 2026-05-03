@@ -41,6 +41,7 @@ set(TEST_SOURCES
     chaos_layout_test.cpp
     chaos_reference_test.cpp
     chaos_code_reference_scanner_test.cpp
+    chaos_structure_reference_scanner_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
     relocation_injector_test.cpp
@@ -181,6 +182,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/rva_remapper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/code_reference_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/structure_reference_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp
