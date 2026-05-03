@@ -42,6 +42,7 @@ set(BUILDER_SOURCES
     pe/refmap/import_descriptor_scanner.cpp
     pe/refmap/export_directory_scanner.cpp
     pe/refmap/delay_import_descriptor_scanner.cpp
+    pe/refmap/tls_directory_scanner.cpp
     pe/refmap/reference_patcher.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
