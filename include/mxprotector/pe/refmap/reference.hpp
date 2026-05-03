@@ -102,6 +102,18 @@ enum class ReferenceOrigin : std::uint8_t {
     entry_point,
     pdata_runtime_function,
     reloc_absolute_va,
+    import_descriptor,        ///< IMAGE_IMPORT_DESCRIPTOR.{Name,OriginalFirstThunk,FirstThunk}
+    import_thunk,             ///< INT/IAT thunk → IMAGE_IMPORT_BY_NAME (low 4B of 8B slot)
+    export_directory,         ///< IMAGE_EXPORT_DIRECTORY.{Name,AddressOf*}
+    export_function_rva,      ///< Single EAT entry → function/forwarder RVA
+    export_name_rva,          ///< Single name pointer → ASCIIZ name string RVA
+    delay_import_descriptor,  ///< IMAGE_DELAYLOAD_DESCRIPTOR.{DllNameRVA,*RVA}
+    delay_import_thunk,       ///< Delay-load thunk → IMAGE_IMPORT_BY_NAME
+    tls_directory,            ///< IMAGE_TLS_DIRECTORY field (absolute VA)
+    tls_callback,              ///< Single callback in TLS callback array (absolute VA)
+    load_config_directory,    ///< IMAGE_LOAD_CONFIG_DIRECTORY VA-bearing field
+    load_config_table_entry,  ///< Single entry in CFG/SEH/etc. table (absolute VA / RVA)
+    resource_data_entry,      ///< IMAGE_RESOURCE_DATA_ENTRY.OffsetToData (RVA)
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -114,6 +126,18 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::entry_point:            return "entry";
         case ReferenceOrigin::pdata_runtime_function: return "pdata";
         case ReferenceOrigin::reloc_absolute_va:      return "reloc-va";
+        case ReferenceOrigin::import_descriptor:      return "import-desc";
+        case ReferenceOrigin::import_thunk:           return "import-thunk";
+        case ReferenceOrigin::export_directory:       return "export-dir";
+        case ReferenceOrigin::export_function_rva:    return "export-fn";
+        case ReferenceOrigin::export_name_rva:        return "export-name";
+        case ReferenceOrigin::delay_import_descriptor: return "delay-desc";
+        case ReferenceOrigin::delay_import_thunk:     return "delay-thunk";
+        case ReferenceOrigin::tls_directory:          return "tls-dir";
+        case ReferenceOrigin::tls_callback:           return "tls-cb";
+        case ReferenceOrigin::load_config_directory:  return "lcfg-dir";
+        case ReferenceOrigin::load_config_table_entry: return "lcfg-tab";
+        case ReferenceOrigin::resource_data_entry:    return "rsrc-data";
     }
     return "unknown";
 }

@@ -39,6 +39,7 @@ set(BUILDER_SOURCES
     pe/refmap/code_reference_scanner.cpp
     pe/refmap/structure_reference_scanner.cpp
     pe/refmap/reloc_absolute_va_scanner.cpp
+    pe/refmap/import_descriptor_scanner.cpp
     pe/refmap/reference_patcher.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
