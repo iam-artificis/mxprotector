@@ -57,10 +57,20 @@ struct Range {
 };
 
 /// Boundary alignment for every chunk emitted into the remapper.
-/// 8-byte alignment guarantees that no naturally-aligned 64-bit
-/// value is split across a chunk boundary — the most common
-/// failure mode of the byte-granular shuffle.
-constexpr std::uint32_t kChunkAlignment = 8;
+/// 4-byte alignment matches MSVC's natural function-boundary
+/// granularity (`/Gy` linker output) — most function `BeginAddress`
+/// / `EndAddress` pairs in `.pdata` already land on 4-aligned RVAs.
+/// 8-byte alignment was overly conservative: it pinned ~91% of the
+/// functions in a typical `/O2` MSVC build via the alignment-
+/// mismatch path, defeating the shuffle.
+///
+/// 4-byte chunks still preserve every 32-bit value (rel32, RVA,
+/// imm32, dword tables) as a single un-split unit. 64-bit absolute
+/// VAs stored in `.reloc`-relocated DIR64 slots ARE always
+/// 8-aligned (linker invariant for `IMAGE_REL_BASED_DIR64`), and
+/// `RelocPointerAtomSource` pins each such 8-byte slot explicitly,
+/// so the 4-byte chunk granularity does not split them.
+constexpr std::uint32_t kChunkAlignment = 4;
 
 [[nodiscard]] constexpr Rva align_down_rva(
     Rva value, std::uint32_t alignment) noexcept

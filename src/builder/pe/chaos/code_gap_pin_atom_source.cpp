@@ -106,8 +106,34 @@ void emit_pin(Rva start, Rva end, AtomTable& out) {
     });
 }
 
+/// True when every byte at `[start, end)` reads as `0xCC` (`INT 3`)
+/// inside `sec.data`. Used to identify pure-padding gaps that
+/// `FunctionAtomSource` will absorb into the adjacent function
+/// atom; we skip pinning them so the function atom stays movable.
+[[nodiscard]] bool is_int3_only(
+    const pe::SectionInfo& sec,
+    Rva                    start,
+    Rva                    end) noexcept
+{
+    if (end <= start) return true;
+    if (start < sec.virtual_address) return false;
+    const auto off = start - sec.virtual_address;
+    const auto count = static_cast<std::size_t>(end - start);
+    if (off + count > sec.data.size()) return false;
+    const std::uint8_t* p = sec.data.data() + off;
+    for (std::size_t k = 0; k < count; ++k) {
+        if (p[k] != 0xCC) return false;
+    }
+    return true;
+}
+
 /// For one code section, emit pinned atoms covering every byte
-/// that does NOT fall inside any `.pdata`-listed function range.
+/// that does NOT fall inside any `.pdata`-listed function range
+/// AND that contains real (non-`0xCC`) content. Pure-`INT 3`
+/// padding is left unpinned: `FunctionAtomSource` extends the
+/// adjacent function's atom over that padding so the function
+/// becomes 8-aligned at the boundary and can participate in the
+/// shuffle as a movable chunk.
 void pin_gaps_in_code_section(
     const pe::SectionInfo&        sec,
     const std::vector<FuncRange>& funcs,
@@ -125,12 +151,16 @@ void pin_gaps_in_code_section(
         const Rva fn_start = std::max(f.start, sec_start);
         const Rva fn_end   = std::min(f.end,   sec_end);
         if (cursor < fn_start) {
-            emit_pin(cursor, fn_start, out);
+            if (!is_int3_only(sec, cursor, fn_start)) {
+                emit_pin(cursor, fn_start, out);
+            }
         }
         if (fn_end > cursor) cursor = fn_end;
     }
     if (cursor < sec_end) {
-        emit_pin(cursor, sec_end, out);
+        if (!is_int3_only(sec, cursor, sec_end)) {
+            emit_pin(cursor, sec_end, out);
+        }
     }
 }
 
