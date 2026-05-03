@@ -47,6 +47,7 @@ set(BUILDER_SOURCES
     pe/refmap/load_config_table_walker.cpp
     pe/refmap/resource_directory_scanner.cpp
     pe/refmap/reference_patcher.cpp
+    pe/refmap/reloc_rebuilder.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
