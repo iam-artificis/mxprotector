@@ -49,6 +49,7 @@ set(BUILDER_SOURCES
     pe/refmap/reference_patcher.cpp
     pe/refmap/reloc_rebuilder.cpp
     pe/refmap/unwind_info_reference_scanner.cpp
+    pe/refmap/switch_jump_table_scanner.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp

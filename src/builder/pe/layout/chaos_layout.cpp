@@ -33,6 +33,7 @@
 #include "mxprotector/pe/refmap/unwind_info_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/rva_remapper.hpp"
 #include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
+#include "mxprotector/pe/refmap/switch_jump_table_scanner.hpp"
 #include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
 #include "mxprotector/pe/section_intent.hpp"
 
@@ -258,7 +259,16 @@ void merge_into_unified_section(PeImage& image) {
     //    keep stale handler RVAs and crash the moment SEH dispatches.
     refmap::UnwindInfoReferenceScanner{}.scan(image, table);
 
-    // 5. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
+    // 5. MSVC x64 switch jump tables — the
+    //    `mov r32, [imageBase + idx*4 + JT_RVA] / add / jmp r64`
+    //    dispatcher reads 4-byte RVAs from `.rdata` that, like
+    //    UNWIND_INFO trailers, are image-relative and hence not in
+    //    `.reloc`. Found in every binary that uses the CRT
+    //    `__memmove_avx2` / `__memset_avx2` family (i.e. essentially
+    //    every C/C++ binary).
+    refmap::SwitchJumpTableScanner{}.scan(image, table);
+
+    // 6. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
     //    emitted. Catches any absolute-VA slot the targeted scanners
     //    missed (defence in depth).
     refmap::RelocAbsoluteVaScanner{}.scan(image, table);

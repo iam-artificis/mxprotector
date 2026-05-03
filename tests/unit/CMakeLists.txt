@@ -63,6 +63,7 @@ set(TEST_SOURCES
     refmap_resource_directory_scanner_test.cpp
     refmap_reference_patcher_test.cpp
     refmap_reloc_rebuilder_test.cpp
+    refmap_switch_jump_table_scanner_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
     relocation_injector_test.cpp
@@ -215,6 +216,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reloc_rebuilder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/unwind_info_reference_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/switch_jump_table_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp

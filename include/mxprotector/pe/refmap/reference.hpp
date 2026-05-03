@@ -116,6 +116,7 @@ enum class ReferenceOrigin : std::uint8_t {
     resource_data_entry,      ///< IMAGE_RESOURCE_DATA_ENTRY.OffsetToData (RVA)
     unwind_exception_handler, ///< UNWIND_INFO.ExceptionHandler (RVA, .reloc-free)
     unwind_chain_info,        ///< UNWIND_INFO.ChainInfo RUNTIME_FUNCTION RVAs (.reloc-free)
+    switch_jump_table_entry,  ///< MSVC x64 switch JT entry (4-byte RVA, .reloc-free)
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -142,6 +143,7 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::resource_data_entry:    return "rsrc-data";
         case ReferenceOrigin::unwind_exception_handler: return "unwind-eh";
         case ReferenceOrigin::unwind_chain_info:      return "unwind-chain";
+        case ReferenceOrigin::switch_jump_table_entry: return "switch-jt";
     }
     return "unknown";
 }
