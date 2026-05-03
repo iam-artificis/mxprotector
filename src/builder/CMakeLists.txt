@@ -35,10 +35,10 @@ set(BUILDER_SOURCES
     pe/relocation_injector.cpp
     pe/layout/standard_layout.cpp
     pe/layout/chaos_layout.cpp
-    pe/chaos/rva_remapper.cpp
-    pe/chaos/code_reference_scanner.cpp
-    pe/chaos/structure_reference_scanner.cpp
-    pe/chaos/reloc_absolute_va_scanner.cpp
+    pe/refmap/rva_remapper.cpp
+    pe/refmap/code_reference_scanner.cpp
+    pe/refmap/structure_reference_scanner.cpp
+    pe/refmap/reloc_absolute_va_scanner.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp

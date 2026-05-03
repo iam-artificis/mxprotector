@@ -1,0 +1,5 @@
+[test_vm_basic] start
+[test_vm_basic] a=0x00000002C0B3DA57
+[test_vm_basic] b=0x00000001483B63DE
+[test_vm_basic] c=0x00000001AFB52695
+[test_vm_basic] ALL CHECKS PASSED

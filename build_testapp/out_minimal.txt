@@ -1,0 +1,6 @@
+[test_exception] start
+[test_exception] int path OK
+[test_exception] runtime_error path OK
+[test_exception] string path OK
+[test_exception] nested path OK (4 iterations)
+[test_exception] ALL 4 PATHS PASSED
