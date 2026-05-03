@@ -51,6 +51,7 @@ set(BUILDER_SOURCES
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
     pe/chaos/atom.cpp
+    pe/chaos/instruction_atom_source.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp
