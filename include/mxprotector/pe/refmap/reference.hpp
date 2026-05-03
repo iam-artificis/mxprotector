@@ -99,6 +99,24 @@ enum class ReferenceEncoding : std::uint8_t {
     /// `imm32` slot bytes; the surrounding `call`/`ret` opcodes
     /// stay verbatim.
     rel32_call_pop_anchored,
+    /// 4-byte signed delta XORed with a per-dispatcher 32-bit
+    /// build-time key — used by the obfuscated tail-dispatch jump
+    /// table (CFG-flattening / VM tail dispatch):
+    ///
+    ///   lea  base, [rip + jt_disp]
+    ///   mov  eax,  [base + rax*4]      ; load encrypted entry
+    ///   xor  eax,  KEY                  ; decrypt
+    ///   movsxd rax, eax                  ; sign-extend
+    ///   add  base, rax                   ; jt_base + delta
+    ///   jmp  base   /  push base; ret
+    ///
+    /// The on-disk slot stores
+    /// `(target_rva - jt_base_rva) XOR KEY` (lower 32 bits only). The
+    /// patcher reads the new target from `target_rva`, recomputes
+    /// `(new_target - jt_base_rva)`, and re-encrypts with `KEY`. Both
+    /// `jt_base_rva` and `KEY` are carried per-reference in
+    /// `Reference::aux` (high 32 bits = jt_base_rva, low 32 = KEY).
+    xor_encoded_signed_delta_imm32,
 };
 
 /**
@@ -130,6 +148,7 @@ enum class ReferenceOrigin : std::uint8_t {
     unwind_chain_info,        ///< UNWIND_INFO.ChainInfo RUNTIME_FUNCTION RVAs (.reloc-free)
     switch_jump_table_entry,  ///< MSVC x64 switch JT entry (4-byte RVA, .reloc-free)
     vm_call_pop_trampoline,   ///< imm32 in `add qword [rsp], imm32` of CallPop trampoline
+    obfuscated_jt_entry,      ///< 4-byte XOR-encrypted signed delta in tail-dispatch JT
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -158,6 +177,7 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::unwind_chain_info:      return "unwind-chain";
         case ReferenceOrigin::switch_jump_table_entry: return "switch-jt";
         case ReferenceOrigin::vm_call_pop_trampoline:  return "vm-callpop";
+        case ReferenceOrigin::obfuscated_jt_entry:     return "obf-jt";
     }
     return "unknown";
 }
@@ -173,6 +193,12 @@ enum class ReferenceOrigin : std::uint8_t {
  *   * `width`        — bytes the slot occupies.
  *   * `encoding`     — how the slot encodes the target (see enum).
  *   * `origin`       — diagnostic tag.
+ *   * `aux`          — encoding-specific auxiliary data. Default 0,
+ *                      ignored by every encoding except
+ *                      `xor_encoded_signed_delta_imm32`, which packs
+ *                      `(jt_base_rva << 32) | KEY` here so the
+ *                      patcher can compute and re-encrypt the new
+ *                      delta without consulting any side table.
  */
 struct Reference {
     Rva               location_rva;
@@ -180,8 +206,33 @@ struct Reference {
     ReferenceWidth    width;
     ReferenceEncoding encoding;
     ReferenceOrigin   origin;
+    std::uint64_t     aux = 0;
 
     [[nodiscard]] constexpr bool operator==(const Reference&) const noexcept = default;
+
+    /// Helper: pack `(jt_base_rva, key)` into the `aux` field for
+    /// the `xor_encoded_signed_delta_imm32` encoding. Returns the
+    /// packed value; callers assign directly to `aux`.
+    [[nodiscard]] static constexpr std::uint64_t pack_xor_aux(
+        Rva jt_base_rva, std::uint32_t key) noexcept
+    {
+        return (static_cast<std::uint64_t>(jt_base_rva) << 32) |
+               static_cast<std::uint64_t>(key);
+    }
+
+    /// Helper: unpack the JT base RVA from a packed `aux` value.
+    [[nodiscard]] static constexpr Rva unpack_xor_jt_base(
+        std::uint64_t aux) noexcept
+    {
+        return static_cast<Rva>(aux >> 32);
+    }
+
+    /// Helper: unpack the XOR key from a packed `aux` value.
+    [[nodiscard]] static constexpr std::uint32_t unpack_xor_key(
+        std::uint64_t aux) noexcept
+    {
+        return static_cast<std::uint32_t>(aux & 0xFFFFFFFFu);
+    }
 };
 
 /**

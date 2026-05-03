@@ -71,6 +71,22 @@ namespace {
             std::memcpy(out.data(), &v, 4);
             break;
         }
+        case ReferenceEncoding::xor_encoded_signed_delta_imm32: {
+            // Slot stores `(target_rva - jt_base_rva) XOR KEY` in 32
+            // bits. Both `jt_base_rva` and `KEY` ride along in the
+            // reference's `aux` field — the JT base is in `.rdata`
+            // and stays put across the shuffle, so we recompute the
+            // delta from the new target alone and re-encrypt.
+            const auto jt_base = Reference::unpack_xor_jt_base(ref.aux);
+            const auto key     = Reference::unpack_xor_key(ref.aux);
+            const std::int32_t delta =
+                static_cast<std::int32_t>(new_target) -
+                static_cast<std::int32_t>(jt_base);
+            const std::uint32_t encoded =
+                static_cast<std::uint32_t>(delta) ^ key;
+            std::memcpy(out.data(), &encoded, 4);
+            break;
+        }
     }
     return out;
 }

@@ -51,6 +51,7 @@ set(BUILDER_SOURCES
     pe/refmap/unwind_info_reference_scanner.cpp
     pe/refmap/switch_jump_table_scanner.cpp
     pe/refmap/vm_call_pop_trampoline_scanner.cpp
+    pe/refmap/obfuscated_jt_scanner.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/self_crc_refinalizer.cpp
     pe/chaos/chaos_shuffler.cpp

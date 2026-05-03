@@ -33,6 +33,7 @@
 #include "mxprotector/pe/refmap/resource_directory_scanner.hpp"
 #include "mxprotector/pe/refmap/unwind_info_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/rva_remapper.hpp"
+#include "mxprotector/pe/refmap/obfuscated_jt_scanner.hpp"
 #include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/switch_jump_table_scanner.hpp"
 #include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
@@ -269,6 +270,17 @@ void merge_into_unified_section(PeImage& image) {
     //    `__memmove_avx2` / `__memset_avx2` family (i.e. essentially
     //    every C/C++ binary).
     refmap::SwitchJumpTableScanner{}.scan(image, table);
+
+    // 5a. Obfuscated tail-dispatch jump tables — the VM tail
+    //     dispatch (`x64_handlers.cpp::emit_tail_dispatch`) emits a
+    //     7-instruction `lea + mov + xor + movsxd + add + jmp/push;ret`
+    //     dispatcher whose JT entries are
+    //     `(target_rva - jt_base_rva) XOR KEY`. The KEY rides along
+    //     in the on-disk `xor eax, imm32` instruction; the scanner
+    //     extracts it and emits one `xor_encoded_signed_delta_imm32`
+    //     reference per entry so the patcher can re-encrypt the
+    //     entry after chaos relocates the target.
+    refmap::ObfuscatedJtScanner{}.scan(image, table);
 
     // 6. MxProtector VM `CallPop` trampolines —
     //    `call $+5; add qword [rsp], imm32; ret` whose imm32 is a
