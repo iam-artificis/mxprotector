@@ -39,6 +39,7 @@ set(BUILDER_SOURCES
     pe/refmap/code_reference_scanner.cpp
     pe/refmap/structure_reference_scanner.cpp
     pe/refmap/reloc_absolute_va_scanner.cpp
+    pe/chaos/chunk_planner.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp

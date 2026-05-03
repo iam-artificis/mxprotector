@@ -39,6 +39,7 @@ set(TEST_SOURCES
     section_intent_test.cpp
     layout_policy_test.cpp
     chaos_layout_test.cpp
+    chaos_chunk_planner_test.cpp
     refmap_reference_test.cpp
     refmap_code_reference_scanner_test.cpp
     refmap_structure_reference_scanner_test.cpp
@@ -185,6 +186,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/code_reference_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/structure_reference_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reloc_absolute_va_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pipeline.cpp
