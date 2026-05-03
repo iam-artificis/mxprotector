@@ -214,6 +214,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/resource_directory_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_patcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reloc_rebuilder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/unwind_info_reference_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
@@ -232,6 +233,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/delay_import_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/volatile_metadata_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/data_section_pin_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/code_gap_pin_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/function_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atomic_chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp

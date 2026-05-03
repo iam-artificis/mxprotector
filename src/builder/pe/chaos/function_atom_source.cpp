@@ -153,21 +153,29 @@ void FunctionAtomSource::emit_atoms(
                   return a.begin_address < b.begin_address;
               });
 
-    // Pass 2 — emit one atom per function with its real range:
-    // start rounded DOWN to 8, end rounded UP to 8. Adjacent
-    // entries' atoms may overlap by up to 7 bytes when functions
-    // are tightly packed; `AtomTable::normalize` merges overlapping
-    // atoms into one larger movable unit.
+    // Pass 2 — emit one atom per function covering its EXACT
+    // `.pdata` range. Critically, we do NOT pad start/end to a
+    // larger alignment: doing so absorbs bytes adjacent to the
+    // function (inter-function thunks, hot-patch pads, link-time
+    // jump pads) into the atom. Those bytes are still real
+    // instructions whose other half lives outside the atom,
+    // and the shuffle would split them across non-contiguous
+    // chunks. Aligning to function boundaries == aligning to
+    // instruction boundaries, which is the strictest guarantee
+    // the chaos shuffle can offer for code without rewriting
+    // control flow.
+    //
+    // The atomic planner skips atoms whose boundaries are not
+    // 8-aligned (passthrough), so functions whose entry isn't
+    // 8-aligned simply don't shuffle. That's a strictly safe
+    // choice — those functions execute from their original RVA.
     for (const auto& rf : entries) {
-        const std::uint32_t aligned_start =
-            align_down_u32(rf.begin_address, kBoundaryAlignment);
-        const std::uint32_t aligned_end =
-            align_up_u32(rf.end_address, kBoundaryAlignment);
-        if (aligned_end <= aligned_start) continue;
+        const std::uint32_t size = rf.end_address - rf.begin_address;
+        if (size == 0) continue;
 
         out.add(Atom{
-            .start_rva = aligned_start,
-            .size      = aligned_end - aligned_start,
+            .start_rva = static_cast<Rva>(rf.begin_address),
+            .size      = size,
             .origin    = AtomOrigin::instruction,
         });
     }

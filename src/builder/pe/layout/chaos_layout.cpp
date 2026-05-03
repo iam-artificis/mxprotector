@@ -6,9 +6,18 @@
 #include "mxprotector/pe/layout/chaos_layout.hpp"
 
 #include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/pe/chaos/atomic_chunk_planner.hpp"
 #include "mxprotector/pe/chaos/chaos_shuffler.hpp"
-#include "mxprotector/pe/chaos/chunk_planner.hpp"
-#include "mxprotector/pe/chaos/load_config_pin_helper.hpp"
+#include "mxprotector/pe/chaos/code_gap_pin_atom_source.hpp"
+#include "mxprotector/pe/chaos/data_section_pin_atom_source.hpp"
+#include "mxprotector/pe/chaos/delay_import_atom_source.hpp"
+#include "mxprotector/pe/chaos/function_atom_source.hpp"
+#include "mxprotector/pe/chaos/import_atom_source.hpp"
+#include "mxprotector/pe/chaos/load_config_atom_source.hpp"
+#include "mxprotector/pe/chaos/pdata_atom_source.hpp"
+#include "mxprotector/pe/chaos/reloc_atom_source.hpp"
+#include "mxprotector/pe/chaos/tls_atom_source.hpp"
+#include "mxprotector/pe/chaos/volatile_metadata_atom_source.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
 #include "mxprotector/pe/refmap/code_reference_scanner.hpp"
@@ -19,7 +28,9 @@
 #include "mxprotector/pe/refmap/reference.hpp"
 #include "mxprotector/pe/refmap/reference_patcher.hpp"
 #include "mxprotector/pe/refmap/reloc_absolute_va_scanner.hpp"
+#include "mxprotector/pe/refmap/reloc_rebuilder.hpp"
 #include "mxprotector/pe/refmap/resource_directory_scanner.hpp"
+#include "mxprotector/pe/refmap/unwind_info_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/rva_remapper.hpp"
 #include "mxprotector/pe/refmap/structure_reference_scanner.hpp"
 #include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
@@ -27,6 +38,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <variant>
 
@@ -240,7 +252,13 @@ void merge_into_unified_section(PeImage& image) {
     refmap::LoadConfigDirectoryScanner{}.scan(image, table);
     refmap::ResourceDirectoryScanner{}.scan(image, table);
 
-    // 4. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
+    // 4. UNWIND_INFO trailers — `ExceptionHandler` and `ChainInfo`
+    //    are 4-byte RVAs into code that the loader reads but `.reloc`
+    //    does not cover. Without this scanner, post-shuffle binaries
+    //    keep stale handler RVAs and crash the moment SEH dispatches.
+    refmap::UnwindInfoReferenceScanner{}.scan(image, table);
+
+    // 5. Final pass — every IMAGE_REL_BASED_DIR64 entry the linker
     //    emitted. Catches any absolute-VA slot the targeted scanners
     //    missed (defence in depth).
     refmap::RelocAbsoluteVaScanner{}.scan(image, table);
@@ -248,68 +266,109 @@ void merge_into_unified_section(PeImage& image) {
     return table;
 }
 
-/// Run the post-merge fragment shuffle. Uses the fixed-256B
-/// `ChunkPlanner` (B.4.7) which pins entire sections containing
-/// DataDirectory entries plus LOAD_CONFIG-pointed table sections.
+/// Per-build random seed for the atomic planner. Drawing it from a
+/// fresh `Randomizer` (auto-seeded from `std::random_device`) gives
+/// each build a non-reproducible permutation. The 64-bit value is
+/// then handed to a deterministic `Randomizer{seed}` so the same
+/// seed produces the same plan for the rest of the run.
+[[nodiscard]] std::uint64_t fresh_seed() {
+    Randomizer rng;
+    return rng.next_u64();
+}
+
+/// Build the atom-source list registered with the atomic planner.
 ///
-/// The B.4.9 atom-based planner (`chaos::AtomicChunkPlanner` plus
-/// 13 atom sources) is implemented and unit-tested but NOT yet
-/// wired here. Replacing the production planner with the atomic
-/// one requires solving three sub-problems first:
+/// Order matters only for diagnostics — every source emits into the
+/// same table and `AtomTable::normalize()` sorts and merges before
+/// the planner consumes the list. The order below groups by
+/// abstraction depth: code (function atoms) first, then PE-format
+/// directory structures, then the data-section blanket pin.
 ///
-///   1. **Alignment** — atoms get packed back-to-back regardless
-///      of alignment. CFG/XFG function-pointer slots inside
-///      LOAD_CONFIG and other 8-byte aligned PE structures get
-///      placed at unaligned RVAs after shuffle, which the Windows
-///      loader rejects on module load.
+/// `InstructionAtomSource` / `InstructionClusterAtomSource` are
+/// intentionally NOT registered: per-instruction or per-cluster
+/// shuffle without rewriting control flow corrupts fall-through
+/// transitions. Function atoms — bracketed by RET / unconditional
+/// JMP — are the smallest unit at which re-ordering is provably
+/// safe. String atoms are also omitted: their natural alignment is
+/// arbitrary, so the planner would skip them; the data-section pin
+/// covers their bytes either way.
+void register_atom_sources(chaos::AtomicChunkPlanner& planner) {
+    using std::make_unique;
+
+    // 1. Movable: per-function atoms covering the exact `.pdata`
+    //    `[BeginAddress, EndAddress)` range of each function.
+    planner.add_source(make_unique<chaos::FunctionAtomSource>());
+
+    // 2. Pinned: every byte in `.text` outside any `.pdata`-listed
+    //    function. These are inter-function thunks and CFG stubs
+    //    the loader and runtime can still call into; pinning them
+    //    keeps their bytes verbatim at the original RVA.
+    planner.add_source(make_unique<chaos::CodeGapPinAtomSource>());
+
+    // 2. Pinned: every PE directory the loader walks linearly.
+    planner.add_source(make_unique<chaos::ImportAtomSource>());
+    planner.add_source(make_unique<chaos::DelayImportAtomSource>());
+    planner.add_source(make_unique<chaos::TlsAtomSource>());
+    planner.add_source(make_unique<chaos::PdataAtomSource>());
+    planner.add_source(make_unique<chaos::LoadConfigAtomSource>());
+    planner.add_source(make_unique<chaos::VolatileMetadataAtomSource>());
+    planner.add_source(make_unique<chaos::RelocBlockAtomSource>());
+    planner.add_source(make_unique<chaos::RelocPointerAtomSource>());
+
+    // 3. Pinned: every byte in every non-code section. Prevents the
+    //    loose-chunk carving from splitting natural-aligned values
+    //    (`__security_cookie`, vtable slots, …) across chunks.
+    planner.add_source(make_unique<chaos::DataSectionPinAtomSource>());
+}
+
+/// Loose-chunk size range. Values are rounded DOWN to a multiple
+/// of 8 inside the planner, so the practical range is 64 / 96 in
+/// 8-byte increments. The padding bytes between functions
+/// (typically `INT3` filler) are what end up in these chunks; their
+/// order is irrelevant for correctness.
+constexpr std::uint32_t kMinLooseChunkSize = 64;
+constexpr std::uint32_t kMaxLooseChunkSize = 96;
+
+/// Run the post-merge fragment shuffle (B.4.12 atomic-mode wire).
 ///
-///   2. **`.reloc` rebuild** — every relocatable slot moves to a
-///      new RVA, but the existing `.reloc` page-RVA + offset
-///      entries still point at the OLD positions. Stripping
-///      relocs sacrifices ASLR; rebuilding `.reloc` post-shuffle
-///      is the proper fix.
-///
-///   3. **Sub-directory atom coverage** — LOAD_CONFIG carries
-///      pointers to volatile-metadata blocks, XFG dispatch
-///      tables, and similar substructures whose targets aren't
-///      yet covered by a dedicated atom source. Without coverage
-///      those bytes shuffle freely and break the runtime.
-///
-/// The atomic infrastructure (B.4.9.1-6) is shipped as foundation
-/// for that follow-up. For production, `--chaos-shuffle` continues
-/// to use the fixed-chunk planner — verified end-to-end on
-/// `test_vm_showcase` across all four protection levels in B.4.8.7.
+/// Pipeline:
+///   1. Scan references (consumes the pre-merge per-section layout).
+///   2. Plan with `AtomicChunkPlanner` — function atoms shuffle
+///      inside `.text`; data sections stay pinned; every chunk
+///      boundary lands on an 8-aligned RVA so no naturally-aligned
+///      64-bit value is split across chunks.
+///   3. Merge sections into the unified `.mxchaos` section.
+///   4. Apply the byte shuffle in the unified section.
+///   5. Patch every reference slot at its new RVA to point at its
+///      new target RVA.
+///   6. Rebuild `.reloc` so the loader's ASLR delta lands on the
+///      new slot positions.
 void apply_fragment_shuffle(PeImage& image) {
     if (image.sections().size() < 2) return;
 
-    // Phase 1 — scan references (consumes the pre-merge layout).
     auto refs = scan_all_references(image);
 
-    // Phase 2 — plan chunks. Pinned set computed from pre-merge
-    // sections + DataDirectory layout so .text + dir bodies are
-    // anchored. LOAD_CONFIG-pointed table sections are pinned via
-    // `compute_load_config_target_pins`.
-    Randomizer rng;
-    chaos::ChunkPlanner planner;
-    const auto extra_pins = chaos::compute_load_config_target_pins(image);
-    auto remapper = planner.plan(image, rng, extra_pins);
+    Randomizer rng{fresh_seed()};
+    chaos::AtomicChunkPlanner planner{
+        kMinLooseChunkSize, kMaxLooseChunkSize};
+    register_atom_sources(planner);
+    auto remapper = planner.plan(image, rng);
 
-    // Phase 3 — merge sections into the unified .mxchaos section.
     merge_into_unified_section(image);
 
-    // Phase 4 — shuffle bytes inside the unified section per the
-    // remapper's chunk plan.
     if (!image.sections().empty()) {
         auto& unified = image.sections()[0];
         chaos::apply_chunk_shuffle(
             unified.data, unified.virtual_address, remapper);
     }
 
-    // Phase 5 — patch every reference's slot at its post-shuffle
-    // location to point at its post-shuffle target.
     refmap::ReferencePatcher patcher;
-    [[maybe_unused]] const auto stats =
+    [[maybe_unused]] const auto patch_stats =
         patcher.apply(image, refs, remapper);
+
+    refmap::RelocRebuilder reloc_rebuilder;
+    [[maybe_unused]] const auto reloc_stats =
+        reloc_rebuilder.rebuild(image, remapper);
 }
 
 } // anonymous namespace

@@ -106,32 +106,34 @@ TEST(AtomicChunkPlanner, EmptyImageProducesEmptyRemapper) {
 // No sources — all loose
 // ---------------------------------------------------------------------------
 
-TEST(AtomicChunkPlanner, NoSourcesAllLooseChunksCoverSpan) {
+TEST(AtomicChunkPlanner, NoSourcesNoChunksEmitted) {
     PeImage img = make_pe32plus_image();
     [[maybe_unused]] const auto sec1 = add_section(img, ".s1", 64);
 
+    // B.4.12: the planner no longer carves "loose" chunks for bytes
+    // outside any atom. With no atom sources registered, the entire
+    // image span is passthrough — 0 chunks emitted.
     AtomicChunkPlanner planner{/*loose_chunk_size=*/16};
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // 64 bytes / 16 per chunk = 4 chunks.
-    EXPECT_EQ(remapper.chunk_count(), 4u);
-    EXPECT_EQ(remapper.total_bytes(), 64u);
+    EXPECT_EQ(remapper.chunk_count(), 0u);
+    EXPECT_EQ(remapper.total_bytes(), 0u);
 }
 
-TEST(AtomicChunkPlanner, SmallLooseSizeIsClampedTo8ByteAlignment) {
+TEST(AtomicChunkPlanner, LooseChunkSizeIgnoredWithoutSources) {
     PeImage img = make_pe32plus_image();
     [[maybe_unused]] const auto sec1 = add_section(img, ".s1", 16);
 
-    // Loose size below `kChunkAlignment` is clamped UP to 8 so the
-    // planner can guarantee 8-aligned chunk boundaries (B.4.11).
+    // B.4.12: the loose-chunk size parameter is preserved in the
+    // public API but no longer drives any carving. With no atom
+    // sources, no chunks are emitted regardless of the size.
     AtomicChunkPlanner planner{/*loose_chunk_size=*/1};
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // 16 / 8 = 2 chunks of 8 bytes each.
-    EXPECT_EQ(remapper.chunk_count(), 2u);
-    EXPECT_EQ(remapper.total_bytes(), 16u);
+    EXPECT_EQ(remapper.chunk_count(), 0u);
+    EXPECT_EQ(remapper.total_bytes(), 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,36 +154,25 @@ TEST(AtomicChunkPlanner, AlignedMovableAtomBecomesItsOwnChunk) {
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // [sec, sec+8): 1 loose chunk of 8.
-    // [sec+8, sec+16): atom kept as 1 chunk.
-    // [sec+16, sec+32): 2 loose chunks of 8.
-    // Total: 1 + 1 + 2 = 4 chunks.
-    EXPECT_EQ(remapper.chunk_count(), 4u);
-    EXPECT_EQ(remapper.total_bytes(), 32u);
+    // B.4.12: only the atom becomes a chunk. The bytes outside it
+    // (the section's leading 8 bytes and trailing 16 bytes) are
+    // passthrough — 0 loose chunks.
+    EXPECT_EQ(remapper.chunk_count(), 1u);
+    EXPECT_EQ(remapper.total_bytes(), 8u);
 }
 
-TEST(AtomicChunkPlanner, TotalBytesEqualsImageSpan) {
+TEST(AtomicChunkPlanner, NoSourcesNoBytesShuffled) {
     PeImage img = make_pe32plus_image();
     [[maybe_unused]] const auto sec1 = add_section(img, ".s1", 100);
     [[maybe_unused]] const auto sec2 = add_section(img, ".s2", 200);
 
-    // Span = max(va + vsize) - min(va). With section_alignment = 0x1000,
-    // each section's vsize rounds up. The PeImage helper aligns
-    // virtual_address to section_alignment between sections, so
-    // span includes the alignment padding between .s1 and .s2.
+    // B.4.12: without atom sources, no chunks are produced. Total
+    // shuffled bytes is therefore 0 regardless of image span size.
     AtomicChunkPlanner planner{/*loose_chunk_size=*/64};
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
-
-    // Don't assert exact chunk count (depends on alignment math),
-    // but total bytes must equal image span.
-    Rva first_va = img.sections().front().virtual_address;
-    std::uint32_t last_end = 0;
-    for (const auto& s : img.sections()) {
-        last_end = std::max(last_end, s.virtual_address + s.virtual_size);
-    }
-    const std::uint64_t span = last_end - first_va;
-    EXPECT_EQ(remapper.total_bytes(), span);
+    EXPECT_EQ(remapper.total_bytes(), 0u);
+    EXPECT_EQ(remapper.chunk_count(), 0u);
 }
 
 TEST(AtomicChunkPlanner, OverlappingAtomsAreMergedBeforePlanning) {
@@ -199,11 +190,11 @@ TEST(AtomicChunkPlanner, OverlappingAtomsAreMergedBeforePlanning) {
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // Merged atom [sec, sec+24): 8-aligned at both ends → kept as 1 chunk.
-    // Loose [sec+24, sec+64): 40 / 8 = 5 chunks.
-    // Total: 1 + 5 = 6 chunks.
-    EXPECT_EQ(remapper.chunk_count(), 6u);
-    EXPECT_EQ(remapper.total_bytes(), 64u);
+    // B.4.12: merged atom [sec, sec+24) is 8-aligned at both ends
+    // and stays movable → 1 chunk. The remaining 40 bytes of the
+    // section are passthrough, no chunk emitted.
+    EXPECT_EQ(remapper.chunk_count(), 1u);
+    EXPECT_EQ(remapper.total_bytes(), 24u);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,12 +240,10 @@ TEST(AtomicChunkPlanner, PinnedAtomKeepsOriginalRvaPassthrough) {
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // Pinned atom [sec+24, sec+32) is passthrough.
-    // Free range A [sec, sec+24): 24/8 = 3 chunks.
-    // Free range B [sec+32, sec+64): 32/8 = 4 chunks.
-    // Total bytes = 56, chunks = 7.
-    EXPECT_EQ(remapper.total_bytes(), 56u);
-    EXPECT_EQ(remapper.chunk_count(), 7u);
+    // B.4.12: pinned atom is passthrough; everything else also
+    // passthrough (no movable atoms registered) → 0 chunks.
+    EXPECT_EQ(remapper.total_bytes(), 0u);
+    EXPECT_EQ(remapper.chunk_count(), 0u);
 
     // Pinned slot RVA must remap to itself.
     for (std::uint32_t off = 0; off < 8; ++off) {
@@ -280,13 +269,10 @@ TEST(AtomicChunkPlanner, MultiplePinnedAtomsCreateMultipleFreeRanges) {
     Randomizer rng;
     const auto remapper = planner.plan(img, rng);
 
-    // Three free ranges, each carved into 8-byte aligned chunks:
-    //   [sec,    sec+32): 4 chunks
-    //   [sec+40, sec+64): 3 chunks (24 / 8)
-    //   [sec+72, sec+96): 3 chunks
-    // Total movable = 80 bytes, chunks = 10.
-    EXPECT_EQ(remapper.total_bytes(), 80u);
-    EXPECT_EQ(remapper.chunk_count(), 10u);
+    // B.4.12: only movable atoms become chunks; without any
+    // movable sources only the pinned atoms exist → 0 chunks.
+    EXPECT_EQ(remapper.total_bytes(), 0u);
+    EXPECT_EQ(remapper.chunk_count(), 0u);
 
     // Both pinned atoms must passthrough.
     EXPECT_EQ(remapper.remap(static_cast<Rva>(sec1 + 32)),
@@ -310,12 +296,10 @@ TEST(AtomicChunkPlanner, MovableAtomShuffledAroundPinnedNeighbour) {
     Randomizer rng{0x1234};
     const auto remapper = planner.plan(img, rng);
 
-    // Free range A [sec, sec+32): 16-byte movable atom kept as 1 chunk +
-    //   16 bytes loose at 8-byte cells = 2 loose chunks → 3 total.
-    // Free range B [sec+40, sec+64): 24 B / 8 = 3 chunks.
-    // Total movable = 56 bytes, chunks = 6.
-    EXPECT_EQ(remapper.total_bytes(), 56u);
-    EXPECT_EQ(remapper.chunk_count(), 6u);
+    // B.4.12: only the 16-byte movable atom (8-aligned at both
+    // ends) becomes a chunk. Bytes after it stay at original RVA.
+    EXPECT_EQ(remapper.total_bytes(), 16u);
+    EXPECT_EQ(remapper.chunk_count(), 1u);
 
     // Pinned atom passthrough.
     for (std::uint32_t off = 0; off < 8; ++off) {

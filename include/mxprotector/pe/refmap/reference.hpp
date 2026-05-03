@@ -114,6 +114,8 @@ enum class ReferenceOrigin : std::uint8_t {
     load_config_directory,    ///< IMAGE_LOAD_CONFIG_DIRECTORY VA-bearing field
     load_config_table_entry,  ///< Single entry in CFG/SEH/etc. table (absolute VA / RVA)
     resource_data_entry,      ///< IMAGE_RESOURCE_DATA_ENTRY.OffsetToData (RVA)
+    unwind_exception_handler, ///< UNWIND_INFO.ExceptionHandler (RVA, .reloc-free)
+    unwind_chain_info,        ///< UNWIND_INFO.ChainInfo RUNTIME_FUNCTION RVAs (.reloc-free)
 };
 
 [[nodiscard]] constexpr std::string_view origin_name(
@@ -138,6 +140,8 @@ enum class ReferenceOrigin : std::uint8_t {
         case ReferenceOrigin::load_config_directory:  return "lcfg-dir";
         case ReferenceOrigin::load_config_table_entry: return "lcfg-tab";
         case ReferenceOrigin::resource_data_entry:    return "rsrc-data";
+        case ReferenceOrigin::unwind_exception_handler: return "unwind-eh";
+        case ReferenceOrigin::unwind_chain_info:      return "unwind-chain";
     }
     return "unknown";
 }

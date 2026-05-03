@@ -125,7 +125,7 @@ TEST(FunctionAtomSource, NoOpWithoutPdataDirectory) {
 // One entry → one atom with rounded boundaries
 // ---------------------------------------------------------------------------
 
-TEST(FunctionAtomSource, SingleEntryEmitsAlignedAtom) {
+TEST(FunctionAtomSource, SingleEntryEmitsExactRange) {
     PeImage img = make_pe32plus_image();
     add_placeholder_text(img, 0x10000);
     // One RUNTIME_FUNCTION: begin=0x1003, end=0x1037, unwind=0x9000.
@@ -139,10 +139,11 @@ TEST(FunctionAtomSource, SingleEntryEmitsAlignedAtom) {
     AtomTable t;
     s.emit_atoms(img, t);
     ASSERT_EQ(t.size(), 1u);
-    // begin 0x1003 → align_down(8) = 0x1000.
-    // end   0x1037 → align_up(8)   = 0x1038.
-    EXPECT_EQ(t.atoms()[0].start_rva, 0x1000u);
-    EXPECT_EQ(t.atoms()[0].size,      0x38u);
+    // B.4.12: atom covers exactly the function's byte range —
+    // padding to alignment would absorb adjacent bytes into the
+    // movable unit and split inter-function thunks.
+    EXPECT_EQ(t.atoms()[0].start_rva, 0x1003u);
+    EXPECT_EQ(t.atoms()[0].size,      0x34u);
     EXPECT_EQ(t.atoms()[0].origin,    AtomOrigin::instruction);
 }
 

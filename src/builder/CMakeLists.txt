@@ -48,6 +48,7 @@ set(BUILDER_SOURCES
     pe/refmap/resource_directory_scanner.cpp
     pe/refmap/reference_patcher.cpp
     pe/refmap/reloc_rebuilder.cpp
+    pe/refmap/unwind_info_reference_scanner.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
@@ -66,6 +67,7 @@ set(BUILDER_SOURCES
     pe/chaos/delay_import_atom_source.cpp
     pe/chaos/volatile_metadata_atom_source.cpp
     pe/chaos/data_section_pin_atom_source.cpp
+    pe/chaos/code_gap_pin_atom_source.cpp
     pe/chaos/function_atom_source.cpp
     pe/chaos/atomic_chunk_planner.cpp
 
