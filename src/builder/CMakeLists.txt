@@ -52,6 +52,7 @@ set(BUILDER_SOURCES
     pe/chaos/load_config_pin_helper.cpp
     pe/chaos/atom.cpp
     pe/chaos/instruction_atom_source.cpp
+    pe/chaos/instruction_cluster_atom_source.cpp
     pe/chaos/string_atom_source.cpp
     pe/chaos/import_atom_source.cpp
     pe/chaos/pdata_atom_source.cpp

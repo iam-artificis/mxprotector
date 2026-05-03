@@ -55,25 +55,45 @@ namespace mx::pe::chaos {
 
 /**
  * @brief Atomic-level chaos chunk planner — see file header.
+ *
+ * Loose-chunk sizing is controlled by a `[min_loose_chunk_size,
+ * max_loose_chunk_size]` range. When the two bounds are equal the
+ * planner emits fixed-size chunks (legacy behaviour). When they
+ * differ each loose chunk's size is sampled uniformly from the
+ * range — gives 50-100 B chunks for the chaos shuffle's mixed
+ * data area while keeping carving deterministic per RNG seed.
  */
 class AtomicChunkPlanner final {
 public:
     /**
      * @brief Default loose-byte chunk size (1 byte = maximum
-     *        granularity). Higher values keep small runs of loose
-     *        bytes together — useful when the user wants 10-50
-     *        byte alternations between code and data.
+     *        granularity). Used when no explicit bounds are passed.
      */
     static constexpr std::uint32_t kDefaultLooseChunkSize = 1;
 
     /**
-     * @brief Construct the planner with the loose-chunk size.
+     * @brief Construct the planner with a fixed loose-chunk size
+     *        (legacy / test-friendly form).
      *
-     * Pre-condition: `loose_chunk_size > 0`. Zero is silently
-     * clamped to `kDefaultLooseChunkSize`.
+     * Equivalent to passing the same value as `min` and `max`.
+     * `0` is silently clamped to `kDefaultLooseChunkSize`.
      */
     explicit AtomicChunkPlanner(
         std::uint32_t loose_chunk_size = kDefaultLooseChunkSize) noexcept;
+
+    /**
+     * @brief Construct the planner with a `[min, max]` loose-chunk
+     *        size range. Each loose chunk's size is sampled uniformly
+     *        from the range using the planner's RNG.
+     *
+     * Pre-conditions:
+     *   * `min_loose_chunk_size > 0` (zero is clamped to 1)
+     *   * `max_loose_chunk_size >= min_loose_chunk_size` (otherwise
+     *     `max` is silently raised to match `min`).
+     */
+    AtomicChunkPlanner(
+        std::uint32_t min_loose_chunk_size,
+        std::uint32_t max_loose_chunk_size) noexcept;
 
     /**
      * @brief Register an atom source. Multiple sources are aggregated
@@ -90,7 +110,9 @@ public:
      *               `image.sections()` (which still holds the
      *               pre-merge layout when called from the chaos
      *               layout's `apply_fragment_shuffle`).
-     * @param rng    Randomizer for the Fisher-Yates permutation.
+     * @param rng    Randomizer for the Fisher-Yates permutation
+     *               and (when `min != max`) for per-chunk loose-
+     *               size sampling.
      *
      * @return  An already-`finalize()`d `RvaRemapper`. An empty
      *          remapper indicates an image with no sections / no
@@ -101,7 +123,8 @@ public:
         Randomizer&    rng) const;
 
 private:
-    std::uint32_t                              loose_chunk_size_;
+    std::uint32_t                              min_loose_chunk_size_;
+    std::uint32_t                              max_loose_chunk_size_;
     std::vector<std::unique_ptr<IAtomSource>>  sources_;
 };
 

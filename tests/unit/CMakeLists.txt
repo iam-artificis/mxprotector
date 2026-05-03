@@ -43,6 +43,7 @@ set(TEST_SOURCES
     chaos_shuffler_test.cpp
     chaos_atom_test.cpp
     chaos_instruction_atom_source_test.cpp
+    chaos_instruction_cluster_atom_source_test.cpp
     chaos_string_atom_source_test.cpp
     chaos_pe_atom_sources_test.cpp
     chaos_directory_atom_sources_test.cpp
@@ -213,6 +214,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atom.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/instruction_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/instruction_cluster_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/string_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/import_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/pdata_atom_source.cpp

@@ -136,18 +136,37 @@ struct Range {
     return frees;
 }
 
-/// Append loose chunks of up to `chunk_size` bytes covering [start, end).
+/// Pick the next loose-chunk size from `[min, max]`. When the range
+/// is degenerate (`min == max`) the bound itself is returned without
+/// touching the RNG, so callers that pass a fixed size do not perturb
+/// the Fisher-Yates stream of an outer caller's RNG.
+[[nodiscard]] std::uint32_t pick_loose_chunk_size(
+    std::uint32_t min_size,
+    std::uint32_t max_size,
+    Randomizer&   rng) noexcept
+{
+    if (max_size <= min_size) return min_size;
+    return rng.next_range(min_size, max_size);
+}
+
+/// Append loose chunks covering [start, end). Each chunk's size is
+/// sampled from `[min_size, max_size]` (degenerate range → fixed).
+/// The trailing chunk is clamped to `remaining` so total bytes
+/// always equal `end - start`.
 void carve_loose_chunks(
     Rva                     start,
     Rva                     end,
-    std::uint32_t           chunk_size,
+    std::uint32_t           min_size,
+    std::uint32_t           max_size,
+    Randomizer&             rng,
     std::vector<PlanChunk>& out)
 {
-    if (chunk_size == 0) return;
+    if (min_size == 0) return;
     Rva pos = start;
     while (pos < end) {
         const auto remaining = static_cast<std::uint32_t>(end - pos);
-        const std::uint32_t sz = std::min(chunk_size, remaining);
+        std::uint32_t sz = pick_loose_chunk_size(min_size, max_size, rng);
+        sz = std::min(sz, remaining);
         out.push_back(PlanChunk{pos, sz});
         pos = static_cast<Rva>(pos + sz);
     }
@@ -155,12 +174,15 @@ void carve_loose_chunks(
 
 /// Build the chunk list for a single free range: every movable atom
 /// that falls inside the range becomes one chunk; gaps between
-/// atoms are carved into `chunk_size`-byte loose chunks. The
-/// invariant `sum(chunks.size) == range.size` holds by construction.
+/// atoms are carved into loose chunks sized in `[min_loose,
+/// max_loose]`. The invariant `sum(chunks.size) == range.size`
+/// holds by construction.
 [[nodiscard]] std::vector<PlanChunk> chunks_in_free_range(
     const Range&     range,
     const AtomTable& atoms,
-    std::uint32_t    loose_chunk_size)
+    std::uint32_t    min_loose,
+    std::uint32_t    max_loose,
+    Randomizer&      rng)
 {
     std::vector<PlanChunk> chunks;
     chunks.reserve(64);
@@ -181,7 +203,7 @@ void carve_loose_chunks(
 
         if (cursor < a.start_rva) {
             carve_loose_chunks(cursor, a.start_rva,
-                               loose_chunk_size, chunks);
+                               min_loose, max_loose, rng, chunks);
         }
         chunks.push_back(PlanChunk{a.start_rva, a.size});
         cursor = a.end_rva();
@@ -189,7 +211,7 @@ void carve_loose_chunks(
 
     if (cursor < range.end()) {
         carve_loose_chunks(cursor, range.end(),
-                           loose_chunk_size, chunks);
+                           min_loose, max_loose, rng, chunks);
     }
     return chunks;
 }
@@ -233,12 +255,14 @@ void emit_layout_for_range(
 void plan_one_free_range(
     const Range&         range,
     const AtomTable&     atoms,
-    std::uint32_t        loose_chunk_size,
+    std::uint32_t        min_loose,
+    std::uint32_t        max_loose,
     Randomizer&          rng,
     refmap::RvaRemapper& remapper)
 {
     if (range.size == 0) return;
-    auto chunks = chunks_in_free_range(range, atoms, loose_chunk_size);
+    auto chunks = chunks_in_free_range(
+        range, atoms, min_loose, max_loose, rng);
     if (chunks.empty()) return;
 
     std::vector<std::size_t> idx(chunks.size());
@@ -251,9 +275,23 @@ void plan_one_free_range(
 
 AtomicChunkPlanner::AtomicChunkPlanner(
     std::uint32_t loose_chunk_size) noexcept
-    : loose_chunk_size_(loose_chunk_size == 0
-                        ? kDefaultLooseChunkSize
-                        : loose_chunk_size)
+    : min_loose_chunk_size_(loose_chunk_size == 0
+                            ? kDefaultLooseChunkSize
+                            : loose_chunk_size)
+    , max_loose_chunk_size_(loose_chunk_size == 0
+                            ? kDefaultLooseChunkSize
+                            : loose_chunk_size)
+{}
+
+AtomicChunkPlanner::AtomicChunkPlanner(
+    std::uint32_t min_loose_chunk_size,
+    std::uint32_t max_loose_chunk_size) noexcept
+    : min_loose_chunk_size_(min_loose_chunk_size == 0
+                            ? kDefaultLooseChunkSize
+                            : min_loose_chunk_size)
+    , max_loose_chunk_size_(max_loose_chunk_size < min_loose_chunk_size_
+                            ? min_loose_chunk_size_
+                            : max_loose_chunk_size)
 {}
 
 void AtomicChunkPlanner::add_source(
@@ -279,7 +317,9 @@ refmap::RvaRemapper AtomicChunkPlanner::plan(
     const auto frees = compute_free_ranges(span, pins);
 
     for (const auto& fr : frees) {
-        plan_one_free_range(fr, atoms, loose_chunk_size_,
+        plan_one_free_range(fr, atoms,
+                            min_loose_chunk_size_,
+                            max_loose_chunk_size_,
                             rng, remapper);
     }
     (void)remapper.finalize();
