@@ -64,26 +64,41 @@ EncodedStub XorChainEncoder::emit(
     Rva         target_rva,
     Randomizer& rng) const
 {
-    // Choose the XOR mask once; we use the same value at both XOR
-    // sites so the two XORs cancel and only the central ADD
-    // contributes to the target VA. See implementation comment for
-    // the rationale.
+    // The LEA sits 1 byte into the stub (after the leading
+    // `push rax`), so its RIP-anchor is `stub_rva + 1 + 7`.
     const std::uint32_t K_xor = pick_positive_imm32(rng);
     const std::int32_t  K_add = pick_offset(rng);
 
-    // After the chain: rax = (RIP + encoded) + K_add.
-    // We want rax = target_rva, so
-    //   encoded = (target - RIP_after_lea) - K_add.
-    const std::int64_t encoded_signed =
+    const std::int64_t standard_signed =
         static_cast<std::int64_t>(target_rva) -
-        static_cast<std::int64_t>(stub_rva + 7) -
-        static_cast<std::int64_t>(K_add);
-    const auto encoded_disp = static_cast<std::int32_t>(encoded_signed);
+        static_cast<std::int64_t>(stub_rva + 8);
+    const auto encoded_disp = static_cast<std::int32_t>(standard_signed);
 
     EncodedStub out;
     out.bytes.reserve(stub_size());
 
-    // lea rax, [rip + encoded_disp]   (REX.W + 8D 05 + disp32)
+    auto emit_xor_rax_imm = [&](std::uint32_t k) {
+        out.bytes.push_back(0x48);
+        out.bytes.push_back(0x35);
+        const std::size_t off = out.bytes.size();
+        out.bytes.resize(off + 4);
+        std::memcpy(out.bytes.data() + off, &k, sizeof(k));
+    };
+
+    auto emit_addsub_rax_imm = [&](std::uint8_t modrm,
+                                   std::int32_t k) {
+        out.bytes.push_back(0x48);
+        out.bytes.push_back(0x81);
+        out.bytes.push_back(modrm);
+        const std::size_t off = out.bytes.size();
+        out.bytes.resize(off + 4);
+        std::memcpy(out.bytes.data() + off, &k, sizeof(k));
+    };
+
+    // push rax — preserve caller's rax across the dispatch
+    out.bytes.push_back(0x50);
+
+    // lea rax, [rip + std_disp]
     out.bytes.push_back(0x48);
     out.bytes.push_back(0x8D);
     out.bytes.push_back(0x05);
@@ -92,42 +107,19 @@ EncodedStub XorChainEncoder::emit(
     std::memcpy(out.bytes.data() + out.disp32_byte_offset,
                 &encoded_disp, sizeof(encoded_disp));
 
-    // xor rax, K_xor   (REX.W + 35 + imm32 sign-ext)
+    emit_xor_rax_imm(K_xor);                  // ^= K_xor
+    emit_addsub_rax_imm(0xC0, K_add);         // += K_add (modrm /0)
+    emit_addsub_rax_imm(0xE8, K_add);         // -= K_add (cancels)
+    emit_xor_rax_imm(K_xor);                  // ^= K_xor (cancels)
+
+    // xchg rax, [rsp]; ret — restore caller's rax, jump to target
     out.bytes.push_back(0x48);
-    out.bytes.push_back(0x35);
-    {
-        const auto k = K_xor;
-        const std::size_t off = out.bytes.size();
-        out.bytes.resize(off + 4);
-        std::memcpy(out.bytes.data() + off, &k, sizeof(k));
-    }
+    out.bytes.push_back(0x87);
+    out.bytes.push_back(0x04);
+    out.bytes.push_back(0x24);
+    out.bytes.push_back(0xC3);
 
-    // add rax, K_add   (REX.W + 81 /0 + imm32 — 7 bytes)
-    out.bytes.push_back(0x48);
-    out.bytes.push_back(0x81);
-    out.bytes.push_back(0xC0);  // ModRM: /0 (add) on rax
-    {
-        const auto k = K_add;
-        const std::size_t off = out.bytes.size();
-        out.bytes.resize(off + 4);
-        std::memcpy(out.bytes.data() + off, &k, sizeof(k));
-    }
-
-    // xor rax, K_xor   (same value, cancels)
-    out.bytes.push_back(0x48);
-    out.bytes.push_back(0x35);
-    {
-        const auto k = K_xor;
-        const std::size_t off = out.bytes.size();
-        out.bytes.resize(off + 4);
-        std::memcpy(out.bytes.data() + off, &k, sizeof(k));
-    }
-
-    // jmp rax
-    out.bytes.push_back(0xFF);
-    out.bytes.push_back(0xE0);
-
-    out.constant_offset = K_add;
+    out.constant_offset = 0;
     return out;
 }
 

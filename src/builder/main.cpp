@@ -34,6 +34,7 @@
 #include "mxprotector/pe/pe_builder.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_parser.hpp"
+#include "mxprotector/protection/anti_static/indirect_call_encoder_pass.hpp"
 #include "mxprotector/protection/cfg/cfg_flattening.hpp"
 #include "mxprotector/protection/guard/guard_pass.hpp"
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
@@ -215,6 +216,8 @@ int main(int argc, char** argv) {
     mx::PassManager pass_manager;
     pass_manager.register_pass(std::make_unique<mx::MutationPass>());
     pass_manager.register_pass(std::make_unique<mx::ObfuscationPass>());
+    pass_manager.register_pass(
+        std::make_unique<mx::protection::anti_static::IndirectCallEncoderPass>());
     pass_manager.register_pass(std::make_unique<mx::VirtualizationPass>());
     pass_manager.register_pass(std::make_unique<mx::GuardPass>());
     pass_manager.register_pass(std::make_unique<mx::CfgFlatteningPass>());

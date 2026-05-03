@@ -60,6 +60,7 @@ set(BUILDER_SOURCES
     protection/anti_static/encoders/add_offset_encoder.cpp
     protection/anti_static/encoders/xor_chain_encoder.cpp
     protection/anti_static/encoders/sub_neg_encoder.cpp
+    protection/anti_static/indirect_call_encoder_pass.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
     pe/chaos/atom.cpp

@@ -1,27 +1,44 @@
 /**
  * @file add_offset_encoder.hpp
- * @brief One-instruction `lea + add + jmp` encoder.
+ * @brief Balanced `push rax + lea + add + sub + xchg + ret` encoder.
  *
- * Stub layout (15 bytes):
+ * Stub layout (25 bytes):
  *
- *     48 8D 05 <encoded_disp32>     lea rax, [rip + encoded]    (7)
+ *     50                            push rax                    (1)
+ *     48 8D 05 <std_disp32>         lea rax, [rip + std_disp]   (7)
  *     48 05    <K_imm32>            add rax, sign_ext(K_imm32)  (6)
- *     FF E0                         jmp rax                     (2)
+ *     48 81 E8 <K_imm32>            sub rax, sign_ext(K_imm32)  (7)
+ *     48 87 04 24                   xchg rax, qword ptr [rsp]   (4)
+ *     C3                            ret                         (1)
  *
- * Algebraic identity at runtime:
+ * The `push rax`/`xchg`/`ret` triple is *transparent* to the
+ * caller: the original `rax` value is saved at entry, swapped
+ * with the computed target right before `ret`, and restored as
+ * the callee inherits a normal x64 calling-convention stack
+ * frame. This matters for callers that pre-load `rax` before
+ * calling (notably MSVC's `__chkstk`, which uses `rax` as the
+ * frame-size argument).
  *
- *     rax = (RIP_after_lea + encoded) + K = target_VA
- *  ⇒  encoded = (target - RIP_after_lea) - K
+ * The `add`/`sub` pair cancels — algebraically the chain is the
+ * identity. The LEA's `disp32` is therefore the standard rel32
+ * displacement, and `CodeReferenceScanner` keeps it in sync when
+ * chaos shuffle moves the target without any new scanner.
  *
- * `K` is a random signed `int32`; the encoder picks a value
- * outside `[-0x10, 0x10]` so the additive transformation is at
- * least visually non-trivial and not a likely no-op.
+ * Why bother emitting a chain at all if it cancels? Three reasons:
  *
- * Static decompilers that constant-fold across `add` resolve the
- * target from the disp32 plus K — but the call-graph builder
- * pass has already committed its edges by the time folding
- * happens, so the obfuscation still hides the original direct
- * edge from the first wave of static analysis.
+ *   * The basic block at the call site no longer has a direct
+ *     rel32 edge to the target — call graph builders see only the
+ *     edge to the stub, and the stub's disp32 is hidden behind
+ *     two arithmetic instructions.
+ *   * Pattern matchers looking for `lea + jmp` fail to recognise
+ *     the dispatch.
+ *   * `K` is randomised per stub, so two stubs to the same target
+ *     differ in bytes — frustrates byte-pattern signatures.
+ *
+ * Sophisticated decompilers (IDA + Hex-Rays) constant-fold the
+ * cancel and recover the target. Defeating them is the job of
+ * future *non-balanced* encoders that ride the `rel32_with_imm_offset`
+ * reference encoding plus a stub-aware refmap scanner.
  */
 
 #pragma once
@@ -40,7 +57,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t stub_size() const noexcept override {
-        return 15;
+        return 26;
     }
 
     [[nodiscard]] EncodedStub emit(

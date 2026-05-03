@@ -111,6 +111,8 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--anti-tamper-veh")     { config.enable_veh_anti_tamper = true; continue; }
         if (arg == "--chaos")               { config.chaos_layout = true; continue; }
         if (arg == "--chaos-shuffle")       { config.chaos_layout = true; config.chaos_shuffle = true; continue; }
+        if (arg == "--indirect-calls")      { config.enable_indirect_calls = true; continue; }
+        if (arg == "--no-indirect-calls")   { config.enable_indirect_calls = false; continue; }
         if (arg == "--trace-hints")         { config.emit_trace_hints = true; continue; }
 
         if (arg.starts_with("--load-mode=") && arg.size() > 12) {

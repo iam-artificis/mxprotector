@@ -1,33 +1,34 @@
 /**
  * @file xor_chain_encoder.hpp
- * @brief Three-step `xor + add` chain encoder.
+ * @brief Balanced four-step `xor / add / sub / xor` chain.
  *
- * Stub layout (28 bytes):
+ * Stub layout (38 bytes):
  *
- *     48 8D 05 <encoded_disp32>     lea rax, [rip + encoded]   (7)
- *     48 35    <K1>                 xor rax, sign_ext(K1)      (6)
- *     48 81 C0 <K2>                 add rax, sign_ext(K2)      (7)
- *     48 35    <K3>                 xor rax, sign_ext(K3)      (6)
- *     FF E0                         jmp rax                    (2)
+ *     50                            push rax                   (1)
+ *     48 8D 05 <std_disp32>         lea rax, [rip + std_disp]  (7)
+ *     48 35    <K_xor>              xor rax, K_xor             (6)
+ *     48 81 C0 <K_add>              add rax, K_add             (7)
+ *     48 81 E8 <K_add>              sub rax, K_add (cancels)   (7)
+ *     48 35    <K_xor>              xor rax, K_xor (cancels)   (6)
+ *     48 87 04 24                   xchg rax, [rsp]            (4)
+ *     C3                            ret                        (1)
  *
- * The chain converts to a single algebraic offset `K`:
+ * The XOR pair and the ADD/SUB pair both cancel — the chain is
+ * algebraically the identity. The LEA's `disp32` is therefore the
+ * standard rel32 displacement, and `CodeReferenceScanner` keeps
+ * it in sync when chaos shuffle moves the target.
  *
- *     rax = (((RIP + encoded) ^ K1) + K2) ^ K3 = target
+ * Variety axis vs `AddOffsetEncoder`:
  *
- * Two of the three operations are XORs whose imm32 are picked
- * with the high bit clear so the 64-bit sign-extend is a no-op
- * on the high half — the high 32 bits of `rax` (which carry the
- * runtime image base) survive untouched.
+ *   * Different opcode mix (XOR involved → different first-byte
+ *     prefix in instruction bytes).
+ *   * Two random per-stub constants instead of one.
+ *   * Different stub size, so back-to-back stubs in the
+ *     `.callstub` section break any "stride-N" pattern matcher.
  *
- * Solving for `encoded`:
- *
- *     encoded = ((target - K_chain - RIP_after_lea) ^ K1)
- *             where K_chain collapses the chain to a single
- *             constant — see implementation.
- *
- * Static decompilers can chase the chain symbolically and recover
- * the target, but a naïve call-graph builder that walks `call
- * rel32 → followee` no longer sees a direct edge.
+ * Sophisticated decompilers will fold the cancel; future
+ * non-balanced encoders will go through the
+ * `rel32_with_imm_offset` reference encoding to defeat them.
  */
 
 #pragma once
@@ -46,7 +47,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t stub_size() const noexcept override {
-        return 28;
+        return 39;
     }
 
     [[nodiscard]] EncodedStub emit(

@@ -51,10 +51,11 @@ using mx::protection::anti_static::XorChainEncoder;
 
 /// Common contract: every encoder must satisfy
 ///
-///   target_rva == (stub_rva + 7) + disp32 + constant_offset
+///   target_rva == lea_rip_anchor + disp32 + constant_offset
 ///
-/// where disp32 lives at `disp32_byte_offset` and the LEA's
-/// runtime RIP after-anchor is `stub_rva + 7`.
+/// where the LEA's RIP-after-anchor is `(stub_rva + disp32_byte_offset + 4)`
+/// — `disp32_byte_offset` is the byte offset of the disp32 within
+/// the stub, plus 4 for the disp32 size itself.
 void verify_chain_resolves(
     const IIndirectCallEncoder& enc,
     Rva                         stub_rva,
@@ -66,8 +67,10 @@ void verify_chain_resolves(
         << "encoder " << enc.name() << " produced wrong byte count";
 
     const std::int32_t disp = read_disp32(stub.bytes, stub.disp32_byte_offset);
+    const Rva lea_rip_anchor = static_cast<Rva>(
+        stub_rva + stub.disp32_byte_offset + 4);
     const std::int64_t computed =
-        static_cast<std::int64_t>(stub_rva + 7) +
+        static_cast<std::int64_t>(lea_rip_anchor) +
         static_cast<std::int64_t>(disp) +
         static_cast<std::int64_t>(stub.constant_offset);
     EXPECT_EQ(static_cast<Rva>(computed), target_rva)
@@ -77,7 +80,8 @@ void verify_chain_resolves(
         << " target=0x" << target_rva
         << " disp=" << std::dec << disp
         << " K=" << stub.constant_offset
-        << " computed=0x" << std::hex << computed << ")";
+        << " lea_anchor=0x" << std::hex << lea_rip_anchor
+        << " computed=0x" << computed << ")";
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +91,7 @@ void verify_chain_resolves(
 TEST(AntiStaticEncoder, AddOffsetResolvesToTarget) {
     AddOffsetEncoder e;
     EXPECT_EQ(e.name(), "add-offset");
-    EXPECT_EQ(e.stub_size(), 15u);
+    EXPECT_EQ(e.stub_size(), 26u);
     verify_chain_resolves(e, /*stub=*/0x10000, /*target=*/0x12345);
     verify_chain_resolves(e, /*stub=*/0x20000, /*target=*/0x18000);
 }
@@ -95,7 +99,7 @@ TEST(AntiStaticEncoder, AddOffsetResolvesToTarget) {
 TEST(AntiStaticEncoder, XorChainResolvesToTarget) {
     XorChainEncoder e;
     EXPECT_EQ(e.name(), "xor-chain");
-    EXPECT_EQ(e.stub_size(), 28u);
+    EXPECT_EQ(e.stub_size(), 39u);
     verify_chain_resolves(e, 0x10000, 0x18000);
     verify_chain_resolves(e, 0x12000, 0x14000);
 }
@@ -103,7 +107,7 @@ TEST(AntiStaticEncoder, XorChainResolvesToTarget) {
 TEST(AntiStaticEncoder, SubNegResolvesToTarget) {
     SubNegEncoder e;
     EXPECT_EQ(e.name(), "sub-neg");
-    EXPECT_EQ(e.stub_size(), 22u);
+    EXPECT_EQ(e.stub_size(), 32u);
     verify_chain_resolves(e, 0x10000, 0x18000);
     verify_chain_resolves(e, 0x20000, 0x10500);
 }

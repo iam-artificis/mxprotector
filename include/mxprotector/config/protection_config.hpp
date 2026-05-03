@@ -95,6 +95,11 @@ struct ProtectionConfig {
     bool enable_cfg_flattening  = true;   ///< Выравнивание потока управления
     bool enable_anti_debug      = true;   ///< Анти-отладка (inline в packer stub)
     bool enable_anti_sandbox    = true;   ///< Анти-песочница / анти-VM
+    bool enable_indirect_calls  = false;  ///< Replace `call rel32` with stub-dispatched
+                                          ///< indirect calls (B.4.20). Off by default
+                                          ///< while the encoder set is curated; once
+                                          ///< stable across all binaries the level
+                                          ///< presets will switch it on for `strong`+.
     bool enable_packer          = false;  ///< Self-unpacking packer (multi-section XOR)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)

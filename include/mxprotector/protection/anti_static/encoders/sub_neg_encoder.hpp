@@ -1,26 +1,27 @@
 /**
  * @file sub_neg_encoder.hpp
- * @brief `lea + neg + neg + sub + jmp` encoder.
+ * @brief Balanced `lea + neg + neg + sub + add + jmp` encoder.
  *
- * Stub layout (15 bytes):
+ * Stub layout (31 bytes):
  *
- *     48 8D 05 <encoded_disp32>     lea rax, [rip + encoded]   (7)
- *     48 F7 D8                      neg rax                    (3)
- *     48 F7 D8                      neg rax                    (3)
- *     48 2D    <K_imm32>            sub rax, sign_ext(K)       (7)
+ *     50                            push rax                  (1)
+ *     48 8D 05 <std_disp32>         lea rax, [rip + std_disp] (7)
+ *     48 F7 D8                      neg rax                   (3)
+ *     48 F7 D8                      neg rax                   (3)
+ *     48 81 E8 <K_imm32>            sub rax, K                (7)
+ *     48 05    <K_imm32>            add rax, K (cancels SUB)  (6)
+ *     48 87 04 24                   xchg rax, [rsp]           (4)
+ *     C3                            ret                       (1)
  *
- *  total: 7+3+3+7 = 20 — header `stub_size()` carries it.
+ * Two cancel-pairs — `neg`/`neg` and `sub`/`add` — make the
+ * chain algebraically the identity. LEA's disp32 carries the
+ * standard rel32, so `CodeReferenceScanner` keeps it in sync
+ * when chaos shuffle moves the target.
  *
- * `neg rax` followed by `neg rax` is an identity but uses three
- * bytes the disassembler must walk through, so a casual byte-
- * pattern scanner sees instructions that look meaningful. The
- * algebraic chain reduces to:
- *
- *     rax = (RIP + encoded) - K
- *  ⇒  encoded = (target - RIP_after_lea) + K
- *
- * Different opcode mix than the `add-offset` encoder — the
- * registry's random pick produces visually distinct stubs.
+ * Variety axis: third opcode mix in the registry (the pair
+ * `neg rax` adds opcodes that don't appear in any other shipped
+ * encoder, so visual fingerprinting fails to lump all three
+ * encoders into one signature).
  */
 
 #pragma once
@@ -39,7 +40,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t stub_size() const noexcept override {
-        return 22; // 7 + 3 + 3 + 7 + 2 (jmp rax)
+        return 32; // 1 + 7 + 3 + 3 + 7 + 6 + 4 + 1 (with rax preservation)
     }
 
     [[nodiscard]] EncodedStub emit(
