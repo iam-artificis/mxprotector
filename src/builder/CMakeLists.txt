@@ -54,6 +54,7 @@ set(BUILDER_SOURCES
     pe/refmap/obfuscated_jt_scanner.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/self_crc_refinalizer.cpp
+    pe/chaos/handler_table_integrity_refinalizer.cpp
     pe/chaos/chaos_shuffler.cpp
     pe/chaos/load_config_pin_helper.cpp
     pe/chaos/atom.cpp

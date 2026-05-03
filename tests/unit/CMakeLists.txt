@@ -67,6 +67,7 @@ set(TEST_SOURCES
     refmap_vm_call_pop_trampoline_scanner_test.cpp
     chaos_self_crc_refinalizer_test.cpp
     refmap_obfuscated_jt_scanner_test.cpp
+    chaos_handler_table_integrity_refinalizer_test.cpp
     section_emitter_test.cpp
     expansion_sink_test.cpp
     relocation_injector_test.cpp
@@ -224,6 +225,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/obfuscated_jt_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/self_crc_refinalizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/handler_table_integrity_refinalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atom.cpp

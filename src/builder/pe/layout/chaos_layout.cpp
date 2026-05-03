@@ -12,6 +12,7 @@
 #include "mxprotector/pe/chaos/data_section_pin_atom_source.hpp"
 #include "mxprotector/pe/chaos/delay_import_atom_source.hpp"
 #include "mxprotector/pe/chaos/function_atom_source.hpp"
+#include "mxprotector/pe/chaos/handler_table_integrity_refinalizer.hpp"
 #include "mxprotector/pe/chaos/import_atom_source.hpp"
 #include "mxprotector/pe/chaos/self_crc_refinalizer.hpp"
 #include "mxprotector/pe/chaos/load_config_atom_source.hpp"
@@ -401,7 +402,19 @@ void apply_fragment_shuffle(PeImage& image) {
     [[maybe_unused]] const auto reloc_stats =
         reloc_rebuilder.rebuild(image, remapper);
 
-    // Step 7 — re-finalise every self-CRC anti-tamper check whose
+    // Step 7 — re-finalise the handler-table XOR-sum integrity
+    // check. `ObfuscatedJtScanner`'s patches just re-encrypted
+    // every JT entry whose target moved, so the stored
+    // `xor edx, expected` immediate is stale. The refinaliser walks
+    // the image once, recomputes `XOR(entry_0 .. entry_N-1)` over
+    // the post-shuffle table bytes, and writes the result to the
+    // placeholder. This MUST run before the self-CRC refinaliser:
+    // the integrity check sits inside the self-CRC byte range, so
+    // updating the integrity-expected slot first lets the self-CRC
+    // hash stabilise on the final byte content.
+    chaos::HandlerTableIntegrityRefinalizer{}.refinalize(image);
+
+    // Step 8 — re-finalise every self-CRC anti-tamper check whose
     // covered byte range overlapped a chunk that the patcher just
     // rewrote. The expected-CRC placeholder was last computed BEFORE
     // chaos shuffle, so any rel32 the patcher updated inside that
