@@ -176,6 +176,31 @@ enum class AtomOrigin : std::uint8_t {
  * keeps the planner free of new-RVA alignment-search logic, yet
  * still permits up to ~85% of typical image bytes (instructions +
  * strings + plain data) to be permuted.
+ *
+ * ### Forward-compatibility fields
+ *
+ * Two optional fields support upcoming features without rippling
+ * through every existing atom source — both default to zero, and
+ * sources written before they were introduced continue to work
+ * unchanged:
+ *
+ *   * `fall_through_to` — non-zero when the atom's last byte is the
+ *     last byte of a basic block whose original successor lives at
+ *     `fall_through_to`. After chaos shuffles the atom to a new RVA,
+ *     a post-shuffle pass (`FallThroughJmpInserter`) writes a 5-byte
+ *     `JMP rel32` into the atom's slack so control flow continues to
+ *     reach the (now-moved) successor. Used by the future
+ *     basic-block atom source. Set to 0 for atoms that already
+ *     terminate with their own control transfer (`JMP`/`RET`/`UD2`)
+ *     or for non-code atoms.
+ *
+ *   * `slack_after` — bytes the atom owns *beyond* its `size`-byte
+ *     content payload. The planner treats `size + slack_after` as
+ *     the atom's footprint when laying it out so subsequent atoms
+ *     do not overlap the slack region. Slack is the cleanest hook
+ *     for emerging mutation passes (MBA byte-insertion, fall-through
+ *     fixups, instrumentation thunks) — they can write into the
+ *     reserved bytes without renegotiating ranges with the planner.
  */
 struct Atom {
     Rva           start_rva;
@@ -183,9 +208,34 @@ struct Atom {
     AtomOrigin    origin;
     std::uint16_t alignment{1};
 
-    /// Half-open end — the first byte *after* this atom.
+    /// Reserved bytes appended after `size` content bytes. The
+    /// planner reserves them at layout time; a post-shuffle pass
+    /// fills them with the desired bytes (NOPs by default; `JMP
+    /// rel32` when `fall_through_to != 0`). Default 0 — atoms with
+    /// no upcoming-mutation needs simply ignore the field.
+    std::uint32_t slack_after{0};
+
+    /// Successor RVA when the atom ends with implicit fall-through.
+    /// Default 0 — every existing atom source still produces atoms
+    /// without explicit control-flow links (function granularity is
+    /// "self-contained": the function ends with `RET`/`JMP`/`UD2`
+    /// from MSVC's perspective, so no fall-through across atom
+    /// boundaries is possible).
+    Rva           fall_through_to{0};
+
+    /// Half-open end of the *content* — the first byte after the
+    /// atom's payload (NOT including slack). Existing planners and
+    /// scanners reason about content ranges, so this is the
+    /// default semantics retained by the function.
     [[nodiscard]] constexpr Rva end_rva() const noexcept {
         return static_cast<Rva>(start_rva + size);
+    }
+
+    /// Half-open end of the *footprint* — content + slack. The
+    /// planner uses this when packing atoms back-to-back so slack
+    /// regions stay reserved for the mutation pass that owns them.
+    [[nodiscard]] constexpr Rva footprint_end_rva() const noexcept {
+        return static_cast<Rva>(start_rva + size + slack_after);
     }
 
     /// `true` when the planner must keep this atom at its original RVA.
