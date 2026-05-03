@@ -56,6 +56,12 @@ set(BUILDER_SOURCES
     pe/chaos/import_atom_source.cpp
     pe/chaos/pdata_atom_source.cpp
     pe/chaos/reloc_atom_source.cpp
+    pe/chaos/load_config_atom_source.cpp
+    pe/chaos/tls_atom_source.cpp
+    pe/chaos/export_atom_source.cpp
+    pe/chaos/resource_atom_source.cpp
+    pe/chaos/debug_atom_source.cpp
+    pe/chaos/delay_import_atom_source.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp
