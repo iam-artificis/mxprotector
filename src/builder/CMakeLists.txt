@@ -38,6 +38,7 @@ set(BUILDER_SOURCES
     pe/chaos/rva_remapper.cpp
     pe/chaos/code_reference_scanner.cpp
     pe/chaos/structure_reference_scanner.cpp
+    pe/chaos/reloc_absolute_va_scanner.cpp
 
     # Модуль анализа
     analysis/zydis_disassembler.cpp
