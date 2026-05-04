@@ -37,6 +37,7 @@
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/pre_scanned_ref_slot.hpp"
 #include "mxprotector/pe/section_emitter.hpp"
 #include "mxprotector/pe/section_manager.hpp"
 #include "mxprotector/protection/anti_static/encoder_registry.hpp"
@@ -300,9 +301,23 @@ MxStatus IndirectCallEncoderPass::execute(ProtectionContext& ctx) {
     ctx.log_fmt("IndirectCallEncoderPass: .callstub @ RVA 0x{:08X} ({} bytes)",
                 section_rva, total_stub_bytes);
 
-    // ---- Emit stubs + rewrite calls -------------------------------
-    std::uint32_t emitted = 0;
-    std::uint32_t rewrote = 0;
+    // ---- Emit stubs + rewrite calls + register pre-scanned refs ----
+    //
+    // For each emitted stub whose encoder reports a non-zero
+    // `constant_offset`, the LEA's on-disk `disp32` does NOT decode
+    // to the actual target — it encodes `target - lea_anchor - K`
+    // where `K = stub.constant_offset`. The chaos pipeline's
+    // `CodeReferenceScanner` would emit a `rel`-encoded reference
+    // with the wrong target; the override path lives in
+    // `SectionInfo::pre_scanned_refs` (see
+    // `pe/pre_scanned_ref_slot.hpp`). We register one slot per
+    // unbalanced stub here; the chaos pipeline's
+    // `scan_all_references` appends matching
+    // `rel32_with_imm_offset` references that overwrite the wrong
+    // patch later in the same patcher pass.
+    std::uint32_t emitted   = 0;
+    std::uint32_t rewrote   = 0;
+    std::uint32_t overrides = 0;
     for (const auto& site : sites) {
         if (site.encoder == nullptr) continue;
         const Rva stub_rva = static_cast<Rva>(section_rva + site.stub_offset);
@@ -314,14 +329,23 @@ MxStatus IndirectCallEncoderPass::execute(ProtectionContext& ctx) {
                     stub.bytes.data(), stub.bytes.size());
         ++emitted;
 
+        if (stub.constant_offset != 0) {
+            stub_section.pre_scanned_refs.push_back(pe::PreScannedRefSlot{
+                .slot_rva   = static_cast<Rva>(stub_rva + stub.disp32_byte_offset),
+                .target_rva = site.target_rva,
+                .imm_offset = stub.constant_offset,
+            });
+            ++overrides;
+        }
+
         if (rewrite_call_target(ctx.pe_image(), site.call_rva, stub_rva)) {
             ++rewrote;
         }
     }
 
     ctx.log_fmt("IndirectCallEncoderPass: emitted {} stubs, "
-                "rewrote {} call sites",
-                emitted, rewrote);
+                "rewrote {} call sites, registered {} disp32 overrides",
+                emitted, rewrote, overrides);
     return {};
 }
 

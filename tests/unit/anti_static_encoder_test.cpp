@@ -28,6 +28,7 @@
 #include "mxprotector/protection/anti_static/encoder_registry.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_chain4_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_offset_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/add_offset_unbalanced_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/interleaved_add_sub_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/sub_neg_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/xor_chain4_encoder.hpp"
@@ -39,6 +40,7 @@ using mx::Randomizer;
 using mx::Rva;
 using mx::protection::anti_static::AddChain4Encoder;
 using mx::protection::anti_static::AddOffsetEncoder;
+using mx::protection::anti_static::AddOffsetUnbalancedEncoder;
 using mx::protection::anti_static::EncodedStub;
 using mx::protection::anti_static::EncoderRegistry;
 using mx::protection::anti_static::IIndirectCallEncoder;
@@ -146,6 +148,56 @@ TEST(AntiStaticEncoder, InterleavedAddSubResolvesToTarget) {
     verify_chain_resolves(e, 0x20000, 0x10500);
 }
 
+// ---------------------------------------------------------------------------
+// Phase B.4.22 — fully non-balanced encoder
+// ---------------------------------------------------------------------------
+
+TEST(AntiStaticEncoder, AddOffsetUnbalancedResolvesToTarget) {
+    AddOffsetUnbalancedEncoder e;
+    EXPECT_EQ(e.name(), "add-offset-unbalanced");
+    EXPECT_EQ(e.stub_size(), 19u);
+    verify_chain_resolves(e, 0x10000, 0x18000);
+    verify_chain_resolves(e, 0x20000, 0x10500);
+}
+
+TEST(AntiStaticEncoder, AddOffsetUnbalancedReportsNonZeroK) {
+    // The whole point of the unbalanced encoder is that
+    // `constant_offset` (the `K` an emitting pass needs to hand to
+    // the chaos refmap as a `PreScannedRefSlot`) is genuinely
+    // non-zero — otherwise the LEA's disp32 would already encode
+    // the target and the standard `rel` reference would suffice.
+    AddOffsetUnbalancedEncoder e;
+    Randomizer rng{0xC0DECAFEu};
+    const auto stub = e.emit(0x10000, 0x18000, rng);
+    EXPECT_NE(stub.constant_offset, 0);
+    // |K| must exceed the minimum-magnitude floor the encoder
+    // applies — the LEA's disp32 should differ from the standard
+    // rel32 by at least 16 bytes, so a static analyser can't
+    // confuse the encoded form with a misalignment artefact.
+    EXPECT_TRUE(stub.constant_offset >= 0x10 ||
+                stub.constant_offset <= -0x10);
+}
+
+TEST(AntiStaticEncoder, AddOffsetUnbalancedDispDiffersFromStandard) {
+    // The LEA's on-disk disp32 must NOT decode to the actual
+    // target — that is what makes the chain non-balanced. Compare
+    // it to the standard rel32 displacement and demand they differ.
+    AddOffsetUnbalancedEncoder e;
+    Randomizer rng{0xFEEDFACEu};
+    constexpr Rva stub_rva   = 0x10000;
+    constexpr Rva target_rva = 0x18000;
+    const auto stub = e.emit(stub_rva, target_rva, rng);
+    ASSERT_EQ(stub.bytes.size(), 19u);
+    const std::int32_t encoded_disp = read_disp32(
+        stub.bytes, stub.disp32_byte_offset);
+    const Rva lea_anchor = static_cast<Rva>(
+        stub_rva + stub.disp32_byte_offset + 4);
+    const std::int32_t standard_disp = static_cast<std::int32_t>(
+        static_cast<std::int64_t>(target_rva) -
+        static_cast<std::int64_t>(lea_anchor));
+    EXPECT_NE(encoded_disp, standard_disp);
+}
+
 TEST(AntiStaticEncoder, AddChain4VariesAcrossSeeds) {
     AddChain4Encoder e;
     Randomizer r1{1};
@@ -223,14 +275,15 @@ TEST(EncoderRegistry, EmptyRegistryReturnsNull) {
 
 TEST(EncoderRegistry, DefaultRegistryHoldsAllShipped) {
     auto r = mx::protection::anti_static::make_default_registry();
-    EXPECT_GE(r.size(), 6u);
-    EXPECT_NE(r.find("add-offset"),          nullptr);
-    EXPECT_NE(r.find("xor-chain"),           nullptr);
-    EXPECT_NE(r.find("sub-neg"),             nullptr);
-    EXPECT_NE(r.find("add-chain-4"),         nullptr);
-    EXPECT_NE(r.find("xor-chain-4"),         nullptr);
-    EXPECT_NE(r.find("interleaved-add-sub"), nullptr);
-    EXPECT_EQ(r.find("nope"),                nullptr);
+    EXPECT_GE(r.size(), 7u);
+    EXPECT_NE(r.find("add-offset"),            nullptr);
+    EXPECT_NE(r.find("xor-chain"),             nullptr);
+    EXPECT_NE(r.find("sub-neg"),               nullptr);
+    EXPECT_NE(r.find("add-chain-4"),           nullptr);
+    EXPECT_NE(r.find("xor-chain-4"),           nullptr);
+    EXPECT_NE(r.find("interleaved-add-sub"),   nullptr);
+    EXPECT_NE(r.find("add-offset-unbalanced"), nullptr);
+    EXPECT_EQ(r.find("nope"),                  nullptr);
 }
 
 TEST(EncoderRegistry, PickReturnsRegisteredEncoder) {

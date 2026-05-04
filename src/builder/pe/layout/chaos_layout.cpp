@@ -305,6 +305,32 @@ void merge_into_unified_section(PeImage& image) {
     //    missed (defence in depth).
     refmap::RelocAbsoluteVaScanner{}.scan(image, table);
 
+    // 8. Pre-scanned-ref slot overrides (B.4.22). Passes that emit
+    //    non-balanced indirect-call stubs register a
+    //    `pe::PreScannedRefSlot {slot, target, K}` per stub on the
+    //    stub section. We append one
+    //    `ReferenceEncoding::rel32_with_imm_offset` reference per
+    //    entry. The patcher iterates references in append order, so
+    //    these LAND AFTER any duplicate `rel`-encoded reference the
+    //    `CodeReferenceScanner` produced for the same slot — the
+    //    final disp32 byte value is the unbalanced one. Living at
+    //    the end of the scan keeps the override semantics implicit
+    //    (no dedup pass), and lets new emitter passes ride this
+    //    plumbing without touching the chaos pipeline.
+    for (const auto& sec : image.sections()) {
+        for (const auto& s : sec.pre_scanned_refs) {
+            table.add(refmap::Reference{
+                .location_rva = s.slot_rva,
+                .target_rva   = s.target_rva,
+                .width        = refmap::ReferenceWidth::byte4,
+                .encoding     = refmap::ReferenceEncoding::rel32_with_imm_offset,
+                .origin       = refmap::ReferenceOrigin::indirect_call_stub_lea,
+                .aux          = static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(s.imm_offset)),
+            });
+        }
+    }
+
     return table;
 }
 

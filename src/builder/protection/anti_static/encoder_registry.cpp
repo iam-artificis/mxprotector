@@ -15,6 +15,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_chain4_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_offset_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/add_offset_unbalanced_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/interleaved_add_sub_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/sub_neg_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/xor_chain4_encoder.hpp"
@@ -62,6 +63,16 @@ EncoderRegistry make_default_registry() {
     r.register_encoder(std::make_unique<AddChain4Encoder>());
     r.register_encoder(std::make_unique<XorChain4Encoder>());
     r.register_encoder(std::make_unique<InterleavedAddSubEncoder>());
+
+    // Phase B.4.22 — fully **non-balanced** encoder. The LEA's
+    // `disp32` does not decode to the target on its own; the chain
+    // folds in a non-zero `K`. Its `constant_offset != 0` triggers
+    // the `IndirectCallEncoderPass` `pre_scanned_refs` path so the
+    // chaos refmap patches with the
+    // `rel32_with_imm_offset` encoding. A static analyser must
+    // constant-fold across two instructions to recover the target —
+    // pure byte-pattern signatures fail.
+    r.register_encoder(std::make_unique<AddOffsetUnbalancedEncoder>());
     return r;
 }
 

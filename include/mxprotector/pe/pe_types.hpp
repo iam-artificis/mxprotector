@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mxprotector/pe/data_region.hpp"
+#include "mxprotector/pe/pre_scanned_ref_slot.hpp"
 
 namespace mx::pe {
 
@@ -626,6 +627,17 @@ struct SectionInfo {
     /// did. See `pe/data_region.hpp` for the contract a block must
     /// satisfy to be movable.
     std::vector<MovableBlock> movable_blocks;
+
+    /// Reference-slot overrides emitted by passes that already know
+    /// the right `(slot, target, K)` triple for a `rel32` slot whose
+    /// effective displacement is `(target - slot - 4) - K`. The chaos
+    /// pipeline appends these to its scanned reference table and
+    /// drops any `rel` reference `CodeReferenceScanner` produced for
+    /// the same slot (the scanner cannot know `K` from the on-disk
+    /// disp32 alone). Used by non-balanced indirect-call stubs whose
+    /// LEA carries a non-zero algebraic offset. Default empty.
+    /// See `pe/pre_scanned_ref_slot.hpp` for the value type.
+    std::vector<PreScannedRefSlot> pre_scanned_refs;
 
     /// @brief Проверяет, содержит ли секция код.
     [[nodiscard]] bool is_code() const noexcept {
