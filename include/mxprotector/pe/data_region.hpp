@@ -120,4 +120,61 @@ struct DataRegion {
     }
 };
 
+/**
+ * @brief Diagnostic tag for a `MovableBlock`. Carried into chaos
+ *        atom logs; never branched on by the planner.
+ */
+enum class MovableBlockKind : std::uint8_t {
+    /// One self-contained indirect-call stub
+    /// (`push rax + lea + … + xchg + ret`). Each stub is independent
+    /// of every other stub: its only refs are a LEA disp32 to the
+    /// target function and an inbound `call rel32` from the caller,
+    /// both of which the existing chaos refmap walks already.
+    indirect_call_stub,
+    /// One CFG-flattening trampoline block — a single basic block
+    /// emitted by the dispatcher with its own state-id transition.
+    cff_state_block,
+    /// Generic byte run the emitter wants chaos to shuffle.
+    generic,
+};
+
+[[nodiscard]] constexpr std::string_view movable_block_kind_name(
+    MovableBlockKind k) noexcept
+{
+    switch (k) {
+        case MovableBlockKind::indirect_call_stub: return "icall-stub";
+        case MovableBlockKind::cff_state_block:    return "cff-block";
+        case MovableBlockKind::generic:            return "movable";
+    }
+    return "movable";
+}
+
+/**
+ * @brief One byte run the emitting pass declares safe to relocate.
+ *
+ * Used by `SectionMovableBlockAtomSource` to feed the atomic chunk
+ * planner a stream of movable atoms, in addition to the canonical
+ * `.pdata`-driven function atoms. Every block must:
+ *
+ *   * be byte-self-contained (every reference into it is captured
+ *     by an existing reference scanner — i.e. nothing else needs
+ *     a side-channel patch when it moves), AND
+ *   * not overlap any registered `DataRegion` on the same section.
+ *
+ * The planner pins the block at its current RVA when the alignment
+ * cannot be satisfied at a new address; otherwise it moves the
+ * block to a fresh free range like any other movable atom.
+ */
+struct MovableBlock {
+    Rva              begin_rva = 0;
+    std::uint32_t    size      = 0;
+    std::uint16_t    alignment = 1;
+    MovableBlockKind kind      = MovableBlockKind::generic;
+
+    /// Half-open end of the block's footprint.
+    [[nodiscard]] constexpr Rva end_rva() const noexcept {
+        return static_cast<Rva>(begin_rva + size);
+    }
+};
+
 } // namespace mx::pe

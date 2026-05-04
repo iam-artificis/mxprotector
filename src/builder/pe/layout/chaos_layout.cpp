@@ -18,6 +18,7 @@
 #include "mxprotector/pe/chaos/load_config_atom_source.hpp"
 #include "mxprotector/pe/chaos/pdata_atom_source.hpp"
 #include "mxprotector/pe/chaos/reloc_atom_source.hpp"
+#include "mxprotector/pe/chaos/section_movable_block_atom_source.hpp"
 #include "mxprotector/pe/chaos/tls_atom_source.hpp"
 #include "mxprotector/pe/chaos/volatile_metadata_atom_source.hpp"
 #include "mxprotector/pe/pe_image.hpp"
@@ -338,6 +339,14 @@ void register_atom_sources(chaos::AtomicChunkPlanner& planner) {
     // 1. Movable: per-function atoms covering the exact `.pdata`
     //    `[BeginAddress, EndAddress)` range of each function.
     planner.add_source(make_unique<chaos::FunctionAtomSource>());
+
+    // 1a. Movable: per-section emitter-declared sub-blocks
+    //     (`SectionInfo::movable_blocks`). Currently feeds the
+    //     1296+ indirect-call stubs from `.callstub` into the
+    //     planner; future passes (CFF block shuffle, MBA-noise
+    //     blocks) drop in here without touching this file.
+    planner.add_source(
+        make_unique<chaos::SectionMovableBlockAtomSource>());
 
     // 2. Pinned: every byte in `.text` outside any `.pdata`-listed
     //    function. These are inter-function thunks and CFG stubs

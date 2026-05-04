@@ -54,6 +54,7 @@ set(BUILDER_SOURCES
     pe/refmap/obfuscated_jt_scanner.cpp
     pe/refmap/reference_overlap_filter.cpp
     pe/chaos/chunk_planner.cpp
+    pe/chaos/section_movable_block_atom_source.cpp
     pe/chaos/self_crc_refinalizer.cpp
     pe/chaos/handler_table_integrity_refinalizer.cpp
     pe/chaos/fall_through_jmp_filler.cpp

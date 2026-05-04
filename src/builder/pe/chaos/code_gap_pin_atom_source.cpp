@@ -126,6 +126,25 @@ void emit_pin(Rva start, Rva end, AtomTable& out) {
     return false;
 }
 
+/// Returns `true` when the byte falls inside any
+/// `SectionInfo::movable_block`. Such bytes are *already* claimed
+/// by `SectionMovableBlockAtomSource` as movable atoms; pinning
+/// them here would let the strictest-alignment merge in
+/// `AtomTable::normalize` upgrade them to pinned and cancel the
+/// movability the emitting pass declared.
+[[nodiscard]] bool byte_is_movable_block(
+    const pe::SectionInfo& sec, Rva byte_rva) noexcept
+{
+    for (const auto& mb : sec.movable_blocks) {
+        if (byte_rva >= mb.begin_rva &&
+            byte_rva <  mb.begin_rva + mb.size)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Walk `[start, end)` byte-by-byte and emit a pin atom for every
 /// maximal sub-run of bytes that must remain at their original
 /// RVA. A byte qualifies when:
@@ -164,6 +183,16 @@ void pin_non_int3_subranges(
     Rva run_start = cursor;
     bool in_run = false;
     for (std::size_t k = 0; k < count; ++k, ++cursor) {
+        // Bytes claimed by `SectionInfo::movable_blocks` are
+        // already movable atoms — never pin them, otherwise the
+        // strictest-alignment merge would silently upgrade them.
+        if (byte_is_movable_block(sec, cursor)) {
+            if (in_run) {
+                emit_pin(run_start, cursor, out);
+                in_run = false;
+            }
+            continue;
+        }
         const bool keep = (p[k] != 0xCC)
                        || byte_is_data_region(sec, cursor);
         if (keep) {

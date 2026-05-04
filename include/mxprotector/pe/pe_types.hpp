@@ -619,6 +619,14 @@ struct SectionInfo {
     /// Default empty: the section is pure code or pure data.
     std::vector<DataRegion> data_regions;
 
+    /// Byte runs inside `data` that the emitting pass declares safe
+    /// for chaos-shuffle to relocate as movable atoms (indirect-call
+    /// stubs, CFF blocks). Default empty — sections without a
+    /// natural sub-block carving stay pinned the way they always
+    /// did. See `pe/data_region.hpp` for the contract a block must
+    /// satisfy to be movable.
+    std::vector<MovableBlock> movable_blocks;
+
     /// @brief Проверяет, содержит ли секция код.
     [[nodiscard]] bool is_code() const noexcept {
         return (characteristics & IMAGE_SCN_CNT_CODE) != 0;

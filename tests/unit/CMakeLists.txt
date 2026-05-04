@@ -68,6 +68,7 @@ set(TEST_SOURCES
     chaos_self_crc_refinalizer_test.cpp
     refmap_obfuscated_jt_scanner_test.cpp
     refmap_reference_overlap_filter_test.cpp
+    chaos_section_movable_block_atom_source_test.cpp
     chaos_handler_table_integrity_refinalizer_test.cpp
     chaos_fall_through_jmp_filler_test.cpp
     anti_static_encoder_test.cpp
@@ -228,6 +229,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/obfuscated_jt_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_overlap_filter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/section_movable_block_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/self_crc_refinalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/handler_table_integrity_refinalizer.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/fall_through_jmp_filler.cpp
