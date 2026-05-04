@@ -13,9 +13,12 @@
 #include <utility>
 
 #include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/protection/anti_static/encoders/add_chain4_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_offset_encoder.hpp"
-#include "mxprotector/protection/anti_static/encoders/xor_chain_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/interleaved_add_sub_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/sub_neg_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/xor_chain4_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/xor_chain_encoder.hpp"
 
 namespace mx::protection::anti_static {
 
@@ -44,9 +47,21 @@ const IIndirectCallEncoder* EncoderRegistry::find(
 
 EncoderRegistry make_default_registry() {
     EncoderRegistry r;
+    // Foundation set — visible cancel mirrors. Kept for diversity:
+    // a registry that mixes mirrored and non-mirrored encoders is
+    // strictly harder to fingerprint than one with only one shape.
     r.register_encoder(std::make_unique<AddOffsetEncoder>());
     r.register_encoder(std::make_unique<XorChainEncoder>());
     r.register_encoder(std::make_unique<SubNegEncoder>());
+
+    // Phase C — non-mirrored chains. Each constant is independently
+    // random; a pattern matcher can't see the cancel structure
+    // without a full constant-fold. Adding new encoders here is the
+    // SOLID extension point — no edit to the pass, the registry, or
+    // any downstream consumer.
+    r.register_encoder(std::make_unique<AddChain4Encoder>());
+    r.register_encoder(std::make_unique<XorChain4Encoder>());
+    r.register_encoder(std::make_unique<InterleavedAddSubEncoder>());
     return r;
 }
 

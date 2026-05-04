@@ -26,19 +26,25 @@
 
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/protection/anti_static/encoder_registry.hpp"
+#include "mxprotector/protection/anti_static/encoders/add_chain4_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/add_offset_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/interleaved_add_sub_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/sub_neg_encoder.hpp"
+#include "mxprotector/protection/anti_static/encoders/xor_chain4_encoder.hpp"
 #include "mxprotector/protection/anti_static/encoders/xor_chain_encoder.hpp"
 
 namespace {
 
 using mx::Randomizer;
 using mx::Rva;
+using mx::protection::anti_static::AddChain4Encoder;
 using mx::protection::anti_static::AddOffsetEncoder;
 using mx::protection::anti_static::EncodedStub;
 using mx::protection::anti_static::EncoderRegistry;
 using mx::protection::anti_static::IIndirectCallEncoder;
+using mx::protection::anti_static::InterleavedAddSubEncoder;
 using mx::protection::anti_static::SubNegEncoder;
+using mx::protection::anti_static::XorChain4Encoder;
 using mx::protection::anti_static::XorChainEncoder;
 
 [[nodiscard]] std::int32_t read_disp32(
@@ -113,6 +119,85 @@ TEST(AntiStaticEncoder, SubNegResolvesToTarget) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C — non-mirrored chain encoders
+// ---------------------------------------------------------------------------
+
+TEST(AntiStaticEncoder, AddChain4ResolvesToTarget) {
+    AddChain4Encoder e;
+    EXPECT_EQ(e.name(), "add-chain-4");
+    EXPECT_EQ(e.stub_size(), 37u);
+    verify_chain_resolves(e, 0x10000, 0x18000);
+    verify_chain_resolves(e, 0x12000, 0x14000);
+}
+
+TEST(AntiStaticEncoder, XorChain4ResolvesToTarget) {
+    XorChain4Encoder e;
+    EXPECT_EQ(e.name(), "xor-chain-4");
+    EXPECT_EQ(e.stub_size(), 37u);
+    verify_chain_resolves(e, 0x10000, 0x18000);
+    verify_chain_resolves(e, 0x20000, 0x10500);
+}
+
+TEST(AntiStaticEncoder, InterleavedAddSubResolvesToTarget) {
+    InterleavedAddSubEncoder e;
+    EXPECT_EQ(e.name(), "interleaved-add-sub");
+    EXPECT_EQ(e.stub_size(), 37u);
+    verify_chain_resolves(e, 0x10000, 0x18000);
+    verify_chain_resolves(e, 0x20000, 0x10500);
+}
+
+TEST(AntiStaticEncoder, AddChain4VariesAcrossSeeds) {
+    AddChain4Encoder e;
+    Randomizer r1{1};
+    Randomizer r2{2};
+    const auto a = e.emit(0x10000, 0x18000, r1);
+    const auto b = e.emit(0x10000, 0x18000, r2);
+    EXPECT_NE(a.bytes, b.bytes);
+}
+
+TEST(AntiStaticEncoder, AddChain4ConstantsHaveNoVisibleMirror) {
+    // Pin the contract: every constant in the chain is independently
+    // random — so byte ranges of the four `add` immediates should
+    // differ (with overwhelming probability) for almost every seed.
+    // This is the OBSERVABLE difference from `AddOffsetEncoder`,
+    // whose `add K, sub K` pair embeds the same byte run twice.
+    AddChain4Encoder e;
+    Randomizer rng{0xDEADBEEFu};
+    const auto stub = e.emit(0x10000, 0x18000, rng);
+    ASSERT_EQ(stub.bytes.size(), 37u);
+    // Add immediates start at offsets 10, 16, 22, 28: 1 (push rax)
+    // + 7 (lea) + 2 (`48 05`) = 10 for the first immediate, then
+    // +6 per subsequent step.
+    auto read_imm = [&](std::size_t off) {
+        std::int32_t v = 0;
+        std::memcpy(&v, stub.bytes.data() + off, sizeof(v));
+        return v;
+    };
+    const std::int32_t k1 = read_imm(10);
+    const std::int32_t k2 = read_imm(16);
+    const std::int32_t k3 = read_imm(22);
+    const std::int32_t k4 = read_imm(28);
+
+    // Sum to zero mod 2^32 — algebraic identity contract.
+    const std::int64_t sum =
+        static_cast<std::int64_t>(k1) +
+        static_cast<std::int64_t>(k2) +
+        static_cast<std::int64_t>(k3) +
+        static_cast<std::int64_t>(k4);
+    EXPECT_EQ(static_cast<std::int32_t>(sum), 0);
+
+    // None of the constants is the negative of any other (the
+    // `add K, sub -K` shortcut a folder might detect). Probability
+    // of all six pairs landing on negatives by chance ≈ 6 × 2^-32.
+    EXPECT_NE(k1, -k2);
+    EXPECT_NE(k1, -k3);
+    EXPECT_NE(k1, -k4);
+    EXPECT_NE(k2, -k3);
+    EXPECT_NE(k2, -k4);
+    EXPECT_NE(k3, -k4);
+}
+
+// ---------------------------------------------------------------------------
 // Variation: different RNG seeds produce different bytes
 // ---------------------------------------------------------------------------
 
@@ -138,11 +223,14 @@ TEST(EncoderRegistry, EmptyRegistryReturnsNull) {
 
 TEST(EncoderRegistry, DefaultRegistryHoldsAllShipped) {
     auto r = mx::protection::anti_static::make_default_registry();
-    EXPECT_GE(r.size(), 3u);
-    EXPECT_NE(r.find("add-offset"), nullptr);
-    EXPECT_NE(r.find("xor-chain"), nullptr);
-    EXPECT_NE(r.find("sub-neg"),   nullptr);
-    EXPECT_EQ(r.find("nope"),      nullptr);
+    EXPECT_GE(r.size(), 6u);
+    EXPECT_NE(r.find("add-offset"),          nullptr);
+    EXPECT_NE(r.find("xor-chain"),           nullptr);
+    EXPECT_NE(r.find("sub-neg"),             nullptr);
+    EXPECT_NE(r.find("add-chain-4"),         nullptr);
+    EXPECT_NE(r.find("xor-chain-4"),         nullptr);
+    EXPECT_NE(r.find("interleaved-add-sub"), nullptr);
+    EXPECT_EQ(r.find("nope"),                nullptr);
 }
 
 TEST(EncoderRegistry, PickReturnsRegisteredEncoder) {

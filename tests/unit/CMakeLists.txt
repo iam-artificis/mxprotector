@@ -237,6 +237,9 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/add_offset_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/xor_chain_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/sub_neg_encoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/add_chain4_encoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/xor_chain4_encoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/encoders/interleaved_add_sub_encoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/anti_static/indirect_call_encoder_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chaos_shuffler.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/load_config_pin_helper.cpp
