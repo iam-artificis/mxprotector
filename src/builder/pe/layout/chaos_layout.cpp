@@ -7,6 +7,7 @@
 
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/chaos/atomic_chunk_planner.hpp"
+#include "mxprotector/pe/chaos/basic_block_atom_source.hpp"
 #include "mxprotector/pe/chaos/chaos_shuffler.hpp"
 #include "mxprotector/pe/chaos/code_gap_pin_atom_source.hpp"
 #include "mxprotector/pe/chaos/data_section_pin_atom_source.hpp"
@@ -338,6 +339,15 @@ void register_atom_sources(chaos::AtomicChunkPlanner& planner) {
 
     // 1. Movable: per-function atoms covering the exact `.pdata`
     //    `[BeginAddress, EndAddress)` range of each function.
+    //    `BasicBlockAtomSource` (B.4.23) is intentionally NOT
+    //    registered here: splitting a function into sub-block atoms
+    //    leaves the `.pdata` `RUNTIME_FUNCTION` describing a
+    //    contiguous range that no longer matches the scattered post-
+    //    shuffle bytes. The unwinder fails to dispatch SEH for any
+    //    RIP outside the patched `BeginAddress`. Re-enabling sub-
+    //    function splits requires emitting one `RUNTIME_FUNCTION`
+    //    per sub-block (with `UNW_FLAG_CHAININFO` linking to the
+    //    parent unwind data) — that is the B.4.23.1 follow-up.
     planner.add_source(make_unique<chaos::FunctionAtomSource>());
 
     // 1a. Movable: per-section emitter-declared sub-blocks

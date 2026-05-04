@@ -49,6 +49,7 @@ set(TEST_SOURCES
     chaos_directory_atom_sources_test.cpp
     chaos_volatile_metadata_atom_source_test.cpp
     chaos_function_atom_source_test.cpp
+    chaos_basic_block_atom_source_test.cpp
     chaos_data_section_pin_atom_source_test.cpp
     chaos_atomic_chunk_planner_test.cpp
     refmap_reference_test.cpp
@@ -260,6 +261,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/data_section_pin_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/code_gap_pin_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/function_atom_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/basic_block_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atomic_chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
