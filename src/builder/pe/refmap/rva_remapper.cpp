@@ -43,6 +43,31 @@ bool RvaRemapper::finalize() noexcept {
         }
     }
 
+    // NEW-RVA overlap check: two chunks landing at overlapping NEW
+    // positions silently corrupt each other's content during the
+    // shuffle. The atomic planner is supposed to make this
+    // impossible (cursor advances inside each free range, free
+    // ranges are non-overlapping), but a violation indicates a
+    // bug we'd rather catch at finalize time than chase via a
+    // wild-VA crash. We sort a side copy by new_rva and compare
+    // adjacent pairs.
+    {
+        std::vector<RvaChunk> by_new = chunks_;
+        std::sort(by_new.begin(), by_new.end(),
+                  [](const RvaChunk& a, const RvaChunk& b) noexcept {
+                      return a.new_rva < b.new_rva;
+                  });
+        for (std::size_t i = 1; i < by_new.size(); ++i) {
+            const auto a_end = static_cast<std::uint64_t>(
+                by_new[i - 1].new_rva) + by_new[i - 1].size;
+            const auto b     = by_new[i].new_rva;
+            if (b < a_end) {
+                finalized_ = false;
+                return false;
+            }
+        }
+    }
+
     finalized_ = true;
     return true;
 }

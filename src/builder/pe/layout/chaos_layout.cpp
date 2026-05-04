@@ -48,6 +48,8 @@
 #include "mxprotector/pe/section_manager.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -358,12 +360,33 @@ void merge_into_unified_section(PeImage& image) {
     return table;
 }
 
-/// Per-build random seed for the atomic planner. Drawing it from a
-/// fresh `Randomizer` (auto-seeded from `std::random_device`) gives
-/// each build a non-reproducible permutation. The 64-bit value is
-/// then handed to a deterministic `Randomizer{seed}` so the same
-/// seed produces the same plan for the rest of the run.
+/// Per-build random seed for the atomic planner. By default drawn
+/// from a fresh `Randomizer` (auto-seeded from `std::random_device`),
+/// giving each build a non-reproducible permutation. When
+/// `MX_CHAOS_SEED` is set in the environment to a 16-hex-digit
+/// value, that seed is used instead — the entire chaos plan is
+/// then deterministic for the run, which is what the
+/// stability-bug debugger needs to capture corrupted bytes and
+/// re-run with the same chunk layout.
 [[nodiscard]] std::uint64_t fresh_seed() {
+    if (const char* env = std::getenv("MX_CHAOS_SEED"); env != nullptr) {
+        std::uint64_t parsed = 0;
+        bool ok = true;
+        for (const char* p = env; *p && ok; ++p) {
+            parsed <<= 4;
+            const char c = *p;
+            if      (c >= '0' && c <= '9') parsed |= static_cast<std::uint64_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') parsed |= static_cast<std::uint64_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') parsed |= static_cast<std::uint64_t>(c - 'A' + 10);
+            else { ok = false; }
+        }
+        if (ok) {
+            std::fprintf(stderr,
+                "[chaos] MX_CHAOS_SEED override: 0x%016llx\n",
+                static_cast<unsigned long long>(parsed));
+            return parsed;
+        }
+    }
     Randomizer rng;
     return rng.next_u64();
 }
@@ -387,19 +410,24 @@ void merge_into_unified_section(PeImage& image) {
 void register_atom_sources(chaos::AtomicChunkPlanner& planner) {
     using std::make_unique;
 
-    // 1. Movable: per-function atoms covering the exact `.pdata`
-    //    `[BeginAddress, EndAddress)` range of each function.
-    //    `BasicBlockAtomSource` (B.4.23) and `PdataChainEmitter`
-    //    (B.4.23.1) are intentionally NOT used here — see the
-    //    deferred-activation note in `PdataChainEmitter`'s class
-    //    docstring. The chaos pipeline's `BeginAddress` /
-    //    `EndAddress` rewriting now uses `rva_end_exclusive` so
-    //    the ENCODING is ready for sub-block atoms; the remaining
-    //    work is identifying the byte-corruption bug that crashes
-    //    100 % of builds when both the planner-level
-    //    `BasicBlockAtomSource` registration and the
-    //    `PdataChainEmitter` step are active.
-    planner.add_source(make_unique<chaos::FunctionAtomSource>());
+    // 1. Movable: per-sub-function atoms (B.4.23 + B.4.23.1).
+    //    `BasicBlockAtomSource` walks `.pdata` with Zydis and emits
+    //    one atom per run that ends with an unconditional terminator
+    //    on a 4-aligned RVA. The planner refuses any split point
+    //    that would put a `rel8`/`rel32` slot in one chunk and its
+    //    target in another (sub_block_planner.cpp::scan_function
+    //    collects every rel-immediate operand and the
+    //    `RelRefSpan` filter drops splits that would break a rel
+    //    after shuffle — without this, an int8 displacement
+    //    overflows when chunks scatter and `JMP rel8` lands
+    //    mid-instruction). Functions with no usable splits collapse
+    //    to a single function-sized atom.
+    //
+    //    `PdataChainEmitter` (called above in
+    //    `ChaosLayout::finalize`) emits a chained `.pdata` /
+    //    `.mxchain` pair so SEH can dispatch for any RIP after
+    //    chaos shuffle.
+    planner.add_source(make_unique<chaos::BasicBlockAtomSource>());
 
     // 1a. Movable: per-section emitter-declared sub-blocks
     //     (`SectionInfo::movable_blocks`). Currently feeds the
@@ -547,13 +575,17 @@ MxStatus ChaosLayout::finalize(PeImage& image) const {
     // name table, LOAD_CONFIG CFG tables, TLS callback array, etc.)
     // are now scanned, but the policy is conservative — flip on via
     // `--chaos-shuffle` and stress-test before defaulting on.
-    // Step 1a — `PdataChainEmitter` (B.4.23.1) is intentionally NOT
-    // invoked here. Its activation is gated on identifying the
-    // byte-corruption bug that crashes 100 % of builds when both
-    // the chained-pdata emission and the basic-block atom source
-    // are turned on. Foundation pieces (rva_end_exclusive encoding,
-    // sub_block_planner, the emitter class itself, the chain-info
-    // ref tracking) are shipped and tested.
+    // Step 1a — emit chained `.pdata` + `.mxchain` so SEH can
+    // dispatch for any RIP after `BasicBlockAtomSource` scatters
+    // a function's sub-blocks. The emitter is a no-op when no
+    // function yields a usable split. See
+    // `chaos/pdata_chain_emitter.hpp` for the full pipeline.
+    if (enable_fragment_shuffle_) {
+        SectionManager     mgr{image};
+        pe::SectionEmitter emitter{mgr, *this};
+        [[maybe_unused]] const auto chained =
+            chaos::PdataChainEmitter{}.emit(image, emitter);
+    }
 
     if (enable_fragment_shuffle_) {
         apply_fragment_shuffle(image);

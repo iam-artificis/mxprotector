@@ -200,27 +200,106 @@ private:
     return sec->data.data() + off;
 }
 
-[[nodiscard]] std::vector<Rva> harvest_split_points(
+/// One rel8 / rel32 reference observed inside a function — paired
+/// `slot_rva` (the disp byte) and `target_rva` (where the jump
+/// lands). Sub-block split points that fall STRICTLY BETWEEN
+/// `min(slot, target)` and `max(slot, target)` would put the slot
+/// in one chunk and the target in another; chaos relocates them
+/// independently and the rel8 displacement overflows int8 range
+/// (or even rel32 range though that is far rarer). The planner
+/// drops such split points so the rel reference stays intra-chunk
+/// and its disp value survives the shuffle byte-for-byte.
+struct RelRefSpan {
+    Rva           lo; ///< min(slot+1, target). slot+1 = byte AFTER disp.
+    Rva           hi; ///< max(slot+1, target).
+    std::uint8_t  width; ///< 1 or 4 — diagnostic only.
+};
+
+/// Decode the entire function and harvest:
+///   * Candidate split points (one per unconditional terminator).
+///   * `RelRefSpan`s for every `rel8` / `rel32` branch slot — these
+///     span the slot-byte and target-byte and constrain where the
+///     planner can split.
+struct FunctionScan {
+    std::vector<Rva>        split_candidates;
+    std::vector<RelRefSpan> rel_spans;
+};
+
+[[nodiscard]] FunctionScan scan_function(
     const PeImage& image, const RuntimeFunction& rf)
 {
-    std::vector<Rva> splits;
+    FunctionScan out;
     const std::uint32_t size = rf.end_address - rf.begin_address;
     const auto* code = code_window(image,
                                    static_cast<Rva>(rf.begin_address), size);
-    if (code == nullptr) return splits;
+    if (code == nullptr) return out;
 
-    ZydisX64Decoder decoder;
-    std::uint32_t   off = 0;
+    ZydisDecoder decoder{};
+    ZydisDecoderInit(&decoder,
+                     ZYDIS_MACHINE_MODE_LONG_64,
+                     ZYDIS_STACK_WIDTH_64);
+
+    std::uint32_t off = 0;
     while (off < size) {
-        const auto d = decoder.decode_one(code + off, size - off);
-        if (d.length == 0) break;
-        const std::uint32_t after = off + d.length;
-        if (is_unconditional_terminator(d.category) && after < size) {
-            splits.push_back(static_cast<Rva>(rf.begin_address + after));
+        ZydisDecodedInstruction insn{};
+        ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT]{};
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, code + off, size - off, &insn, ops))) {
+            break;
+        }
+        const std::uint32_t after = off + insn.length;
+
+        // Harvest `rel` operand spans from this instruction. We
+        // examine every operand for `IMM` types whose width is 8
+        // or 32 bits and whose source was a relative immediate
+        // (Zydis sets `imm.is_relative` for those).
+        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
+            const auto& op = ops[i];
+            if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) continue;
+            if (!op.imm.is_relative) continue;
+
+            const auto& raw = insn.raw.imm[i];
+            if (raw.size != 8 && raw.size != 32) continue;
+            const Rva slot_rva = static_cast<Rva>(
+                rf.begin_address + off + raw.offset);
+            const std::int64_t disp = op.imm.value.s;
+            const Rva target_rva = static_cast<Rva>(
+                static_cast<std::int64_t>(rf.begin_address + after) + disp);
+            if (target_rva < rf.begin_address ||
+                target_rva > rf.end_address)
+            {
+                // Cross-function ref — split policy doesn't care:
+                // the slot is inside the function, target outside,
+                // any split inside the function leaves the slot
+                // and target on opposite sides regardless. Skip.
+                continue;
+            }
+            // The span is `[min(slot, target), max(slot, target)]`
+            // — the slot and target byte positions. A split point
+            // `S` breaks this span when `min < S <= max`, putting
+            // the slot in one chunk and the target in another.
+            out.rel_spans.push_back(RelRefSpan{
+                .lo    = std::min(slot_rva, target_rva),
+                .hi    = std::max(slot_rva, target_rva),
+                .width = static_cast<std::uint8_t>(raw.size / 8),
+            });
+        }
+
+        if (is_unconditional_terminator(insn.meta.category) &&
+            after < size)
+        {
+            out.split_candidates.push_back(
+                static_cast<Rva>(rf.begin_address + after));
         }
         off = after;
     }
-    return splits;
+    return out;
+}
+
+[[nodiscard]] std::vector<Rva> harvest_split_points(
+    const PeImage& image, const RuntimeFunction& rf)
+{
+    return scan_function(image, rf).split_candidates;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,14 +377,37 @@ private:
     return (rva % kSubBlockSplitAlignment) == 0;
 }
 
+/// `true` when splitting the function at `split` would put a rel
+/// slot in one sub-block and its target in another. Such a split
+/// would force the chaos refmap to write a new disp into the slot,
+/// and for `rel8` slots a cross-chunk distance overflows the int8
+/// range — the patcher truncates and the jump lands on a wrong
+/// byte (most often mid-instruction → illegal-instruction crash).
+/// We refuse the split rather than break the jump.
+[[nodiscard]] bool split_breaks_any_rel(
+    Rva                          split,
+    std::span<const RelRefSpan>  rel_spans) noexcept
+{
+    // Reject splits that would put the slot in one chunk and the
+    // target in another. A split at `S` breaks the rel reference
+    // when `lo < S <= hi` — the half-open boundary on the high
+    // side is what lets us split RIGHT AT the rel's source byte
+    // (slot strictly precedes the split) without breaking it.
+    for (const auto& s : rel_spans) {
+        if (s.lo < split && split <= s.hi) return true;
+    }
+    return false;
+}
+
 void emit_sub_blocks_for_function(
-    const PeImage&         image,
-    const RuntimeFunction& rf,
-    std::uint32_t          function_index,
-    std::uint32_t          prev_function_end,
-    std::uint32_t          next_function_start,
-    std::span<const Rva>   raw_splits,
-    std::vector<SubBlock>& out)
+    const PeImage&              image,
+    const RuntimeFunction&      rf,
+    std::uint32_t               function_index,
+    std::uint32_t               prev_function_end,
+    std::uint32_t               next_function_start,
+    std::span<const Rva>        raw_splits,
+    std::span<const RelRefSpan> rel_spans,
+    std::vector<SubBlock>&      out)
 {
     const Rva fn_start_with_head = static_cast<Rva>(
         extend_head(image, rf, prev_function_end));
@@ -315,10 +417,11 @@ void emit_sub_blocks_for_function(
     const std::size_t first_emit = out.size();
     Rva run_start = fn_start_with_head;
     for (const Rva split : raw_splits) {
-        if (split <= run_start)        continue;
-        if (split >= fn_end_with_tail) break;
-        if (!is_split_aligned(split))  continue;
+        if (split <= run_start)         continue;
+        if (split >= fn_end_with_tail)  break;
+        if (!is_split_aligned(split))   continue;
         if (!is_split_aligned(run_start)) continue;
+        if (split_breaks_any_rel(split, rel_spans)) continue;
         out.push_back(SubBlock{
             .function_index = function_index,
             .start_rva      = run_start,
@@ -360,11 +463,14 @@ std::vector<SubBlock> plan_sub_blocks(const PeImage& image) {
             (i > 0) ? entries[i - 1].end_address : 0;
         const std::uint32_t next_start =
             (i + 1 < entries.size()) ? entries[i + 1].begin_address : 0;
-        const auto splits = harvest_split_points(image, rf);
+        const auto scan = scan_function(image, rf);
         emit_sub_blocks_for_function(
             image, rf, static_cast<std::uint32_t>(i),
             prev_end, next_start,
-            std::span<const Rva>{splits.data(), splits.size()},
+            std::span<const Rva>{scan.split_candidates.data(),
+                                 scan.split_candidates.size()},
+            std::span<const RelRefSpan>{scan.rel_spans.data(),
+                                        scan.rel_spans.size()},
             out);
     }
     return out;

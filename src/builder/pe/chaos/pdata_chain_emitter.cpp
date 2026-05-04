@@ -498,6 +498,21 @@ std::size_t PdataChainEmitter::emit(
     auto& chain_section = image.sections()[chain_idx];
     const Rva chain_rva = chain_section.virtual_address;
 
+    // The chaos layout policy stamps `IMAGE_SCN_CNT_CODE` on every
+    // section's characteristics so the merged `.mxchaos` reads as
+    // mixed code/data uniformly. As a side effect,
+    // `CodeReferenceScanner` walks `.mxchain`'s structured bytes
+    // through Zydis and emits BOGUS `rel`/`rip-rel` references
+    // from coincidental opcode patterns inside the 16-byte
+    // chained-UNWIND_INFO blobs. Register the entire byte range
+    // as a `DataRegion` so the scanner skips it and the patcher
+    // never writes to those bytes.
+    chain_section.data_regions.push_back(DataRegion{
+        .begin_rva = chain_rva,
+        .size      = static_cast<std::uint32_t>(chain_bytes.size()),
+        .kind      = DataRegionKind::chained_unwind_info_array,
+    });
+
     // 3. Build .mxpdat content.
     const auto mxpdat_entries = build_mxpdat_entries(
         sub_blocks, groups, pdata, chained, chain_rva);
@@ -515,6 +530,18 @@ std::size_t PdataChainEmitter::emit(
     const auto mxpdat_idx = *mxpdat_idx_result;
     auto& mxpdat_section = image.sections()[mxpdat_idx];
     const Rva mxpdat_rva = mxpdat_section.virtual_address;
+
+    // Same Zydis-treats-as-code hazard as `.mxchain` — the chaos
+    // layout policy stamps `CNT_CODE` on every section. Register
+    // the full `.mxpdat` extent so the scanner skips it and the
+    // existing `StructureReferenceScanner` (which walks `.mxpdat`
+    // structurally now that the EXCEPTION directory points at it)
+    // remains the sole producer of references for those bytes.
+    mxpdat_section.data_regions.push_back(DataRegion{
+        .begin_rva = mxpdat_rva,
+        .size      = static_cast<std::uint32_t>(mxpdat_bytes.size()),
+        .kind      = DataRegionKind::pdata_runtime_function_array,
+    });
 
     // 5. Re-resolve chain_section pointer — `append_section` may
     // have invalidated the earlier reference if the section vector

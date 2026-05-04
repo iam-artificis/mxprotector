@@ -75,6 +75,17 @@ enum class DataRegionKind : std::uint8_t {
     /// S3 ephemeral scratch ring — counter + N fixed-size slots
     /// the runtime decryptor copies plaintext into.
     string_scratch_ring,
+    /// `.mxpdat` byte range emitted by `PdataChainEmitter` —
+    /// contiguous array of `RUNTIME_FUNCTION` triples (3 RVAs per
+    /// entry). Plain data, not instructions; the chaos layout
+    /// policy stamps `IMAGE_SCN_CNT_CODE` on every section so
+    /// `CodeReferenceScanner` would otherwise feed these bytes to
+    /// Zydis and emit bogus rel/rip-rel references.
+    pdata_runtime_function_array,
+    /// `.mxchain` byte range emitted by `PdataChainEmitter` —
+    /// 16-byte chained `UNWIND_INFO` blobs. Same Zydis-treats-as-
+    /// code hazard as `pdata_runtime_function_array`.
+    chained_unwind_info_array,
 };
 
 /**
@@ -92,6 +103,8 @@ enum class DataRegionKind : std::uint8_t {
         case DataRegionKind::string_descriptor_table:   return "str-desc-tbl";
         case DataRegionKind::string_data_pool:          return "str-data-pool";
         case DataRegionKind::string_scratch_ring:       return "str-scratch";
+        case DataRegionKind::pdata_runtime_function_array: return "pdata-rfun-arr";
+        case DataRegionKind::chained_unwind_info_array:    return "chained-uwi-arr";
     }
     return "data";
 }
