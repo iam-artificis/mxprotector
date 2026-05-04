@@ -76,15 +76,31 @@ void scan_pdata(
         // remaps the target through the chunk planner; if the
         // target's RVA didn't move, the remapper returns the input
         // unchanged.
+        //
+        // `EndAddress` uses `rva_end_exclusive` because its target
+        // is the BYTE AFTER the function — for a function split
+        // into sub-block atoms (B.4.23.1), that byte falls inside
+        // the NEXT sub-block's chunk and a plain `rva` remap would
+        // return the wrong value. The encoding remaps `target - 1`
+        // (the last byte of the owning chunk) and adds 1, yielding
+        // the correct end-exclusive RVA. For contiguous functions
+        // whose `FunctionAtomSource` chunk absorbs trailing INT3
+        // padding past `EndAddress`, the encoding's result equals
+        // plain `rva` — `target - 1` and `target` map to the same
+        // delta within the chunk.
         if (begin != 0) {
             emit_header_rva_ref(
                 entry_rva + 0, begin,
                 ReferenceOrigin::pdata_runtime_function, table);
         }
         if (end != 0) {
-            emit_header_rva_ref(
-                entry_rva + 4, end,
-                ReferenceOrigin::pdata_runtime_function, table);
+            table.add(Reference{
+                .location_rva = static_cast<Rva>(entry_rva + 4),
+                .target_rva   = static_cast<Rva>(end),
+                .width        = ReferenceWidth::byte4,
+                .encoding     = ReferenceEncoding::rva_end_exclusive,
+                .origin       = ReferenceOrigin::pdata_runtime_function,
+            });
         }
         if (unwind != 0) {
             emit_header_rva_ref(
