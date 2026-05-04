@@ -133,6 +133,26 @@ enum class ReferenceEncoding : std::uint8_t {
     /// `jt_base_rva` and `KEY` are carried per-reference in
     /// `Reference::aux` (high 32 bits = jt_base_rva, low 32 = KEY).
     xor_encoded_signed_delta_imm32,
+    /// 4-byte RVA whose target is the byte ONE PAST a chunk's last
+    /// byte — i.e. `chunk.old_rva + chunk.size`. Used by `.pdata`
+    /// `RUNTIME_FUNCTION.EndAddress`, which is the byte immediately
+    /// after the function (or sub-block). That byte typically falls
+    /// inside the NEXT chunk in the original layout, so a plain
+    /// `rva` remap returns the next chunk's new position — which is
+    /// not the same as "this chunk's new end". The patcher remaps
+    /// the LAST byte of the owning chunk (`target - 1`) and adds 1,
+    /// yielding the correct post-shuffle "end-exclusive" RVA.
+    ///
+    /// `target_rva` SHOULD point to a byte that is NOT inside any
+    /// chunk in the original layout (e.g. trailing INT3 padding) —
+    /// in that case `remap` is identity, `remap(target - 1) + 1` is
+    /// the right "end of preceding chunk +1" anchor, and the result
+    /// equals what a plain `rva` patch would produce. The
+    /// `rva_end_exclusive` encoding is only required when
+    /// `target_rva` falls INSIDE a different chunk than the one
+    /// whose end the slot describes (the basic-block sub-function
+    /// shuffle case from B.4.23.1).
+    rva_end_exclusive,
 };
 
 /**

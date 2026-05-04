@@ -11,6 +11,7 @@
 
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/pe/pe_types.hpp"
+#include "mxprotector/pe/refmap/rva_remapper.hpp"
 
 namespace mx::pe::refmap {
 
@@ -23,10 +24,16 @@ namespace {
 
 /// Encode the new target into a max-8-byte little-endian buffer.
 /// The buffer's leading `width` bytes are the on-disk slot value.
+///
+/// The remapper is passed through so encodings whose new value is
+/// NOT a direct remap of `ref.target_rva` can compute their own
+/// adjustment (`rva_end_exclusive` remaps `target - 1` and adds 1
+/// to land on the correct "byte after a chunk" RVA).
 [[nodiscard]] std::array<std::uint8_t, 8> encode_value(
     const Reference&      ref,
     Rva                   new_location,
     Rva                   new_target,
+    const RvaRemapper&    remapper,
     std::uint64_t         image_base) noexcept
 {
     std::array<std::uint8_t, 8> out{};
@@ -85,6 +92,26 @@ namespace {
                 static_cast<std::int64_t>(new_location + 4) -
                 static_cast<std::int64_t>(k);
             const auto v = static_cast<std::int32_t>(disp);
+            std::memcpy(out.data(), &v, 4);
+            break;
+        }
+        case ReferenceEncoding::rva_end_exclusive: {
+            // The slot stores a "byte after the function" RVA — for
+            // a contiguous function with trailing INT3 absorbed into
+            // the chunk, plain `remap(target_rva)` lands inside the
+            // chunk and returns the right post-shuffle byte. For a
+            // sub-block whose end byte falls inside the NEXT chunk
+            // in the original layout (B.4.23.1), `remap(target_rva)`
+            // returns the next chunk's new start — wrong. Remap the
+            // LAST byte of the owning chunk (target-1) and add 1.
+            //
+            // `target == 0` is treated as identity to keep the
+            // encoding safe for callers that pass a sentinel value.
+            const Rva remapped = ref.target_rva == 0
+                ? new_target
+                : static_cast<Rva>(
+                      remapper.remap(static_cast<Rva>(ref.target_rva - 1)) + 1);
+            const auto v = static_cast<std::uint32_t>(remapped);
             std::memcpy(out.data(), &v, 4);
             break;
         }
@@ -193,7 +220,7 @@ PatchStats ReferencePatcher::apply(
         const Rva new_target   = remapper.remap(ref.target_rva);
 
         const auto value = encode_value(
-            ref, new_location, new_target, image_base);
+            ref, new_location, new_target, remapper, image_base);
         const std::uint8_t w = width_bytes(ref.width);
 
         const bool wrote = is_header_rva(image, new_location)

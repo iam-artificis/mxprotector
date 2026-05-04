@@ -322,4 +322,77 @@ TEST(ReferencePatcher, UnreachableLocationIsSkipped) {
     EXPECT_EQ(stats.skipped,  1u);
 }
 
+// ---------------------------------------------------------------------------
+// rva_end_exclusive encoding (B.4.23.1)
+// ---------------------------------------------------------------------------
+
+TEST(ReferencePatcher, RvaEndExclusiveRemapsLastByteAndAddsOne) {
+    // Set up a chunk [0x1000, 0x1080) (size 0x80) that the planner
+    // remaps to [0x5000, 0x5080). The slot stores `0x1080` — the
+    // byte AFTER the chunk's last byte. With plain `rva` encoding,
+    // remap(0x1080) returns 0x1080 (identity, since 0x1080 is not
+    // inside any chunk). With `rva_end_exclusive`, the patcher
+    // remaps `0x1080 - 1 = 0x107F` → `0x5000 + 0x7F = 0x507F`,
+    // adds 1 → `0x5080`, the correct post-shuffle "end exclusive"
+    // RVA.
+    PeImage img = make_pe32plus_image();
+    SectionManager mgr{img};
+    auto idx = mgr.add_section(
+        ".text",
+        mx::ByteView{std::vector<std::uint8_t>(0x10000, 0).data(), 0x10000},
+        mx::pe::IMAGE_SCN_CNT_CODE | mx::pe::IMAGE_SCN_MEM_READ);
+    ASSERT_TRUE(idx.has_value());
+    const Rva text_va = img.sections()[*idx].virtual_address;
+
+    RvaRemapper remapper;
+    remapper.add_chunk(text_va + 0x1000, text_va + 0x5000, 0x80);
+    ASSERT_TRUE(remapper.finalize());
+
+    ReferenceTable t;
+    t.add(Reference{
+        .location_rva = text_va + 0x10,
+        .target_rva   = static_cast<Rva>(text_va + 0x1080),
+        .width        = ReferenceWidth::byte4,
+        .encoding     = ReferenceEncoding::rva_end_exclusive,
+        .origin       = ReferenceOrigin::pdata_runtime_function,
+    });
+
+    ReferencePatcher p;
+    auto stats = p.apply(img, t, remapper);
+    EXPECT_EQ(stats.total,          1u);
+    EXPECT_EQ(stats.patched,        1u);
+    EXPECT_EQ(read_le_u32(img, text_va + 0x10),
+              static_cast<std::uint32_t>(text_va + 0x5080));
+}
+
+TEST(ReferencePatcher, RvaEndExclusiveZeroTargetIsIdentity) {
+    // `target_rva == 0` is the sentinel "no chained tail" — the
+    // patcher must treat it as a plain `rva` write of zero, not
+    // attempt to remap `target - 1 = 0xFFFFFFFF`.
+    PeImage img = make_pe32plus_image();
+    SectionManager mgr{img};
+    auto idx = mgr.add_section(
+        ".text",
+        mx::ByteView{std::vector<std::uint8_t>(0x100, 0).data(), 0x100},
+        mx::pe::IMAGE_SCN_CNT_CODE | mx::pe::IMAGE_SCN_MEM_READ);
+    const Rva text_va = img.sections()[*idx].virtual_address;
+
+    RvaRemapper remapper;
+    ASSERT_TRUE(remapper.finalize());
+
+    ReferenceTable t;
+    t.add(Reference{
+        .location_rva = text_va + 0x10,
+        .target_rva   = 0,
+        .width        = ReferenceWidth::byte4,
+        .encoding     = ReferenceEncoding::rva_end_exclusive,
+        .origin       = ReferenceOrigin::pdata_runtime_function,
+    });
+
+    ReferencePatcher p;
+    auto stats = p.apply(img, t, remapper);
+    EXPECT_EQ(stats.patched, 1u);
+    EXPECT_EQ(read_le_u32(img, text_va + 0x10), 0u);
+}
+
 } // namespace

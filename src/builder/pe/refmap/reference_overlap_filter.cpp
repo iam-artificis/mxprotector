@@ -32,6 +32,7 @@ struct ByteRange {
         case ReferenceEncoding::rel32_call_pop_anchored:
         case ReferenceEncoding::rel32_with_imm_offset:
         case ReferenceEncoding::xor_encoded_signed_delta_imm32:
+        case ReferenceEncoding::rva_end_exclusive:
             return true;
     }
     return false;
