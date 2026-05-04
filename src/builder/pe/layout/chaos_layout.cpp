@@ -28,6 +28,7 @@
 #include "mxprotector/pe/refmap/import_descriptor_scanner.hpp"
 #include "mxprotector/pe/refmap/load_config_directory_scanner.hpp"
 #include "mxprotector/pe/refmap/reference.hpp"
+#include "mxprotector/pe/refmap/reference_overlap_filter.hpp"
 #include "mxprotector/pe/refmap/reference_patcher.hpp"
 #include "mxprotector/pe/refmap/reloc_absolute_va_scanner.hpp"
 #include "mxprotector/pe/refmap/reloc_rebuilder.hpp"
@@ -44,6 +45,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
 #include <variant>
 
@@ -231,7 +233,11 @@ void merge_into_unified_section(PeImage& image) {
 
     // 1. Code-side references: rel32 / rel8 branches + RIP-relative
     //    operands. Emit per-section, ignoring per-section decode-error
-    //    counts (chaos is best-effort, not a verifier).
+    //    counts (chaos is best-effort, not a verifier). Each section
+    //    forwards its registered `data_regions` so the scanner skips
+    //    VM bytecode / handler-table bytes — bypassing both bogus-ref
+    //    emissions and Zydis desync cascades that would otherwise leak
+    //    misaligned references into adjacent real code.
     refmap::CodeReferenceScanner code;
     for (const auto& sec : image.sections()) {
         if (!sec.is_code() || sec.data.empty()) continue;
@@ -240,6 +246,8 @@ void merge_into_unified_section(PeImage& image) {
                      std::min(sec.data.size(),
                               static_cast<std::size_t>(sec.virtual_size))},
             sec.virtual_address,
+            std::span<const DataRegion>{
+                sec.data_regions.data(), sec.data_regions.size()},
             table);
     }
 
@@ -379,6 +387,27 @@ void apply_fragment_shuffle(PeImage& image) {
     if (image.sections().size() < 2) return;
 
     auto refs = scan_all_references(image);
+
+    // Drop bogus `rel`/`rip-rel` references whose byte range overlaps
+    // a structurally-encoded slot OR a section-registered data region
+    // (VM bytecode, handler tables, immediate pools). These are
+    // emitted by `CodeReferenceScanner` whenever Zydis opportunistically
+    // decodes structured bytes as ghost instructions; surviving them
+    // into the patcher silently corrupts the structured byte run and
+    // crashes the protected binary at runtime. See
+    // `reference_overlap_filter.hpp` for the full rationale.
+    {
+        std::vector<DataRegion> data_regions;
+        for (const auto& sec : image.sections()) {
+            data_regions.insert(
+                data_regions.end(),
+                sec.data_regions.begin(), sec.data_regions.end());
+        }
+        refs = refmap::ReferenceOverlapFilter{}.filter(
+            refs,
+            std::span<const DataRegion>{
+                data_regions.data(), data_regions.size()});
+    }
 
     Randomizer rng{fresh_seed()};
     chaos::AtomicChunkPlanner planner{

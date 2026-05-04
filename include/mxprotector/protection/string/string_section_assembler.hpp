@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mxprotector/core/randomizer.hpp"
+#include "mxprotector/pe/data_region.hpp"
 #include "mxprotector/protection/string/string_artifact_builder.hpp"
 
 namespace mx {
@@ -53,6 +54,18 @@ struct StringSectionLayout {
     size_t               vm_blob_offset       = 0;
     uint32_t             vm_blob_entry_offset = 0;
     bool                 vm_lift_succeeded    = false;
+
+    /// One section-relative byte range that is *not* x86 instructions
+    /// (VM-lift handler table, VM-lift bytecode). The pipeline
+    /// promotes each to an absolute-RVA `pe::DataRegion` on the
+    /// emitted `.mxstr` section so chaos-shuffle's reference filter
+    /// keeps the patcher out of these bytes.
+    struct LocalDataRegion {
+        size_t              offset_in_buf = 0;
+        uint32_t            size          = 0;
+        pe::DataRegionKind  kind          = pe::DataRegionKind::string_vm_bytecode;
+    };
+    std::vector<LocalDataRegion> data_regions;
 };
 
 /// Compose the `.mxstr` section buffer from a gather output + the

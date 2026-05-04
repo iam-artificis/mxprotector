@@ -114,6 +114,21 @@ MxStatus commit_string_section(
     auto&          added_sec   = image.sections()[added_idx];
     const Rva      section_rva = added_sec.virtual_address;
 
+    // Promote each local data range (VM-lift handler table +
+    // bytecode) to an absolute-RVA `pe::DataRegion` on the
+    // committed section. Chaos-shuffle's `ReferenceOverlapFilter`
+    // reads `SectionInfo::data_regions` to drop bogus rel refs that
+    // `CodeReferenceScanner` would otherwise emit while linearly
+    // walking these encrypted-opcode bytes as if they were x86
+    // instructions.
+    for (const auto& dr : layout.data_regions) {
+        added_sec.data_regions.push_back(pe::DataRegion{
+            .begin_rva = static_cast<Rva>(section_rva + dr.offset_in_buf),
+            .size      = dr.size,
+            .kind      = dr.kind,
+        });
+    }
+
     // (9) Patch the rip+disp32 slots inside `mx_str_get`.
     //
     //   disp32_abs  = decryptor_offset + disp32_offset_in_code

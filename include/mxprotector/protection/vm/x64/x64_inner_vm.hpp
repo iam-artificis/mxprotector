@@ -284,6 +284,15 @@ struct InnerVmIsa {
 ///   56 bytes handler table (14 × int32 relative offsets)
 inline constexpr size_t kInnerVmRuntimeSize = 160;
 
+/// Byte offset of the inner-VM handler table (14 × int32) within an
+/// emitted inner-VM runtime. Stable for any randomised ISA — the
+/// table entries are reordered, but their position is fixed. Used
+/// by chaos-shuffle's reference filter to classify the table bytes
+/// as data and prevent `CodeReferenceScanner` from emitting bogus
+/// rel refs from them.
+inline constexpr size_t kInnerVmHandlerTableOffset = 104;
+inline constexpr size_t kInnerVmHandlerTableSize   = 14 * 4;
+
 /// Emit the inner VM runtime (dispatcher + 13 handlers + handler
 /// table) into `e`. Returns the offset of the dispatcher entry
 /// point relative to the start of the emitted bytes — callers add

@@ -113,6 +113,34 @@ void try_append_vm_lift(
                 "entry @ section+0x{:X}",
         gen_result->blob.size(),
         out.vm_blob_offset + out.vm_blob_entry_offset);
+
+    // Mark the runtime's handler-table + bytecode bytes as data so
+    // chaos-shuffle's `ReferenceOverlapFilter` drops every bogus
+    // `rel`/`rip-rel` slot Zydis surfaces while linearly walking
+    // these encrypted-opcode bytes as if they were instructions.
+    if (gen_result->handler_count != 0) {
+        out.data_regions.push_back(StringSectionLayout::LocalDataRegion{
+            .offset_in_buf = out.vm_blob_offset
+                           + gen_result->handler_table_offset,
+            .size          = gen_result->handler_count * 4u,
+            .kind          = pe::DataRegionKind::string_vm_handler_table,
+        });
+    }
+    if (gen_result->bytecode_size != 0) {
+        out.data_regions.push_back(StringSectionLayout::LocalDataRegion{
+            .offset_in_buf = out.vm_blob_offset + gen_result->bytecode_offset,
+            .size          = gen_result->bytecode_size,
+            .kind          = pe::DataRegionKind::string_vm_bytecode,
+        });
+    }
+    if (gen_result->inner_vm_handler_table_size != 0) {
+        out.data_regions.push_back(StringSectionLayout::LocalDataRegion{
+            .offset_in_buf = out.vm_blob_offset
+                           + gen_result->inner_vm_handler_table_offset,
+            .size          = gen_result->inner_vm_handler_table_size,
+            .kind          = pe::DataRegionKind::string_vm_handler_table,
+        });
+    }
 }
 
 } // anonymous namespace
@@ -153,6 +181,21 @@ StringSectionLayout assemble_string_section(
                                tr.code.end());
     }
 
+    // Helper: register the byte range `[start, end)` as a data
+    // region. Used below for descriptor table, ciphertext pool, and
+    // scratch ring — every span the chaos pipeline must keep the
+    // reference patcher out of.
+    const auto register_data_range =
+        [&](size_t start, size_t end, pe::DataRegionKind kind) {
+            if (end <= start) return;
+            out.data_regions.push_back(
+                StringSectionLayout::LocalDataRegion{
+                    .offset_in_buf = start,
+                    .size = static_cast<uint32_t>(end - start),
+                    .kind = kind,
+                });
+        };
+
     // --- Descriptor table --------------------------------------------
     //
     // One packed 8-byte record per protected string. `data_offset`
@@ -191,6 +234,8 @@ StringSectionLayout assemble_string_section(
                 out.section_buf.end(), packed.begin(), packed.end());
         }
     }
+    register_data_range(out.desc_table_offset, out.section_buf.size(),
+                        pe::DataRegionKind::string_descriptor_table);
 
     // --- Data pool: ciphertext + per-string key (NUL-terminator) -----
     out.data_pool_offset = out.section_buf.size();
@@ -200,6 +245,8 @@ StringSectionLayout assemble_string_section(
                                enc.ciphertext.end());
         out.section_buf.push_back(enc.key);  // key ^ 0 = plain NUL after decrypt
     }
+    register_data_range(out.data_pool_offset, out.section_buf.size(),
+                        pe::DataRegionKind::string_data_pool);
 
     // --- S3 scratch ring (ephemeral mode only) -----------------------
     //
@@ -223,6 +270,8 @@ StringSectionLayout assemble_string_section(
         out.section_buf.insert(out.section_buf.end(),
                                kEphemeralRingTotalSize,
                                static_cast<uint8_t>(0));
+        register_data_range(out.scratch_ring_offset, out.section_buf.size(),
+                            pe::DataRegionKind::string_scratch_ring);
     }
 
     // --- Optional VM lift (S2c: --strings=vm) ------------------------

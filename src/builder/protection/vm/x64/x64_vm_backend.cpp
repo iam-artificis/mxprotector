@@ -180,6 +180,11 @@ MxResult<VmRuntime> GenerationSession::run() {
     result.bytecode_offset = static_cast<uint32_t>(bytecode_offset);
     result.bytecode_size   = static_cast<uint32_t>(bytecode_plain.size());
     result.handler_count   = total_handlers;
+    result.handler_table_offset = static_cast<uint32_t>(handler_table_offset);
+    result.inner_vm_handler_table_offset = static_cast<uint32_t>(
+        inner_vm_entry_offset + x64::kInnerVmHandlerTableOffset);
+    result.inner_vm_handler_table_size = static_cast<uint32_t>(
+        x64::kInnerVmHandlerTableSize);
     result.opcode_map      = map;
     result.exit_jmp_patch  = exit_jmp_offset;
     return result;

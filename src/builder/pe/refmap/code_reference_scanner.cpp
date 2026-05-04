@@ -5,6 +5,9 @@
 
 #include "mxprotector/pe/refmap/code_reference_scanner.hpp"
 
+#include <algorithm>
+#include <vector>
+
 #include <Zydis/Zydis.h>
 
 namespace mx::pe::refmap {
@@ -93,6 +96,57 @@ void emit_rip_relative_reference(
 
 } // anonymous namespace
 
+/// Sorted list of `[begin_rva, end_rva)` byte ranges inside the
+/// scanned buffer that are data, not instructions. Caller passes
+/// these as `pe::DataRegion`s; the scanner converts them into this
+/// internal form once at the start of `scan` and binary-searches
+/// per cursor position.
+struct ScanSkipRange {
+    Rva begin;
+    Rva end;
+};
+
+[[nodiscard]] std::vector<ScanSkipRange> build_skip_ranges(
+    std::span<const DataRegion> regions,
+    Rva                         base_rva,
+    std::size_t                 code_size)
+{
+    std::vector<ScanSkipRange> out;
+    out.reserve(regions.size());
+    const Rva code_end = static_cast<Rva>(base_rva + code_size);
+    for (const auto& dr : regions) {
+        if (dr.size == 0) continue;
+        const Rva b = dr.begin_rva;
+        const Rva e = static_cast<Rva>(dr.begin_rva + dr.size);
+        if (e <= base_rva || b >= code_end) continue;
+        const Rva clamped_b = std::max(b, base_rva);
+        const Rva clamped_e = std::min(e, code_end);
+        if (clamped_b >= clamped_e) continue;
+        out.push_back(ScanSkipRange{clamped_b, clamped_e});
+    }
+    std::sort(out.begin(), out.end(),
+        [](const ScanSkipRange& a, const ScanSkipRange& b) {
+            return a.begin < b.begin;
+        });
+    return out;
+}
+
+/// Returns the end-RVA of the skip range containing `rva`, or 0 if
+/// `rva` is not in any skip range. Skip ranges are sorted; the
+/// search is `O(log N)` per query.
+[[nodiscard]] Rva skip_range_end_for(
+    const std::vector<ScanSkipRange>& ranges, Rva rva) noexcept
+{
+    auto it = std::lower_bound(
+        ranges.begin(), ranges.end(), rva,
+        [](const ScanSkipRange& r, Rva v) {
+            return r.end <= v;
+        });
+    if (it == ranges.end()) return 0;
+    if (rva >= it->begin && rva < it->end) return it->end;
+    return 0;
+}
+
 struct CodeReferenceScanner::Impl {
     ZydisDecoder decoder{};
 
@@ -103,14 +157,31 @@ struct CodeReferenceScanner::Impl {
     }
 
     [[nodiscard]] std::uint32_t scan(
-        ByteView code,
-        Rva      base_rva,
-        ReferenceTable& table)
+        ByteView                     code,
+        Rva                          base_rva,
+        std::span<const DataRegion>  data_regions,
+        ReferenceTable&              table)
     {
+        const auto skip_ranges = build_skip_ranges(
+            data_regions, base_rva, code.size());
+
         std::uint32_t errors = 0;
         std::size_t   offset = 0;
 
         while (offset < code.size()) {
+            const Rva cursor_rva =
+                static_cast<Rva>(base_rva + offset);
+
+            // Skip data regions in one jump so the decoder resyncs
+            // to instruction boundaries on the far side.
+            if (const Rva skip_end = skip_range_end_for(
+                    skip_ranges, cursor_rva); skip_end != 0)
+            {
+                offset = static_cast<std::size_t>(skip_end - base_rva);
+                if (offset >= code.size()) break;
+                continue;
+            }
+
             ZydisDecodedInstruction insn{};
             ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT]{};
 
@@ -127,7 +198,33 @@ struct CodeReferenceScanner::Impl {
                 continue;
             }
 
-            const Rva inst_rva = static_cast<Rva>(base_rva + offset);
+            // If the decoded instruction overlaps a data region,
+            // honour the data range and skip — Zydis will have
+            // happily produced something even though those bytes
+            // are not instructions.
+            const Rva insn_end = static_cast<Rva>(
+                cursor_rva + insn.length);
+            if (skip_range_end_for(skip_ranges, cursor_rva) != 0 ||
+                skip_range_end_for(skip_ranges, insn_end - 1) != 0)
+            {
+                // Re-check after decoding — covers the case where a
+                // multi-byte instruction *crosses into* a skip
+                // range. Round the cursor to the range's end.
+                Rva jump_to = 0;
+                for (const auto& r : skip_ranges) {
+                    if (r.begin >= cursor_rva && r.begin < insn_end) {
+                        jump_to = r.end;
+                        break;
+                    }
+                }
+                if (jump_to != 0) {
+                    offset = static_cast<std::size_t>(jump_to - base_rva);
+                    if (offset >= code.size()) break;
+                    continue;
+                }
+            }
+
+            const Rva inst_rva = cursor_rva;
 
             // Branch immediates. Iterate visible operands so we can
             // pick up `imm.value.s` for the signed displacement;
@@ -169,9 +266,20 @@ CodeReferenceScanner::CodeReferenceScanner(CodeReferenceScanner&&) noexcept = de
 CodeReferenceScanner& CodeReferenceScanner::operator=(CodeReferenceScanner&&) noexcept = default;
 
 std::uint32_t CodeReferenceScanner::scan(
+    ByteView                     code,
+    Rva                          base_rva,
+    std::span<const DataRegion>  data_regions,
+    ReferenceTable&              table)
+{
+    return impl_->scan(code, base_rva, data_regions, table);
+}
+
+std::uint32_t CodeReferenceScanner::scan(
     ByteView code, Rva base_rva, ReferenceTable& table)
 {
-    return impl_->scan(code, base_rva, table);
+    return impl_->scan(code, base_rva,
+                       std::span<const DataRegion>{},
+                       table);
 }
 
 } // namespace mx::pe::refmap

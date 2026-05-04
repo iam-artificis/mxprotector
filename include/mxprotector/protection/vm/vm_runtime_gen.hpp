@@ -39,6 +39,22 @@ struct VmRuntime {
     uint32_t   bytecode_offset = 0;   ///< Смещение bytecode
     uint32_t   bytecode_size = 0;
     uint32_t   handler_count = 0;
+    /// Offset of the obfuscated handler table inside `blob`. The
+    /// table is `handler_count * 4` bytes of XOR-encrypted entries
+    /// the dispatcher reads during every opcode fetch. Reported here
+    /// so post-emit consumers (chaos-shuffle, CFG diagnostics) can
+    /// classify the byte range as data rather than instructions.
+    uint32_t   handler_table_offset = 0;
+    /// Offset and byte size of the inner-VM handler table inside
+    /// `blob`. The inner VM (G2 V2 sub-VM, 14 entries × int32) is
+    /// emitted as a 160-byte block somewhere between the outer
+    /// handlers and the outer JT; its 56-byte tail is a dispatch
+    /// table whose bytes routinely decode as ghost x86 instructions
+    /// in a linear walk. Reported here so chaos-shuffle's reference
+    /// filter can classify it as data. Zero when no inner VM was
+    /// emitted (e.g. very small lifts that bypass G2 V2).
+    uint32_t   inner_vm_handler_table_offset = 0;
+    uint32_t   inner_vm_handler_table_size   = 0;
     VmOpcodeMap opcode_map;
 
     /// If non-zero, the exit handler emits `jmp rel32` instead of `ret`.

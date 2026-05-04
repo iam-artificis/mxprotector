@@ -38,8 +38,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/pe/data_region.hpp"
 #include "mxprotector/pe/refmap/reference.hpp"
 
 namespace mx::pe::refmap {
@@ -71,14 +73,45 @@ public:
      * instructions is returned so the caller can log if the scan
      * tripped.
      *
-     * @param code      Code bytes to scan. Lifetime must outlive the
-     *                  call.
-     * @param base_rva  RVA of `code[0]`. Used to compute slot and
-     *                  target RVAs.
-     * @param table     Receives every emitted reference. Reset by
-     *                  the caller if a fresh scan is desired.
+     * Optional `data_regions` lists byte ranges inside `code` that
+     * are *not* x86 instructions (VM jump tables, encrypted
+     * bytecode). When the cursor enters such a range, the scanner
+     * jumps directly to `range.end` rather than letting Zydis decode
+     * the bytes — this prevents two failure modes:
+     *
+     *   1. Bogus references emitted from data bytes that happen to
+     *      decode as valid instructions with rel32 / rip-rel slots.
+     *   2. *Desync cascades* — Zydis consuming N+δ bytes of a 4-byte
+     *      JT entry pushes the cursor mid-stream, and every
+     *      subsequent decode lands at a misaligned offset until a
+     *      lucky resynchronisation (or, in the worst case, never).
+     *      Misaligned references emitted *outside* the data range
+     *      then point at innocent code bytes, so a downstream
+     *      reference-overlap filter cannot drop them. Skipping the
+     *      range outright resyncs the cursor at `range.end`.
+     *
+     * @param code         Code bytes to scan. Lifetime must outlive
+     *                     the call.
+     * @param base_rva     RVA of `code[0]`. Used to compute slot
+     *                     and target RVAs.
+     * @param data_regions Byte ranges (in absolute RVAs) that the
+     *                     scanner must skip without decoding.
+     *                     Ranges outside `[base_rva, base_rva + code.size())`
+     *                     are silently ignored.
+     * @param table        Receives every emitted reference. Reset by
+     *                     the caller if a fresh scan is desired.
      * @return Number of decode failures encountered.
      */
+    [[nodiscard]] std::uint32_t scan(
+        ByteView                     code,
+        Rva                          base_rva,
+        std::span<const DataRegion>  data_regions,
+        ReferenceTable&              table);
+
+    /// Backwards-compatible overload — equivalent to passing an
+    /// empty `data_regions` span. Retained so existing call sites
+    /// (tests, scanners that have no data-region context) continue
+    /// to compile.
     [[nodiscard]] std::uint32_t scan(
         ByteView         code,
         Rva              base_rva,

@@ -106,8 +106,37 @@ void emit_pin(Rva start, Rva end, AtomTable& out) {
     });
 }
 
+/// Returns `true` when the byte at section-offset `byte_offset`
+/// (relative to `sec.virtual_address`) is inside any
+/// `pe::DataRegion` registered on the section. Such bytes are
+/// **structured data** (VM bytecode, jump tables, descriptor
+/// tables) — even when they happen to be `0xCC` they must remain
+/// pinned, because a movable chunk landing on top of them silently
+/// corrupts the structure.
+[[nodiscard]] bool byte_is_data_region(
+    const pe::SectionInfo& sec, Rva byte_rva) noexcept
+{
+    for (const auto& dr : sec.data_regions) {
+        if (byte_rva >= dr.begin_rva &&
+            byte_rva <  dr.begin_rva + dr.size)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Walk `[start, end)` byte-by-byte and emit a pin atom for every
-/// maximal sub-run of non-`0xCC` bytes. Pure-`INT 3` runs are left
+/// maximal sub-run of bytes that must remain at their original
+/// RVA. A byte qualifies when:
+///
+///   * it is non-`0xCC` (real instruction or data), OR
+///   * it falls inside a registered `pe::DataRegion` — even pure
+///     `0xCC` bytes inside structured data must be pinned because
+///     they are *not* INT 3 padding, they're a co-incidence in the
+///     XOR-encrypted bytecode / handler table.
+///
+/// Outside the structured ranges, pure-`INT 3` runs are left
 /// unpinned so they become passthrough — a chunk can land on top
 /// of them without breaking anything (`INT 3` is unreachable code
 /// by definition).
@@ -135,7 +164,9 @@ void pin_non_int3_subranges(
     Rva run_start = cursor;
     bool in_run = false;
     for (std::size_t k = 0; k < count; ++k, ++cursor) {
-        if (p[k] != 0xCC) {
+        const bool keep = (p[k] != 0xCC)
+                       || byte_is_data_region(sec, cursor);
+        if (keep) {
             if (!in_run) { run_start = cursor; in_run = true; }
         } else {
             if (in_run) {

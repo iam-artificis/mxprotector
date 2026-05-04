@@ -16,6 +16,9 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
+
+#include "mxprotector/pe/data_region.hpp"
 
 namespace mx::pe {
 
@@ -608,6 +611,13 @@ struct SectionInfo {
     uint32_t     raw_offset = 0;      ///< Файловое смещение
     uint32_t     characteristics = 0; ///< Флаги (RWX и т.д.)
     ByteBuffer   data;                ///< Содержимое секции
+
+    /// Byte ranges inside `data` that are *not* x86 instructions —
+    /// jump tables, encrypted bytecode, immediate pools. The chaos
+    /// pipeline reads this list to keep the reference patcher out of
+    /// these bytes (see `pe/data_region.hpp` for the full rationale).
+    /// Default empty: the section is pure code or pure data.
+    std::vector<DataRegion> data_regions;
 
     /// @brief Проверяет, содержит ли секция код.
     [[nodiscard]] bool is_code() const noexcept {

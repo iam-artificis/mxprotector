@@ -110,10 +110,65 @@ void inject_safe_junk(std::vector<vm::VmInstruction>& vm_insns,
     return split;
 }
 
+/// Append `(handler_table, bytecode)` data regions for one runtime
+/// rooted at `runtime_offset_in_blob` to `out`. The runtime's
+/// internal layout is:
+///
+///   [...prologue...]
+///   handler_table : `handler_count * 4` bytes XOR-encrypted
+///   [CC pad to 8B]
+///   bytecode      : `bytecode_size` bytes encrypted opcodes
+///
+/// The chaos pipeline reads these ranges to keep
+/// `CodeReferenceScanner` from emitting bogus rel refs into the
+/// non-instruction bytes.
+void register_runtime_data_regions(
+    const vm::VmRuntime&             rt,
+    std::uint32_t                    runtime_offset_in_blob,
+    std::vector<PendingDataRegion>&  out)
+{
+    if (rt.handler_count != 0) {
+        out.push_back(PendingDataRegion{
+            .offset_in_blob = runtime_offset_in_blob + rt.handler_table_offset,
+            .size           = rt.handler_count * 4u,
+            .kind           = pe::DataRegionKind::vm_handler_table,
+        });
+    }
+    if (rt.bytecode_size != 0) {
+        out.push_back(PendingDataRegion{
+            .offset_in_blob = runtime_offset_in_blob + rt.bytecode_offset,
+            .size           = rt.bytecode_size,
+            .kind           = pe::DataRegionKind::vm_bytecode,
+        });
+    }
+    // Inner VM (G2 V2) handler table — 14 × int32 deltas inside the
+    // 160-byte inner-VM block. Bytes routinely decode as ghost
+    // instructions and trip the same bogus-rel-ref bug as the outer
+    // JT and bytecode.
+    if (rt.inner_vm_handler_table_size != 0) {
+        out.push_back(PendingDataRegion{
+            .offset_in_blob = runtime_offset_in_blob
+                            + rt.inner_vm_handler_table_offset,
+            .size           = rt.inner_vm_handler_table_size,
+            .kind           = pe::DataRegionKind::vm_handler_table,
+        });
+    }
+}
+
+/// Bundle of build-time information needed downstream of the
+/// cross-VM concatenation step. Returned by `build_cross_vm_blob`
+/// so `lift_region` can populate `PendingRegion::data_regions`
+/// without rebuilding the runtime offsets.
+struct CrossVmBuild {
+    ByteBuffer                     blob;
+    std::uint32_t                  entry_offset_in_blob;
+    std::vector<PendingDataRegion> data_regions;
+};
+
 /// Build a cross-VM blob: split at `split`, generate two independent
 /// runtimes, patch the rt1 exit jmp to rt2's entry, concatenate.
 /// Returns nullopt if either generation step fails.
-[[nodiscard]] std::optional<std::pair<ByteBuffer, std::uint32_t>>
+[[nodiscard]] std::optional<CrossVmBuild>
 build_cross_vm_blob(const std::vector<vm::VmInstruction>& vm_insns,
                      std::size_t                          split,
                      vm::VmRuntimeGenerator&              gen,
@@ -155,7 +210,16 @@ build_cross_vm_blob(const std::vector<vm::VmInstruction>& vm_insns,
     merged.insert(merged.end(), rt1->blob.begin(), rt1->blob.end());
     merged.insert(merged.end(), rt2->blob.begin(), rt2->blob.end());
 
-    return std::make_pair(std::move(merged), rt1->entry_offset);
+    std::vector<PendingDataRegion> regions;
+    regions.reserve(4);
+    register_runtime_data_regions(*rt1, /*runtime_offset_in_blob=*/0, regions);
+    register_runtime_data_regions(*rt2, rt1_size,                     regions);
+
+    return CrossVmBuild{
+        .blob                 = std::move(merged),
+        .entry_offset_in_blob = rt1->entry_offset,
+        .data_regions         = std::move(regions),
+    };
 }
 
 /// Write `CALL rel32 vm_entry` followed by NOP padding into the
@@ -279,8 +343,9 @@ std::optional<PendingRegion> VirtualizationPipeline::lift_region(
             p.body_end_rva         = body_end;
             p.total_patch_size     =
                 region.begin_marker_size + body_size + region.end_marker_size;
-            p.vm_blob              = std::move(cross->first);
-            p.entry_offset_in_blob = cross->second;
+            p.vm_blob              = std::move(cross->blob);
+            p.entry_offset_in_blob = cross->entry_offset_in_blob;
+            p.data_regions         = std::move(cross->data_regions);
             ctx_.log_fmt("  Cross-VM: split at insn {}/{}, total={}B",
                 split, vm_insns.size(), p.vm_blob.size());
             return p;
@@ -303,6 +368,8 @@ std::optional<PendingRegion> VirtualizationPipeline::lift_region(
         region.begin_marker_size + body_size + region.end_marker_size;
     p.vm_blob              = std::move(runtime_result->blob);
     p.entry_offset_in_blob = runtime_result->entry_offset;
+    register_runtime_data_regions(*runtime_result, /*runtime_offset_in_blob=*/0,
+                                  p.data_regions);
     return p;
 }
 
@@ -431,11 +498,27 @@ MxStatus VirtualizationPipeline::execute() {
     auto section_idx = emit_section(section_data);
     if (!section_idx) return std::unexpected(section_idx.error());
 
-    const Rva mxvm_rva =
-        ctx_.pe_image().sections()[*section_idx].virtual_address;
+    auto& mxvm_section = ctx_.pe_image().sections()[*section_idx];
+    const Rva mxvm_rva = mxvm_section.virtual_address;
     ctx_.log_fmt("VirtualizationPass: секция '{}' добавлена: RVA=0x{:08X}, "
                  "размер={} байт",
         ctx_.section_names().vm, mxvm_rva, section_data.size());
+
+    // Promote each pending's blob-internal data ranges (handler
+    // table + bytecode) to absolute-RVA ranges on the emitted
+    // section. The chaos pipeline reads `SectionInfo::data_regions`
+    // when filtering bogus rel refs that `CodeReferenceScanner`
+    // would otherwise emit from these non-instruction bytes.
+    for (const auto& p : pendings) {
+        for (const auto& dr : p.data_regions) {
+            mxvm_section.data_regions.push_back(pe::DataRegion{
+                .begin_rva = static_cast<Rva>(
+                    mxvm_rva + p.blob_offset_in_section + dr.offset_in_blob),
+                .size      = dr.size,
+                .kind      = dr.kind,
+            });
+        }
+    }
 
     emit_trace_hints(mxvm_rva, pendings);
     patch_call_sites(mxvm_rva, pendings);

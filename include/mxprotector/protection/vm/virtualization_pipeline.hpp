@@ -34,6 +34,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/core/types.hpp"
+#include "mxprotector/pe/data_region.hpp"
 #include "mxprotector/protection/vm/vm_lifter.hpp"
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
@@ -47,6 +48,16 @@ namespace vm {
 /// emit-ready VM blob. The emit phase concatenates these into the
 /// `.mxvm` section; the patch phase rewrites every original region
 /// with `CALL vm_entry + NOPs`.
+/// One blob-internal byte range that is data, not instructions
+/// (handler table, encrypted bytecode). Carried by `PendingRegion`
+/// so the pipeline can register the absolute-RVA range on the
+/// emitted section after `blob_offset_in_section` is fixed.
+struct PendingDataRegion {
+    std::uint32_t offset_in_blob = 0;
+    std::uint32_t size = 0;
+    pe::DataRegionKind kind = pe::DataRegionKind::vm_bytecode;
+};
+
 struct PendingRegion {
     Rva           begin_marker_rva;
     Rva           body_start_rva;
@@ -55,6 +66,11 @@ struct PendingRegion {
     ByteBuffer    vm_blob;
     std::uint32_t entry_offset_in_blob;
     std::uint32_t blob_offset_in_section = 0;
+    /// Internal data byte ranges (handler table + bytecode for each
+    /// runtime in this blob). Populated by `lift_region`; consumed
+    /// by `execute()` after `emit_section` so absolute RVAs can be
+    /// stamped onto the emitted `SectionInfo`.
+    std::vector<PendingDataRegion> data_regions;
 };
 
 /// Stateful orchestrator for one virtualization pass run.
