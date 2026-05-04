@@ -13,6 +13,7 @@
 #include "mxprotector/pe/chaos/data_section_pin_atom_source.hpp"
 #include "mxprotector/pe/chaos/delay_import_atom_source.hpp"
 #include "mxprotector/pe/chaos/function_atom_source.hpp"
+#include "mxprotector/pe/chaos/pdata_chain_emitter.hpp"
 #include "mxprotector/pe/chaos/handler_table_integrity_refinalizer.hpp"
 #include "mxprotector/pe/chaos/import_atom_source.hpp"
 #include "mxprotector/pe/chaos/self_crc_refinalizer.hpp"
@@ -42,7 +43,9 @@
 #include "mxprotector/pe/refmap/switch_jump_table_scanner.hpp"
 #include "mxprotector/pe/refmap/tls_directory_scanner.hpp"
 #include "mxprotector/pe/refmap/vm_call_pop_trampoline_scanner.hpp"
+#include "mxprotector/pe/section_emitter.hpp"
 #include "mxprotector/pe/section_intent.hpp"
+#include "mxprotector/pe/section_manager.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -331,6 +334,27 @@ void merge_into_unified_section(PeImage& image) {
         }
     }
 
+    // 9. Extra RVA refs (B.4.23.1). `PdataChainEmitter` registers
+    //    these for each ChainInfo RVA inside the new `.mxchain`
+    //    section so the chaos refmap remaps them through the chunk
+    //    planner — `rva` for `BeginAddress` / `UnwindInfoAddress`,
+    //    `rva_end_exclusive` for `EndAddress`. As with
+    //    `pre_scanned_refs`, append-order semantics let new
+    //    emitters plug in without touching the chaos pipeline.
+    for (const auto& sec : image.sections()) {
+        for (const auto& s : sec.extra_rva_refs) {
+            table.add(refmap::Reference{
+                .location_rva = s.slot_rva,
+                .target_rva   = s.target_rva,
+                .width        = refmap::ReferenceWidth::byte4,
+                .encoding     = s.end_exclusive
+                    ? refmap::ReferenceEncoding::rva_end_exclusive
+                    : refmap::ReferenceEncoding::rva,
+                .origin       = refmap::ReferenceOrigin::pdata_runtime_function,
+            });
+        }
+    }
+
     return table;
 }
 
@@ -365,15 +389,16 @@ void register_atom_sources(chaos::AtomicChunkPlanner& planner) {
 
     // 1. Movable: per-function atoms covering the exact `.pdata`
     //    `[BeginAddress, EndAddress)` range of each function.
-    //    `BasicBlockAtomSource` (B.4.23) is intentionally NOT
-    //    registered here: splitting a function into sub-block atoms
-    //    leaves the `.pdata` `RUNTIME_FUNCTION` describing a
-    //    contiguous range that no longer matches the scattered post-
-    //    shuffle bytes. The unwinder fails to dispatch SEH for any
-    //    RIP outside the patched `BeginAddress`. Re-enabling sub-
-    //    function splits requires emitting one `RUNTIME_FUNCTION`
-    //    per sub-block (with `UNW_FLAG_CHAININFO` linking to the
-    //    parent unwind data) — that is the B.4.23.1 follow-up.
+    //    `BasicBlockAtomSource` (B.4.23) and `PdataChainEmitter`
+    //    (B.4.23.1) are intentionally NOT used here — see the
+    //    deferred-activation note in `PdataChainEmitter`'s class
+    //    docstring. The chaos pipeline's `BeginAddress` /
+    //    `EndAddress` rewriting now uses `rva_end_exclusive` so
+    //    the ENCODING is ready for sub-block atoms; the remaining
+    //    work is identifying the byte-corruption bug that crashes
+    //    100 % of builds when both the planner-level
+    //    `BasicBlockAtomSource` registration and the
+    //    `PdataChainEmitter` step are active.
     planner.add_source(make_unique<chaos::FunctionAtomSource>());
 
     // 1a. Movable: per-section emitter-declared sub-blocks
@@ -522,6 +547,14 @@ MxStatus ChaosLayout::finalize(PeImage& image) const {
     // name table, LOAD_CONFIG CFG tables, TLS callback array, etc.)
     // are now scanned, but the policy is conservative — flip on via
     // `--chaos-shuffle` and stress-test before defaulting on.
+    // Step 1a — `PdataChainEmitter` (B.4.23.1) is intentionally NOT
+    // invoked here. Its activation is gated on identifying the
+    // byte-corruption bug that crashes 100 % of builds when both
+    // the chained-pdata emission and the basic-block atom source
+    // are turned on. Foundation pieces (rva_end_exclusive encoding,
+    // sub_block_planner, the emitter class itself, the chain-info
+    // ref tracking) are shipped and tested.
+
     if (enable_fragment_shuffle_) {
         apply_fragment_shuffle(image);
     } else {

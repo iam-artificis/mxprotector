@@ -639,6 +639,18 @@ struct SectionInfo {
     /// See `pe/pre_scanned_ref_slot.hpp` for the value type.
     std::vector<PreScannedRefSlot> pre_scanned_refs;
 
+    /// Per-section 4-byte RVA-slot overrides for sections the
+    /// existing structured scanners do not walk — currently the
+    /// chained `UNWIND_INFO` blobs in `.mxchain` produced by
+    /// `PdataChainEmitter` (B.4.23.1). The chaos pipeline turns
+    /// each entry into a `Reference` with `ReferenceEncoding::rva`
+    /// or `rva_end_exclusive` (per the `end_exclusive` flag) so
+    /// the patcher remaps the stored value through the chunk
+    /// planner. Default empty — sections without structured RVA
+    /// content the scanners miss leave the field alone. See
+    /// `pe/pre_scanned_ref_slot.hpp` for the value type.
+    std::vector<ExtraRvaRefSlot> extra_rva_refs;
+
     /// @brief Проверяет, содержит ли секция код.
     [[nodiscard]] bool is_code() const noexcept {
         return (characteristics & IMAGE_SCN_CNT_CODE) != 0;

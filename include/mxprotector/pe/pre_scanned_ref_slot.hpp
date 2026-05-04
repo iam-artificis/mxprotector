@@ -82,4 +82,28 @@ struct PreScannedRefSlot {
     std::int32_t  imm_offset = 0;
 };
 
+/**
+ * @brief Per-section RVA-slot override for the chaos refmap, where
+ *        the slot holds a plain 4-byte RVA (or "byte after a chunk"
+ *        end-exclusive RVA).
+ *
+ * Emitted by passes that build new structured sections the existing
+ * scanners don't walk — currently the chained UNWIND_INFO blobs in
+ * `.mxchain` (B.4.23.1). The chaos pipeline turns each slot into a
+ * `Reference` with `rva` (when `end_exclusive == false`) or
+ * `rva_end_exclusive` (when `true`) so the patcher remaps the
+ * stored value through the chunk planner.
+ *
+ *   * `slot_rva`      — RVA of the first byte of the 4-byte slot.
+ *   * `target_rva`    — RVA the slot currently stores.
+ *   * `end_exclusive` — `true` when the target is the BYTE AFTER the
+ *                       owning chunk (e.g. a `RUNTIME_FUNCTION.EndAddress`
+ *                       inside a chained ChainInfo trailer).
+ */
+struct ExtraRvaRefSlot {
+    Rva  slot_rva      = 0;
+    Rva  target_rva    = 0;
+    bool end_exclusive = false;
+};
+
 } // namespace mx::pe
