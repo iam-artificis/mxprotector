@@ -100,6 +100,22 @@ struct ProtectionConfig {
                                           ///< while the encoder set is curated; once
                                           ///< stable across all binaries the level
                                           ///< presets will switch it on for `strong`+.
+    bool enable_mba_substitution = false; ///< Mixed-Boolean-Arithmetic rewriting
+                                          ///< (`add/sub/xor/or/and r, imm32` →
+                                          ///< multi-step boolean+arithmetic body,
+                                          ///< plus `mov r32, imm32` → permutation
+                                          ///< polynomial). Defeats SMT solvers and
+                                          ///< angr/Triton symbolic tactics. Default
+                                          ///< OFF: the rewriters end with a final
+                                          ///< arithmetic op whose OF/AF differ from
+                                          ///< the original instruction's, so
+                                          ///< flag-sensitive callers (signed JCC
+                                          ///< right after the rewritten op) miscompile.
+                                          ///< Opt in for binaries that have been
+                                          ///< profiled and confirmed flag-insensitive
+                                          ///< at the rewrite sites — typically by
+                                          ///< placing markers around hot loops that
+                                          ///< don't immediately consume OF/AF.
     bool enable_packer          = false;  ///< Self-unpacking packer (multi-section XOR)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)

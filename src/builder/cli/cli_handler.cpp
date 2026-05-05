@@ -113,6 +113,8 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
         if (arg == "--chaos-shuffle")       { config.chaos_layout = true; config.chaos_shuffle = true; continue; }
         if (arg == "--indirect-calls")      { config.enable_indirect_calls = true; continue; }
         if (arg == "--no-indirect-calls")   { config.enable_indirect_calls = false; continue; }
+        if (arg == "--mba-substitution")    { config.enable_mba_substitution = true; continue; }
+        if (arg == "--no-mba-substitution") { config.enable_mba_substitution = false; continue; }
         if (arg == "--trace-hints")         { config.emit_trace_hints = true; continue; }
 
         if (arg.starts_with("--load-mode=") && arg.size() > 12) {

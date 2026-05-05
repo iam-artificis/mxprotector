@@ -23,6 +23,7 @@
 #include "mxprotector/protection/mutation/overflow/fallback_expansion_sink.hpp"
 #include "mxprotector/protection/mutation/overflow/grow_source_section_sink.hpp"
 #include "mxprotector/protection/mutation/padding_filler.hpp"
+#include "mxprotector/protection/mutation/substitution_rule_groups.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
@@ -75,6 +76,15 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
 
     Randomizer rng;
     auto rules = SubstitutionRuleRegistry::create_default();
+    if (ctx.config().enable_mba_substitution) {
+        // Mixed-Boolean-Arithmetic rewriting is opt-in — the bodies
+        // change OF/AF flag effects relative to the original ALU op
+        // and need flag-insensitive call sites to ship safely. See
+        // `ProtectionConfig::enable_mba_substitution`.
+        mutation::rules::register_mba_rules(rules);
+        ctx.log("MutationPass: MBA substitution enabled "
+                "(adds 1 adapter rule wrapping the MBA registry)");
+    }
     auto junk = std::make_unique<JunkGenerator>(ctx.pe_image().architecture());
     MutationEngine engine(std::move(rules), std::move(junk), rng);
 

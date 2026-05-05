@@ -1,6 +1,21 @@
 # MxProtector — Agent Working Notes
 
-**Tech:** C++23, Windows PE x64. **Rule:** Test everything. Commit + push after every step.
+**Tech:** C++23. **Rule:** Test everything. Commit + push after every step.
+
+## Cross-platform stance
+
+* **Host:** the builder runs on Windows and Linux. Don't hard-code
+  `\\` separators (use `std::filesystem::path` + forward slashes),
+  Win32-only APIs, or MSVC-only intrinsics. CI runs on both.
+* **Targets:** today only Windows PE x64 is fully wired. ELF + ARM64
+  are roadmap. Every new pass must (1) gate via
+  `ctx.target().is_...()` (e.g. `is_windows_pe_x64()`) and bail out
+  cleanly when the predicate fails — never crash on non-PE / non-x64
+  inputs; (2) keep architecture-specific code (encoders, emitters,
+  rewriters, VM handlers) under an arch directory (`x64/`, future
+  `arm64/`) behind an `arch::IXxxBackend` interface so adding ARM64
+  is a new sibling, not edits to existing files. PE/ELF differences
+  belong behind `pe::` / future `elf::` containers.
 
 ## Build & Test
 ```
@@ -11,7 +26,7 @@ for i in $(seq 1 15); do ../build/.../mxprotector_builder.exe -i in.exe -o t.exe
 ```
 
 ## Pipeline
-1. `MutationPass` (100): Substitutions, junk, splitting, register reassignment.
+1. `MutationPass` (100): Substitutions, junk, splitting, register reassignment. Optional MBA rewriting via `enable_mba_substitution` (defeats SMT/symbolic; OF/AF differ from original — opt-in only).
 2. `ObfuscationPass` (200): Opaque predicates, MBA, constant unfolding.
 3. `VirtualizationPass` (300): Lifts `MX_VM_BEGIN/END` to VM bytecode.
 4. `GuardPass` (350): Relocates `MX_GUARD_BEGIN/END` to `.mxguard`, VEH dispatch, VM-lifted decrypt.

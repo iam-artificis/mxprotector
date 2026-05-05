@@ -78,6 +78,25 @@ void register_semantic_transform_rules(SubstitutionRuleRegistry& registry);
  */
 void register_inc_dec_rules(SubstitutionRuleRegistry& registry);
 
+/**
+ * @brief Mixed-Boolean-Arithmetic family adapter.
+ *
+ * Wraps the entire `mba::MbaRewriterRegistry` (additive / Boolean
+ * MBA identities for `ADD/SUB/XOR/OR/AND r, imm32` plus
+ * permutation-polynomial obfuscation for `MOV r32, imm32`) behind
+ * a single substitution-rule slot. The wrapped registry is the
+ * extension point: new MBA shapes plug into
+ * `MbaRewriterRegistry::create_default` without touching this
+ * substitution registry — see
+ * `protection/mutation/mba/mba_rewriter_groups.hpp`.
+ *
+ * MBA bytes are always longer than the original instruction's
+ * slot, so the engine routes them through the expansion sink and
+ * patches a `JMP rel32` at the original site. Sites shorter than
+ * 5 bytes are skipped automatically.
+ */
+void register_mba_rules(SubstitutionRuleRegistry& registry);
+
 } // namespace mutation::rules
 
 } // namespace mx

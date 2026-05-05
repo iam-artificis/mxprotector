@@ -128,6 +128,15 @@ set(BUILDER_SOURCES
     protection/mutation/rules/shift_add_rules.cpp
     protection/mutation/rules/semantic_transform_rules.cpp
     protection/mutation/rules/inc_dec_rules.cpp
+    protection/mutation/rules/mba_substitution_rule.cpp
+    protection/mutation/mba/mba_alu_imm_decoder.cpp
+    protection/mutation/mba/mba_rewriter_registry.cpp
+    protection/mutation/mba/rewriters/add_imm_xor_and_rewriter.cpp
+    protection/mutation/mba/rewriters/sub_imm_xor_and_rewriter.cpp
+    protection/mutation/mba/rewriters/xor_imm_or_and_rewriter.cpp
+    protection/mutation/mba/rewriters/or_imm_xor_and_rewriter.cpp
+    protection/mutation/mba/rewriters/and_imm_or_xor_rewriter.cpp
+    protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     protection/mutation/register_reassignment.cpp
     protection/mutation/junk_generator.cpp
 

@@ -42,6 +42,10 @@ SubstitutionRuleRegistry SubstitutionRuleRegistry::create_default() {
     mutation::rules::register_shift_add_rules(registry);
     mutation::rules::register_semantic_transform_rules(registry);
     mutation::rules::register_inc_dec_rules(registry);
+    // MBA rewrites land via `register_mba_rules` which `MutationPass`
+    // calls only when `ProtectionConfig::enable_mba_substitution` is
+    // true — the rewrites change OF/AF flag side-effects and need
+    // flag-insensitivity at the rewrite site to be safe to ship.
     return registry;
 }
 
