@@ -282,6 +282,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/function_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/basic_block_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/sub_block_planner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/sub_block_planner_function_scan.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/pdata_chain_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chain_pdata_reader.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chain_blob_builder.cpp

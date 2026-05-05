@@ -1,306 +1,44 @@
 /**
  * @file sub_block_planner.cpp
- * @brief Implementation — see header.
+ * @brief Sub-block planning — emission side.
  *
  * Two-pass walker per function (kept identical to the legacy logic
  * in `basic_block_atom_source.cpp` so both consumers see the same
  * splits):
  *
- *   1. Decode every instruction in `[BeginAddress, EndAddress)`.
- *      Record the byte offset immediately after each unconditional
- *      terminator (`RET` / `JMP`).
- *   2. Walk those candidate split points; keep only the ones that
- *      are `kSubBlockSplitAlignment`-aligned RVAs and emit one
- *      sub-block per surviving span.
+ *   1. `scan_function` (in `sub_block_planner_function_scan.cpp`)
+ *      decodes every instruction in `[BeginAddress, EndAddress)`.
+ *      Records the byte AFTER each unconditional terminator
+ *      (`RET` / `JMP`) and every intra-function rel8/rel32 span.
+ *   2. This file walks the candidate split points and keeps only
+ *      the ones that are `kSubBlockSplitAlignment`-aligned RVAs and
+ *      do not break any rel reference, then emits one `SubBlock`
+ *      per surviving span.
  *
  * The trailing sub-block extends across the function's INT3 tail
  * padding up to the next 8-aligned RVA, capped by the next
  * function's start. The leading sub-block extends BACK over INT3
  * padding down to the previous 8-aligned RVA, capped by the
- * previous function's end. This is the same head/tail absorption
- * `FunctionAtomSource` performs.
+ * previous function's end. This matches `FunctionAtomSource`'s
+ * head/tail absorption.
  */
 
 #include "mxprotector/pe/chaos/sub_block_planner.hpp"
 
+#include "sub_block_planner_function_scan.hpp"
+
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <span>
-#include <variant>
-
-#include <Zydis/Zydis.h>
+#include <vector>
 
 #include "mxprotector/pe/pe_image.hpp"
-#include "mxprotector/pe/pe_types.hpp"
 
 namespace mx::pe::chaos {
 
 namespace {
 
-constexpr std::uint32_t kRuntimeFunctionSize = 12;
-constexpr std::uint8_t  kInt3                = 0xCC;
-constexpr std::uint32_t kMaxFunctionBytes    = 1u << 20;
-
-// ---------------------------------------------------------------------------
-// `.pdata` reading
-// ---------------------------------------------------------------------------
-
-struct PdataLocation {
-    Rva           rva;
-    std::uint32_t size;
-};
-
-[[nodiscard]] PdataLocation find_pdata_directory(
-    const PeImage& image) noexcept
-{
-    PdataLocation result{0, 0};
-    std::visit([&](const auto& nt) {
-        using NT = std::decay_t<decltype(nt)>;
-        if constexpr (std::is_same_v<NT, pe::IMAGE_NT_HEADERS64>) {
-            if (pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION <
-                nt.OptionalHeader.NumberOfRvaAndSizes)
-            {
-                const auto& dir = nt.OptionalHeader.DataDirectory[
-                    pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-                result = {dir.VirtualAddress, dir.Size};
-            }
-        }
-    }, image.nt_headers());
-    return result;
-}
-
-struct RuntimeFunction {
-    std::uint32_t begin_address;
-    std::uint32_t end_address;
-    std::uint32_t unwind_data;
-};
-
-[[nodiscard]] RuntimeFunction read_one(
-    const std::uint8_t* data, std::size_t offset) noexcept
-{
-    RuntimeFunction rf{};
-    std::memcpy(&rf, data + offset, sizeof(rf));
-    return rf;
-}
-
-[[nodiscard]] bool entry_is_valid(
-    const RuntimeFunction& rf, std::uint32_t image_size_hint) noexcept
-{
-    if (rf.begin_address == 0 && rf.end_address == 0)         return false;
-    if (rf.end_address <= rf.begin_address)                   return false;
-    if (rf.end_address - rf.begin_address > kMaxFunctionBytes) return false;
-    if (image_size_hint != 0 && rf.end_address > image_size_hint) {
-        return false;
-    }
-    return true;
-}
-
-[[nodiscard]] std::uint32_t compute_image_size_hint(
-    const PeImage& image) noexcept
-{
-    std::uint32_t end = 0;
-    for (const auto& s : image.sections()) {
-        end = std::max(end, s.virtual_address + s.virtual_size);
-    }
-    return end;
-}
-
-[[nodiscard]] std::vector<RuntimeFunction> collect_pdata_entries(
-    const PeImage& image)
-{
-    std::vector<RuntimeFunction> out;
-    if (!image.is_64bit()) return out;
-
-    const auto loc = find_pdata_directory(image);
-    if (loc.rva == 0 || loc.size < kRuntimeFunctionSize) return out;
-
-    const auto* sec = image.section_by_rva(loc.rva);
-    if (sec == nullptr) return out;
-
-    const auto off_in_section = loc.rva - sec->virtual_address;
-    if (off_in_section + loc.size > sec->data.size()) return out;
-
-    const std::uint8_t* dir       = sec->data.data() + off_in_section;
-    const std::uint32_t entry_cnt = loc.size / kRuntimeFunctionSize;
-    const auto          hint      = compute_image_size_hint(image);
-
-    out.reserve(entry_cnt);
-    for (std::uint32_t i = 0; i < entry_cnt; ++i) {
-        const auto rf = read_one(dir, i * kRuntimeFunctionSize);
-        if (entry_is_valid(rf, hint)) out.push_back(rf);
-    }
-    std::sort(out.begin(), out.end(),
-              [](const RuntimeFunction& a, const RuntimeFunction& b) {
-                  return a.begin_address < b.begin_address;
-              });
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Zydis wrapper
-// ---------------------------------------------------------------------------
-
-class ZydisX64Decoder {
-public:
-    ZydisX64Decoder() noexcept {
-        ZydisDecoderInit(&decoder_,
-                         ZYDIS_MACHINE_MODE_LONG_64,
-                         ZYDIS_STACK_WIDTH_64);
-    }
-
-    struct Decoded {
-        std::uint8_t            length;
-        ZydisInstructionCategory category;
-    };
-
-    [[nodiscard]] Decoded decode_one(
-        const std::uint8_t* data, std::size_t remaining) noexcept
-    {
-        ZydisDecodedInstruction insn{};
-        ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT]{};
-        const auto status = ZydisDecoderDecodeFull(
-            &decoder_, data, remaining, &insn, ops);
-        if (!ZYAN_SUCCESS(status)) return {0, ZYDIS_CATEGORY_INVALID};
-        return {insn.length, insn.meta.category};
-    }
-
-private:
-    ZydisDecoder decoder_;
-};
-
-// ---------------------------------------------------------------------------
-// Terminator classification
-// ---------------------------------------------------------------------------
-
-/// `true` when the decoded instruction transfers control
-/// unconditionally — see `basic_block_atom_source.cpp` for the
-/// rationale (kept identical so the two consumers stay in sync).
-[[nodiscard]] bool is_unconditional_terminator(
-    ZydisInstructionCategory cat) noexcept
-{
-    switch (cat) {
-        case ZYDIS_CATEGORY_RET:
-        case ZYDIS_CATEGORY_UNCOND_BR:
-            return true;
-        default:
-            return false;
-    }
-}
-
-[[nodiscard]] const std::uint8_t* code_window(
-    const PeImage& image, Rva rva, std::uint32_t size) noexcept
-{
-    const auto* sec = image.section_by_rva(rva);
-    if (sec == nullptr) return nullptr;
-    const auto off = rva - sec->virtual_address;
-    if (static_cast<std::size_t>(off) + size > sec->data.size()) {
-        return nullptr;
-    }
-    return sec->data.data() + off;
-}
-
-/// One rel8 / rel32 reference observed inside a function — paired
-/// `slot_rva` (the disp byte) and `target_rva` (where the jump
-/// lands). Sub-block split points that fall STRICTLY BETWEEN
-/// `min(slot, target)` and `max(slot, target)` would put the slot
-/// in one chunk and the target in another; chaos relocates them
-/// independently and the rel8 displacement overflows int8 range
-/// (or even rel32 range though that is far rarer). The planner
-/// drops such split points so the rel reference stays intra-chunk
-/// and its disp value survives the shuffle byte-for-byte.
-struct RelRefSpan {
-    Rva           lo; ///< min(slot+1, target). slot+1 = byte AFTER disp.
-    Rva           hi; ///< max(slot+1, target).
-    std::uint8_t  width; ///< 1 or 4 — diagnostic only.
-};
-
-/// Decode the entire function and harvest:
-///   * Candidate split points (one per unconditional terminator).
-///   * `RelRefSpan`s for every `rel8` / `rel32` branch slot — these
-///     span the slot-byte and target-byte and constrain where the
-///     planner can split.
-struct FunctionScan {
-    std::vector<Rva>        split_candidates;
-    std::vector<RelRefSpan> rel_spans;
-};
-
-[[nodiscard]] FunctionScan scan_function(
-    const PeImage& image, const RuntimeFunction& rf)
-{
-    FunctionScan out;
-    const std::uint32_t size = rf.end_address - rf.begin_address;
-    const auto* code = code_window(image,
-                                   static_cast<Rva>(rf.begin_address), size);
-    if (code == nullptr) return out;
-
-    ZydisDecoder decoder{};
-    ZydisDecoderInit(&decoder,
-                     ZYDIS_MACHINE_MODE_LONG_64,
-                     ZYDIS_STACK_WIDTH_64);
-
-    std::uint32_t off = 0;
-    while (off < size) {
-        ZydisDecodedInstruction insn{};
-        ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT]{};
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-                &decoder, code + off, size - off, &insn, ops))) {
-            break;
-        }
-        const std::uint32_t after = off + insn.length;
-
-        // Harvest `rel` operand spans from this instruction. We
-        // examine every operand for `IMM` types whose width is 8
-        // or 32 bits and whose source was a relative immediate
-        // (Zydis sets `imm.is_relative` for those).
-        for (ZyanU8 i = 0; i < insn.operand_count; ++i) {
-            const auto& op = ops[i];
-            if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) continue;
-            if (!op.imm.is_relative) continue;
-
-            const auto& raw = insn.raw.imm[i];
-            if (raw.size != 8 && raw.size != 32) continue;
-            const Rva slot_rva = static_cast<Rva>(
-                rf.begin_address + off + raw.offset);
-            const std::int64_t disp = op.imm.value.s;
-            const Rva target_rva = static_cast<Rva>(
-                static_cast<std::int64_t>(rf.begin_address + after) + disp);
-            if (target_rva < rf.begin_address ||
-                target_rva > rf.end_address)
-            {
-                // Cross-function ref — split policy doesn't care:
-                // the slot is inside the function, target outside,
-                // any split inside the function leaves the slot
-                // and target on opposite sides regardless. Skip.
-                continue;
-            }
-            // The span is `[min(slot, target), max(slot, target)]`
-            // — the slot and target byte positions. A split point
-            // `S` breaks this span when `min < S <= max`, putting
-            // the slot in one chunk and the target in another.
-            out.rel_spans.push_back(RelRefSpan{
-                .lo    = std::min(slot_rva, target_rva),
-                .hi    = std::max(slot_rva, target_rva),
-                .width = static_cast<std::uint8_t>(raw.size / 8),
-            });
-        }
-
-        if (is_unconditional_terminator(insn.meta.category) &&
-            after < size)
-        {
-            out.split_candidates.push_back(
-                static_cast<Rva>(rf.begin_address + after));
-        }
-        off = after;
-    }
-    return out;
-}
-
-[[nodiscard]] std::vector<Rva> harvest_split_points(
-    const PeImage& image, const RuntimeFunction& rf)
-{
-    return scan_function(image, rf).split_candidates;
-}
+constexpr std::uint8_t kInt3 = 0xCC;
 
 // ---------------------------------------------------------------------------
 // Tail / head INT3 absorption
