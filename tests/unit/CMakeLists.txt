@@ -38,6 +38,7 @@ set(TEST_SOURCES
     guard_tls_installer_test.cpp
     target_info_test.cpp
     pe_image_binary_adapter_test.cpp
+    pe_import_table_view_test.cpp
     pe_parser_pe_type_test.cpp
     section_intent_test.cpp
     layout_policy_test.cpp

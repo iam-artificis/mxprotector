@@ -57,6 +57,7 @@
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
+#include "mxprotector/target/binary_capabilities.hpp"
 #include "mxprotector/target/target_info.hpp"
 
 namespace mx::target {
@@ -166,6 +167,21 @@ public:
 
     /// @brief True iff the image is 64-bit (x86_64, aarch64, ...).
     [[nodiscard]] virtual bool is_64bit() const noexcept = 0;
+
+    // ------------------------------------------------------------------------
+    // Capability views — narrow per-table interfaces (see
+    // binary_capabilities.hpp). Each accessor returns a pointer to a
+    // capability view owned by the image, or `nullptr` if the container
+    // doesn't model that capability. Default `nullptr` lets adapters
+    // opt in over time without forcing every existing impl to provide a
+    // stub.
+    // ------------------------------------------------------------------------
+
+    /// @brief Read-only view of the import / dynamic-symbol table.
+    ///        `nullptr` when the container has no concept of dynamic
+    ///        imports.
+    [[nodiscard]] virtual const IImportTableView*
+        import_table() const noexcept { return nullptr; }
 };
 
 /**

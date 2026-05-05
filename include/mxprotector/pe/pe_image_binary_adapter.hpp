@@ -36,6 +36,8 @@
 #pragma once
 
 #include "mxprotector/pe/pe_image.hpp"
+#include "mxprotector/pe/pe_import_table_view.hpp"
+#include "mxprotector/target/binary_capabilities.hpp"
 #include "mxprotector/target/binary_image.hpp"
 #include "mxprotector/target/target_info.hpp"
 
@@ -58,7 +60,7 @@ namespace mx::pe {
 class PeImageBinaryAdapter final : public target::IBinaryImage {
 public:
     PeImageBinaryAdapter(PeImage& image, target::TargetInfo info) noexcept
-        : image_(image), info_(info) {}
+        : image_(image), info_(info), import_view_(image) {}
 
     [[nodiscard]] target::TargetInfo target() const noexcept override { return info_; }
     [[nodiscard]] uint64_t           image_base() const noexcept override { return image_.image_base(); }
@@ -79,6 +81,10 @@ public:
     patch_section_bytes(uint32_t section_index, uint32_t offset,
                         ByteView data) override;
 
+    /// PE-side capability: read-only import-table view.
+    [[nodiscard]] const target::IImportTableView*
+    import_table() const noexcept override { return &import_view_; }
+
     /// Update the cached `TargetInfo` — used when `ProtectionContext`
     /// learns the load mode (CLI flag) after construction.
     void set_target(target::TargetInfo info) noexcept { info_ = info; }
@@ -86,6 +92,7 @@ public:
 private:
     PeImage&            image_;
     target::TargetInfo  info_;
+    PeImportTableView   import_view_;
 };
 
 } // namespace mx::pe
