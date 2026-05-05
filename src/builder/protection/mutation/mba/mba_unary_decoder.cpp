@@ -44,9 +44,19 @@ std::optional<UnaryView> decode_unary(
     std::uint8_t reg_id = x86::modrm_rm(modrm);
     if (rex_b) reg_id |= 0x08;
 
+    const auto dst_reg = static_cast<x86::Reg>(reg_id);
+    // Reject rsp — the deep-chain unary shapes wrap their work in
+    // `push scratch ... pop scratch`, which corrupts the body's view
+    // of `dst` if `dst == rsp`. The single-shape unary rewriters
+    // (twocomplement, xor-cancel, not-add1) would tolerate rsp, but
+    // gating once at the decoder is cleaner than gating per-shape;
+    // `not rsp` / `neg rsp` are essentially never emitted by
+    // compilers, so the coverage loss is nil.
+    if (dst_reg == x86::Reg::rsp) return std::nullopt;
+
     UnaryView view{};
     view.op       = op;
-    view.dst      = static_cast<x86::Reg>(reg_id);
+    view.dst      = dst_reg;
     view.is_64bit = rex_w;
     return view;
 }

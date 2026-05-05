@@ -30,10 +30,17 @@
  *     boundary, so the engine can route them through the overflow
  *     sink alongside the general `81 /op id` form.
  *
- * Smaller forms (`83 /op ib`, 4 bytes max — too short for the
- * 5-byte `JMP rel32` redirect) remain out of scope. Adding them
- * would require a multi-instruction redirect mechanism; that's a
- * roadmap item, not a decoder extension.
+ *   * `[REX] 83 /op ib` — group-1 ALU r/m, imm8 (sign-extended to
+ *     32-bit; sign-extended to 64-bit when REX.W is set). 3 bytes
+ *     without REX, 4 bytes with REX. Compilers emit these for tiny
+ *     arithmetic (`add esp, 8`, `sub rcx, 16`, `xor eax, 1`, …) — by
+ *     far the most common ALU encoding in optimised binaries. Below
+ *     the 5-byte `JMP rel32` redirect threshold, so the engine's
+ *     multi-instruction redirect (Phase 11) widens the slot at
+ *     substitution time by consuming 1..3 following ops. The
+ *     sign-extended imm8 is stored as a sign-extended int32 in
+ *     `AluImm32View::imm`, so existing imm32 rewriters apply
+ *     unchanged.
  */
 
 #pragma once
@@ -80,18 +87,23 @@ struct AluImm32View {
 /**
  * @brief Try to decode `insn` as one of the imm32 ALU encodings.
  *
- * Accepts two encoding shapes:
- *   * `[REX] 81 /op id` — general r/m32 or r/m64, any GPR dst.
- *   * `[REX.W] {05|0D|25|2D|35} id` — EAX/RAX-only short form.
+ * Accepts three encoding shapes:
+ *   * `[REX] 81 /op id` — general r/m32 or r/m64, imm32, any GPR dst.
+ *   * `[REX.W] {05|0D|25|2D|35} id` — EAX/RAX-only imm32 short form.
+ *   * `[REX] 83 /op ib` — group-1 r/m32 or r/m64, imm8 (sign-extended).
+ *
+ * For the imm8 form, the immediate is sign-extended to int32 and
+ * stored in `AluImm32View::imm` so callers do not need to branch on
+ * the form — every shipped imm32 rewriter applies unchanged.
  *
  * Returns `std::nullopt` when:
- *   * length is < 5 (no room for any imm32 ALU encoding),
+ *   * length is < 3 (no room for any accepted encoding),
  *   * any legacy prefix is present (the rewriter family does not
  *     target `66h` operand-size or segment-prefixed variants),
- *   * the opcode is neither `0x81` nor a recognised short-form
- *     opcode,
- *   * for `0x81`: ModR/M `mod` field is not 3 (memory operand) or
- *     `reg` field is not one of {0, 1, 4, 5, 6}.
+ *   * the opcode is none of `0x81`, `0x83`, or a recognised short-
+ *     form opcode,
+ *   * for `0x81` / `0x83`: ModR/M `mod` field is not 3 (memory
+ *     operand) or `reg` field is not one of {0, 1, 4, 5, 6}.
  *
  * @param insn       Instruction to inspect.
  * @param expected_op If set, also requires the decoded op to match.

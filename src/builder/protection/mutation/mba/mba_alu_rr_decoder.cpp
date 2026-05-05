@@ -107,6 +107,17 @@ std::optional<AluRrView> decode_alu_rr(
     // body shape.
     if (view.dst == view.src) return std::nullopt;
 
+    // Reject rsp on either side of the r-r form. The r-r affine
+    // body wraps three scratches in push/pop and reads `view.dst` /
+    // `view.src` inside that wrap — if either operand is rsp, the
+    // body sees rsp at the wrong stack-frame depth (24 bytes off)
+    // and writes back a wrong value. Compilers very rarely emit
+    // ALU r-r against rsp anyway; the gate's coverage cost is
+    // negligible and it removes a whole class of segfaults.
+    if (view.dst == x86::Reg::rsp || view.src == x86::Reg::rsp) {
+        return std::nullopt;
+    }
+
     return view;
 }
 

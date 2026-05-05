@@ -548,10 +548,57 @@ TEST(MbaAluImm32Decoder, RejectsExpectedOpMismatch) {
         insn, mx::mutation::mba::AluImm32Op::sub).has_value());
 }
 
-TEST(MbaAluImm32Decoder, RejectsShortImm8Form) {
-    // ADD r/m64, imm8 (`83 /0 ib`) — out of scope.
+TEST(MbaAluImm32Decoder, AcceptsShortImm8FormAddRax) {
+    // ADD r/m64, imm8 (`REX.W 83 /0 ib`) — sign-extended to 64 bits.
+    // The decoder normalises the imm8 to a sign-extended int32 stored
+    // in `view.imm` so existing imm32 rewriters can apply unchanged.
     mx::ByteBuffer bytes{0x48, 0x83, 0xC0, 0x05};
     auto insn = make_insn(std::move(bytes), "add", "rax, 5");
+    auto view = mx::mutation::mba::decode_alu_imm32(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op,  mx::mutation::mba::AluImm32Op::add);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_EQ(view->imm, 0x05u);
+    EXPECT_TRUE(view->is_64bit);
+}
+
+TEST(MbaAluImm32Decoder, AcceptsShortImm8FormSubEcx) {
+    // SUB r/m32, imm8 (`83 /5 ib`) — 32-bit, no REX. The decoder
+    // accepts `sub ecx, 0x10` (rm = 1 = rcx); `sub esp, K` is
+    // explicitly rejected because the MBA bodies use push/pop
+    // wraps that corrupt rsp.
+    mx::ByteBuffer bytes{0x83, 0xE9, 0x10};
+    auto insn = make_insn(std::move(bytes), "sub", "ecx, 0x10");
+    auto view = mx::mutation::mba::decode_alu_imm32(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op,  mx::mutation::mba::AluImm32Op::sub);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rcx);
+    EXPECT_EQ(view->imm, 0x10u);
+    EXPECT_FALSE(view->is_64bit);
+}
+
+TEST(MbaAluImm32Decoder, RejectsRsp) {
+    // `sub rsp, 0x10` (`REX.W 83 /5 ib`) — rsp dst breaks every
+    // push/pop-wrapped MBA body, so the decoder rejects it.
+    mx::ByteBuffer bytes{0x48, 0x83, 0xEC, 0x10};
+    auto insn = make_insn(std::move(bytes), "sub", "rsp, 0x10");
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(insn).has_value());
+}
+
+TEST(MbaAluImm32Decoder, ShortImm8FormSignExtendsNegativeImm) {
+    // SUB r/m32, imm8 with imm = 0x80 (-128). Sign-extended to int32
+    // is 0xFFFFFF80; the decoder must store that in `view.imm`.
+    mx::ByteBuffer bytes{0x83, 0xE8, 0x80};
+    auto insn = make_insn(std::move(bytes), "sub", "eax, -128");
+    auto view = mx::mutation::mba::decode_alu_imm32(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->imm, 0xFFFFFF80u);
+}
+
+TEST(MbaAluImm32Decoder, RejectsShortImm8FormForeignOp) {
+    // CMP rax, 0 (`REX.W 83 /7 ib`) — /7 = CMP is unsupported.
+    mx::ByteBuffer bytes{0x48, 0x83, 0xF8, 0x00};
+    auto insn = make_insn(std::move(bytes), "cmp", "rax, 0");
     EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(insn).has_value());
 }
 
@@ -1650,6 +1697,81 @@ TEST(MbaRewriterRegistry, FindMatchingDispatchesByOp) {
         << "the baseline shape must remain in the matching set";
     EXPECT_TRUE(seen_affine)
         << "the new affine shape must also match";
+}
+
+TEST(MbaRewriterRegistry, ShortImm8Form32bitMatchesAllAddShapes) {
+    // `add eax, 5` — `83 /0 ib` (3 bytes, no REX). All five ADD shapes
+    // (3 fixed + 1 affine + 1 deep-affine) must match: deep-affine
+    // gates on `!is_64bit` which the no-REX form satisfies.
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    mx::ByteBuffer bytes{0x83, 0xC0, 0x05};
+    auto insn = make_insn(std::move(bytes), "add", "eax, 5");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 5u)
+        << "every ADD-imm shape must match the 3-byte `83 /0 ib` "
+        << "form — deep-affine included thanks to the 32-bit gate";
+}
+
+TEST(MbaRewriterRegistry, ShortImm8Form64bitMatchesNonDeepShapes) {
+    // `add rax, 5` — `REX.W 83 /0 ib` (4 bytes). The four non-deep ADD
+    // shapes match; deep-affine rejects `is_64bit==true`.
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    mx::ByteBuffer bytes{0x48, 0x83, 0xC0, 0x05};
+    auto insn = make_insn(std::move(bytes), "add", "rax, 5");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 4u)
+        << "the four non-deep ADD shapes must match `REX.W 83 /0 ib`";
+    for (const auto* r : matching) {
+        EXPECT_NE(r->name(), "add-imm-deep-affine")
+            << "deep-affine must skip 64-bit imm8 sites";
+    }
+}
+
+TEST(MbaRewriter, AffineRewritesPreserveImm8FormSemantics) {
+    // Smoke test: drive each of the 5 affine shapes against a 3-byte
+    // imm8 site and verify the body emits the right answer. Picks
+    // a small K with bit 7 clear so the imm8 sign-extension is
+    // identity — this isolates the imm8 decoding from any algebra
+    // edge-case.
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    mx::Randomizer rng(0xCABA1234u);
+
+    constexpr std::array<
+        std::pair<mx::mutation::mba::AluImm32Op, std::string_view>, 5>
+    kShapes = {{
+        {mx::mutation::mba::AluImm32Op::add, "add-imm-affine"},
+        {mx::mutation::mba::AluImm32Op::sub, "sub-imm-affine"},
+        {mx::mutation::mba::AluImm32Op::xor_, "xor-imm-affine"},
+        {mx::mutation::mba::AluImm32Op::or_,  "or-imm-affine"},
+        {mx::mutation::mba::AluImm32Op::and_, "and-imm-affine"},
+    }};
+
+    for (auto [op, name] : kShapes) {
+        const auto* rewriter = registry.find(name);
+        ASSERT_NE(rewriter, nullptr) << name;
+
+        // `83 /op ib` with imm = 0x05. Sign-extends to int32(0x05).
+        const std::uint8_t modrm =
+            static_cast<std::uint8_t>(0xC0 |
+                (static_cast<std::uint8_t>(op) << 3));
+        mx::ByteBuffer bytes{0x48, 0x83, modrm, 0x05};
+        auto insn = make_insn(std::move(bytes), std::string(name), "rax, 5");
+
+        ASSERT_TRUE(rewriter->matches(insn)) << name;
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value()) << name << " emit failed";
+
+        MbaSimulator sim;
+        constexpr std::uint64_t kInputX = 0x0123456789ABCDEFULL;
+        sim.set_reg(mx::x86::Reg::rax, kInputX);
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << name << " simulator stalled";
+
+        const auto expected = apply_alu64(op, kInputX, 0x05u);
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), expected)
+            << name << " imm8-form mismatch";
+    }
 }
 
 TEST(MbaRewriterRegistry, FindReturnsNullForUnknownName) {

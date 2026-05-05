@@ -68,10 +68,9 @@ std::optional<AluImm32View> decode_alu_imm32(
     std::optional<AluImm32Op>    expected_op) noexcept
 {
     const auto bytes = insn.raw_bytes();
-    // 5 bytes is the smallest accepted encoding (`<op> EAX, imm32`
-    // with no REX). Anything shorter cannot possibly be one of the
-    // imm32 forms we cover.
-    if (bytes.size() < 5) return std::nullopt;
+    // 3 bytes is the smallest accepted encoding (`83 /op ib`, no REX).
+    // Anything shorter cannot possibly be one of the forms we cover.
+    if (bytes.size() < 3) return std::nullopt;
 
     std::size_t cursor = 0;
 
@@ -102,14 +101,16 @@ std::optional<AluImm32View> decode_alu_imm32(
 
         AluImm32View view{};
         view.op       = *op;
-        view.dst      = x86::Reg::rax;
+        view.dst      = x86::Reg::rax; // never rsp — short form is EAX/RAX
         view.imm      = read_imm32_le(bytes, cursor);
         view.is_64bit = rex_w;
         return view;
     }
 
-    // General form: `[REX] 81 /op id`.
-    if (opcode != 0x81) return std::nullopt;
+    // General form: `[REX] 81 /op id` (imm32) or `[REX] 83 /op ib`
+    // (imm8, sign-extended to operand width).
+    const bool is_imm8_form = (opcode == 0x83);
+    if (opcode != 0x81 && !is_imm8_form) return std::nullopt;
 
     if (cursor >= bytes.size()) return std::nullopt;
     const std::uint8_t modrm = bytes[cursor++];
@@ -121,15 +122,37 @@ std::optional<AluImm32View> decode_alu_imm32(
     const auto decoded_op = static_cast<AluImm32Op>(reg_field);
     if (expected_op && *expected_op != decoded_op) return std::nullopt;
 
-    if (cursor + 4 > bytes.size()) return std::nullopt;
+    const std::size_t imm_size = is_imm8_form ? 1u : 4u;
+    if (cursor + imm_size > bytes.size()) return std::nullopt;
 
     std::uint8_t reg_id = x86::modrm_rm(modrm);
     if (rex_b) reg_id |= 0x08;
 
+    const auto dst_reg = static_cast<x86::Reg>(reg_id);
+    // RSP is the only register the MBA bodies cannot safely target.
+    // Every shipped shape wraps its work in `push scratch ... pop
+    // scratch` to preserve a scratch register across the body — but
+    // `push` decrements rsp before the body reads `view.dst`, so a
+    // body whose `dst == rsp` would see (and write back) rsp at the
+    // wrong stack-frame depth. Compilers emit `[REX.W] 83 /op ib` on
+    // rsp very aggressively (`sub rsp, 0x28` etc.), so the decoder
+    // gate has to live here, not in each rewriter's `matches`.
+    if (dst_reg == x86::Reg::rsp) return std::nullopt;
+
     AluImm32View view{};
-    view.op       = decoded_op;
-    view.dst      = static_cast<x86::Reg>(reg_id);
-    view.imm      = read_imm32_le(bytes, cursor);
+    view.op  = decoded_op;
+    view.dst = dst_reg;
+    if (is_imm8_form) {
+        // Sign-extend imm8 → int32 → uint32 so existing rewriters
+        // see a single integer field regardless of the source form.
+        // This matches hardware semantics: `83 /op ib` sign-extends
+        // the byte to 32 bits before applying the op (and to 64 bits
+        // when REX.W is set).
+        const auto imm8 = static_cast<std::int8_t>(bytes[cursor]);
+        view.imm = static_cast<std::uint32_t>(static_cast<std::int32_t>(imm8));
+    } else {
+        view.imm = read_imm32_le(bytes, cursor);
+    }
     view.is_64bit = rex_w;
     return view;
 }

@@ -29,6 +29,7 @@
 #include "mxprotector/protection/mutation/overflow/jmp_emit.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 namespace mx {
@@ -153,6 +154,27 @@ MxResult<uint32_t> MutationEngine::mutate_region(
         return uint32_t{0};
     }
 
+    // Collect every branch target inside the region. The multi-
+    // instruction redirect (Phase 11+) widens a slot by consuming
+    // 1..3 following instructions; if any consumed instruction is the
+    // landing site of a jump from elsewhere, after the JMP rel32 +
+    // NOPs are planted, the landing site falls into the NOP pad
+    // (or worse, into the middle of the JMP rel32) and the binary
+    // segfaults at runtime.
+    //
+    // For imm32 / unary / r-r MBA sites this hazard was rare in
+    // practice (sites are uncommon enough that compilers don't often
+    // place jump targets right after them). Phase 16's imm8 form
+    // surfaces it constantly because `83 /op ib` is by far the most
+    // common ALU encoding and frequently appears at the head of a
+    // basic block immediately following a `jcc` from elsewhere.
+    std::unordered_set<Va> branch_target_vas;
+    for (const auto& instr : instructions) {
+        for (const Va target : instr.branch_targets()) {
+            branch_target_vas.insert(target);
+        }
+    }
+
     uint32_t mutations_applied = 0;
     uint32_t junk_inserted = 0;
 
@@ -269,6 +291,10 @@ MxResult<uint32_t> MutationEngine::mutate_region(
                 if (next_idx >= instructions.size()) break;
                 const auto& next = instructions[next_idx];
                 if (!consumed_instruction_is_relocatable(next)) break;
+                // Refuse to swallow a jump landing site — see the
+                // comment on `branch_target_vas` above. The check is
+                // O(1) per consumed instruction.
+                if (branch_target_vas.contains(next.address())) break;
                 slot_size += next.length();
                 ++consumed_count;
             }
