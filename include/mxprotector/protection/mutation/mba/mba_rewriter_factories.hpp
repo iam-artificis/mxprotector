@@ -165,6 +165,20 @@ namespace factories {
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_affine();
 
 // ---------------------------------------------------------------------------
+// ALU r-r (register-register) shapes — `01/03/09/0B/21/23/29/2B/31/33 /r`
+// with mod = 3. Two encoding directions per op fold into one normalised
+// `(dst, src)` view at decode time. All five affine shapes share the
+// same coefficient algebra as the imm32 family but read from a register
+// source instead of an immediate.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_add_rr_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_rr_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_rr_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_rr_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_rr_affine();
+
+// ---------------------------------------------------------------------------
 // MOV r32, imm32 shapes — `[REX.B] B8+rd id` (5/6 bytes).
 // ---------------------------------------------------------------------------
 

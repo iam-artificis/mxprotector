@@ -89,6 +89,38 @@ pick_three_scratches_for(x86::Reg dst) noexcept {
 }
 
 /**
+ * @brief Pick three 64-bit scratch registers that don't alias either
+ *        of the two operand registers.
+ *
+ * The r-r affine shapes have to keep BOTH `dst` and `src` live
+ * throughout the body — the basis terms `(x|y)`, `(x&y)`, `(x^y)`
+ * each read both operands. If a scratch aliased `src`, the first
+ * `mov scratch, dst` would clobber `src` and every subsequent read
+ * from `src` would see the dst value instead. The picker walks a
+ * 6-deep candidate list (`r10..r15`) and returns the first three
+ * that don't collide with either operand — there are always at
+ * least four candidates left after subtracting two registers, so
+ * the result is always fully populated.
+ */
+[[nodiscard]] inline std::array<x86::Reg, 3>
+pick_three_scratches_for(x86::Reg dst, x86::Reg src) noexcept {
+    constexpr std::array<x86::Reg, 6> candidates = {
+        x86::Reg::r10, x86::Reg::r11, x86::Reg::r12,
+        x86::Reg::r13, x86::Reg::r14, x86::Reg::r15,
+    };
+    std::array<x86::Reg, 3> result = {
+        x86::Reg::r10, x86::Reg::r11, x86::Reg::r12};
+    std::size_t filled = 0;
+    for (auto reg : candidates) {
+        if (reg != dst && reg != src) {
+            result[filled++] = reg;
+            if (filled == 3) break;
+        }
+    }
+    return result;
+}
+
+/**
  * @brief Emit `push s1 ; push s2 ; push s3 ; body(em) ; pop s3 ;
  *        pop s2 ; pop s1` into `em`.
  *

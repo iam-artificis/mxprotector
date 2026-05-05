@@ -14,6 +14,7 @@
 
 #include "mxprotector/protection/mutation/mba/mba_affine_emit.hpp"
 
+#include "mxprotector/protection/mutation/mba/mba_alu_rr_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_emit_helpers.hpp"
 
 namespace mx::mutation::mba {
@@ -113,6 +114,51 @@ MxResult<void> emit_affine_alu_body(
             if (view.op == AluImm32Op::sub) {
                 e.sub(view.dst, k);
                 e.sub(view.dst, k);
+            }
+        });
+
+    return {};
+}
+
+MxResult<void> emit_affine_alu_rr_body(
+    analysis::X86CodeEmitter& em,
+    const AluRrView&          view,
+    AffineCoefficients        coefficients)
+{
+    // Both operand registers must stay live across the body — the
+    // basis prep reads `view.src` three times. Pick three scratches
+    // that don't alias either operand.
+    const auto scratches = pick_three_scratches_for(view.dst, view.src);
+    const x86::Reg s_or  = scratches[0];
+    const x86::Reg s_and = scratches[1];
+    const x86::Reg s_xor = scratches[2];
+
+    wrap_with_push_pop_3(em, scratches,
+        [&](analysis::X86CodeEmitter& e) {
+            // Compute each basis term into its own scratch — `view.src`
+            // takes the place of `K` from the imm32 path.
+            e.mov(s_or,  view.dst);
+            e.or_(s_or,  view.src);
+            e.mov(s_and, view.dst);
+            e.and_(s_and, view.src);
+            e.mov(s_xor, view.dst);
+            e.xor_(s_xor, view.src);
+
+            emit_imul_const(e, s_or,  coefficients.c_or);
+            emit_imul_const(e, s_and, coefficients.c_and);
+            emit_imul_const(e, s_xor, coefficients.c_xor);
+
+            // Combine: dst = c_or*OR + c_and*AND + c_xor*XOR.
+            e.mov(view.dst, s_or);
+            e.add(view.dst, s_and);
+            e.add(view.dst, s_xor);
+
+            // SUB post-correction: -2*src. Two `sub dst, src` ops
+            // are byte-stable (3 bytes each w/ REX) and avoid any
+            // overflow concerns the imm32 path has to manage.
+            if (view.op == AluImm32Op::sub) {
+                e.sub(view.dst, view.src);
+                e.sub(view.dst, view.src);
             }
         });
 

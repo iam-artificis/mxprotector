@@ -62,6 +62,23 @@ void register_or_imm_rewriters(MbaRewriterRegistry& registry);
 void register_and_imm_rewriters(MbaRewriterRegistry& registry);
 
 /**
+ * @brief r-r (register-register) ALU MBA family.
+ *
+ * Five affine shapes — one per ALU op (ADD/SUB/XOR/OR/AND) —
+ * targeting the `01 /r .. 33 /r` group-1 r-r encodings (mod = 3).
+ * Each shape opens a 14-element coefficient family parameterised
+ * by a per-site random `t ∈ [2, 15]`, matching the variety of the
+ * imm32 affine shapes.
+ *
+ * The targeted instructions are 2 bytes (no REX) or 3 bytes (with
+ * REX) — below the 5-byte JMP rel32 redirect threshold — so this
+ * family relies on the engine's multi-instruction redirect
+ * mechanism (`MutationEngine::mutate_region`'s consume-next-N path,
+ * Phase 11) to widen the slot at substitution time.
+ */
+void register_rr_affine_rewriters(MbaRewriterRegistry& registry);
+
+/**
  * @brief `MOV r, imm` MBA family — covers both the 5/6-byte
  *        `[REX.B] B8+rd id` (mov r32, imm32) and the 10/11-byte
  *        `[REX.W (.B)] B8+rd iq` (mov r64, imm64) encodings.

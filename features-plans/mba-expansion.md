@@ -1,6 +1,6 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–10 merged on master, all stress green.
+**Status:** shipped — phases 1–12 merged on master, all stress green.
 
 ## What this is
 
@@ -44,6 +44,45 @@ or 6 (with REX.W), fitting the JMP rel32 redirect threshold.
 Coverage uplift on `test_vm_showcase.exe` at strong: redirect count
 180 → 195 (**+8.3%**). On binaries with more RAX-bound arithmetic
 (syscall stubs, ABI shims) the uplift will be larger.
+
+### Phase 12: Register-register ALU MBA
+
+Five new affine shapes targeting the group-1 r-r ALU encodings
+`01/03/09/0B/21/23/29/2B/31/33 /r` with `mod = 3`. Each shape uses
+the same coefficient algebra as the imm32 affine shapes but reads
+from a register source instead of an immediate.
+
+| Shape (name)  | Identity                                              |
+| ------------- | ----------------------------------------------------- |
+| `add-rr-affine` | `(1+t)*(x|y) + (1-t)*(x&y) - t*(x^y) = x + y`     |
+| `sub-rr-affine` | ADD body, then `dst -= src; dst -= src`           |
+| `xor-rr-affine` | `(1-t)*(x|y) + (t-1)*(x&y) + t*(x^y) = x ^ y`     |
+| `or-rr-affine`  | `-t*(x|y) + (1+t)*(x&y) + (1+t)*(x^y) = x | y`    |
+| `and-rr-affine` | `(1+t)*(x|y) - t*(x&y) - (1+t)*(x^y) = x & y`     |
+
+Same per-site `t ∈ [2, 15]` parameterisation — 14 SMT-distinct
+shapes per op, identical defeat strength to the imm32 affine path.
+
+The targeted instructions are 2 bytes (no REX) or 3 bytes (with
+REX) — below the 5-byte JMP rel32 redirect threshold. Phase 11's
+multi-instruction redirect engine drags the next 1..3 instructions
+into the slot to widen it to ≥ 5 bytes.
+
+* New `mba_alu_rr_decoder.hpp/cpp` accepts both encoding directions
+  (rm-r `01 /r` and r-rm `03 /r`) and normalises to a single
+  `(dst, src)` view. Same-register sites (`xor r, r` zero idiom)
+  and memory-operand variants are rejected at decode.
+* New `pick_three_scratches_for(dst, src)` overload that walks a
+  6-deep candidate list (`r10..r15`) so neither operand register
+  is aliased by a scratch. The original imm32 picker (1-arg) is
+  unchanged.
+* New `emit_affine_alu_rr_body` shares all the coefficient logic
+  with the imm32 path; only the basis-prep and SUB-correction
+  switch from imm operand to register operand.
+* 5 thin per-shape rewriter files + 1 aggregator file
+  (`rr_affine_aggregator.cpp`) wire factories into the registry.
+* `MbaSubstitutionRule` adapter is unchanged — it dispatches to the
+  registry generically, so r-r shapes are picked up automatically.
 
 ### Phase 10: Multi-step deep MBA chains
 
@@ -198,8 +237,11 @@ aggregator call. No edits to existing rewriter files.
     SUB-imm-neg-add's mov scratch, K with negative K.
   - phase 2: `REX.W + C7 /0 id` sign-extension to 64 bits.
   - phase 7: `C1 /op ib` for ROL/ROR/SHL/SHR r/m, imm8.
+  - phase 8: REX.W sign-extension for `IMUL r64, r/m64, imm32`.
+  - phase 9: `0x6B /r ib` IMUL r,r,imm8 for affine small-coef path.
+  - phase 10: `0xD1` extended to ROL/ROR/SHL/SHR by 1 (was SHL only).
 
-* Full ctest at every phase: 894 → 909 tests, all passing.
+* Full ctest at every phase: 894 → 939 tests, all passing.
 
 * Stress per phase: 15 runs at strong + 15 at maximum.
   Final sweep (phase 8): 10 runs each at minimal/standard/strong/
@@ -207,17 +249,19 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Phase 7 | Phase 8 | Phase 9 | Phase 10 |
-| ---------------------------- | ------- | ------- | ------- | -------- |
-| MBA rewriters in registry    | 18      | 21      | 26      | 29       |
-| Per-ALU shape options        | 3       | 3       | 4       | 4        |
-| Per-MOV-imm32 shape options  | 3       | 3       | 3       | 3 + 3    |
-| Per-MOV-imm64 shape options  | n/a     | 3       | 3       | 3        |
-| Affine `t` choices per site  | n/a     | n/a     | 14      | 14       |
-| MBA tests                    | 38      | 49      | 54      | 57       |
-| Total ctest                  | 909     | 920     | 925     | 928      |
-| Stress (strong, 15 runs)     | 15/15   | 15/15   | 15/15   | 15/15    |
-| Stress (maximum, 15 runs)    | 15/15   | 15/15   | 15/15   | 15/15    |
+| Metric                       | Phase 8 | Phase 9 | Phase 10 | Phase 11 | Phase 12 |
+| ---------------------------- | ------- | ------- | -------- | -------- | -------- |
+| MBA rewriters in registry    | 21      | 26      | 29       | 29       | 34       |
+| Per-ALU-imm shape options    | 3       | 4       | 4        | 4        | 4        |
+| Per-ALU-rr shape options     | 0       | 0       | 0        | 0        | 1        |
+| Per-MOV-imm32 shape options  | 3       | 3       | 3 + 3    | 3 + 3    | 3 + 3    |
+| Per-MOV-imm64 shape options  | 3       | 3       | 3        | 3        | 3        |
+| Affine `t` choices per site  | n/a     | 14      | 14       | 14       | 14       |
+| Multi-instruction redirect   | n/a     | n/a     | n/a      | yes      | yes      |
+| MBA tests                    | 49      | 54      | 57       | 57       | 68       |
+| Total ctest                  | 920     | 925     | 928      | 928      | 939      |
+| Stress (strong, 15 runs)     | 15/15   | 15/15   | 15/15    | 15/15    | 15/15    |
+| Stress (maximum, 15 runs)    | 15/15   | 15/15   | 15/15    | 15/15    | 15/15    |
 
 Phase 8 does not change redirect-site count on the showcase binary
 because that input is compiled with `mov r32, imm32` for all 32-bit
@@ -234,12 +278,7 @@ infrastructure cost is paid up front: future MBA work that targets
 The following are higher-effort or higher-risk and were not
 attempted in this pass:
 
-1. **Register-register MBA**: covers `01/03/09/0B/21/23/29/2B/31/33 /r`
-   forms. Bodies need multi-variable identities (e.g. `x + y =
-   (x^y) + 2*(x&y)`). Requires multi-instruction redirect because
-   r-r encodings are 2–3 bytes — below the JMP rel32 threshold.
-
-2. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
+1. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
    below the JMP rel32 threshold. Same multi-instruction-redirect
    prerequisite as r-r forms.
 

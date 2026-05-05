@@ -33,6 +33,7 @@
 #include "mxprotector/analysis/x86_encoding.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mba_alu_rr_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
 #include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/substitution_rule_groups.hpp"
@@ -637,6 +638,75 @@ TEST(MbaMovR64Imm64Decoder, RejectsZeroImmediate) {
 }
 
 // ---------------------------------------------------------------------------
+// `decode_alu_rr` decoder tests — exercises both encoding directions
+// (rm-r and r-rm), REX register extension, and the same-register +
+// memory-operand rejection paths.
+// ---------------------------------------------------------------------------
+
+/// Encode `<op> rax, rbx` as `48 <opcode> <modrm>` (REX.W rm-r form).
+mx::ByteBuffer encode_alu_rr_rax_rbx(std::uint8_t opcode) {
+    // ModR/M: mod=3, reg=rbx(3), rm=rax(0) => 0xC0 | (3<<3) | 0 = 0xD8.
+    return {0x48, opcode, 0xD8};
+}
+
+TEST(MbaAluRrDecoder, AcceptsAddRaxRbxRmrForm) {
+    auto insn = make_insn(
+        encode_alu_rr_rax_rbx(0x01), "add", "rax, rbx");
+    auto view = mx::mutation::mba::decode_alu_rr(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op,  mx::mutation::mba::AluImm32Op::add);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_EQ(view->src, mx::x86::Reg::rbx);
+    EXPECT_TRUE(view->is_64bit);
+}
+
+TEST(MbaAluRrDecoder, AcceptsAddRaxRbxRrmForm) {
+    // 03 /r — destination is in modrm.reg. modrm = 0xD8 puts reg=rbx(3),
+    // rm=rax(0). The `03 /r` encoding makes dst the reg field — so we
+    // expect dst=rbx, src=rax.
+    auto insn = make_insn(
+        {0x48, 0x03, 0xD8}, "add", "rbx, rax");
+    auto view = mx::mutation::mba::decode_alu_rr(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->dst, mx::x86::Reg::rbx);
+    EXPECT_EQ(view->src, mx::x86::Reg::rax);
+}
+
+TEST(MbaAluRrDecoder, RejectsSameRegisterSite) {
+    // `xor rax, rax` — modrm = 0xC0 (mod=3, reg=0, rm=0). Both fields
+    // hold register 0 → dst == src → decoder must reject.
+    auto insn = make_insn(
+        {0x48, 0x31, 0xC0}, "xor", "rax, rax");
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_rr(insn).has_value());
+}
+
+TEST(MbaAluRrDecoder, RejectsMemoryOperand) {
+    // `add rax, [rbx]` — modrm = 0x03 (mod=0, reg=0, rm=3 = rbx);
+    // rm with mod=0 is a memory-operand encoding → decoder must reject.
+    auto insn = make_insn(
+        {0x48, 0x03, 0x03}, "add", "rax, [rbx]");
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_rr(insn).has_value());
+}
+
+TEST(MbaAluRrDecoder, RejectsForeignOpcode) {
+    // CMP r/m, r is `39 /r` — not in the supported set.
+    auto insn = make_insn(
+        {0x48, 0x39, 0xD8}, "cmp", "rax, rbx");
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_rr(insn).has_value());
+}
+
+TEST(MbaAluRrDecoder, ParsesRexBExtendedRegisters) {
+    // `add r11, rbx` → REX.W|REX.B 01 /r modrm. rm = r11 (rex_b puts
+    // it in the high half), reg = rbx.
+    auto insn = make_insn(
+        {0x49, 0x01, 0xDB}, "add", "r11, rbx");
+    auto view = mx::mutation::mba::decode_alu_rr(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->dst, mx::x86::Reg::r11);
+    EXPECT_EQ(view->src, mx::x86::Reg::rbx);
+}
+
+// ---------------------------------------------------------------------------
 // Per-family rewriter tests (matches + semantic equivalence)
 // ---------------------------------------------------------------------------
 
@@ -814,6 +884,113 @@ TEST(MbaRewriter, OrImmAffinePreservesSemantics) {
 TEST(MbaRewriter, AndImmAffinePreservesSemantics) {
     check_rewriter_semantics({
         mx::mutation::mba::AluImm32Op::and_, "and-imm-affine", "and"});
+}
+
+// ---------------------------------------------------------------------------
+// r-r affine semantic tests. The decoder normalises (dst, src) so the
+// rewriter sees the same view shape regardless of which encoding
+// direction the compiler picked. The simulator already understands
+// every byte the body emits (mov r-r, ALU r-r, ALU r-imm, imul, neg,
+// push/pop) so no further simulator work is needed.
+// ---------------------------------------------------------------------------
+
+constexpr std::array<std::pair<std::uint64_t, std::uint64_t>, 6> kSampleXY = {{
+    {0x0000000000000001ULL, 0x0000000000000001ULL},
+    {0x000000007FFFFFFFULL, 0x0000000080000000ULL},
+    {0x00000000FFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL},
+    {0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL},
+    {0xDEADBEEFCAFEBABEULL, 0x1122334455667788ULL},
+    {0xFFFFFFFFFFFFFFFFULL, 0x0000000000000001ULL},
+}};
+
+[[nodiscard]] std::uint64_t apply_alu_rr(
+    mx::mutation::mba::AluImm32Op op,
+    std::uint64_t                 x,
+    std::uint64_t                 y)
+{
+    using Op = mx::mutation::mba::AluImm32Op;
+    switch (op) {
+        case Op::add:  return x + y;
+        case Op::sub:  return x - y;
+        case Op::xor_: return x ^ y;
+        case Op::or_:  return x | y;
+        case Op::and_: return x & y;
+    }
+    return 0;
+}
+
+void check_rr_rewriter_semantics(
+    mx::mutation::mba::AluImm32Op op,
+    std::string_view              rewriter_name,
+    std::uint8_t                  opcode_rmr,
+    std::string_view              mnemonic)
+{
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(rewriter_name);
+    ASSERT_NE(rewriter, nullptr) << rewriter_name;
+
+    mx::Randomizer rng(0xCAFE0000u | static_cast<std::uint32_t>(opcode_rmr));
+
+    for (auto [x, y] : kSampleXY) {
+        auto insn = make_insn(
+            encode_alu_rr_rax_rbx(opcode_rmr),
+            std::string(mnemonic), "rax, rbx");
+        ASSERT_TRUE(rewriter->matches(insn)) << rewriter_name;
+
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value())
+            << rewriter_name << " emit failed";
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, x);
+        sim.set_reg(mx::x86::Reg::rbx, y);
+        // Pre-fill scratches with poison so a missed pop surfaces.
+        sim.set_reg(mx::x86::Reg::r10, 0x1010101010101010ULL);
+        sim.set_reg(mx::x86::Reg::r11, 0x1111111111111111ULL);
+        sim.set_reg(mx::x86::Reg::r12, 0x1212121212121212ULL);
+
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << rewriter_name << " simulator stalled";
+
+        const auto expected = apply_alu_rr(op, x, y);
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), expected)
+            << rewriter_name << " mismatch for x=" << std::hex << x
+            << " y=" << y;
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rbx), y)
+            << rewriter_name << " clobbered src";
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::r10), 0x1010101010101010ULL)
+            << rewriter_name << " did not restore r10";
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::r11), 0x1111111111111111ULL)
+            << rewriter_name << " did not restore r11";
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::r12), 0x1212121212121212ULL)
+            << rewriter_name << " did not restore r12";
+    }
+}
+
+TEST(MbaRewriter, AddRrAffinePreservesSemantics) {
+    check_rr_rewriter_semantics(
+        mx::mutation::mba::AluImm32Op::add, "add-rr-affine", 0x01, "add");
+}
+
+TEST(MbaRewriter, SubRrAffinePreservesSemantics) {
+    check_rr_rewriter_semantics(
+        mx::mutation::mba::AluImm32Op::sub, "sub-rr-affine", 0x29, "sub");
+}
+
+TEST(MbaRewriter, XorRrAffinePreservesSemantics) {
+    check_rr_rewriter_semantics(
+        mx::mutation::mba::AluImm32Op::xor_, "xor-rr-affine", 0x31, "xor");
+}
+
+TEST(MbaRewriter, OrRrAffinePreservesSemantics) {
+    check_rr_rewriter_semantics(
+        mx::mutation::mba::AluImm32Op::or_, "or-rr-affine", 0x09, "or");
+}
+
+TEST(MbaRewriter, AndRrAffinePreservesSemantics) {
+    check_rr_rewriter_semantics(
+        mx::mutation::mba::AluImm32Op::and_, "and-rr-affine", 0x21, "and");
 }
 
 TEST(MbaRewriter, ModularInversePreservesMovImmSemantics) {
@@ -1018,7 +1195,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 29u);
+    EXPECT_EQ(registry.size(), 34u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -1048,6 +1225,11 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("mov-imm-deep-modular"), nullptr);
     EXPECT_NE(registry.find("mov-imm-deep-xor"), nullptr);
     EXPECT_NE(registry.find("mov-imm-deep-rotate"), nullptr);
+    EXPECT_NE(registry.find("add-rr-affine"), nullptr);
+    EXPECT_NE(registry.find("sub-rr-affine"), nullptr);
+    EXPECT_NE(registry.find("xor-rr-affine"), nullptr);
+    EXPECT_NE(registry.find("or-rr-affine"), nullptr);
+    EXPECT_NE(registry.find("and-rr-affine"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {

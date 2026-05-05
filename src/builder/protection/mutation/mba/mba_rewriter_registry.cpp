@@ -61,6 +61,12 @@ MbaRewriterRegistry MbaRewriterRegistry::create_default() {
     register_or_imm_rewriters(registry);
     register_and_imm_rewriters(registry);
 
+    // r-r affine family — 2/3-byte ALU r-r sites picked up via the
+    // engine's multi-instruction redirect (the JMP rel32 needs ≥ 5
+    // bytes; the engine consumes 1..3 following ops to widen the
+    // slot). One affine shape per ALU op family.
+    register_rr_affine_rewriters(registry);
+
     // MOV-imm family covers both the 5/6-byte `mov r32, imm32`
     // (`B8+rd id`) and the 10/11-byte `mov r64, imm64`
     // (`REX.W B8+rd iq`) encodings — three shapes per width.

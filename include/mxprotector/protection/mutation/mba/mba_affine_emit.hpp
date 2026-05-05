@@ -101,3 +101,20 @@ MxResult<void> emit_affine_alu_body(
     AffineCoefficients        coefficients);
 
 } // namespace mx::mutation::mba
+
+// Forward-declare AluRrView to keep this header light — the r-r
+// affine emitter only needs its layout in the cpp.
+namespace mx::mutation::mba {
+struct AluRrView;
+
+/// Emit the affine-MBA body for `view.op view.dst, view.src` into
+/// `em`. Same algebraic shape as the imm32 affine body but the
+/// basis prep reads from a register source (`or scratch, view.src`)
+/// instead of an immediate. SUB post-correction subtracts `view.src`
+/// twice.
+MxResult<void> emit_affine_alu_rr_body(
+    analysis::X86CodeEmitter& em,
+    const AluRrView&          view,
+    AffineCoefficients        coefficients);
+
+} // namespace mx::mutation::mba

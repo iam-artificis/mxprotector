@@ -223,6 +223,13 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/or_imm_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/add_rr_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/sub_rr_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_rr_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/or_rr_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_rr_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/rr_affine_aggregator.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/mba_alu_rr_decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/mba_affine_emit.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp
