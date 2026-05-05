@@ -213,6 +213,9 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_injector.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/standard_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_layout.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_section_merger.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_reference_collector.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/layout/chaos_atom_source_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/rva_remapper.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/code_reference_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/structure_reference_scanner.cpp
