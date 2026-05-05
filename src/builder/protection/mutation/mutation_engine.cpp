@@ -68,6 +68,37 @@ namespace {
     return true;
 }
 
+/// Conservative check that a *consumed* instruction (one we want to
+/// drag into a multi-instruction redirect slot) is safe to relocate
+/// verbatim into the overflow section.
+///
+/// Two failure modes have to be caught:
+///
+///   1. Branch/call/return — relative offset would point at a
+///      stale RVA. Rejected via the explicit `is_branch_*` flags.
+///   2. Memory operand of any kind — `[base+disp]`, `[rip+disp]`,
+///      absolute `[0x...]`. RIP-relative addressing in 64-bit mode
+///      bakes the original site's RIP into the displacement; once
+///      relocated, the operand reads from the wrong VA. Stack and
+///      base-register addressing is position-independent in
+///      principle, but the engine has no cheap way to tell those
+///      from RIP-rel forms without operand-level introspection that
+///      the `Instruction` class doesn't currently expose.
+///
+/// The textual `[` heuristic catches every memory-operand variant
+/// the disassembler formats (Intel syntax always brackets memory),
+/// so the guard is conservative but correct: it occasionally rejects
+/// register-only stack ops that would have been safe, but it never
+/// admits a position-dependent instruction into the redirect slot.
+[[nodiscard]] bool consumed_instruction_is_relocatable(
+    const analysis::Instruction& insn) noexcept
+{
+    if (insn.is_branch() || insn.is_call() || insn.is_return()) {
+        return false;
+    }
+    return insn.operands_text().find('[') == std::string_view::npos;
+}
+
 /// Patch a slot of `slot_size` bytes at `code + offset` so that the
 /// next executed byte is `JMP rel32 → overflow_rva`. The trailing
 /// `slot_size - 5` bytes are filled with `0x90` NOPs so a linear
@@ -187,11 +218,10 @@ MxResult<uint32_t> MutationEngine::mutate_region(
             continue;
         }
 
-        // Size mismatch. Three cases:
+        // Size mismatch. Cases:
         //   1. Replacement shorter — would need padding shrink; not
         //      handled (skip).
-        //   2. Replacement longer + no sink + slot < 5 — cannot fit
-        //      `JMP rel32`; skip.
+        //   2. Replacement longer + no sink — cannot redirect; skip.
         //   3. Replacement longer + site VA inside an excluded range
         //      (a marked VM / Guard region) — the downstream lifter
         //      parses the post-mutation byte stream and would mis-
@@ -199,7 +229,13 @@ MxResult<uint32_t> MutationEngine::mutate_region(
         //      Refuse the redirect; same-size substitutions are
         //      still applied so the rest of the mutation set runs.
         //   4. Replacement longer + sink + slot ≥ 5 + replacement is
-        //      position-independent — redirect via sink.
+        //      position-independent — single-instruction redirect.
+        //   5. Replacement longer + sink + slot < 5 — try to widen
+        //      the slot by greedily consuming the next 1..3
+        //      instructions, provided each is safe to relocate
+        //      (not a branch/call/return, no memory operand). The
+        //      consumed instructions ride along verbatim at the tail
+        //      of the planted body so their semantics are preserved.
         const Va  site_va = insn.address();
         const bool site_excluded = std::any_of(
             excluded_redirect_ranges_.begin(),
@@ -210,12 +246,39 @@ MxResult<uint32_t> MutationEngine::mutate_region(
 
         if (replacement.size() < insn.length() ||
             expansion_sink_ == nullptr      ||
-            insn.length() < mx::mutation::overflow::kJmpRel32Size ||
             site_excluded)
         {
             ctx.log_fmt("  MutationEngine: правило '{}' вернуло {} байт вместо {} для '{}' по VA 0x{:016X} — пропуск",
                 rule->name(), replacement.size(), insn.length(),
                 insn.to_string(), insn.address());
+            continue;
+        }
+
+        // Multi-instruction widening when the candidate site is
+        // below the JMP rel32 threshold. Cap the consumption at 3
+        // additional instructions so a runaway widen cannot
+        // accidentally swallow a whole basic block.
+        std::uint32_t slot_size = insn.length();
+        std::size_t   consumed_count = 0;
+        if (slot_size < mx::mutation::overflow::kJmpRel32Size) {
+            constexpr std::size_t kMaxConsumed = 3;
+            while (slot_size < mx::mutation::overflow::kJmpRel32Size &&
+                   consumed_count < kMaxConsumed)
+            {
+                const std::size_t next_idx = insn_idx + 1 + consumed_count;
+                if (next_idx >= instructions.size()) break;
+                const auto& next = instructions[next_idx];
+                if (!consumed_instruction_is_relocatable(next)) break;
+                slot_size += next.length();
+                ++consumed_count;
+            }
+        }
+
+        if (slot_size < mx::mutation::overflow::kJmpRel32Size) {
+            ctx.log_fmt("  MutationEngine: '{}' по VA 0x{:016X} ({} байт) не достиг 5 байт даже с {} последующими — пропуск",
+                insn.to_string(), insn.address(),
+                static_cast<unsigned>(insn.length()),
+                static_cast<unsigned>(consumed_count));
             continue;
         }
 
@@ -229,13 +292,34 @@ MxResult<uint32_t> MutationEngine::mutate_region(
             continue;
         }
 
+        // For multi-instruction redirect, append the consumed
+        // instructions' bytes to the replacement body so they execute
+        // verbatim at the relocated RVA. Single-instruction redirect
+        // skips this allocation — just pass `replacement` through.
+        ByteBuffer expanded_body;
+        ByteView   body_view;
+        if (consumed_count == 0) {
+            body_view = ByteView{replacement.data(), replacement.size()};
+        } else {
+            expanded_body.reserve(slot_size + replacement.size());
+            expanded_body.insert(expanded_body.end(),
+                replacement.begin(), replacement.end());
+            for (std::size_t j = 1; j <= consumed_count; ++j) {
+                const auto consumed_bytes =
+                    instructions[insn_idx + j].raw_bytes();
+                expanded_body.insert(expanded_body.end(),
+                    consumed_bytes.begin(), consumed_bytes.end());
+            }
+            body_view = ByteView{expanded_body.data(), expanded_body.size()};
+        }
+
         const Rva site_rva = static_cast<Rva>(
             insn.address() - ctx.pe_image().image_base());
 
         mx::mutation::ExpansionRequest req{
             .site_rva       = site_rva,
-            .site_size      = static_cast<std::uint32_t>(insn.length()),
-            .expanded_bytes = ByteView{replacement.data(), replacement.size()},
+            .site_size      = slot_size,
+            .expanded_bytes = body_view,
         };
 
         auto plan = expansion_sink_->plant(req);
@@ -254,15 +338,14 @@ MxResult<uint32_t> MutationEngine::mutate_region(
         // the bytes in [0, region_size) are preserved across the
         // realloc, only the address has moved.
         code = refresh_view();
-        if (offset + insn.length() > code.size()) {
+        if (offset + slot_size > code.size()) {
             ctx.log_fmt("  MutationEngine: post-plant view shrunk for '{}' — пропуск patch",
                 insn.to_string());
             continue;
         }
 
         patch_jmp_with_nop_pad(
-            code, offset,
-            static_cast<std::uint32_t>(insn.length()),
+            code, offset, slot_size,
             site_rva, plan->overflow_rva);
 
         ++mutations_applied;
@@ -271,11 +354,16 @@ MxResult<uint32_t> MutationEngine::mutate_region(
 
         if (ctx.config().emit_trace_hints) {
             ctx.trace_hints().add_mutation_site(
-                site_rva,
-                static_cast<std::uint32_t>(insn.length()),
-                plan->overflow_size,
+                site_rva, slot_size, plan->overflow_size,
                 analysis::MutationSiteKind::substitution);
         }
+
+        // Skip the consumed instructions so the outer loop does not
+        // re-process bytes that were just packed into the redirect
+        // slot. The `++insn_idx` from the for-loop covers the
+        // candidate instruction itself; the additional `+=` covers
+        // the consumed ones.
+        insn_idx += consumed_count;
     }
 
     total_junk_insertions_ += junk_inserted;
