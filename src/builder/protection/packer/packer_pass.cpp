@@ -57,7 +57,7 @@
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
 #include "mxprotector/protection/packer/packer_tls_finalizer.hpp"
-#include "mxprotector/protection/packer/rc4.hpp"
+#include "mxprotector/protection/packer/rc4_stream_cipher.hpp"
 #include "mxprotector/protection/packer/reloc_partition.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
 
@@ -357,12 +357,14 @@ private:
                           encrypted_[i].size};
         }
 
+        packer::Rc4StreamCipher cipher;
         return packer::hash_derive_and_encrypt(
             ctx_, pack_sec.data,
             patches_.hash_range_end_offset,
             patches_.self_hash.count_imm32_offset,
             layer_count_, layer_keys_,
-            std::span<const packer::EncryptionTarget>{targets});
+            std::span<const packer::EncryptionTarget>{targets},
+            cipher);
     }
 
     // --- inputs ------------------------------------------------------

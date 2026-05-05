@@ -52,7 +52,10 @@
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/core/types.hpp"
 
-namespace mx { class ProtectionContext; }
+namespace mx {
+class ProtectionContext;
+class IStreamCipher;
+}
 
 namespace mx::packer {
 
@@ -93,6 +96,13 @@ struct EncryptionTarget {
  *                           local copies.
  * @param targets            Sections to encrypt, in build order
  *                           (layer 0 first, then 1, …, then N-1).
+ * @param cipher             Stream cipher used for the per-layer
+ *                           encryption pass. The same instance is
+ *                           re-initialised once per layer with the
+ *                           derived effective key. Constructor-injected
+ *                           via `IStreamCipher` so a future swap
+ *                           (e.g. ChaCha20) is one factory line in
+ *                           the caller, not a fork of this function.
  */
 [[nodiscard]] MxStatus hash_derive_and_encrypt(
     mx::ProtectionContext&            ctx,
@@ -101,6 +111,7 @@ struct EncryptionTarget {
     uint32_t                          count_imm32_offset,
     uint32_t                          layer_count,
     const std::vector<ByteBuffer>&    layer_keys,
-    std::span<const EncryptionTarget> targets);
+    std::span<const EncryptionTarget> targets,
+    mx::IStreamCipher&                cipher);
 
 } // namespace mx::packer

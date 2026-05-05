@@ -11,9 +11,9 @@
 
 #include "mxprotector/common/hash/fnv1a.hpp"
 #include "mxprotector/core/context.hpp"
+#include "mxprotector/core/interfaces.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/protection/packer/byte_io.hpp"
-#include "mxprotector/protection/packer/rc4.hpp"
 #include "mxprotector/protection/packer/stub_self_hash.hpp"
 
 namespace mx::packer {
@@ -25,7 +25,8 @@ MxStatus hash_derive_and_encrypt(
     uint32_t                          count_imm32_offset,
     uint32_t                          layer_count,
     const std::vector<ByteBuffer>&    layer_keys,
-    std::span<const EncryptionTarget> targets)
+    std::span<const EncryptionTarget> targets,
+    mx::IStreamCipher&                cipher)
 {
     if (hash_range_end == 0 ||
         hash_range_end > pack_section_data.size())
@@ -60,22 +61,20 @@ MxStatus hash_derive_and_encrypt(
             stub_hash,
             MutableByteView{effective.data(), effective.size()});
 
-        Rc4State rc4{};
-        rc4_init(rc4,
-                 ByteView{effective.data(), effective.size()},
-                 /*anti_debug_bias=*/0);
+        cipher.init(ByteView{effective.data(), effective.size()},
+                    /*bias=*/0);
         for (const auto& tgt : targets) {
             auto& sec = ctx.pe_image().sections()[tgt.image_index];
-            rc4_process(rc4,
-                        MutableByteView{sec.data.data(), sec.data.size()});
+            cipher.process(MutableByteView{sec.data.data(), sec.data.size()});
         }
     }
 
     for (const auto& tgt : targets) {
         const auto& sec = ctx.pe_image().sections()[tgt.image_index];
-        ctx.log_fmt("PackerPass: зашифрована (RC4 ×{}, P6) '{}' "
+        ctx.log_fmt("PackerPass: зашифрована ({} ×{}, P6) '{}' "
                     "(RVA=0x{:08X}, {} байт)",
-            layer_count, sec.name, sec.virtual_address, tgt.size);
+            cipher.algorithm_name(), layer_count, sec.name,
+            sec.virtual_address, tgt.size);
     }
     return {};
 }

@@ -29,6 +29,7 @@ set(TEST_SOURCES
     veh_int3_trap_test.cpp
     stub_self_hash_test.cpp
     fnv1a_test.cpp
+    rc4_stream_cipher_test.cpp
     marker_scanner_test.cpp
     guard_page_layout_test.cpp
     guard_veh_emitter_test.cpp
