@@ -437,6 +437,29 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         return off - pos + 6;
     }
 
+    // 6B /r ib — IMUL r32/r64, r/m, imm8. Hardware sign-extends
+    // the imm8 to the operand width unconditionally — this is the
+    // form `imul reg, reg, c` collapses to whenever the affine
+    // coefficient `c` fits in `[-128, 127]`. The rewriter picks
+    // `t ∈ [2, 15]` so every coefficient lands in `[-16, 16]`,
+    // which is solidly inside imm8 range.
+    if (op == 0x6B) {
+        if (off + 3 > bytes.size()) return 0;
+        const std::uint8_t modrm = bytes[off + 1];
+        if (mx::x86::modrm_mod(modrm) != 3) return 0;
+        std::uint8_t rm  = mx::x86::modrm_rm(modrm);
+        std::uint8_t reg = mx::x86::modrm_reg(modrm);
+        if (rex_b) rm  |= 0x08;
+        if (rex_r) reg |= 0x08;
+        const std::int64_t imm_se = static_cast<std::int64_t>(
+            static_cast<std::int8_t>(bytes[off + 2]));
+        const std::uint64_t multiplier =
+            static_cast<std::uint64_t>(imm_se);
+        regs_[reg] = regs_[rm] * multiplier;
+        if (!rex_w) regs_[reg] &= 0xFFFFFFFFu;
+        return off - pos + 3;
+    }
+
     return 0; // unsupported
 }
 
@@ -737,6 +760,31 @@ TEST(MbaRewriter, AndImmDeMorganPreservesSemantics) {
         mx::mutation::mba::AluImm32Op::and_, "and-imm-demorgan", "and"});
 }
 
+TEST(MbaRewriter, AddImmAffinePreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::add, "add-imm-affine", "add"});
+}
+
+TEST(MbaRewriter, SubImmAffinePreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::sub, "sub-imm-affine", "sub"});
+}
+
+TEST(MbaRewriter, XorImmAffinePreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::xor_, "xor-imm-affine", "xor"});
+}
+
+TEST(MbaRewriter, OrImmAffinePreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::or_, "or-imm-affine", "or"});
+}
+
+TEST(MbaRewriter, AndImmAffinePreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::and_, "and-imm-affine", "and"});
+}
+
 TEST(MbaRewriter, ModularInversePreservesMovImmSemantics) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
     const auto* rewriter = registry.find("mov-imm-modular-inverse");
@@ -882,7 +930,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 21u);
+    EXPECT_EQ(registry.size(), 26u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -904,6 +952,11 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("mov-imm64-modular-inverse"), nullptr);
     EXPECT_NE(registry.find("mov-imm64-xor-blind"), nullptr);
     EXPECT_NE(registry.find("mov-imm64-rotate-blind"), nullptr);
+    EXPECT_NE(registry.find("add-imm-affine"), nullptr);
+    EXPECT_NE(registry.find("sub-imm-affine"), nullptr);
+    EXPECT_NE(registry.find("xor-imm-affine"), nullptr);
+    EXPECT_NE(registry.find("or-imm-affine"), nullptr);
+    EXPECT_NE(registry.find("and-imm-affine"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {
@@ -946,9 +999,10 @@ TEST(MbaRewriterRegistry, ShortFormAddEaxMatchesAllAddShapes) {
             mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
         "add", "eax, 0xDEADBEEF");
     auto matching = registry.find_matching(insn);
-    EXPECT_EQ(matching.size(), 3u)
-        << "every ADD-imm shape must accept the 5-byte EAX,imm32 "
-        << "short form (`05 id`) — same coverage as `81 /0 id`";
+    EXPECT_EQ(matching.size(), 4u)
+        << "every ADD-imm shape (3 fixed + 1 affine) must accept the "
+        << "5-byte EAX,imm32 short form (`05 id`) — same coverage as "
+        << "`81 /0 id`";
 }
 
 TEST(MbaRewriterRegistry, ShortFormSubRaxMatchesAllSubShapes) {
@@ -958,9 +1012,9 @@ TEST(MbaRewriterRegistry, ShortFormSubRaxMatchesAllSubShapes) {
             mx::mutation::mba::AluImm32Op::sub, 0x12345678),
         "sub", "rax, 0x12345678");
     auto matching = registry.find_matching(insn);
-    EXPECT_EQ(matching.size(), 3u)
-        << "every SUB-imm shape must accept the 6-byte RAX,imm32 "
-        << "short form (`REX.W 2D id`)";
+    EXPECT_EQ(matching.size(), 4u)
+        << "every SUB-imm shape (3 fixed + 1 affine) must accept the "
+        << "6-byte RAX,imm32 short form (`REX.W 2D id`)";
 }
 
 TEST(MbaRewriterRegistry, FindMatchingReturnsAllAddShapesForAddSite) {
@@ -969,9 +1023,10 @@ TEST(MbaRewriterRegistry, FindMatchingReturnsAllAddShapesForAddSite) {
         encode_alu_imm32_rax(mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
         "add", "rax, 0xDEADBEEF");
     auto matching = registry.find_matching(insn);
-    EXPECT_EQ(matching.size(), 3u)
-        << "every ADD-imm shape must match an `add r,K` site so the "
-        << "adapter can pick one uniformly at random per call";
+    EXPECT_EQ(matching.size(), 4u)
+        << "every ADD-imm shape (3 fixed + 1 affine) must match an "
+        << "`add r,K` site so the adapter can pick one uniformly at "
+        << "random per call";
 }
 
 TEST(MbaRewriterRegistry, FindMatchingDispatchesByOp) {
@@ -980,14 +1035,19 @@ TEST(MbaRewriterRegistry, FindMatchingDispatchesByOp) {
         encode_alu_imm32_rax(mx::mutation::mba::AluImm32Op::xor_, 0x1234),
         "xor", "rax, 0x1234");
     auto matching = registry.find_matching(insn);
-    EXPECT_EQ(matching.size(), 3u)
-        << "every XOR-imm shape must match an `xor r,K` site";
+    EXPECT_EQ(matching.size(), 4u)
+        << "every XOR-imm shape (3 fixed + 1 affine) must match an "
+        << "`xor r,K` site";
     bool seen_baseline = false;
+    bool seen_affine   = false;
     for (const auto* r : matching) {
         if (r->name() == "xor-imm-or-and") seen_baseline = true;
+        if (r->name() == "xor-imm-affine") seen_affine   = true;
     }
     EXPECT_TRUE(seen_baseline)
         << "the baseline shape must remain in the matching set";
+    EXPECT_TRUE(seen_affine)
+        << "the new affine shape must also match";
 }
 
 TEST(MbaRewriterRegistry, FindReturnsNullForUnknownName) {

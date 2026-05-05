@@ -99,12 +99,15 @@ std::unique_ptr<IMbaRewriter> make_sub_imm_xor_not_and() {
 } // namespace factories
 
 void register_sub_imm_rewriters(MbaRewriterRegistry& registry) {
-    // Three subtractive identities cover the same `81 /5 id` site;
+    // Four subtractive identities cover the same `81 /5 id` site;
     // the MBA adapter picks one uniformly per call so two
     // `sub r, K` instructions in the same binary look different.
+    // The fixed shapes pin specific coefficient triples; the affine
+    // shape opens a 14-element family parameterised by per-site `t`.
     registry.register_rewriter(factories::make_sub_imm_xor_not_and());
     registry.register_rewriter(factories::make_sub_imm_neg_add());
     registry.register_rewriter(factories::make_sub_imm_offset());
+    registry.register_rewriter(factories::make_sub_imm_affine());
 }
 
 } // namespace mx::mutation::mba

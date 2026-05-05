@@ -57,6 +57,13 @@ namespace factories {
 /// the other two.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_add_imm_shift_or_xor();
 
+/// Affine-MBA shape: `(1+t)*(x|K) + (1-t)*(x&K) + (-t)*(x^K)` for
+/// per-site random `t ∈ [2, 15]`. Opens a 14-element family of
+/// SMT-distinct identities in the same coefficient space the three
+/// fixed shapes draw from, defeating frequency-pattern matchers
+/// that key on the canonical Knuth/disjoint coefficient triples.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_add_imm_affine();
+
 // ---------------------------------------------------------------------------
 // SUB r, K shapes — `81 /5 id` (and REX.W variant).
 // ---------------------------------------------------------------------------
@@ -79,6 +86,11 @@ namespace factories {
 /// chain than either pure additive or pure subtractive identity.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_offset();
 
+/// Affine-MBA shape: applies the ADD affine identity then subtracts
+/// `2K` (split as two `sub dst, K` to avoid imm32 overflow) to
+/// recover `x - K`. Per-site random `t ∈ [2, 15]`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_affine();
+
 // ---------------------------------------------------------------------------
 // XOR r, K shapes — `81 /6 id` (and REX.W variant).
 // ---------------------------------------------------------------------------
@@ -100,6 +112,11 @@ namespace factories {
 /// arithmetic with bitwise reasoning.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_add_minus_and();
 
+/// Affine-MBA shape: `(1-t)*(x|K) + (t-1)*(x&K) + t*(x^K)` for
+/// per-site random `t ∈ [2, 15]`. Reduces to `OR - AND = x ^ K`
+/// for any `t`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_affine();
+
 // ---------------------------------------------------------------------------
 // OR r, K shapes — `81 /1 id` (and REX.W variant).
 // ---------------------------------------------------------------------------
@@ -119,6 +136,11 @@ namespace factories {
 /// Pure Boolean, no carry, no arithmetic.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_xor_or_and();
 
+/// Affine-MBA shape: `-t*(x|K) + (1+t)*(x&K) + (1+t)*(x^K)` for
+/// per-site random `t ∈ [2, 15]`. Reduces to `AND + XOR = x | K`
+/// for any `t`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_affine();
+
 // ---------------------------------------------------------------------------
 // AND r, K shapes — `81 /4 id` (and REX.W variant).
 // ---------------------------------------------------------------------------
@@ -136,6 +158,11 @@ namespace factories {
 /// one OR — the AND is materialised entirely from negation, with
 /// no arithmetic and no SUB.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_demorgan();
+
+/// Affine-MBA shape: `(1+t)*(x|K) + (-t)*(x&K) + (-(1+t))*(x^K)`
+/// for per-site random `t ∈ [2, 15]`. Reduces to `OR - XOR = x & K`
+/// for any `t`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_affine();
 
 // ---------------------------------------------------------------------------
 // MOV r32, imm32 shapes — `[REX.B] B8+rd id` (5/6 bytes).

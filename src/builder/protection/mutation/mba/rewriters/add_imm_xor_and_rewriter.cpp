@@ -107,14 +107,18 @@ std::unique_ptr<IMbaRewriter> make_add_imm_xor_and() {
 } // namespace factories
 
 void register_add_imm_rewriters(MbaRewriterRegistry& registry) {
-    // Three additive identities cover the same `81 /0 id` site.
-    // The MBA substitution adapter picks one uniformly at random
-    // per site — so two `add r, K` instructions in the same binary
-    // get visually-different bodies even though both reduce to
-    // `x + K` semantically.
+    // Four additive identities cover the same `81 /0 id` site. The
+    // MBA substitution adapter picks one uniformly at random per
+    // site — three fixed shapes pin specific coefficient triples
+    // `(1, 1, 0) / (0, 2, 1) / (2, 0, -1)`, while `add-imm-affine`
+    // opens a 14-element family of triples parameterised by a per-
+    // site random `t`, so two `add r, K` instructions in the same
+    // binary get structurally-distinct bodies even when they both
+    // reduce to `x + K` semantically.
     registry.register_rewriter(factories::make_add_imm_xor_and());
     registry.register_rewriter(factories::make_add_imm_or_and());
     registry.register_rewriter(factories::make_add_imm_shift_or_xor());
+    registry.register_rewriter(factories::make_add_imm_affine());
 }
 
 } // namespace mx::mutation::mba

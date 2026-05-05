@@ -1,6 +1,6 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–8 merged on master, all stress green.
+**Status:** shipped — phases 1–9 merged on master, all stress green.
 
 ## What this is
 
@@ -44,6 +44,41 @@ or 6 (with REX.W), fitting the JMP rel32 redirect threshold.
 Coverage uplift on `test_vm_showcase.exe` at strong: redirect count
 180 → 195 (**+8.3%**). On binaries with more RAX-bound arithmetic
 (syscall stubs, ABI shims) the uplift will be larger.
+
+### Phase 9: Affine MBA basis combinator (Tigress-style)
+
+A fifth shape per ALU family — `<op>-imm-affine` — emits a *random
+integer linear combination* of three bitwise-basis functions:
+
+    f(x, K) = c_or*(x|K) + c_and*(x&K) + c_xor*(x^K) (+ post)
+
+The coefficient triple is parameterised by a per-site random
+`t ∈ [2, 15]`, exploiting the zero-identity
+`(x|K) - (x&K) - (x^K) ≡ 0 (mod 2^n)` to add any integer multiple
+of zero to a base shape without changing the result. Per-op maps:
+
+| Op  | (c_or, c_and, c_xor) | Post-correction |
+| --- | -------------------- | --------------- |
+| ADD | `(1+t, 1-t, -t)`     | —               |
+| SUB | `(1+t, 1-t, -t)`     | `dst -= 2K` (split as 2× `sub dst, K`) |
+| XOR | `(1-t, t-1, t)`      | —               |
+| OR  | `(-t, 1+t, 1+t)`     | —               |
+| AND | `(1+t, -t, -(1+t))`  | —               |
+
+That gives **14 SMT-distinct identities per op** in the affine
+shape alone, on top of the 3 fixed shapes — so a single ALU site
+now has 17 candidate identities (4 register slots × diversity in
+coefficients) instead of 3. Frequency-pattern matchers that key on
+the canonical Knuth/disjoint coefficient triples cannot keep up
+with a per-site randomly chosen `t`.
+
+The body uses three scratch registers via a new
+`wrap_with_push_pop_3` helper: one slot per basis term so the
+multiplications fan out cleanly. `emit_imul_const` folds `c == -1`
+into `neg`, `c == 1` into a no-op, and `c == 0` into `xor reg, reg`,
+keeping the body free of redundant operations. The shared emitter
+`emit_affine_alu_body` parameterises by `(view, coefficients)` so
+each per-family rewriter file is a thin wrapper (≤ 80 LOC).
 
 ### Phase 8: REX.W full 64-bit MOV-imm
 
@@ -131,16 +166,17 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Baseline | After phase 7 | After phase 8 |
-| ---------------------------- | -------- | ------------- | ------------- |
-| MBA rewriters in registry    | 6        | 18            | 21            |
-| MBA-redirected sites         | 180      | 195 (+8.3%)   | 195           |
-| Total substitutions          | 5105     | 5120          | 5120          |
-| Per-family shape options     | 1        | 3             | 3             |
-| MBA tests                    | 21       | 38            | 49            |
-| Total ctest                  | 894      | 909           | 920           |
-| Stress (strong, 15 runs)     | 15/15    | 15/15         | 15/15         |
-| Stress (maximum, 15 runs)    | 15/15    | 15/15         | 15/15         |
+| Metric                       | Baseline | Phase 7 | Phase 8 | Phase 9 |
+| ---------------------------- | -------- | ------- | ------- | ------- |
+| MBA rewriters in registry    | 6        | 18      | 21      | 26      |
+| MBA-redirected sites         | 180      | 195     | 195     | 195     |
+| Per-ALU shape options        | 1        | 3       | 3       | 4       |
+| Per-MOV-imm shape options    | 1        | 3       | 3 + 3   | 3 + 3   |
+| Affine `t` choices per site  | n/a      | n/a     | n/a     | 14      |
+| MBA tests                    | 21       | 38      | 49      | 54      |
+| Total ctest                  | 894      | 909     | 920     | 925     |
+| Stress (strong, 15 runs)     | 15/15    | 15/15   | 15/15   | 15/15   |
+| Stress (maximum, 15 runs)    | 15/15    | 15/15   | 15/15   | 15/15   |
 
 Phase 8 does not change redirect-site count on the showcase binary
 because that input is compiled with `mov r32, imm32` for all 32-bit
@@ -162,16 +198,11 @@ attempted in this pass:
    (x^y) + 2*(x&y)`). Requires multi-instruction redirect because
    r-r encodings are 2–3 bytes — below the JMP rel32 threshold.
 
-2. **Affine MBA over a 16-element bitwise basis**: the Tigress-
-   style technique. Requires a builder that emits a random linear
-   combination of basis expressions, with per-site coefficients.
-   Complex but very strong against SMT.
-
-3. **Multi-step deep chains**: re-apply the rewriter pipeline to
+2. **Multi-step deep chains**: re-apply the rewriter pipeline to
    the output of one MBA body, producing nested expansions. Cheap
    to wire (one extra pass invocation), but increases binary size
    significantly.
 
-4. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
+3. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
    below the JMP rel32 threshold. Same multi-instruction-redirect
    prerequisite as r-r forms.

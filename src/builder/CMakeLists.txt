@@ -147,6 +147,12 @@ set(BUILDER_SOURCES
     protection/mutation/mba/rewriters/and_imm_or_xor_rewriter.cpp
     protection/mutation/mba/rewriters/and_imm_add_minus_or_rewriter.cpp
     protection/mutation/mba/rewriters/and_imm_demorgan_rewriter.cpp
+    protection/mutation/mba/rewriters/add_imm_affine_rewriter.cpp
+    protection/mutation/mba/rewriters/sub_imm_affine_rewriter.cpp
+    protection/mutation/mba/rewriters/xor_imm_affine_rewriter.cpp
+    protection/mutation/mba/rewriters/or_imm_affine_rewriter.cpp
+    protection/mutation/mba/rewriters/and_imm_affine_rewriter.cpp
+    protection/mutation/mba/mba_affine_emit.cpp
     protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp
     protection/mutation/mba/rewriters/mov_imm_rotate_blind_rewriter.cpp

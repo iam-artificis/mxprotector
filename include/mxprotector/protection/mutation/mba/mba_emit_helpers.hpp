@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <array>
 #include <utility>
 
 #include "mxprotector/analysis/assembler.hpp"
@@ -64,6 +65,52 @@ void wrap_with_push_pop(
     em.push(scratch);
     std::forward<Body>(body)(em);
     em.pop(scratch);
+}
+
+/**
+ * @brief Pick three 64-bit scratch registers that don't alias `dst`.
+ *
+ * The affine MBA shapes need three live scratches at once (one for
+ * each basis term: OR, AND, XOR). `r10`, `r11`, `r12` are the
+ * default — `r10`/`r11` are caller-saved on both Windows-x64 and
+ * SysV-x64; `r12` is callee-saved but the rewriter wraps every use
+ * in push/pop so the original value is restored before any control
+ * transfer. If `dst` collides with one of the defaults, that slot
+ * falls back to `r13` (also callee-saved, also push/pop-protected).
+ */
+[[nodiscard]] inline std::array<x86::Reg, 3>
+pick_three_scratches_for(x86::Reg dst) noexcept {
+    std::array<x86::Reg, 3> scratches = {
+        x86::Reg::r10, x86::Reg::r11, x86::Reg::r12};
+    for (auto& reg : scratches) {
+        if (reg == dst) reg = x86::Reg::r13;
+    }
+    return scratches;
+}
+
+/**
+ * @brief Emit `push s1 ; push s2 ; push s3 ; body(em) ; pop s3 ;
+ *        pop s2 ; pop s1` into `em`.
+ *
+ * Same balance guarantee as `wrap_with_push_pop` — the body cannot
+ * skip the pops, so the surrounding stack and register state is
+ * always restored. Pop order is the reverse of push order so each
+ * scratch's original value lands back in the correct register even
+ * if the body trashed all three.
+ */
+template <class Body>
+void wrap_with_push_pop_3(
+    analysis::X86CodeEmitter&     em,
+    const std::array<x86::Reg, 3>& scratches,
+    Body&&                        body)
+{
+    em.push(scratches[0]);
+    em.push(scratches[1]);
+    em.push(scratches[2]);
+    std::forward<Body>(body)(em);
+    em.pop(scratches[2]);
+    em.pop(scratches[1]);
+    em.pop(scratches[0]);
 }
 
 } // namespace mx::mutation::mba

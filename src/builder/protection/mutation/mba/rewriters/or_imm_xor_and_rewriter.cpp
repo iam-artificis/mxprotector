@@ -93,6 +93,7 @@ void register_or_imm_rewriters(MbaRewriterRegistry& registry) {
     registry.register_rewriter(factories::make_or_imm_xor_plus_and());
     registry.register_rewriter(factories::make_or_imm_add_minus_and());
     registry.register_rewriter(factories::make_or_imm_xor_or_and());
+    registry.register_rewriter(factories::make_or_imm_affine());
 }
 
 } // namespace mx::mutation::mba
