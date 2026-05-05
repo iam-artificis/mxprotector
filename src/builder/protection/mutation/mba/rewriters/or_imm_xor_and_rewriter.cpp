@@ -28,6 +28,7 @@
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_emit_helpers.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
+#include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 
 namespace mx::mutation::mba {
 
@@ -80,8 +81,18 @@ public:
 
 } // namespace
 
+namespace factories {
+
+std::unique_ptr<IMbaRewriter> make_or_imm_xor_plus_and() {
+    return std::make_unique<OrImmXorAndRewriter>();
+}
+
+} // namespace factories
+
 void register_or_imm_rewriters(MbaRewriterRegistry& registry) {
-    registry.register_rewriter(std::make_unique<OrImmXorAndRewriter>());
+    registry.register_rewriter(factories::make_or_imm_xor_plus_and());
+    registry.register_rewriter(factories::make_or_imm_add_minus_and());
+    registry.register_rewriter(factories::make_or_imm_xor_or_and());
 }
 
 } // namespace mx::mutation::mba

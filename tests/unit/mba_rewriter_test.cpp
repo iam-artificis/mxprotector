@@ -511,6 +511,16 @@ TEST(MbaRewriter, OrImmXorAndPreservesSemantics) {
         mx::mutation::mba::AluImm32Op::or_, "or-imm-xor-and", "or"});
 }
 
+TEST(MbaRewriter, OrImmAddMinusAndPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::or_, "or-imm-add-minus-and", "or"});
+}
+
+TEST(MbaRewriter, OrImmXorOrAndPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::or_, "or-imm-xor-or-and", "or"});
+}
+
 TEST(MbaRewriter, AndImmOrXorPreservesSemantics) {
     check_rewriter_semantics({
         mx::mutation::mba::AluImm32Op::and_, "and-imm-or-xor", "and"});
@@ -556,7 +566,7 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 12u);
+    EXPECT_EQ(registry.size(), 14u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -567,6 +577,8 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("xor-imm-or-xor-and"), nullptr);
     EXPECT_NE(registry.find("xor-imm-add-minus-and"), nullptr);
     EXPECT_NE(registry.find("or-imm-xor-and"), nullptr);
+    EXPECT_NE(registry.find("or-imm-add-minus-and"), nullptr);
+    EXPECT_NE(registry.find("or-imm-xor-or-and"), nullptr);
     EXPECT_NE(registry.find("and-imm-or-xor"), nullptr);
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
 }

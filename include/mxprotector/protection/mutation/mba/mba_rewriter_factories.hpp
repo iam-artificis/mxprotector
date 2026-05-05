@@ -100,5 +100,24 @@ namespace factories {
 /// arithmetic with bitwise reasoning.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_add_minus_and();
 
+// ---------------------------------------------------------------------------
+// OR r, K shapes — `81 /1 id` (and REX.W variant).
+// ---------------------------------------------------------------------------
+
+/// `(x ^ K) + (x & K)` — disjoint-decomposition (existing).
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_xor_plus_and();
+
+/// `x + K - (x & K)` — additive identity minus intersection.
+/// Derivation: `x + K = (x^K) + 2*(x&K)`, so subtracting `(x&K)`
+/// leaves `(x^K) + (x&K) = x | K`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_add_minus_and();
+
+/// `(x ^ K) | (x & K)` — pure-Boolean OR-of-XOR-and-AND.
+/// Bit i of `(x^K) | (x&K)`: if both x_i and K_i are 0, both
+/// operands contribute 0 → 0. If exactly one is 1, `(x^K)_i = 1` →
+/// 1. If both are 1, `(x&K)_i = 1` → 1. Matches `x | K` bit-by-bit.
+/// Pure Boolean, no carry, no arithmetic.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_xor_or_and();
+
 } // namespace factories
 } // namespace mx::mutation::mba
