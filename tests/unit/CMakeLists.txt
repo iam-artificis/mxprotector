@@ -85,6 +85,7 @@ set(TEST_SOURCES
     vm_kernel_safety_test.cpp
     x64_vm_backend_arch_test.cpp
     x86_arch_emitter_test.cpp
+    x64_pe_stub_backend_test.cpp
     reloc_applier_test.cpp
     driver_cipher_body_test.cpp
     reloc_partition_test.cpp
@@ -173,6 +174,7 @@ set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/rc4.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stolen_bytes.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/stub_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/x64_pe_stub_backend.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/tls_callback.cpp
 )
 
