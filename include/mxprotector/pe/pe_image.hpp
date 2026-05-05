@@ -1,16 +1,25 @@
 /**
  * @file pe_image.hpp
- * @brief [BUILDER] Центральный класс PeImage — полное высокоуровневое представление PE-файла.
+ * @brief [BUILDER] Central PE-image class — full high-level view of a PE file.
  *
- * @details PeImage инкапсулирует всё содержимое PE: сырые данные файла, заголовки DOS/NT,
- *          таблицу секций, импорты, экспорты, релокации и метаданные.
- *          Обеспечивает конвертацию RVA ↔ FileOffset, навигацию по секциям,
- *          чтение/запись байтов по RVA, добавление новых секций.
- *          Является основной единицей работы для всех модулей BUILDER.
+ * @details `PeImage` owns every component of a parsed PE binary: raw
+ *          file bytes, DOS / NT headers (variant PE32 / PE32+), the
+ *          section table, imports, exports, relocations, and image
+ *          metadata (entry point, base, alignments). It also provides
+ *          RVA ↔ file-offset conversion, section navigation by name
+ *          or RVA, byte read / write by RVA, and section addition.
  *
- * @note NT-заголовки хранятся в std::variant<IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64>.
- *       Архитектура определяется по полю Machine в FILE_HEADER при парсинге.
- *       PeImage не зависит от Windows.h — все PE-типы определены в pe_types.hpp.
+ * @note    NT headers live in a `std::variant<IMAGE_NT_HEADERS32,
+ *          IMAGE_NT_HEADERS64>` so the same class handles both PE32
+ *          and PE32+ without subclassing. PE types are vendored under
+ *          `mxprotector/pe/types/`, so the class never depends on
+ *          `<windows.h>`.
+ *
+ *          SOLID: SRP — `PeImage` only stores parsed state and
+ *          provides navigation. Parsing (`PeParser`), serialization
+ *          (`PeBuilder`), section management (`SectionManager`), and
+ *          per-table editors (`ImportTableManager`, …) live in
+ *          dedicated classes.
  */
 
 #pragma once
@@ -20,10 +29,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <span>
 #include <variant>
-#include <algorithm>
-#include <ranges>
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
@@ -32,10 +38,10 @@
 namespace mx {
 
 /**
- * @brief Выравнивает значение вверх до кратного alignment.
- * @param value Исходное значение.
- * @param alignment Выравнивание (должно быть степенью двойки).
- * @return Выровненное значение.
+ * @brief Round @p value up to the nearest multiple of @p alignment.
+ * @param value      Value to align.
+ * @param alignment  Alignment (must be a power of two).
+ * @return           Aligned value.
  */
 [[nodiscard]] constexpr uint64_t align_up(uint64_t value, uint64_t alignment) noexcept {
     if (alignment == 0) return value;
@@ -45,17 +51,13 @@ namespace mx {
 /**
  * @brief Полное высокоуровневое представление PE-файла.
  *
- * @details Хранит все разобранные компоненты PE-образа и предоставляет
- *          API для навигации, модификации и подготовки к сборке.
- *          Создаётся через PeParser::parse(), собирается через PeBuilder::build().
- *
- *          SOLID: SRP — PeImage только хранит данные и предоставляет базовую навигацию.
- *          Парсинг (PeParser), сборка (PeBuilder), управление секциями (SectionManager)
- *          и таблицами (ImportTableManager и т.д.) вынесены в отдельные классы.
+ * Создаётся через `PeParser::parse()`, собирается через
+ * `PeBuilder::build()`. Все мутации идут через сеттеры или прямые
+ * ссылки на изменяемые поля (sections, imports, exports, relocations).
  */
 class PeImage {
 public:
-    /// @brief Тип для хранения NT-заголовков (PE32 или PE32+).
+    /// Variant of NT headers (PE32 vs PE32+) — picked by `Machine`.
     using NtHeaders = std::variant<pe::IMAGE_NT_HEADERS32, pe::IMAGE_NT_HEADERS64>;
 
     PeImage() = default;
@@ -70,110 +72,65 @@ public:
     // Основные свойства
     // ====================================================================
 
-    /**
-     * @brief Проверяет, является ли образ 64-битным (PE32+).
-     * @return true для x64, false для x86.
-     */
+    /// @brief True for PE32+ (x64), false for PE32 (x86).
     [[nodiscard]] bool is_64bit() const noexcept { return arch_ == Architecture::x64; }
 
-    /**
-     * @brief Возвращает архитектуру PE-файла.
-     * @return Architecture::x86 или Architecture::x64.
-     */
+    /// @brief Architecture of the parsed image.
     [[nodiscard]] Architecture architecture() const noexcept { return arch_; }
 
-    /**
-     * @brief Возвращает тип PE-файла (exe/dll/sys).
-     * @return PeType.
-     */
+    /// @brief PE file kind (executable / dynamic_library / kernel_driver).
     [[nodiscard]] PeType pe_type() const noexcept { return type_; }
 
-    /**
-     * @brief Возвращает RVA точки входа.
-     * @return RVA entry point.
-     */
+    /// @brief RVA of the entry point.
     [[nodiscard]] Rva entry_point_rva() const noexcept { return entry_point_rva_; }
 
-    /**
-     * @brief Возвращает предпочтительную базу загрузки образа.
-     * @return Виртуальный адрес базы.
-     */
+    /// @brief Preferred image base.
     [[nodiscard]] Va image_base() const noexcept { return image_base_; }
 
-    /**
-     * @brief Возвращает выравнивание секций на диске.
-     * @return Выравнивание файла в байтах.
-     */
+    /// @brief File alignment (on-disk section padding).
     [[nodiscard]] uint32_t file_alignment() const noexcept { return file_alignment_; }
 
-    /**
-     * @brief Возвращает выравнивание секций в памяти.
-     * @return Выравнивание секций в байтах.
-     */
+    /// @brief Section alignment (in-memory section padding).
     [[nodiscard]] uint32_t section_alignment() const noexcept { return section_alignment_; }
 
     // ====================================================================
     // Заголовки
     // ====================================================================
 
-    /**
-     * @brief Возвращает константную ссылку на DOS-заголовок.
-     * @return Константная ссылка на IMAGE_DOS_HEADER.
-     */
+    /// @brief Read-only DOS header.
     [[nodiscard]] const pe::IMAGE_DOS_HEADER& dos_header() const noexcept { return dos_header_; }
 
-    /**
-     * @brief Возвращает изменяемую ссылку на DOS-заголовок.
-     * @return Ссылка на IMAGE_DOS_HEADER.
-     */
+    /// @brief Mutable DOS header.
     [[nodiscard]] pe::IMAGE_DOS_HEADER& dos_header() noexcept { return dos_header_; }
 
-    /**
-     * @brief Возвращает константную ссылку на NT-заголовки (variant PE32/PE32+).
-     * @return Константная ссылка на NtHeaders.
-     */
+    /// @brief Read-only NT headers (variant PE32 / PE32+).
     [[nodiscard]] const NtHeaders& nt_headers() const noexcept { return nt_headers_; }
 
-    /**
-     * @brief Возвращает изменяемую ссылку на NT-заголовки.
-     * @return Ссылка на NtHeaders.
-     */
+    /// @brief Mutable NT headers.
     [[nodiscard]] NtHeaders& nt_headers() noexcept { return nt_headers_; }
 
     // ====================================================================
     // Секции
     // ====================================================================
 
-    /**
-     * @brief Возвращает константный список секций.
-     * @return Константная ссылка на вектор SectionInfo.
-     */
+    /// @brief Read-only sections.
     [[nodiscard]] const std::vector<pe::SectionInfo>& sections() const noexcept { return sections_; }
 
-    /**
-     * @brief Возвращает изменяемый список секций.
-     * @return Ссылка на вектор SectionInfo.
-     */
+    /// @brief Mutable sections.
     [[nodiscard]] std::vector<pe::SectionInfo>& sections() noexcept { return sections_; }
 
-    /**
-     * @brief Ищет секцию, содержащую указанный RVA.
-     * @param rva Относительный виртуальный адрес для поиска.
-     * @return Указатель на SectionInfo или nullptr, если секция не найдена.
-     */
+    /// @brief Find the section containing @p rva, or `nullptr`.
     [[nodiscard]] const pe::SectionInfo* section_by_rva(Rva rva) const noexcept;
 
-    /**
-     * @brief Ищет секцию по имени.
-     * @param name Имя секции (например, ".text").
-     * @return Указатель на SectionInfo или nullptr, если секция не найдена.
-     */
+    /// @brief Find a section by name (e.g. ".text"), or `nullptr`.
     [[nodiscard]] const pe::SectionInfo* section_by_name(std::string_view name) const noexcept;
 
     /**
-     * @brief Добавляет новую секцию в образ.
-     * @param section Информация о добавляемой секции (имя, данные, характеристики).
-     * @return Индекс добавленной секции или ошибка при нехватке места в заголовках.
+     * @brief Append a new section to the image.
+     * @param section  Section to append (raw bytes + characteristics).
+     * @return         Index of the new section, or an error if the
+     *                 section table can no longer hold an entry
+     *                 (96-section hard cap).
      */
     [[nodiscard]] MxResult<uint32_t> add_section(pe::SectionInfo section);
 
@@ -181,182 +138,92 @@ public:
     // Импорты / Экспорты / Релокации
     // ====================================================================
 
-    /**
-     * @brief Возвращает константный список импортируемых DLL.
-     * @return Константная ссылка на вектор ImportEntry.
-     */
+    /// @brief Read-only imports.
     [[nodiscard]] const std::vector<pe::ImportEntry>& imports() const noexcept { return imports_; }
-
-    /**
-     * @brief Возвращает изменяемый список импортируемых DLL.
-     * @return Ссылка на вектор ImportEntry.
-     */
+    /// @brief Mutable imports.
     [[nodiscard]] std::vector<pe::ImportEntry>& imports() noexcept { return imports_; }
 
-    /**
-     * @brief Возвращает константную таблицу экспортов.
-     * @return Константная ссылка на ExportTable.
-     */
+    /// @brief Read-only export table.
     [[nodiscard]] const pe::ExportTable& exports() const noexcept { return exports_; }
-
-    /**
-     * @brief Возвращает изменяемую таблицу экспортов.
-     * @return Ссылка на ExportTable.
-     */
+    /// @brief Mutable export table.
     [[nodiscard]] pe::ExportTable& exports() noexcept { return exports_; }
 
-    /**
-     * @brief Возвращает константный список блоков релокаций.
-     * @return Константная ссылка на вектор RelocationBlock.
-     */
+    /// @brief Read-only base-relocation blocks.
     [[nodiscard]] const std::vector<pe::RelocationBlock>& relocations() const noexcept { return relocations_; }
-
-    /**
-     * @brief Возвращает изменяемый список блоков релокаций.
-     * @return Ссылка на вектор RelocationBlock.
-     */
+    /// @brief Mutable base-relocation blocks.
     [[nodiscard]] std::vector<pe::RelocationBlock>& relocations() noexcept { return relocations_; }
 
     // ====================================================================
-    // Конвертация адресов
+    // Конвертация адресов / чтение байтов
     // ====================================================================
 
-    /**
-     * @brief Конвертирует RVA в файловое смещение.
-     * @param rva Относительный виртуальный адрес.
-     * @return Файловое смещение или ошибка, если RVA не принадлежит ни одной секции.
-     */
+    /// @brief Convert @p rva to its on-disk file offset, or error.
     [[nodiscard]] MxResult<FileOffset> rva_to_offset(Rva rva) const;
 
-    /**
-     * @brief Конвертирует файловое смещение в RVA.
-     * @param offset Смещение от начала файла.
-     * @return RVA или ошибка, если смещение не принадлежит ни одной секции.
-     */
+    /// @brief Convert an on-disk @p offset to its RVA, or error.
     [[nodiscard]] MxResult<Rva> offset_to_rva(FileOffset offset) const;
 
-    // ====================================================================
-    // Чтение/запись байтов по RVA
-    // ====================================================================
-
-    /**
-     * @brief Читает блок байтов из сырых данных файла по RVA.
-     * @param rva Стартовый RVA.
-     * @param size Количество байтов для чтения.
-     * @return Представление (ByteView) запрошенного диапазона или ошибка.
-     */
+    /// @brief Borrow @p size bytes starting at @p rva from the raw image.
     [[nodiscard]] MxResult<ByteView> read_bytes(Rva rva, size_t size) const;
 
-    /**
-     * @brief Записывает блок байтов в сырые данные файла по RVA.
-     * @param rva Стартовый RVA.
-     * @param data Данные для записи.
-     * @return MxStatus — успех или ошибка при выходе за границы.
-     */
+    /// @brief Overwrite @p data.size() bytes at @p rva in the raw image.
     [[nodiscard]] MxStatus write_bytes(Rva rva, ByteView data);
 
     // ====================================================================
     // Сырые данные
     // ====================================================================
 
-    /**
-     * @brief Возвращает неизменяемое представление сырых данных файла.
-     * @return ByteView на raw_data_.
-     */
+    /// @brief Read-only view over the underlying raw byte buffer.
     [[nodiscard]] ByteView raw_data() const noexcept {
         return ByteView{raw_data_.data(), raw_data_.size()};
     }
 
-    /**
-     * @brief Возвращает изменяемую ссылку на владеющий буфер сырых данных.
-     * @return Ссылка на ByteBuffer.
-     */
+    /// @brief Mutable owning byte buffer (used by serializers).
     [[nodiscard]] ByteBuffer& raw_data_buffer() noexcept { return raw_data_; }
 
-    /**
-     * @brief Возвращает константную ссылку на владеющий буфер сырых данных.
-     * @return Константная ссылка на ByteBuffer.
-     */
+    /// @brief Read-only owning byte buffer.
     [[nodiscard]] const ByteBuffer& raw_data_buffer() const noexcept { return raw_data_; }
 
     // ====================================================================
-    // Сеттеры (используются PeParser при построении PeImage)
+    // Setters (used by `PeParser` while building the `PeImage`)
     // ====================================================================
 
-    /// @brief Устанавливает сырые данные файла.
-    /// @param data Владеющий буфер байтов.
-    void set_raw_data(ByteBuffer data) { raw_data_ = std::move(data); }
-
-    /// @brief Устанавливает архитектуру.
-    /// @param arch Архитектура (x86/x64).
-    void set_architecture(Architecture arch) noexcept { arch_ = arch; }
-
-    /// @brief Устанавливает тип PE-файла.
-    /// @param type Тип (executable/dynamic_library/kernel_driver).
-    void set_pe_type(PeType type) noexcept { type_ = type; }
-
-    /// @brief Устанавливает DOS-заголовок.
-    /// @param hdr Копия DOS-заголовка.
+    void set_raw_data(ByteBuffer data)                     { raw_data_ = std::move(data); }
+    void set_architecture(Architecture arch)      noexcept { arch_ = arch; }
+    void set_pe_type(PeType type)                 noexcept { type_ = type; }
     void set_dos_header(const pe::IMAGE_DOS_HEADER& hdr) noexcept { dos_header_ = hdr; }
-
-    /// @brief Устанавливает NT-заголовки.
-    /// @param hdrs Variant с NT-заголовками PE32 или PE32+.
-    void set_nt_headers(NtHeaders hdrs) { nt_headers_ = std::move(hdrs); }
-
-    /// @brief Устанавливает список секций.
-    /// @param secs Вектор информации о секциях.
-    void set_sections(std::vector<pe::SectionInfo> secs) { sections_ = std::move(secs); }
-
-    /// @brief Устанавливает таблицу импортов.
-    /// @param imps Вектор записей импорта.
-    void set_imports(std::vector<pe::ImportEntry> imps) { imports_ = std::move(imps); }
-
-    /// @brief Устанавливает таблицу экспортов.
-    /// @param exp Таблица экспортов.
-    void set_exports(pe::ExportTable exp) { exports_ = std::move(exp); }
-
-    /// @brief Устанавливает таблицу релокаций.
-    /// @param relocs Вектор блоков релокаций.
+    void set_nt_headers(NtHeaders hdrs)                    { nt_headers_ = std::move(hdrs); }
+    void set_sections(std::vector<pe::SectionInfo> secs)   { sections_ = std::move(secs); }
+    void set_imports(std::vector<pe::ImportEntry> imps)    { imports_ = std::move(imps); }
+    void set_exports(pe::ExportTable exp)                  { exports_ = std::move(exp); }
     void set_relocations(std::vector<pe::RelocationBlock> relocs) { relocations_ = std::move(relocs); }
-
-    /// @brief Устанавливает RVA точки входа.
-    /// @param rva RVA entry point.
-    void set_entry_point_rva(Rva rva) noexcept { entry_point_rva_ = rva; }
-
-    /// @brief Устанавливает базу загрузки образа.
-    /// @param base Виртуальный адрес базы.
-    void set_image_base(Va base) noexcept { image_base_ = base; }
-
-    /// @brief Устанавливает файловое выравнивание.
-    /// @param align Выравнивание в байтах.
-    void set_file_alignment(uint32_t align) noexcept { file_alignment_ = align; }
-
-    /// @brief Устанавливает выравнивание секций в памяти.
-    /// @param align Выравнивание в байтах.
-    void set_section_alignment(uint32_t align) noexcept { section_alignment_ = align; }
+    void set_entry_point_rva(Rva rva)             noexcept { entry_point_rva_ = rva; }
+    void set_image_base(Va base)                  noexcept { image_base_ = base; }
+    void set_file_alignment(uint32_t align)       noexcept { file_alignment_ = align; }
+    void set_section_alignment(uint32_t align)    noexcept { section_alignment_ = align; }
 
 private:
-    ByteBuffer                        raw_data_;                            ///< Оригинальные сырые данные файла
+    ByteBuffer                        raw_data_;
 
-    Architecture                      arch_             = Architecture::x64;///< Архитектура
-    PeType                            type_             = PeType::executable;///< Тип PE
+    Architecture                      arch_              = Architecture::x64;
+    PeType                            type_              = PeType::executable;
 
-    pe::IMAGE_DOS_HEADER              dos_header_{};                        ///< DOS-заголовок
-    NtHeaders                         nt_headers_;                          ///< NT-заголовки (PE32/PE32+)
+    pe::IMAGE_DOS_HEADER              dos_header_{};
+    NtHeaders                         nt_headers_;
 
-    std::vector<pe::SectionInfo>      sections_;                            ///< Секции PE
-    std::vector<pe::ImportEntry>      imports_;                             ///< Таблица импортов
-    pe::ExportTable                   exports_;                             ///< Таблица экспортов
-    std::vector<pe::RelocationBlock>  relocations_;                         ///< Таблица релокаций
+    std::vector<pe::SectionInfo>      sections_;
+    std::vector<pe::ImportEntry>      imports_;
+    pe::ExportTable                   exports_;
+    std::vector<pe::RelocationBlock>  relocations_;
 
-    Rva                               entry_point_rva_  = 0;               ///< RVA точки входа
-    Va                                image_base_       = 0;               ///< Предпочтительная база загрузки
-    uint32_t                          file_alignment_   = 0x200;           ///< Файловое выравнивание
-    uint32_t                          section_alignment_= 0x1000;          ///< Выравнивание секций в памяти
+    Rva                               entry_point_rva_   = 0;
+    Va                                image_base_        = 0;
+    uint32_t                          file_alignment_    = 0x200;
+    uint32_t                          section_alignment_ = 0x1000;
 };
 
 // ============================================================================
-// Инлайн-реализации методов PeImage
+// Tiny inline accessors (kept here so callers stay free of an extra TU).
 // ============================================================================
 
 inline const pe::SectionInfo* PeImage::section_by_rva(Rva rva) const noexcept {
@@ -375,139 +242,6 @@ inline const pe::SectionInfo* PeImage::section_by_name(std::string_view name) co
         }
     }
     return nullptr;
-}
-
-inline MxResult<FileOffset> PeImage::rva_to_offset(Rva rva) const {
-    if (rva == 0) {
-        return static_cast<FileOffset>(0);
-    }
-
-    if (!sections_.empty() && rva < sections_.front().virtual_address) {
-        if (static_cast<size_t>(rva) < raw_data_.size()) {
-            return static_cast<FileOffset>(rva);
-        }
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::invalid_rva,
-            "RVA 0x{:08X} в области заголовков выходит за пределы файла (размер: 0x{:X})",
-            rva, raw_data_.size()));
-    }
-
-    const auto* sec = section_by_rva(rva);
-    if (!sec) {
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::invalid_rva,
-            "RVA 0x{:08X} не принадлежит ни одной секции", rva));
-    }
-
-    const uint32_t offset_in_section = rva - sec->virtual_address;
-    if (offset_in_section >= sec->raw_size) {
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::invalid_rva,
-            "RVA 0x{:08X} выходит за пределы сырых данных секции '{}' "
-            "(смещение в секции: 0x{:X}, raw_size: 0x{:X})",
-            rva, sec->name, offset_in_section, sec->raw_size));
-    }
-
-    return static_cast<FileOffset>(sec->raw_offset + offset_in_section);
-}
-
-inline MxResult<Rva> PeImage::offset_to_rva(FileOffset offset) const {
-    if (offset == 0) {
-        return static_cast<Rva>(0);
-    }
-
-    if (!sections_.empty() && offset < sections_.front().raw_offset) {
-        return static_cast<Rva>(offset);
-    }
-
-    for (const auto& sec : sections_) {
-        if (offset >= sec.raw_offset && offset < sec.raw_offset + sec.raw_size) {
-            const uint32_t delta = offset - sec.raw_offset;
-            return static_cast<Rva>(sec.virtual_address + delta);
-        }
-    }
-
-    return std::unexpected(error::pe_fmt(
-        PeErrorCode::invalid_rva,
-        "Файловое смещение 0x{:08X} не принадлежит ни одной секции", offset));
-}
-
-inline MxResult<ByteView> PeImage::read_bytes(Rva rva, size_t size) const {
-    auto offset_result = rva_to_offset(rva);
-    if (!offset_result) {
-        return std::unexpected(offset_result.error());
-    }
-
-    const FileOffset off = *offset_result;
-    if (static_cast<size_t>(off) + size > raw_data_.size()) {
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::invalid_rva,
-            "Чтение по RVA 0x{:08X} (смещение 0x{:08X}, размер 0x{:X}) "
-            "выходит за пределы файла (размер файла: 0x{:X})",
-            rva, off, size, raw_data_.size()));
-    }
-
-    return ByteView{raw_data_.data() + off, size};
-}
-
-inline MxStatus PeImage::write_bytes(Rva rva, ByteView data) {
-    auto offset_result = rva_to_offset(rva);
-    if (!offset_result) {
-        return std::unexpected(offset_result.error());
-    }
-
-    const FileOffset off = *offset_result;
-    if (static_cast<size_t>(off) + data.size() > raw_data_.size()) {
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::invalid_rva,
-            "Запись по RVA 0x{:08X} (смещение 0x{:08X}, размер 0x{:X}) "
-            "выходит за пределы файла (размер файла: 0x{:X})",
-            rva, off, data.size(), raw_data_.size()));
-    }
-
-    std::ranges::copy(data, raw_data_.begin() + off);
-    return {};
-}
-
-inline MxResult<uint32_t> PeImage::add_section(pe::SectionInfo section) {
-    constexpr uint32_t max_sections = 96;
-    if (sections_.size() >= max_sections) {
-        return std::unexpected(error::pe_fmt(
-            PeErrorCode::section_out_of_bounds,
-            "Превышено максимальное количество секций ({}/{})",
-            sections_.size(), max_sections));
-    }
-
-    if (!sections_.empty()) {
-        const auto& last = sections_.back();
-        const auto next_va = static_cast<uint32_t>(
-            align_up(last.virtual_address + last.virtual_size, section_alignment_));
-        section.virtual_address = next_va;
-
-        const auto next_raw = static_cast<uint32_t>(
-            align_up(last.raw_offset + last.raw_size, file_alignment_));
-        section.raw_offset = next_raw;
-    } else {
-        section.virtual_address = static_cast<uint32_t>(
-            align_up(sizeof(pe::IMAGE_DOS_HEADER) + 256, section_alignment_));
-        section.raw_offset = static_cast<uint32_t>(
-            align_up(sizeof(pe::IMAGE_DOS_HEADER) + 256, file_alignment_));
-    }
-
-    section.raw_size = static_cast<uint32_t>(
-        align_up(section.data.size(), file_alignment_));
-    if (section.virtual_size == 0) {
-        section.virtual_size = static_cast<uint32_t>(section.data.size());
-    }
-
-    const auto index = static_cast<uint32_t>(sections_.size());
-    sections_.push_back(std::move(section));
-
-    std::visit([this](auto& nt) {
-        nt.FileHeader.NumberOfSections = static_cast<uint16_t>(sections_.size());
-    }, nt_headers_);
-
-    return index;
 }
 
 } // namespace mx

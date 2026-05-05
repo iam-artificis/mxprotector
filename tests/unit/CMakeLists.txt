@@ -203,6 +203,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_code_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/cfg_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_image.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_parser.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp

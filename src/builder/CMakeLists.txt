@@ -25,6 +25,7 @@ set(BUILDER_SOURCES
     core/context.cpp
 
     # PE-модуль
+    pe/pe_image.cpp
     pe/pe_parser.cpp
     pe/pe_builder.cpp
     pe/section_manager.cpp
