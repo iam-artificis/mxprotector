@@ -407,6 +407,62 @@ Acceptance: x64 PE pipeline behaves identically (793/793 +
 new file; the diff to add ELF support is one new
 `IBinaryImage` impl + one `IBinaryImageBuilder` impl.
 
+### R9 — Linux build verification (physical)
+
+**Status as of 2026-05-05:** **shipped.** R6 was a static audit
+asserting the source tree was Linux-clean; R9 is the physical
+gcc-13.3 + ninja build through WSL Ubuntu 24.04 that confirms it.
+
+**Toolchain:** Ubuntu 24.04 LTS (kernel 6.6.87-microsoft-WSL2),
+g++ 13.3.0 (libstdc++-13), CMake 3.28.3, ninja 1.11.1. Out-of-tree
+build (sources mounted via `/mnt/c/`, build dir on native ext4
+under `~/build-mxprotector-linux/` — required because CMake's
+`configure_file` cannot write through the WSL DrvFS overlay).
+
+**Findings (real code changes needed):**
+
+  1. Three `anti_emulation/*.cpp` files were missing
+     `#include <memory>` for `std::unique_ptr` factory functions
+     — MSVC was getting it transitively, libstdc++ is stricter.
+     Files: `rdtsc_timing_check.cpp`, `cpuid_hypervisor_check.cpp`,
+     `eflags_reserved_bit_check.cpp`. One-line fix per file.
+  2. `include/.../anti_emulation/check.hpp` had an inline
+     comment referencing `*.cpp` glob pattern; the literal `/*`
+     inside a `/** ... */` block triggered `-Wcomment` on g++.
+     Rephrased to drop the wildcard.
+  3. `tests/CMakeLists.txt` registered `mx_test_target` (a
+     PE-target sample app that intentionally `#include
+     <Windows.h>`) unconditionally — gated with `if(WIN32)`.
+     The Linux build tree still produces the unit-test suite
+     and the builder; the target app stays Windows-only.
+  4. Top-level `CMakeLists.txt` was missing a top-level
+     `enable_testing()`, so `ctest` from the build root reported
+     "No tests were found" — `gtest_discover_tests` had registered
+     them only inside `tests/unit/`. One-line fix.
+
+**Acceptance:** ✅
+  * `mxprotector_builder` Linux ELF (2.8 MB) builds cleanly,
+    runs `--help` with full UTF-8 (Cyrillic + box-drawing
+    characters intact).
+  * **Linux ctest: 847/847 pass** (~1.66 s) — same suite as
+    Windows, mocking the PE-target tests.
+  * **Windows ctest: 847/847 pass** — no regression from the
+    portability fixes.
+  * **Stress: 15/15** on `mx_test_target` × `-l strong` after
+    rebuild.
+
+**Deliberately deferred to a separate `linux-runtime` branch:**
+
+  * Linux runtime stubs for *protected* binaries (the protected
+    EXE will still target Windows even when built on Linux —
+    this is what the "Windows x64 Binary Protection Suite"
+    contract says).
+  * ELF parser / builder (tracked under the `elf-image`
+    follow-up branch — needs `target::IBinaryImage` impl that
+    models PLT/GOT instead of IAT).
+  * CMake preset / CI lane (the manual WSL recipe is captured
+    in the commit message; preset can land alongside CI).
+
 ## Out of scope for this branch
 
   * Implementing arm64 backends.
@@ -503,10 +559,7 @@ Listed in dependency order:
      keyed), implement `mx::hash::IHash` for it, update the
      runtime stub's FNV loop. Smaller scope than the cipher
      swap; same shape.
-  6. **`linux-builder`** — physical Linux compile + link of the
-     builder. Most likely a no-op on the source; just adds a
-     CMake preset and CI lane.
-  7. **`elf-image`** — implement `target::IBinaryImage` for ELF.
+  6. **`elf-image`** — implement `target::IBinaryImage` for ELF.
      Provides `IImportTableView` impl modelling PLT/GOT.
      Concrete protection of Linux binaries lands in subsequent
      branches once the parser/builder is solid.

@@ -40,8 +40,12 @@ add_subdirectory(external/zydis)
 
 add_subdirectory(src/builder)
 
-# Тесты (опционально)
+# Тесты (опционально). enable_testing() в корне нужен для того, чтобы
+# CMake сгенерировал верхнеуровневый CTestTestfile.cmake — без него
+# `ctest` из build-root не видит тесты из tests/unit/ (gtest_discover_tests
+# регистрирует их, но только в подкаталоге).
 option(MXPROTECTOR_BUILD_TESTS "Собирать модульные тесты" OFF)
 if(MXPROTECTOR_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(tests)
 endif()

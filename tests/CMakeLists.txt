@@ -25,5 +25,12 @@ enable_testing()
 
 add_subdirectory(unit)
 
-add_executable(mx_test_target testapp/test_target.cpp)
-target_include_directories(mx_test_target PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/sdk/include)
+# mx_test_target — Windows-only PE testapp. The protected output runs on
+# Windows; on Linux the target's source itself includes <Windows.h>, so we
+# skip building it there. Linux builds still get mxprotector_builder + the
+# unit-test suite (tests/unit/), which is all that's needed for the
+# linux-builder portability gate.
+if(WIN32)
+    add_executable(mx_test_target testapp/test_target.cpp)
+    target_include_directories(mx_test_target PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/sdk/include)
+endif()

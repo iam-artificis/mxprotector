@@ -61,7 +61,7 @@ namespace mx::anti_emulation {
 /**
  * @brief Abstract anti-emulation check. One instance per technique.
  *
- * Implementations live in `src/builder/protection/anti_emulation/*.cpp`
+ * Implementations live in `src/builder/protection/anti_emulation/`
  * and are instantiated into a `CheckRegistry` at build time. The VM
  * pass asks the registry for a random subset and emits them.
  */

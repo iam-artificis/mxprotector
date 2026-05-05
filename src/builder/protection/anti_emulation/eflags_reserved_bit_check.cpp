@@ -38,6 +38,8 @@
 
 #include "mxprotector/protection/anti_emulation/check.hpp"
 
+#include <memory>
+
 namespace mx::anti_emulation {
 
 class EflagsReservedBitCheck final : public ICheck {
