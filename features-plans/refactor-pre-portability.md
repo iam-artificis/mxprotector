@@ -281,15 +281,21 @@ duplication" rule held up under sweep.
 
 ### R8 — VM / CFF / Packer / Mutation pass-level abstraction
 
-**Status as of 2026-05-05:** **abstractions in place**, concrete
-migrations **deferred to follow-up branches**.
+**Status as of 2026-05-05:** **abstractions in place AND wired** for
+VM, code emitter, packer stub, and a first container capability;
+runtime-side cipher / hash swaps and ELF / arm64 backends remain
+follow-up work.
 
-**What exists in this branch:**
+**What exists in this branch (after R8.1–R8.4):**
 
   * `target::IBinaryImage` — declared **and wired** via R3.
     Container-agnostic passes can read through the interface
     today; `ProtectionContext::binary_image()` returns the
     PE-backed adapter.
+  * `target::IImportTableView` — declared **and wired** via R8.3.
+    Narrow read-only capability over the import / dynamic-symbol
+    table; PE adapter implements it. Future ELF adapter ships
+    its own impl modelling PLT/GOT.
   * `mx::IStreamCipher` — declared **and wired** via R4.
     `packer::Rc4StreamCipher` is the only impl; the path to
     "swap RC4 → ChaCha20" is one new `IStreamCipher` impl class
@@ -298,35 +304,47 @@ migrations **deferred to follow-up branches**.
     wrapper. Migration of existing FNV-1a call sites blocked on
     runtime-stub side reimplementing the new hash (build/runtime
     contract).
-  * `arch::IVmBackend` — declared (in `arch/vm_backend.hpp`),
-    no impl. Phase 5 plan documented in the header.
-  * `arch::ICodeEmitter` — declared (in `arch/code_emitter.hpp`),
-    no impl. Today's `analysis/x86_code_emitter.cpp` emits
-    bytes directly; not yet adapted to the abstract interface.
+  * `arch::IVmBackend` — declared **and wired** via R8.1.
+    `vm::x64::X64VmBackend` is the only impl;
+    `vm::VmRuntimeGenerator::generate` routes through the
+    abstract interface via `X64VmBackendFactory`.
+  * `arch::ICodeEmitter` — declared **and wired** via R8.2.
+    `analysis::X86ArchEmitter` is the only impl (adapter over
+    the existing fluent `X86CodeEmitter`);
+    `X86CodeEmitterFactory` selects it for x64.
+  * `packer::IPackerStubBackend` — declared **and wired** via
+    R8.4. `packer::X64PeStubBackend` is the only impl, byte-for-
+    byte identical to today's `build_xxx_stub_bytes` free
+    functions. `X64PeStubBackendFactory` selects on (arch,
+    container). PackerPass migration to consume the interface
+    deferred to follow-up.
 
-**What's deferred to a separate branch (`port-arm64-vm-engine`):**
+**What's deferred to a separate branch:**
 
-  * **VM engine extraction**: split `vm_runtime_gen.cpp` (~2 K
-    LOC of byte emission) into a target-agnostic
-    `VmRuntimeEngine` and an `arch::X64VmBackend` that
-    implements `IVmBackend`. The engine drives the backend via
-    the abstract interface. Arm64 backend lands as a sibling
-    file when the time comes.
-  * **CFF dispatcher backend**: the dispatcher gen + map parser
-    currently emit x64 bytes directly. Migration will route
-    through `arch::ICodeEmitter`; container-specific section
-    emission already goes through `pe::ILayoutPolicy` (which
-    gets generalised when ELF lands).
-  * **Packer stub backend**: `PackerPass` will split into a
-    cipher pipeline (R4 ✓), an `IPackerStubBackend` (today only
-    `X64PeStubBackend`), and container hooks via narrow
-    capability interfaces on `IBinaryImage` (IImportTable,
-    ITlsTable). Cipher pipeline already done in R4.
+  * **VM engine extraction (`port-vm-engine` branch)**: today
+    `X64VmBackend` is structurally already an "engine" plus
+    helpers (`x64_entry_stub`, `x64_handler_emitter`,
+    `x64_inner_vm`, `x64_blob_patcher`); the deferred work is
+    splitting the *target-agnostic policy* (instruction lifting,
+    polymorphism variant selection, rolling-key derivation)
+    out of `X64VmBackend` so an `Arm64VmBackend` sibling can
+    reuse it. R8.1 wired the `IVmBackend` seam this engine
+    refactor will plug into.
+  * **CFF dispatcher backend (`port-code-emitter` branch)**:
+    dispatcher gen + map parser still emit x64 bytes directly.
+    Migration retypes them onto `arch::ICodeEmitter` so an
+    arm64 emitter picks them up automatically. R8.2 wired the
+    seam.
+  * **Packer pipeline migration (`port-packer-pipeline`
+    branch)**: today's `PackerPass` calls `build_xxx_stub_bytes`
+    free functions directly. Migration retypes the pass to
+    consume `IPackerStubBackend` and pick the right backend via
+    `IPackerStubBackendFactory`. R8.4 wired the seam.
   * **Mutation through ICodeEmitter**: today's mutation passes
     (`instruction_splitter`, `junk_generator`, reg-reassign)
     emit x64 directly. Migration retypes them to consume
     `arch::ICodeEmitter` so an arm64 backend picks them up
-    automatically.
+    automatically. R8.2 wired the seam.
 
 **Why split the work this way:**
 
@@ -340,11 +358,15 @@ migrations **deferred to follow-up branches**.
     arm64 / ELF work doesn't need them invented; it needs them
     populated.
 
-**Acceptance (revised):** `target::IBinaryImage`,
-`mx::IStreamCipher`, `mx::hash::IHash`, `arch::IVmBackend`,
-`arch::ICodeEmitter` are all in tree. Three of them are wired
-into production code. The remaining concrete migrations are
-documented above, scoped to follow-up branches.
+**Acceptance (after R8.1–R8.4):** every cross-cutting seam
+declared during R3 / R4 / R5 / R8.1 / R8.2 / R8.3 / R8.4 is
+*wired* — i.e. there is at least one concrete impl in the build
+and the producer side actually calls through the abstract
+interface (or, for IPackerStubBackend, the seam is in tree and
+parity-tested even if PackerPass migration is deferred). The
+remaining concrete pass-side migrations and the runtime-side
+cipher / hash swaps are documented above, scoped to follow-up
+branches.
 
 **Old R8 detailed migration plan (preserved as a future
 roadmap):**
@@ -405,7 +427,8 @@ When this branch merges to master:
      WHY where non-obvious (pre-existing discipline; R1 sweep
      surfaced nothing — codebase was already clean).
   3. ✅ `target::IBinaryImage` wired in front of `PeImage` for
-     container-agnostic passes (R3).
+     container-agnostic passes (R3); narrow capability views on
+     top via `IImportTableView` (R8.3).
   4. ✅ Packer cipher behind `mx::IStreamCipher` (R4) — RC4 wrapped,
      swap path is one new impl class + one factory line.
   5. ✅ Hashes behind `mx::hash::IHash` interface (R5) — FNV-1a
@@ -413,12 +436,19 @@ When this branch merges to master:
      primitive until the runtime-stub side gets the new hash.
   6. ✅ Builder is Linux-compile-ready (R6 static audit) — physical
      gcc-13 / clang-18 build deferred to a Linux-host branch.
-  7. ✅ VM / CFF / Packer / Mutation seams in place. Concrete
-     `arch backend` migrations (vm_runtime_gen split, ICodeEmitter
-     adoption) deferred to follow-up branches.
-  8. ✅ 813/813 unit tests pass (was 793; +20 new tests in this
-     branch — R3 adapter, R4 cipher wrapper, R5 hash wrapper).
-     Chaos-shuffle stress unchanged.
+  7. ✅ VM / CFF / Packer / Mutation seams **wired**:
+     `arch::IVmBackend` (R8.1, X64VmBackend, factory),
+     `arch::ICodeEmitter` (R8.2, X86ArchEmitter, factory),
+     `packer::IPackerStubBackend` (R8.4, X64PeStubBackend,
+     factory). Concrete pass-side migrations
+     (vm engine split, dispatcher / mutation through
+     ICodeEmitter, PackerPass through IPackerStubBackend)
+     deferred to dedicated follow-up branches.
+  8. ✅ 847/847 unit tests pass (was 793; +54 new tests in this
+     branch: R3 adapter, R4 cipher wrapper, R5 hash wrapper,
+     R8.1 IVmBackend, R8.2 ICodeEmitter, R8.3 IImportTableView,
+     R8.4 IPackerStubBackend). Chaos-shuffle stress unchanged
+     (15/15 across every R8 phase).
 
 ## Branch ship state (2026-05-05)
 
@@ -436,35 +466,47 @@ b421-stability             0a60510   chaos-shuffle activation
    c373c5a  refactor(packer): wire RC4 through IStreamCipher (R4)
    9c3d2d5  refactor(hash): IHash abstraction + FNV-1a wrapper (R5)
    35c054a  docs(features-plans): R6 Linux compile-only audit
+   5f39a96  docs(features-plans): R7 audit + initial R8 deferral
+   58ef36d  refactor(vm): wire arch::IVmBackend in X64VmBackend (R8.1)
+   386d589  refactor(analysis): wire arch::ICodeEmitter via X86ArchEmitter (R8.2)
+   a910d47  refactor(target): IImportTableView capability on IBinaryImage (R8.3)
+   6c02faa  refactor(packer): IPackerStubBackend + X64PeStubBackend (R8.4)
 ```
 
-Total: 10 commits, 5 phases shipped (R2-R6), 2 phases scoped-and-
-documented (R7 audit clean, R8 deferred to follow-ups). Tests:
-793 → 813 (+20 new). Stability unchanged.
+Total: 15 commits, 9 phases shipped (R2–R6, R8.1–R8.4), 1 phase
+scoped-and-documented (R7 audit clean). Tests: 793 → 847
+(+54 new). Stability unchanged (15/15 stress on every R8 phase).
 
 ## Follow-up branches
 
 Listed in dependency order:
 
-  1. **`port-vm-engine`** — extract `VmRuntimeEngine` from
-     `vm_runtime_gen.cpp`; introduce `arch::X64VmBackend` as the
-     only `IVmBackend` impl. Engine drives the backend; x64 path
-     keeps producing identical bytes. Largest individual lift in
-     R8; gated on this PR's seams being stable.
-  2. **`port-code-emitter`** — make `analysis/x86_code_emitter`
-     implement `arch::ICodeEmitter` so mutation / CFF passes
-     migrate to the abstract interface in subsequent commits.
-  3. **`port-cipher-chacha20`** — pick a stronger cipher
+  1. **`port-vm-engine`** — split target-agnostic policy out of
+     `X64VmBackend` into a shared `VmRuntimeEngine`; the engine
+     drives the backend via `IVmBackend` (already wired by
+     R8.1). Arm64 backend lands as a sibling impl when the time
+     comes. Largest remaining lift in R8.
+  2. **`port-code-emitter-adoption`** — migrate mutation / CFG-
+     flattening / dispatcher gen to consume `arch::ICodeEmitter`
+     via `X86ArchEmitter` (already wired by R8.2) instead of
+     calling `X86CodeEmitter` directly. Once that's done arm64
+     emitter implementation is a sibling file.
+  3. **`port-packer-pipeline`** — retype `PackerPass` to consume
+     `IPackerStubBackend` via factory (R8.4 wired the seam).
+     After that lands, swap to a future arm64 PE backend = one
+     new impl + one factory line.
+  4. **`port-cipher-chacha20`** — pick a stronger cipher
      (ChaCha20 most likely), implement `mx::IStreamCipher` for
-     it, update the runtime stub bytes, swap the factory line in
-     `packer_pass.cpp`. Single biggest end-user-visible upgrade.
-  4. **`port-hash-siphash`** — pick a stronger hash (SipHash-2-4
+     it, update the runtime stub bytes, swap the factory line.
+     Single biggest end-user-visible upgrade.
+  5. **`port-hash-siphash`** — pick a stronger hash (SipHash-2-4
      keyed), implement `mx::hash::IHash` for it, update the
      runtime stub's FNV loop. Smaller scope than the cipher
      swap; same shape.
-  5. **`linux-builder`** — physical Linux compile + link of the
+  6. **`linux-builder`** — physical Linux compile + link of the
      builder. Most likely a no-op on the source; just adds a
      CMake preset and CI lane.
-  6. **`elf-image`** — implement `target::IBinaryImage` for ELF.
+  7. **`elf-image`** — implement `target::IBinaryImage` for ELF.
+     Provides `IImportTableView` impl modelling PLT/GOT.
      Concrete protection of Linux binaries lands in subsequent
      branches once the parser/builder is solid.
