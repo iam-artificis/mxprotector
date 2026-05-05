@@ -30,6 +30,8 @@
 #include "mxprotector/analysis/cfg.hpp"
 #include "mxprotector/analysis/disassembler.hpp"
 #include "mxprotector/analysis/trace_hints.hpp"
+#include "mxprotector/pe/pe_image_binary_adapter.hpp"
+#include "mxprotector/target/binary_image.hpp"
 #include "mxprotector/target/target_info.hpp"
 
 namespace mx {
@@ -74,7 +76,10 @@ public:
                       ProtectionConfig config,
                       std::shared_ptr<analysis::IDisassembler> disasm);
 
-    ~ProtectionContext() = default;
+    /// Out-of-line so the destructors of the unique_ptr-held forward-
+    /// declared types (`PeImageBinaryAdapter`, `pe::ILayoutPolicy`)
+    /// are instantiated where they are complete — see `context.cpp`.
+    ~ProtectionContext();
 
     ProtectionContext(const ProtectionContext&) = delete;
     ProtectionContext& operator=(const ProtectionContext&) = delete;
@@ -161,7 +166,27 @@ public:
     }
 
     /// @brief Установить дескриптор target платформы.
-    void set_target(target::TargetInfo info) noexcept { target_ = info; }
+    void set_target(target::TargetInfo info) noexcept;
+
+    // ====================================================================
+    // Format-agnostic binary-image facade (R3 — IBinaryImage wiring)
+    // ====================================================================
+
+    /**
+     * @brief Format-agnostic view over the underlying image.
+     *
+     * Container-agnostic passes (mutation, obfuscation, parts of CFF,
+     * future ELF / Mach-O work) read the image through this seam so
+     * they work uniformly across PE / ELF / Mach-O. The current build
+     * always returns a `PeImageBinaryAdapter` over the owned `PeImage`;
+     * future ELF / Mach-O builds will swap in their own
+     * `IBinaryImage` implementations without touching call sites.
+     *
+     * Hot-path passes that need the rich PE-specific API keep using
+     * `pe_image()` directly — that escape hatch stays.
+     */
+    [[nodiscard]] target::IBinaryImage& binary_image() noexcept;
+    [[nodiscard]] const target::IBinaryImage& binary_image() const noexcept;
 
     // ====================================================================
     // Section layout policy (R2.2)
@@ -308,6 +333,11 @@ private:
     /// constructor so the header stays free of `<memory>` for the
     /// concrete `StandardLayout` type — see `context.cpp`.
     std::unique_ptr<pe::ILayoutPolicy>               layout_policy_;
+    /// Format-agnostic adapter exposing `image_` through
+    /// `target::IBinaryImage`. Constructed alongside the layout
+    /// policy in `context.cpp` so the header stays free of the
+    /// adapter definition.
+    std::unique_ptr<pe::PeImageBinaryAdapter>        binary_adapter_;
 };
 
 } // namespace mx

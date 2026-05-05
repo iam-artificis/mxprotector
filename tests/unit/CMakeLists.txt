@@ -35,6 +35,7 @@ set(TEST_SOURCES
     guard_decrypt_unit_test.cpp
     guard_tls_installer_test.cpp
     target_info_test.cpp
+    pe_image_binary_adapter_test.cpp
     pe_parser_pe_type_test.cpp
     section_intent_test.cpp
     layout_policy_test.cpp
@@ -206,6 +207,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/cfg_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_image.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_image_binary_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_parser.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp

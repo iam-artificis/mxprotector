@@ -5,6 +5,8 @@
 
 #include "mxprotector/protection/cfg/state_reg_picker.hpp"
 
+#include <optional>
+
 #include <Zydis/Zydis.h>
 
 namespace mx::cff {

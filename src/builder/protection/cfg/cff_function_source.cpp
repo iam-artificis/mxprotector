@@ -5,6 +5,8 @@
 
 #include "mxprotector/protection/cfg/cff_function_source.hpp"
 
+#include <optional>
+
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/pe/pe_image.hpp"
 #include "mxprotector/protection/cfg/cff_safety_filters.hpp"

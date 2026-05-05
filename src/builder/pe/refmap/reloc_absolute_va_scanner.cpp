@@ -6,6 +6,7 @@
 #include "mxprotector/pe/refmap/reloc_absolute_va_scanner.hpp"
 
 #include <cstring>
+#include <optional>
 #include <variant>
 
 #include "mxprotector/pe/pe_image.hpp"

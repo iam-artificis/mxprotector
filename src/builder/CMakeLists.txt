@@ -26,6 +26,7 @@ set(BUILDER_SOURCES
 
     # PE-модуль
     pe/pe_image.cpp
+    pe/pe_image_binary_adapter.cpp
     pe/pe_parser.cpp
     pe/pe_builder.cpp
     pe/section_manager.cpp
