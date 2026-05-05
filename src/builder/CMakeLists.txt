@@ -198,6 +198,8 @@ set(BUILDER_SOURCES
     protection/packer/packer_section_encryptor.cpp
     protection/packer/packer_setup.cpp
     protection/packer/cipher_body.cpp
+    protection/packer/cipher_body_multi_layer.cpp
+    protection/packer/cipher_body_reprotect.cpp
     protection/packer/driver_cipher_body.cpp
     protection/packer/reloc_applier.cpp
     protection/packer/reloc_partition.cpp

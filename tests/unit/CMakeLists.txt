@@ -168,6 +168,8 @@ set(PACKER_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_section_encryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/packer_setup.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body_multi_layer.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/cipher_body_reprotect.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/driver_cipher_body.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/reloc_applier.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/packer/reloc_partition.cpp
