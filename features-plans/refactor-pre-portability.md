@@ -539,6 +539,117 @@ behaviour, full ctest + 15-run stress):**
 (15/15 on `mx_test_target` × `-l strong`). Two skipped files
 documented as cohesive-by-design.
 
+### R11 — `port-packer-pipeline` (PackerPass → IPackerStubBackend)
+
+**Status as of 2026-05-05:** **shipped** (one migration commit
++ one cleanup commit).
+
+R8.4 declared `IPackerStubBackend` + the `PackerStubPatches`
+variant + `X64PeStubBackend` adapter. R11 retypes the consumer:
+
+  * `PackerPipeline<Emitter>` (template, instantiated 4× per-shape)
+    → non-template `PackerPipeline` taking `(ProtectionContext&,
+    PackerStubKind, std::unique_ptr<IPackerStubBackend>)`.
+  * `Emitter::patches_type patches_` → `PackerStubPatches patches_`
+    (variant). Two `std::visit` getters return const-refs to
+    the `CipherBodyPatches` / `CommonStubPatches` base subobjects
+    every downstream patcher already takes.
+  * `if constexpr (std::is_same_v<Emitter, DriverStubEmitter> || ...)`
+    → `is_driver_or_efi()` runtime check on `kind_`.
+  * `step3_emit_stub_body()` returns `MxStatus` so a backend
+    `produce()` failure propagates instead of silently emitting
+    empty bytes.
+  * `PackerPass::execute` resolves the backend via
+    `X64PeStubBackendFactory::create(arch::ArchInfo::x64_baseline(),
+    ctx.target().container)`.
+
+Cleanup (R11.5): the four `*StubEmitter` policy-wrapper classes
+and the `StubEmitter` concept that only existed to satisfy the
+removed template are deleted from `stub_emitter.hpp`. The
+`build_*_stub_bytes` free functions (X64PeStubBackend's actual
+byte drivers) and the four `*StubPatches` structs stay.
+`stub_emitter.hpp`: 382 → 262 LOC.
+
+**Acceptance:** ✅ Linux + Windows ctest 847/847; stress 15/15
+on every shape. Adding a future arm64 PE backend or ELF
+backend now lands as: one new `IPackerStubBackendFactory` impl
++ one factory selection line in `PackerPass::execute`, no
+churn in `PackerPipeline`.
+
+### R12 — `port-code-emitter-adoption` — audit + scope retraction
+
+**Status as of 2026-05-05:** **audited + scope retracted**.
+The R8.2 seam (`arch::ICodeEmitter` + `X86ArchEmitter` adapter)
+stays as-is for new code that wants the abstract interface;
+existing X86CodeEmitter consumers are intentionally NOT
+migrated, with the rationale documented here.
+
+**Audit findings (5 files use X86CodeEmitter directly):**
+
+  * `src/builder/analysis/x86_code_emitter.cpp` — backend impl
+    (legitimate).
+  * `src/builder/analysis/x86_arch_emitter.cpp` — the R8.2
+    adapter (legitimate; wraps X86CodeEmitter into ICodeEmitter).
+  * `src/builder/protection/cfg/dispatcher_gen.cpp` — CFG
+    flattening dispatcher emission. Uses `em.push`, `em.pop`,
+    `em.lea`, `x86::Reg::rsp` — all x86-specific.
+  * `src/builder/protection/obfuscation/mba_transform.cpp` —
+    Mixed Boolean-Arithmetic identity emission. Uses
+    `em.not_`, `em.shl`, plus the standard
+    `mov/add/sub/xor/and/or/cmp` family. `not_` and `shl` are
+    not in `arch::ICodeEmitter`.
+  * `src/builder/protection/mutation/instruction_splitter.cpp` —
+    splits one x86 instruction into two equivalent x86
+    instructions (e.g., `add reg, imm8` → two `add reg, imm`).
+    The whole concept is x86-specific; arm64 has its own
+    splitter strategies (different mnemonics, different
+    immediate encoding rules).
+
+**Why migration is the wrong move here:**
+
+`arch::ICodeEmitter` exposes a small, target-agnostic operation
+set: `mov_rr` / `mov_ri` / `load` / `store` / `add_rr` / `xor_rr`
+/ `cmp_ri` / `jmp` / `jcc` / `call` / `ret` / `raw`. All five
+consumers above use x86 mnemonics (`push`, `pop`, `lea`, `shl`,
+`not_`) that `ICodeEmitter` deliberately does NOT include —
+each has no clean arm64 equivalent (`pop` ≈ `LDP`, `lea` ≈
+`ADD <Xd>, <Xn>, <imm>{, lsl <#shift>}`, etc., but the
+direct-translation cost is high enough that arm64 emission
+should drive its own pattern).
+
+Two unattractive options surface if we force migration:
+
+  1. Replace every X86CodeEmitter call with `em.raw(<x86 bytes>)`.
+     The abstraction layer becomes pass-through; portability
+     gain is zero; we lose the typed mnemonic API the calls
+     already use.
+  2. Grow `ICodeEmitter` to include `push` / `pop` / `lea` /
+     `shl` / `not`. Each of these poisons the abstraction with
+     x86-style operations that arm64 backends would have to
+     simulate awkwardly. ISP violation: pass code that only
+     wants `mov_ri` would now depend on `push` / `pop` /
+     `lea`.
+
+**Decision:** keep existing X86CodeEmitter consumers as-is —
+they are *intentionally x86-specific passes*. When arm64 lands,
+the right shape is sibling files: `protection/cfg/arm64_dispatcher_gen.cpp`,
+`protection/obfuscation/arm64_mba_transform.cpp`,
+`protection/mutation/arm64_instruction_splitter.cpp` — each
+implementing the same high-level pass interface but emitting
+arch-specific code. This matches the existing pattern of
+`protection/vm/x64/` containing the x64-specific VM byte
+emitters. The `arch::ICodeEmitter` seam is the right place for
+genuinely cross-arch code (e.g., a future generic state-update
+helper) but is the wrong fit for an x86-MBA identity emitter.
+
+**Acceptance:** ✅ no code changes — audit complete. The
+R8.2 seam stays available; consumers documented as
+arch-specific by design.
+
+### R13 — `port-vm-engine` (split target-agnostic VM policy)
+
+(pending — see Follow-up branches below)
+
 ## Out of scope for this branch
 
   * Implementing arm64 backends.
