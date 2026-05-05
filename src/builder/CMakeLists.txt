@@ -31,6 +31,7 @@ set(BUILDER_SOURCES
     pe/pe_builder.cpp
     pe/section_manager.cpp
     pe/import_table.cpp
+    pe/import_table_parser.cpp
     pe/export_table.cpp
     pe/relocation_table.cpp
     pe/section_emitter.cpp

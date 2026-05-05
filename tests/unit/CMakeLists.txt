@@ -220,6 +220,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/pe_parser.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/import_table_parser.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/export_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/relocation_table.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/section_emitter.cpp
