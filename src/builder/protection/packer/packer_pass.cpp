@@ -4,8 +4,9 @@
  *
  * `PackerPass` is a thin facade over a seven-step pipeline. Every
  * sub-step lives in its own translation unit; this file is the
- * orchestrator that threads them together and owns the
- * EXE/DLL/SYS-specific stub-shape choice.
+ * orchestrator that threads them together and resolves the stub
+ * shape (EXE / DLL / SYS / EFI) at runtime through
+ * `IPackerStubBackend`.
  *
  * Pipeline (decrypt order at runtime is the reverse):
  *
@@ -19,10 +20,12 @@
  *           base keys, mark target sections writable, decide the G3
  *           VEH trap gate.
  *
- *   step3 — the policy Emitter (`ExeStubEmitter` /
- *           `DllFullStubEmitter` / `DriverStubEmitter` from
- *           `stub_emitter.hpp`) produces the stub code bytes +
- *           `CipherBodyPatches`.
+ *   step3 — `IPackerStubBackend::produce(kind, ...)` produces the
+ *           stub bytes + a per-shape `PackerStubPatches` variant
+ *           (R11). The variant index matches `kind`; downstream
+ *           steps read `CipherBodyPatches` / `CommonStubPatches` via
+ *           the `cipher_patches()` / `common_patches()` `std::visit`
+ *           helpers.
  *
  *   step4 — `packer::append_stub_artifacts` walks the fixed
  *           stub-tail layout: per-layer keys, sbox scratch, P3
@@ -33,11 +36,12 @@
  *   step5 — inject the .mxpack section via `finalize_packer_stub`,
  *           then delegate every rel32 / imm32 / anchor patch to
  *           `packer::apply_post_inject_patches` (analogue of
- *           `x64_blob_patcher`).
+ *           `x64_blob_patcher`). The driver / EFI shapes use the
+ *           subset patcher `packer::apply_driver_post_inject_patches`.
  *
  *   step6 — `packer::finalize_tls_metadata` fills the TLS directory
  *           and callback array, points `DataDirectory[TLS]` at the
- *           new directory.
+ *           new directory. No-op for driver / EFI shapes.
  *
  *   step7 — `packer::hash_derive_and_encrypt` stamps the self-hash
  *           count imm32, computes FNV-1a over the stub, derives
@@ -46,6 +50,7 @@
  */
 
 #include "mxprotector/protection/packer/packer_pass.hpp"
+#include "mxprotector/arch/arch_info.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/pe/pe_image.hpp"
@@ -55,15 +60,18 @@
 #include "mxprotector/protection/packer/packer_section_encryptor.hpp"
 #include "mxprotector/protection/packer/packer_setup.hpp"
 #include "mxprotector/protection/packer/packer_stub_artifacts.hpp"
+#include "mxprotector/protection/packer/packer_stub_backend.hpp"
 #include "mxprotector/protection/packer/packer_stub_patcher.hpp"
 #include "mxprotector/protection/packer/packer_tls_finalizer.hpp"
 #include "mxprotector/protection/packer/rc4_stream_cipher.hpp"
 #include "mxprotector/protection/packer/reloc_partition.hpp"
 #include "mxprotector/protection/packer/stub_emitter.hpp"
+#include "mxprotector/protection/packer/x64_pe_stub_backend.hpp"
 
-#include <concepts>
+#include <memory>
 #include <span>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace mx {
@@ -71,20 +79,51 @@ namespace mx {
 namespace {
 
 using mx::packer::CommonStubPatches;
-using mx::packer::DllFullStubEmitter;
-using mx::packer::DriverStubEmitter;
-using mx::packer::EfiStubEmitter;
-using mx::packer::ExeStubEmitter;
+using mx::packer::IPackerStubBackend;
+using mx::packer::IPackerStubBackendFactory;
 using mx::packer::OepStealResult;
+using mx::packer::PackerStubKind;
+using mx::packer::PackerStubPatches;
+using mx::packer::PackerStubResult;
 using mx::packer::StubArtifactsInfo;
 using mx::packer::StubEmissionParams;
-using mx::packer::StubEmitter;
+using mx::packer::X64PeStubBackendFactory;
 using mx::packer::collect_target_sections;
 using mx::packer::finalize_packer_stub;
 using mx::packer::kKeySize;
 using mx::packer::prepare_oep_steal;
 
-/// Orchestration state for one `execute_encrypted_stub<Emitter>` call.
+/// Map from `PeType` to the matching `PackerStubKind` so step3 can
+/// drive the runtime backend.
+[[nodiscard]] PackerStubKind kind_for_pe_type(PeType pe_type) noexcept {
+    switch (pe_type) {
+        case PeType::executable:      return PackerStubKind::exe_executable;
+        case PeType::dynamic_library: return PackerStubKind::dll_full;
+        case PeType::kernel_driver:   return PackerStubKind::driver;
+        case PeType::efi_application: return PackerStubKind::efi;
+    }
+    // Caller (`PackerPass::execute`) gates on `is_applicable`, which
+    // requires `is_windows_pe_x64`; a value outside the known set
+    // reaches here only on a future PE-type extension that forgot to
+    // update this switch. Default to EXE — safest fallback because
+    // every `is_applicable` PE has at least the EXE shape.
+    return PackerStubKind::exe_executable;
+}
+
+/// Steal label that pairs with each stub kind. Drives
+/// `prepare_oep_steal`'s log line; the label has no impact on byte
+/// emission.
+[[nodiscard]] std::string_view steal_label_for_kind(PackerStubKind kind) noexcept {
+    switch (kind) {
+        case PackerStubKind::exe_executable: return "OEP";
+        case PackerStubKind::dll_full:       return "DllMain";
+        case PackerStubKind::driver:         return "DriverEntry";
+        case PackerStubKind::efi:            return "_ModuleEntryPoint";
+    }
+    return "OEP";
+}
+
+/// Orchestration state for one `execute_encrypted_stub` call.
 ///
 /// Holds all cross-step state (`steal_`, `layer_keys_`, `encrypted_`,
 /// `stub_buf_`, `patches_`, `artifacts_`, `stub_rva_`) as private
@@ -92,12 +131,21 @@ using mx::packer::prepare_oep_steal;
 /// 2 can short-circuit via `skip_` when the image has no encryptable
 /// target, and steps 5 and 7 can propagate `MxStatus` errors
 /// (section-injection failure, bad hash range).
-template <StubEmitter Emitter>
-    requires std::constructible_from<Emitter, StubEmissionParams>
+///
+/// The pipeline is shape-agnostic: it owns one `IPackerStubBackend`
+/// (resolved by the caller via `IPackerStubBackendFactory`) and a
+/// `PackerStubKind` enum, and dispatches between user-mode and
+/// driver / EFI specifics on the kind value at runtime.
 class PackerPipeline {
 public:
-    PackerPipeline(ProtectionContext& ctx, std::string_view steal_label) noexcept
-        : ctx_(ctx), steal_label_(steal_label) {}
+    PackerPipeline(ProtectionContext&                  ctx,
+                   PackerStubKind                      kind,
+                   std::unique_ptr<IPackerStubBackend> backend) noexcept
+        : ctx_(ctx)
+        , kind_(kind)
+        , backend_(std::move(backend))
+        , steal_label_(steal_label_for_kind(kind))
+    {}
 
     [[nodiscard]] MxStatus execute() {
         step1_prepare();
@@ -105,7 +153,7 @@ public:
         step2_generate_keys_and_targets();
         if (skip_) return {};
         step2b_partition_relocs();
-        step3_emit_stub_body();
+        if (auto r = step3_emit_stub_body(); !r) return r;
         step4_append_artifacts();
         if (auto r = step5_inject_and_patch(); !r) return r;
         step6_finalize_tls();
@@ -120,6 +168,33 @@ private:
         Rva         rva;
         std::uint32_t size;
     };
+
+    /// `true` for kernel-driver and UEFI shapes, where the stub
+    /// uses the subset cipher body without the user-mode reprotect
+    /// loop / IAT wipe / TLS plumbing.
+    [[nodiscard]] bool is_driver_or_efi() const noexcept {
+        return kind_ == PackerStubKind::driver ||
+               kind_ == PackerStubKind::efi;
+    }
+
+    /// Read access to the `CipherBodyPatches` slice of the active
+    /// variant alternative — the downstream patchers and step7
+    /// only need this base.
+    [[nodiscard]] const packer::CipherBodyPatches& cipher_patches() const {
+        return std::visit(
+            [](const auto& p) -> const packer::CipherBodyPatches& {
+                return p;
+            }, patches_);
+    }
+
+    /// Read access to the `CommonStubPatches` slice — `step5`'s
+    /// `finalize_packer_stub` uses this.
+    [[nodiscard]] const CommonStubPatches& common_patches() const {
+        return std::visit(
+            [](const auto& p) -> const CommonStubPatches& {
+                return p;
+            }, patches_);
+    }
 
     void step1_prepare() {
         target_indices_ = collect_target_sections(ctx_.pe_image(),
@@ -257,37 +332,41 @@ private:
         }
     }
 
-    void step3_emit_stub_body() {
-        Emitter emitter{StubEmissionParams{
+    [[nodiscard]] MxStatus step3_emit_stub_body() {
+        const StubEmissionParams params{
             .section_count        =
                 static_cast<std::uint32_t>(encrypted_.size()),
             .layer_count          = layer_count_,
             .enable_veh_trap      = enable_veh_trap_,
             .apply_relocs_inline  = apply_relocs_inline_,
-        }};
-        auto [stub_buf, patches] = emitter.emit(
-            rng_,
-            ByteView{steal_.stolen_bytes.data(), steal_.stolen_bytes.size()});
-        stub_buf_ = std::move(stub_buf);
-        patches_  = std::move(patches);
+        };
+        auto produced = backend_->produce(
+            kind_, rng_,
+            ByteView{steal_.stolen_bytes.data(), steal_.stolen_bytes.size()},
+            params);
+        if (!produced) {
+            return std::unexpected(produced.error());
+        }
+        stub_buf_ = std::move(produced->bytes);
+        patches_  = std::move(produced->patches);
+        return {};
     }
 
     void step4_append_artifacts() {
         // `emit_tls` is forced off for kernel drivers and UEFI
         // applications — neither image loader honours
         // `DataDirectory[TLS]` (UEFI has no TLS facility at all),
-        // and `step6_finalize_tls` is already a compile-time no-op
-        // for both shapes.
-        constexpr bool emit_tls =
-            !std::is_same_v<Emitter, DriverStubEmitter> &&
-            !std::is_same_v<Emitter, EfiStubEmitter>;
+        // and `step6_finalize_tls` is already a no-op for both
+        // shapes.
+        const bool emit_tls = !is_driver_or_efi();
+        const auto& cb = cipher_patches();
         artifacts_ = packer::append_stub_artifacts(
             ctx_, stub_buf_, rng_,
             layer_keys_,
             layer_count_,
             encrypted_.size(),
-            patches_.ksa_block_start_offset,
-            patches_.ksa_block_end_offset,
+            cb.ksa_block_start_offset,
+            cb.ksa_block_end_offset,
             ByteView{stub_private_relocs_.data(),
                      stub_private_relocs_.size()},
             emit_tls);
@@ -302,7 +381,7 @@ private:
 
         auto inject = finalize_packer_stub(
             ctx_, std::move(stub_buf_),
-            pack_intent, steal_, patches_);
+            pack_intent, steal_, common_patches());
         if (!inject) return std::unexpected(inject.error());
 
         pack_section_index_ = inject->pack_section_index;
@@ -319,17 +398,15 @@ private:
         // driver and UEFI versions skip them because the driver
         // cipher body (shared with the EFI stub) never emits the
         // corresponding code.
-        if constexpr (std::is_same_v<Emitter, DriverStubEmitter> ||
-                      std::is_same_v<Emitter, EfiStubEmitter>)
-        {
+        if (is_driver_or_efi()) {
             packer::apply_driver_post_inject_patches(
                 ctx_, pack_sec.data, stub_rva_,
-                layer_count_, patches_, artifacts_,
+                layer_count_, cipher_patches(), artifacts_,
                 std::span<const packer::TargetSection>{tgt_sections});
         } else {
             packer::apply_post_inject_patches(
                 ctx_, pack_sec.data, stub_rva_,
-                layer_count_, patches_, artifacts_,
+                layer_count_, cipher_patches(), artifacts_,
                 std::span<const packer::TargetSection>{tgt_sections});
         }
 
@@ -337,11 +414,7 @@ private:
     }
 
     void step6_finalize_tls() {
-        if constexpr (std::is_same_v<Emitter, DriverStubEmitter> ||
-                      std::is_same_v<Emitter, EfiStubEmitter>)
-        {
-            return;
-        }
+        if (is_driver_or_efi()) return;
         auto& pack_sec = ctx_.pe_image().sections()[pack_section_index_];
         packer::finalize_tls_metadata(
             ctx_, pack_sec.data, stub_rva_, artifacts_);
@@ -357,19 +430,22 @@ private:
                           encrypted_[i].size};
         }
 
+        const auto& cb = cipher_patches();
         packer::Rc4StreamCipher cipher;
         return packer::hash_derive_and_encrypt(
             ctx_, pack_sec.data,
-            patches_.hash_range_end_offset,
-            patches_.self_hash.count_imm32_offset,
+            cb.hash_range_end_offset,
+            cb.self_hash.count_imm32_offset,
             layer_count_, layer_keys_,
             std::span<const packer::EncryptionTarget>{targets},
             cipher);
     }
 
     // --- inputs ------------------------------------------------------
-    ProtectionContext& ctx_;
-    std::string_view   steal_label_;
+    ProtectionContext&                  ctx_;
+    PackerStubKind                      kind_;
+    std::unique_ptr<IPackerStubBackend> backend_;
+    std::string_view                    steal_label_;
 
     // --- shared rng used across steps 2/3/4 --------------------------
     Randomizer rng_{};
@@ -391,9 +467,9 @@ private:
     /// relocations were found.
     ByteBuffer                   stub_private_relocs_;
 
-    // --- step3 outputs (emitter) -------------------------------------
-    ByteBuffer                     stub_buf_;
-    typename Emitter::patches_type patches_{};
+    // --- step3 outputs (backend) -------------------------------------
+    ByteBuffer        stub_buf_;
+    PackerStubPatches patches_{};
 
     // --- step4 outputs -----------------------------------------------
     StubArtifactsInfo artifacts_{};
@@ -403,44 +479,33 @@ private:
     Rva         stub_rva_           = 0;
 };
 
-/// Thin wrapper retained so the facade below keeps its familiar
-/// call-site shape. Behaviour is entirely in `PackerPipeline`.
-template <StubEmitter Emitter>
-    requires std::constructible_from<Emitter, StubEmissionParams>
-[[nodiscard]] MxStatus execute_encrypted_stub(ProtectionContext& ctx,
-                                              std::string_view   steal_label)
-{
-    return PackerPipeline<Emitter>(ctx, steal_label).execute();
-}
-
 } // anonymous namespace
 
 bool PackerPass::is_applicable(const ProtectionContext& ctx) const noexcept {
     if (!ctx.config().enable_packer)        return false;
     if (!ctx.target().is_windows_pe_x64())  return false;
     // EXE / DLL / SYS / EFI are all dispatched below — every kind
-    // has its own dedicated stub emitter. The Feature C EFI path
-    // shares the driver cipher body and post-inject patcher.
+    // has its own dedicated stub kind on the backend.
     return true;
 }
 
 MxStatus PackerPass::execute(ProtectionContext& ctx) {
     ctx.log("PackerPass: начало самораспаковывающейся защиты");
 
-    const auto pe_type = ctx.pe_image().pe_type();
-    if (pe_type == PeType::executable) {
-        return execute_encrypted_stub<ExeStubEmitter>(ctx, "OEP");
+    // Resolve the stub backend through the factory. R8.4 wired
+    // `IPackerStubBackend` + `X64PeStubBackendFactory`; this is the
+    // first consumer-side migration off the per-shape Emitter
+    // template (R11). A future arm64 PE backend or ELF backend
+    // becomes one new factory + one factory selection here.
+    X64PeStubBackendFactory factory;
+    auto backend = factory.create(arch::ArchInfo::x64_baseline(),
+                                  ctx.target().container);
+    if (!backend) {
+        return std::unexpected(backend.error());
     }
-    if (pe_type == PeType::dynamic_library) {
-        return execute_encrypted_stub<DllFullStubEmitter>(ctx, "DllMain");
-    }
-    if (pe_type == PeType::kernel_driver) {
-        return execute_encrypted_stub<DriverStubEmitter>(ctx, "DriverEntry");
-    }
-    if (pe_type == PeType::efi_application) {
-        return execute_encrypted_stub<EfiStubEmitter>(ctx, "_ModuleEntryPoint");
-    }
-    return {};
+
+    const auto kind = kind_for_pe_type(ctx.pe_image().pe_type());
+    return PackerPipeline(ctx, kind, std::move(*backend)).execute();
 }
 
 } // namespace mx
