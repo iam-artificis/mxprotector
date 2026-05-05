@@ -113,6 +113,8 @@ set(VM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_entry_stub.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_handler_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_backend.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_session.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/vm/x64/x64_vm_session_step1.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/zydis_disassembler.cpp
 )
 

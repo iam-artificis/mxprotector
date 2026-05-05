@@ -646,9 +646,69 @@ helper) but is the wrong fit for an x86-MBA identity emitter.
 R8.2 seam stays available; consumers documented as
 arch-specific by design.
 
-### R13 — `port-vm-engine` (split target-agnostic VM policy)
+### R13 — `port-vm-engine` — file split + engine-extraction retraction
 
-(pending — see Follow-up branches below)
+**Status as of 2026-05-05:** **shipped** (one split commit) +
+engine-extraction explicitly retracted with rationale.
+
+**File split (x64_vm_backend.cpp 595 → 72 LOC):**
+
+The backend file mixed three concerns: the public facade, the
+seven-step generation pipeline (`GenerationSession`), and the
+heavy per-build randomisation policy in `step1_randomize`.
+Split by responsibility:
+
+  * `x64_vm_backend.cpp` (72 LOC) — public facade only:
+    `X64VmBackend::generate` (validates request, delegates to
+    session) + `X64VmBackendFactory::create`.
+  * `x64_vm_session.{hpp,cpp}` (134 + 266 LOC) — `GenerationSession`
+    declaration + `run()` + the light delegating step methods
+    (step2..step4 + step3a/3/3f/3g) that forward to the
+    sibling byte-emitter files.
+  * `x64_vm_session_step1.cpp` (185 LOC) — `step1_randomize`,
+    the heavy per-build policy step (opcode permutation, vEFLAGS
+    scramble, stack layout, specialisation picks, handler-id
+    shuffle, per-handler keys). Lives in its own TU so the
+    policy logic is independently readable / testable.
+
+`x64_vm_session.hpp` is a private header under
+`src/builder/protection/vm/x64/` — public consumers see only
+`X64VmBackend` from `mxprotector/protection/vm/x64/x64_vm_backend.hpp`.
+
+**Engine-extraction decision (NOT done — retracted with rationale):**
+
+The original R13 plan was "extract target-agnostic policy into
+a shared `vm::VmRuntimeEngine`; the engine drives the backend
+through `IVmBackend`". On audit this turns out to be the wrong
+shape:
+
+  * R8.1 already declared `arch::IVmBackend` with one method:
+    `generate(instructions, rng, opts) -> VmRuntime`. The
+    interface IS the engine seam — there is no smaller seam to
+    introduce above it.
+  * The "policy" that step1_randomize encapsulates is only
+    *partly* target-agnostic. The handler-id shuffle and
+    per-handler key generation are abstract; vEFLAGS scramble
+    parameters, stack layout choice, and specialisable-op set
+    are all x86-specific. Splitting the abstract bits into a
+    `vm::policy` namespace would leave each backend with a
+    1-call wrapper — pure framework cost with no payoff.
+  * A `VmRuntimeEngine` class on top of `IVmBackend` would
+    duplicate the `IVmBackend::generate` API surface. ISP
+    violation on the framework side: every call site would
+    need to choose engine vs backend handle, where today they
+    just have one.
+  * When arm64 lands, an `Arm64VmBackend` will own its own
+    `GenerationSession` (likely with substantial reuse of the
+    abstract bits via free functions, not a class hierarchy).
+    The current x64 GenerationSession is a fine reference —
+    fork at that level when arm64 actually exists.
+
+**Acceptance:** ✅
+  * Linux ctest: 847/847.
+  * Windows ctest: 847/847.
+  * Stress: 15/15 on `mx_test_target` × `-l strong`.
+  * Every file under the 300-LOC cap.
 
 ## Out of scope for this branch
 

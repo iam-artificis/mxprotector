@@ -191,6 +191,8 @@ set(BUILDER_SOURCES
     protection/vm/x64/x64_entry_stub.cpp
     protection/vm/x64/x64_handler_emitter.cpp
     protection/vm/x64/x64_vm_backend.cpp
+    protection/vm/x64/x64_vm_session.cpp
+    protection/vm/x64/x64_vm_session_step1.cpp
 
     # Phase 5: Self-unpacking packer (multi-section XOR + anti-debug + IAT wipe)
     protection/packer/packer_pass.cpp
