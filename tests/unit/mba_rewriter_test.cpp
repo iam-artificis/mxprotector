@@ -34,6 +34,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_alu_rr_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mba_unary_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
 #include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/substitution_rule_groups.hpp"
@@ -993,6 +994,119 @@ TEST(MbaRewriter, AndRrAffinePreservesSemantics) {
         mx::mutation::mba::AluImm32Op::and_, "and-rr-affine", 0x21, "and");
 }
 
+// ---------------------------------------------------------------------------
+// Unary (NOT/NEG) decoder + semantic tests.
+// ---------------------------------------------------------------------------
+
+/// Encode `<op> rax` as `48 F7 /<reg>` with mod=3, rm=rax(0).
+mx::ByteBuffer encode_unary_rax(std::uint8_t reg_field) {
+    return {0x48, 0xF7, static_cast<std::uint8_t>(0xC0 | (reg_field << 3))};
+}
+
+TEST(MbaUnaryDecoder, AcceptsNotRax) {
+    auto insn = make_insn(encode_unary_rax(2), "not", "rax");
+    auto view = mx::mutation::mba::decode_unary(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op,  mx::mutation::mba::UnaryOp::not_);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_TRUE(view->is_64bit);
+}
+
+TEST(MbaUnaryDecoder, AcceptsNegR11) {
+    // `neg r11` → REX.W|REX.B F7 /3 with rm=r11(3 in low 3 bits).
+    auto insn = make_insn({0x49, 0xF7, 0xDB}, "neg", "r11");
+    auto view = mx::mutation::mba::decode_unary(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op,  mx::mutation::mba::UnaryOp::neg);
+    EXPECT_EQ(view->dst, mx::x86::Reg::r11);
+}
+
+TEST(MbaUnaryDecoder, RejectsForeignRegField) {
+    // F7 /0 is TEST r/m, imm — not in our set.
+    mx::ByteBuffer bytes{0x48, 0xF7, 0xC0, 0, 0, 0, 0};
+    auto insn = make_insn(std::move(bytes), "test", "rax, 0");
+    EXPECT_FALSE(mx::mutation::mba::decode_unary(insn).has_value());
+}
+
+TEST(MbaUnaryDecoder, RejectsMemoryOperand) {
+    // F7 /2 [rax] — mod=0, rm=rax. Memory operand → reject.
+    auto insn = make_insn({0x48, 0xF7, 0x10}, "not", "[rax]");
+    EXPECT_FALSE(mx::mutation::mba::decode_unary(insn).has_value());
+}
+
+TEST(MbaUnaryDecoder, RespectsExpectedOpFilter) {
+    auto insn = make_insn(encode_unary_rax(2), "not", "rax");
+    EXPECT_FALSE(mx::mutation::mba::decode_unary(
+        insn, mx::mutation::mba::UnaryOp::neg).has_value());
+}
+
+void check_unary_rewriter_semantics(
+    mx::mutation::mba::UnaryOp op,
+    std::string_view           rewriter_name,
+    std::uint32_t              seed)
+{
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(rewriter_name);
+    ASSERT_NE(rewriter, nullptr) << rewriter_name;
+
+    constexpr std::array<std::uint64_t, 5> kSampleX = {
+        0x0000000000000000ULL,
+        0x0000000000000001ULL,
+        0x000000007FFFFFFFULL,
+        0x0123456789ABCDEFULL,
+        0xFFFFFFFFFFFFFFFFULL,
+    };
+
+    mx::Randomizer rng(seed);
+    for (auto x : kSampleX) {
+        auto insn = make_insn(
+            encode_unary_rax(static_cast<std::uint8_t>(op)),
+            (op == mx::mutation::mba::UnaryOp::not_) ? "not" : "neg",
+            "rax");
+        ASSERT_TRUE(rewriter->matches(insn)) << rewriter_name;
+
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value()) << rewriter_name << " emit failed";
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, x);
+        sim.set_reg(mx::x86::Reg::r11, 0xDEADBEEF11223344ULL);
+        const auto pre_scratch = sim.get_reg(mx::x86::Reg::r11);
+
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << rewriter_name << " simulator stalled";
+
+        const std::uint64_t expected =
+            (op == mx::mutation::mba::UnaryOp::not_) ? ~x
+                                                     : (0ULL - x);
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), expected)
+            << rewriter_name << " mismatch for x=" << std::hex << x;
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::r11), pre_scratch)
+            << rewriter_name << " did not restore scratch";
+    }
+}
+
+TEST(MbaRewriter, NotRmTwoComplementPreservesSemantics) {
+    check_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::not_, "not-rm-twocomplement", 0xAAAA1u);
+}
+
+TEST(MbaRewriter, NotRmXorCancelPreservesSemantics) {
+    check_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::not_, "not-rm-xor-cancel", 0xBBBB2u);
+}
+
+TEST(MbaRewriter, NegRmNotAdd1PreservesSemantics) {
+    check_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::neg, "neg-rm-not-add1", 0xCCCC3u);
+}
+
+TEST(MbaRewriter, NegRmZeroSubPreservesSemantics) {
+    check_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::neg, "neg-rm-zero-sub", 0xDDDD4u);
+}
+
 TEST(MbaRewriter, ModularInversePreservesMovImmSemantics) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
     const auto* rewriter = registry.find("mov-imm-modular-inverse");
@@ -1195,7 +1309,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 34u);
+    EXPECT_EQ(registry.size(), 38u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -1230,6 +1344,10 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("xor-rr-affine"), nullptr);
     EXPECT_NE(registry.find("or-rr-affine"), nullptr);
     EXPECT_NE(registry.find("and-rr-affine"), nullptr);
+    EXPECT_NE(registry.find("not-rm-twocomplement"), nullptr);
+    EXPECT_NE(registry.find("not-rm-xor-cancel"), nullptr);
+    EXPECT_NE(registry.find("neg-rm-not-add1"), nullptr);
+    EXPECT_NE(registry.find("neg-rm-zero-sub"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {

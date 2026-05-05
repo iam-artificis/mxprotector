@@ -179,6 +179,20 @@ namespace factories {
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_rr_affine();
 
 // ---------------------------------------------------------------------------
+// Unary (NOT/NEG) shapes — `[REX] F7 /<2|3>` with mod = 3. Each op
+// gets two shape options:
+//   * NOT: `~x = -x - 1` (NEG + SUB) and `~x = (x^K) ^ ~K` (XOR + XOR).
+//   * NEG: `-x = ~x + 1` (NOT + ADD) and `-x = 0 - x` (MOV + XOR + SUB).
+// 2-byte (no REX) or 3-byte (with REX) sites — picked up via the
+// engine's multi-instruction redirect.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_not_rm_twocomplement();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_not_rm_xor_cancel();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_neg_rm_not_add1();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_neg_rm_zero_sub();
+
+// ---------------------------------------------------------------------------
 // MOV r32, imm32 shapes — `[REX.B] B8+rd id` (5/6 bytes).
 // ---------------------------------------------------------------------------
 

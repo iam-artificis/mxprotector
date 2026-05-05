@@ -158,7 +158,13 @@ set(BUILDER_SOURCES
     protection/mutation/mba/rewriters/or_rr_affine_rewriter.cpp
     protection/mutation/mba/rewriters/and_rr_affine_rewriter.cpp
     protection/mutation/mba/rewriters/rr_affine_aggregator.cpp
+    protection/mutation/mba/rewriters/not_rm_twocomplement_rewriter.cpp
+    protection/mutation/mba/rewriters/not_rm_xor_cancel_rewriter.cpp
+    protection/mutation/mba/rewriters/neg_rm_not_add1_rewriter.cpp
+    protection/mutation/mba/rewriters/neg_rm_zero_sub_rewriter.cpp
+    protection/mutation/mba/rewriters/unary_aggregator.cpp
     protection/mutation/mba/mba_alu_rr_decoder.cpp
+    protection/mutation/mba/mba_unary_decoder.cpp
     protection/mutation/mba/mba_affine_emit.cpp
     protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp

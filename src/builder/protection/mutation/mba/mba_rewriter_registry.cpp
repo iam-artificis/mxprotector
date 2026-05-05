@@ -67,6 +67,10 @@ MbaRewriterRegistry MbaRewriterRegistry::create_default() {
     // slot). One affine shape per ALU op family.
     register_rr_affine_rewriters(registry);
 
+    // Unary NOT/NEG MBA — 2 shapes per op. Same multi-instruction
+    // redirect path as the r-r family (sites are 2/3 bytes).
+    register_unary_rewriters(registry);
+
     // MOV-imm family covers both the 5/6-byte `mov r32, imm32`
     // (`B8+rd id`) and the 10/11-byte `mov r64, imm64`
     // (`REX.W B8+rd iq`) encodings — three shapes per width.

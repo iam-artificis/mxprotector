@@ -1,6 +1,12 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–12 merged on master, all stress green.
+**Status:** shipped — phases 1–13 merged on master, all stress green.
+
+**Roadmap completion:** all 5 deferred items from the original
+roadmap (r-r MBA, REX.W full 64-bit operand, affine MBA over a
+bitwise basis, multi-step deep chains, NOT/NEG MBA) shipped through
+phases 8–13. Engineering follow-on items (ALU multi-step deep
+chains) are documented as future work.
 
 ## What this is
 
@@ -44,6 +50,40 @@ or 6 (with REX.W), fitting the JMP rel32 redirect threshold.
 Coverage uplift on `test_vm_showcase.exe` at strong: redirect count
 180 → 195 (**+8.3%**). On binaries with more RAX-bound arithmetic
 (syscall stubs, ABI shims) the uplift will be larger.
+
+### Phase 13: NOT/NEG MBA
+
+Two shapes per unary op (4 rewriters total) targeting `[REX] F7 /<2|3>`
+with `mod = 3`. Each shape replaces the original unary opcode with
+a binary-arithmetic chain so frequency matchers tracking unary
+opcodes lose the signal.
+
+| Shape (name)             | Identity              | Body                       |
+| ------------------------ | --------------------- | -------------------------- |
+| `not-rm-twocomplement`   | `~x = -x - 1`         | `neg dst ; sub dst, 1`     |
+| `not-rm-xor-cancel`      | `~x = (x^K) ^ ~K`     | `xor dst, K ; xor dst, ~K` |
+| `neg-rm-not-add1`        | `-x = ~x + 1`         | `not dst ; add dst, 1`     |
+| `neg-rm-zero-sub`        | `-x = 0 - x`          | `mov s, dst ; xor dst, dst ; sub dst, s` |
+
+Pairing inside each op:
+* NOT — TWOCOMPLEMENT emits a NEG (changing the unary signal); 
+  XOR-CANCEL emits zero unary opcodes at all (pure binary arithmetic).
+* NEG — NOT-ADD1 emits a NOT (changing the unary signal); ZERO-SUB
+  emits zero unary opcodes (`mov + xor + sub` chain).
+
+The MBA adapter picks one of the two shapes uniformly per site, so
+roughly half the NOT/NEG sites get each treatment. The `xor-cancel`
+shape uses a per-site random `K` (forced outside imm8 range) for
+visual polymorphism between sites.
+
+2-byte (no REX) / 3-byte (with REX) sites — picked up via Phase 11's
+multi-instruction redirect.
+
+* New `mba_unary_decoder.hpp/cpp` decodes `[REX] F7 /<2|3>` with
+  `mod = 3`. Memory operands and foreign /reg extensions rejected.
+* 4 thin per-shape rewriter files + `unary_aggregator.cpp`.
+* 5 new decoder tests + 4 new semantic tests over a 5-element
+  sample set (including the `x = 0` and `x = -1` boundary values).
 
 ### Phase 12: Register-register ALU MBA
 
@@ -249,19 +289,21 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Phase 8 | Phase 9 | Phase 10 | Phase 11 | Phase 12 |
-| ---------------------------- | ------- | ------- | -------- | -------- | -------- |
-| MBA rewriters in registry    | 21      | 26      | 29       | 29       | 34       |
-| Per-ALU-imm shape options    | 3       | 4       | 4        | 4        | 4        |
-| Per-ALU-rr shape options     | 0       | 0       | 0        | 0        | 1        |
-| Per-MOV-imm32 shape options  | 3       | 3       | 3 + 3    | 3 + 3    | 3 + 3    |
-| Per-MOV-imm64 shape options  | 3       | 3       | 3        | 3        | 3        |
-| Affine `t` choices per site  | n/a     | 14      | 14       | 14       | 14       |
-| Multi-instruction redirect   | n/a     | n/a     | n/a      | yes      | yes      |
-| MBA tests                    | 49      | 54      | 57       | 57       | 68       |
-| Total ctest                  | 920     | 925     | 928      | 928      | 939      |
-| Stress (strong, 15 runs)     | 15/15   | 15/15   | 15/15    | 15/15    | 15/15    |
-| Stress (maximum, 15 runs)    | 15/15   | 15/15   | 15/15    | 15/15    | 15/15    |
+| Metric                       | Phase 9 | Phase 10 | Phase 11 | Phase 12 | Phase 13 |
+| ---------------------------- | ------- | -------- | -------- | -------- | -------- |
+| MBA rewriters in registry    | 26      | 29       | 29       | 34       | 38       |
+| Per-ALU-imm shape options    | 4       | 4        | 4        | 4        | 4        |
+| Per-ALU-rr shape options     | 0       | 0        | 0        | 1        | 1        |
+| Per-MOV-imm32 shape options  | 3       | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    |
+| Per-MOV-imm64 shape options  | 3       | 3        | 3        | 3        | 3        |
+| Per-NOT shape options        | 0       | 0        | 0        | 0        | 2        |
+| Per-NEG shape options        | 0       | 0        | 0        | 0        | 2        |
+| Affine `t` choices per site  | 14      | 14       | 14       | 14       | 14       |
+| Multi-instruction redirect   | n/a     | n/a      | yes      | yes      | yes      |
+| MBA tests                    | 54      | 57       | 57       | 68       | 77       |
+| Total ctest                  | 925     | 928      | 928      | 939      | 948      |
+| Stress (strong, 15 runs)     | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    |
+| Stress (maximum, 15 runs)    | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    |
 
 Phase 8 does not change redirect-site count on the showcase binary
 because that input is compiled with `mov r32, imm32` for all 32-bit
@@ -278,14 +320,20 @@ infrastructure cost is paid up front: future MBA work that targets
 The following are higher-effort or higher-risk and were not
 attempted in this pass:
 
-1. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
-   below the JMP rel32 threshold. Same multi-instruction-redirect
-   prerequisite as r-r forms.
-
-3. **ALU multi-step deep chains**: extend the Phase-10 deep-chain
+1. **ALU multi-step deep chains**: extend the Phase-10 deep-chain
    pattern to imm32 ALU rewriters by routing each basis-prep
    `or/and/xor reg, K` in the affine body through a recursive MBA
    layer. Requires a small refactor of `emit_affine_alu_body` to
    accept per-term `MovImmEmitter`-style overrides for the K-
    materialization. Mostly mechanical once the contract is in
    place; saved for a future MBA expansion.
+
+2. **NOT/NEG with deep chains**: the Phase-13 unary shapes are
+   single-layer; deep chains over the NOT/NEG body would compose
+   another MBA layer on top (e.g. apply XOR-cancel inside
+   two-complement). Same recursion contract as Phase 10 for MOV-imm.
+
+3. **r-r MBA over the SUB-r-r short-form `2C ib` family**: NOT
+   covered today — the imm8-form ALU encodings (`80/82/83 /<op> ib`,
+   3 bytes) need their own decoder and bodies that fit within the
+   multi-instruction redirect budget.

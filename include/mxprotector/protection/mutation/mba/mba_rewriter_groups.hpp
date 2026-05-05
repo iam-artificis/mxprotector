@@ -62,6 +62,20 @@ void register_or_imm_rewriters(MbaRewriterRegistry& registry);
 void register_and_imm_rewriters(MbaRewriterRegistry& registry);
 
 /**
+ * @brief Unary (NOT/NEG) MBA family.
+ *
+ * Two shapes per op (4 rewriters total) targeting `[REX] F7 /<2|3>`
+ * with `mod = 3`. Each shape replaces the original unary opcode
+ * with a binary-arithmetic chain so frequency matchers tracking
+ * unary opcodes lose the signal.
+ *
+ * 2-byte (no REX) / 3-byte (with REX) sites — relies on the
+ * engine's multi-instruction redirect (Phase 11) to widen the slot
+ * to ≥ 5 bytes by consuming 1..3 following instructions.
+ */
+void register_unary_rewriters(MbaRewriterRegistry& registry);
+
+/**
  * @brief r-r (register-register) ALU MBA family.
  *
  * Five affine shapes — one per ALU op (ADD/SUB/XOR/OR/AND) —
