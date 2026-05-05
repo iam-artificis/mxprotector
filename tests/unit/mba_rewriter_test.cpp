@@ -444,6 +444,16 @@ TEST(MbaRewriter, AddImmXorAndPreservesSemantics) {
         mx::mutation::mba::AluImm32Op::add, "add-imm-xor-and", "add"});
 }
 
+TEST(MbaRewriter, AddImmOrAndPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::add, "add-imm-or-and", "add"});
+}
+
+TEST(MbaRewriter, AddImmShiftOrXorPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::add, "add-imm-shift-or-xor", "add"});
+}
+
 TEST(MbaRewriter, SubImmXorAndPreservesSemantics) {
     check_rewriter_semantics({
         mx::mutation::mba::AluImm32Op::sub, "sub-imm-xor-and", "sub"});
@@ -504,13 +514,26 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 6u);
+    EXPECT_EQ(registry.size(), 8u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
+    EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
+    EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
     EXPECT_NE(registry.find("sub-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("xor-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("or-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("and-imm-or-xor"), nullptr);
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
+}
+
+TEST(MbaRewriterRegistry, FindMatchingReturnsAllAddShapesForAddSite) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    auto insn = make_insn(
+        encode_alu_imm32_rax(mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
+        "add", "rax, 0xDEADBEEF");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 3u)
+        << "every ADD-imm shape must match an `add r,K` site so the "
+        << "adapter can pick one uniformly at random per call";
 }
 
 TEST(MbaRewriterRegistry, FindMatchingDispatchesByOp) {

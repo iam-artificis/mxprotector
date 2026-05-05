@@ -28,6 +28,12 @@
  * Flags after the final ADD differ from the original in OF/AF
  * (same CF/ZF/SF/PF, see `mba_rewriter.hpp` for the full
  * preservation note).
+ *
+ * Per-family aggregator: this TU also hosts
+ * `register_add_imm_rewriters`, which collects every ADD-r,K MBA
+ * shape into the registry. Adding a shape is one new file under
+ * `rewriters/`, one factory declaration in
+ * `mba_rewriter_factories.hpp`, and one call in the aggregator.
  */
 
 #include "mxprotector/protection/mutation/mba/mba_rewriter_groups.hpp"
@@ -38,6 +44,7 @@
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_emit_helpers.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
+#include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 
 namespace mx::mutation::mba {
 
@@ -91,8 +98,23 @@ public:
 
 } // namespace
 
+namespace factories {
+
+std::unique_ptr<IMbaRewriter> make_add_imm_xor_and() {
+    return std::make_unique<AddImmXorAndRewriter>();
+}
+
+} // namespace factories
+
 void register_add_imm_rewriters(MbaRewriterRegistry& registry) {
-    registry.register_rewriter(std::make_unique<AddImmXorAndRewriter>());
+    // Three additive identities cover the same `81 /0 id` site.
+    // The MBA substitution adapter picks one uniformly at random
+    // per site — so two `add r, K` instructions in the same binary
+    // get visually-different bodies even though both reduce to
+    // `x + K` semantically.
+    registry.register_rewriter(factories::make_add_imm_xor_and());
+    registry.register_rewriter(factories::make_add_imm_or_and());
+    registry.register_rewriter(factories::make_add_imm_shift_or_xor());
 }
 
 } // namespace mx::mutation::mba

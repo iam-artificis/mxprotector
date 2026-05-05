@@ -132,6 +132,8 @@ set(BUILDER_SOURCES
     protection/mutation/mba/mba_alu_imm_decoder.cpp
     protection/mutation/mba/mba_rewriter_registry.cpp
     protection/mutation/mba/rewriters/add_imm_xor_and_rewriter.cpp
+    protection/mutation/mba/rewriters/add_imm_or_and_rewriter.cpp
+    protection/mutation/mba/rewriters/add_imm_shift_or_xor_rewriter.cpp
     protection/mutation/mba/rewriters/sub_imm_xor_and_rewriter.cpp
     protection/mutation/mba/rewriters/xor_imm_or_and_rewriter.cpp
     protection/mutation/mba/rewriters/or_imm_xor_and_rewriter.cpp
