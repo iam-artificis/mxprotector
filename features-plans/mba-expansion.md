@@ -1,12 +1,16 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–13 merged on master, all stress green.
+**Status:** shipped — phases 1–16 merged on master, all stress green.
 
 **Roadmap completion:** all 5 deferred items from the original
 roadmap (r-r MBA, REX.W full 64-bit operand, affine MBA over a
 bitwise basis, multi-step deep chains, NOT/NEG MBA) shipped through
-phases 8–13. Engineering follow-on items (ALU multi-step deep
-chains) are documented as future work.
+phases 8–13, plus all 3 deferred follow-on items (ALU multi-step
+deep chains, NOT/NEG with deep chains, imm8 short-form coverage)
+shipped through phases 14–16. Phase 16 also fixed a latent
+multi-instruction-redirect hazard around jump targets that affected
+phases 11+ but rarely triggered until imm8 sites broadened the MBA
+match surface.
 
 ## What this is
 
@@ -289,21 +293,24 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Phase 9 | Phase 10 | Phase 11 | Phase 12 | Phase 13 |
-| ---------------------------- | ------- | -------- | -------- | -------- | -------- |
-| MBA rewriters in registry    | 26      | 29       | 29       | 34       | 38       |
-| Per-ALU-imm shape options    | 4       | 4        | 4        | 4        | 4        |
-| Per-ALU-rr shape options     | 0       | 0        | 0        | 1        | 1        |
-| Per-MOV-imm32 shape options  | 3       | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    |
-| Per-MOV-imm64 shape options  | 3       | 3        | 3        | 3        | 3        |
-| Per-NOT shape options        | 0       | 0        | 0        | 0        | 2        |
-| Per-NEG shape options        | 0       | 0        | 0        | 0        | 2        |
-| Affine `t` choices per site  | 14      | 14       | 14       | 14       | 14       |
-| Multi-instruction redirect   | n/a     | n/a      | yes      | yes      | yes      |
-| MBA tests                    | 54      | 57       | 57       | 68       | 77       |
-| Total ctest                  | 925     | 928      | 928      | 939      | 948      |
-| Stress (strong, 15 runs)     | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    |
-| Stress (maximum, 15 runs)    | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    |
+| Metric                          | Phase 9 | Phase 10 | Phase 11 | Phase 12 | Phase 13 | Phase 14 | Phase 15 | Phase 16 |
+| ------------------------------- | ------- | -------- | -------- | -------- | -------- | -------- | -------- | -------- |
+| MBA rewriters in registry       | 26      | 29       | 29       | 34       | 38       | 43       | 45       | 45       |
+| Per-ALU-imm shape options (32b) | 4       | 4        | 4        | 4        | 4        | 5        | 5        | 5        |
+| Per-ALU-imm shape options (64b) | 4       | 4        | 4        | 4        | 4        | 4        | 4        | 4        |
+| Per-ALU-rr shape options        | 0       | 0        | 0        | 1        | 1        | 1        | 1        | 1        |
+| Per-MOV-imm32 shape options     | 3       | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    | 3 + 3    |
+| Per-MOV-imm64 shape options     | 3       | 3        | 3        | 3        | 3        | 3        | 3        | 3        |
+| Per-NOT shape options (32b)     | 0       | 0        | 0        | 0        | 2        | 2        | 3        | 3        |
+| Per-NEG shape options (32b)     | 0       | 0        | 0        | 0        | 2        | 2        | 3        | 3        |
+| imm8 short-form coverage        | n/a     | n/a      | n/a      | n/a      | n/a      | n/a      | n/a      | yes      |
+| Affine `t` choices per site     | 14      | 14       | 14       | 14       | 14       | 14       | 14       | 14       |
+| Multi-instruction redirect      | n/a     | n/a      | yes      | yes      | yes      | yes      | yes      | yes      |
+| Jump-target gate (engine)       | n/a     | n/a      | n/a      | n/a      | n/a      | n/a      | n/a      | yes      |
+| MBA tests                       | 54      | 57       | 57       | 68       | 77       | 86       | 89       | 96       |
+| Total ctest                     | 925     | 928      | 928      | 939      | 948      | 954      | 957      | 964      |
+| Stress (strong, 15 runs)        | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    |
+| Stress (maximum, 15 runs)       | 15/15   | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    | 15/15    |
 
 Phase 8 does not change redirect-site count on the showcase binary
 because that input is compiled with `mov r32, imm32` for all 32-bit
@@ -315,25 +322,88 @@ loaders), the new shapes contribute additional polymorphism. The
 infrastructure cost is paid up front: future MBA work that targets
 64-bit constants now has a working decoder + emitter contract.
 
+### Phase 14: ALU multi-step deep chains
+
+Five new shapes (`<op>-imm-deep-affine` for ADD/SUB/XOR/OR/AND).
+Outer is the `<op>-imm-affine` body; inner materialises K through a
+random MOV-imm MBA shape (modular-inverse / xor-blind /
+rotate-blind) into a scratch register, then basis prep does
+`op s, dst` (commutative). Stacks two MBA proofs in series.
+
+Constraint: 32-bit operand only (`is_64bit==false`). The 32-bit
+MOV-imm step functions zero-extend their destination — REX.W
+support would need an extra `movsxd` after K materialisation;
+documented as a roadmap extension.
+
+Per-site variability per ALU op: 3 inner shapes × 14 affine `t`
+choices = 42 SMT-distinct identities, in addition to the existing
+17 from the fixed + affine shapes.
+
+### Phase 15: NOT/NEG with deep chains
+
+Two new shapes:
+
+* `not-rm-deep-xor` — `~x = (x^K) ^ ~K` with K and ~K each
+  materialised via random MOV-imm MBA shape (modular-inverse /
+  xor-blind / rotate-blind) into a scratch register. The xor-cancel
+  uses the register form `xor dst, scratch` so the body emits zero
+  unary opcodes AND zero direct imm32 xor opcodes.
+* `neg-rm-deep-add` — `-x = ~x + K - (K-1)` with K and K-1 each
+  materialised via random MOV-imm MBA shape. Outer body has only
+  the initial NOT plus register-form ALU ops on the scratch.
+
+Same 32-bit operand constraint as Phase 14. Per-site variability:
+3 × 3 inner combinations × 2^31 K values = the deepest defeat
+strength of any shipped unary shape.
+
+### Phase 16: ALU imm8 short-form support
+
+Decoder change: `decode_alu_imm32` now also accepts the imm8 form
+`[REX] 83 /op ib` (3 bytes no-REX, 4 bytes with REX). Sign-extends
+imm8 → int32 in `view.imm` so every existing imm32 rewriter applies
+unchanged — no new shape files needed.
+
+Decoder safety gate: `decode_alu_imm32`, `decode_alu_rr`, and
+`decode_unary` now reject rsp dst (and rsp src for r-r). The MBA
+bodies wrap their work in `push scratch ... pop scratch` which
+corrupts a body that reads `view.dst == rsp`. Compilers emit
+`[REX.W] 83 /op ib` on rsp very aggressively (`sub rsp, 0x28` etc.),
+so the rsp gate is mandatory for imm8 support.
+
+Engine change (latent bug surfaced by Phase 16):
+`MutationEngine::mutate_region` now collects every branch target
+in the region and refuses to consume a jump-landing site during
+multi-instruction redirect widening. Without this, the planted
+`JMP rel32 + NOP pad` swallows a basic-block head, breaking any
+`jcc` that lands there. The hazard existed since Phase 11 but was
+rare in practice; imm8 ALU sites are common enough at the heads of
+basic blocks that the bug fires every build.
+
+Coverage uplift: imm8 sites are ~3-5× more common than imm32 sites
+in optimised compiler output. Every shipped MBA shape (fixed +
+affine + deep-affine + r-r affine + unary fixed + unary deep) now
+covers imm8 sites in addition to imm32.
+
 ## Roadmap (not in this expansion)
 
-The following are higher-effort or higher-risk and were not
-attempted in this pass:
+The roadmap is now complete — all 5 originally-deferred items plus
+all 3 follow-on items have shipped. Any future MBA work would be a
+fresh expansion, not a continuation of this plan. Possible
+directions, not committed:
 
-1. **ALU multi-step deep chains**: extend the Phase-10 deep-chain
-   pattern to imm32 ALU rewriters by routing each basis-prep
-   `or/and/xor reg, K` in the affine body through a recursive MBA
-   layer. Requires a small refactor of `emit_affine_alu_body` to
-   accept per-term `MovImmEmitter`-style overrides for the K-
-   materialization. Mostly mechanical once the contract is in
-   place; saved for a future MBA expansion.
+1. **64-bit deep-affine + deep-unary**: the deep-chain shapes from
+   phases 14–15 are gated to 32-bit destinations because their MOV-
+   imm step functions zero-extend the high half of the scratch.
+   64-bit support needs an explicit `movsxd scratch, scratch_lo32`
+   after each K materialisation.
 
-2. **NOT/NEG with deep chains**: the Phase-13 unary shapes are
-   single-layer; deep chains over the NOT/NEG body would compose
-   another MBA layer on top (e.g. apply XOR-cancel inside
-   two-complement). Same recursion contract as Phase 10 for MOV-imm.
+2. **Multi-step depth ≥ 3**: the deep-chain shapes today stack two
+   MBA layers. Adding a third layer would require extending
+   `MovImmEmitter` to accept its own `inner` override (currently
+   only the *outer* layer is parameterisable). Diminishing returns
+   per layer; better defeat-strength path is broader basis families.
 
-3. **r-r MBA over the SUB-r-r short-form `2C ib` family**: NOT
-   covered today — the imm8-form ALU encodings (`80/82/83 /<op> ib`,
-   3 bytes) need their own decoder and bodies that fit within the
-   multi-instruction redirect budget.
+3. **Tigress-style 2-parameter affine**: today's affine combinator
+   has one parameter `t`. A 2-parameter family `(t, u)` over a
+   4-element basis would multiply the per-site shape count without
+   touching the body skeleton.
