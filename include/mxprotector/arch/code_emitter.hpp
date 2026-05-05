@@ -49,6 +49,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"

@@ -140,6 +140,7 @@ set(BUILDER_SOURCES
 
     # Phase 3: Assembler / Code Emitter
     analysis/x86_code_emitter.cpp
+    analysis/x86_arch_emitter.cpp
 
     # Phase 3: CFG Flattening
     protection/cfg/cfg_flattening_pass.cpp

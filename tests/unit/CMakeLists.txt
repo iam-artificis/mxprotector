@@ -83,6 +83,7 @@ set(TEST_SOURCES
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
     x64_vm_backend_arch_test.cpp
+    x86_arch_emitter_test.cpp
     reloc_applier_test.cpp
     driver_cipher_body_test.cpp
     reloc_partition_test.cpp
@@ -304,6 +305,8 @@ set(ANALYSIS_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/marker_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/trace_hints.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/analysis/trace_hints_serialize.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_code_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/analysis/x86_arch_emitter.cpp
 )
 
 # CLI helpers needed by CLI-level unit tests (section name pool —
