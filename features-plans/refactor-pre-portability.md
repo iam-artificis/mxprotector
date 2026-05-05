@@ -180,18 +180,68 @@ identical (regression test); call sites accept a hash-by-interface.
 
 ### R6 — Linux compile-only audit
 
-  1. CMake adds a Linux preset (gcc-13 + clang-18 + libstdc++ /
-     libc++).
-  2. Compile-only smoke target — no link, no artefacts. Goal is to
-     *surface* every remaining `<windows.h>` / `HANDLE` /
-     `GetProcAddress` etc. usage in the BUILDER (NOT the protected
-     runtime stubs; those stay PE+x64).
-  3. Every surfaced gap gets either:
-       * a small `mx::platform::*` shim with Windows + POSIX impls,
-         OR
-       * a documented "leave for later" item in this file.
+**Status as of 2026-05-05 audit:** the builder is **already
+essentially Linux-compile-ready**. No physical Linux build was
+performed (refactor branch is on Windows host) — findings are
+from static analysis.
 
-Acceptance: `cmake --preset linux-builder-compile-check` green.
+**Findings:**
+
+  * **No `<windows.h>` / `<intrin.h>` / `<psapi.h>` includes**
+    anywhere under `src/builder/` or `include/mxprotector/`. PE
+    structs are vendored under `include/mxprotector/pe/types/`
+    (no Windows SDK dependency).
+  * **No `_MSC_VER` / `_WIN32` / `_WIN64` / `#ifdef WIN32`**
+    preprocessor guards in any source file. Every `__declspec` /
+    `WIN32` mention found by grep is a comment describing PROTECTED-
+    BINARY runtime behaviour, never builder code.
+  * **No MSVC intrinsics** (`_BitScan*`, `_byteswap_*`, etc.) in
+    builder code. Generic C++23 idioms only.
+  * **CMake** already gates MSVC-specific options (`/W4 /utf-8
+    /Zc:__cplusplus /permissive-`) inside `if(MSVC) ... else()`
+    blocks; the `else()` branch sets gcc/clang-friendly
+    `-Wall -Wextra -Wpedantic`. Both `src/builder/CMakeLists.txt`
+    and `tests/unit/CMakeLists.txt` are symmetric on this.
+  * **Dependencies**: only Zydis (portable C library, has its own
+    Linux build path) and GoogleTest (portable). No find_package
+    for Windows SDK, no link against Windows runtime libraries.
+  * **C++23 features used**: `std::format`, `std::expected`,
+    `std::span`, designated initializers, `[[nodiscard]]`,
+    `std::variant<>` with template lambdas. All supported in
+    gcc 13+ / clang 17+ with libstdc++ 13+ / libc++ 17+.
+
+**Remaining action items:**
+
+  1. Once a Linux host or container is available, run
+     `cmake --preset linux-builder-compile-check` (preset to be
+     added) to surface anything the static audit missed —
+     particularly:
+       * Russian (Cyrillic) literals in source: gcc/clang accept
+         UTF-8 by default but want a sane locale.
+       * Format-string literals using `std::format` — gcc 13's
+         `std::format` is complete; older gccs would need
+         `<fmt>`.
+       * Any test that hard-codes a Windows-style path (none found,
+         but worth a final scan).
+  2. Add a CMake preset:
+        ```
+        {
+          "name": "linux-builder-compile-check",
+          "generator": "Ninja",
+          "binaryDir": "${sourceDir}/build-linux",
+          "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_CXX_COMPILER": "g++-13",
+            "CMAKE_C_COMPILER":   "gcc-13"
+          }
+        }
+        ```
+     Skipped in this branch — no Linux host on the dev machine to
+     validate.
+
+**Acceptance (revised):** static audit complete, no Windows-only
+deps surfaced in the builder. Action items above are tracked for a
+follow-up branch on a Linux host.
 
 ### R7 — SOLID + DI rolling audit
 
