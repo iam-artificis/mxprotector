@@ -496,6 +496,16 @@ TEST(MbaRewriter, XorImmOrAndPreservesSemantics) {
         mx::mutation::mba::AluImm32Op::xor_, "xor-imm-or-and", "xor"});
 }
 
+TEST(MbaRewriter, XorImmOrXorAndPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::xor_, "xor-imm-or-xor-and", "xor"});
+}
+
+TEST(MbaRewriter, XorImmAddMinusAndPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::xor_, "xor-imm-add-minus-and", "xor"});
+}
+
 TEST(MbaRewriter, OrImmXorAndPreservesSemantics) {
     check_rewriter_semantics({
         mx::mutation::mba::AluImm32Op::or_, "or-imm-xor-and", "or"});
@@ -546,7 +556,7 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 10u);
+    EXPECT_EQ(registry.size(), 12u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -554,6 +564,8 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("sub-imm-neg-add"), nullptr);
     EXPECT_NE(registry.find("sub-imm-offset"), nullptr);
     EXPECT_NE(registry.find("xor-imm-or-and"), nullptr);
+    EXPECT_NE(registry.find("xor-imm-or-xor-and"), nullptr);
+    EXPECT_NE(registry.find("xor-imm-add-minus-and"), nullptr);
     EXPECT_NE(registry.find("or-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("and-imm-or-xor"), nullptr);
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
@@ -576,8 +588,14 @@ TEST(MbaRewriterRegistry, FindMatchingDispatchesByOp) {
         encode_alu_imm32_rax(mx::mutation::mba::AluImm32Op::xor_, 0x1234),
         "xor", "rax, 0x1234");
     auto matching = registry.find_matching(insn);
-    ASSERT_EQ(matching.size(), 1u);
-    EXPECT_EQ(matching[0]->name(), "xor-imm-or-and");
+    EXPECT_EQ(matching.size(), 3u)
+        << "every XOR-imm shape must match an `xor r,K` site";
+    bool seen_baseline = false;
+    for (const auto* r : matching) {
+        if (r->name() == "xor-imm-or-and") seen_baseline = true;
+    }
+    EXPECT_TRUE(seen_baseline)
+        << "the baseline shape must remain in the matching set";
 }
 
 TEST(MbaRewriterRegistry, FindReturnsNullForUnknownName) {

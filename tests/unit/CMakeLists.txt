@@ -209,6 +209,8 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/sub_imm_neg_add_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/sub_imm_offset_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_or_and_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_or_xor_and_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_add_minus_and_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/or_imm_xor_and_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_or_xor_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp

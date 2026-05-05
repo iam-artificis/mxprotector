@@ -79,5 +79,26 @@ namespace factories {
 /// chain than either pure additive or pure subtractive identity.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_offset();
 
+// ---------------------------------------------------------------------------
+// XOR r, K shapes — `81 /6 id` (and REX.W variant).
+// ---------------------------------------------------------------------------
+
+/// `(x | K) - (x & K)` — symmetric-difference identity (existing).
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_or_minus_and();
+
+/// `(x | K) ^ (x & K)` — XOR-of-OR-and-AND identity.
+/// Bit i of `(x|K)^(x&K)` is 1 iff `(x|K)_i ≠ (x&K)_i`, which holds
+/// iff exactly one of `x_i, K_i` is set — i.e. precisely the bit
+/// definition of `x ^ K`. Pure-Boolean expression with no carry,
+/// so SMT solvers cannot fold it via linear arithmetic.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_or_xor_and();
+
+/// `(x + K) - 2*(x & K)` — additive identity then subtract carry.
+/// Derivation: `x + K = (x^K) + 2*(x&K)` (Knuth), so subtracting
+/// `2*(x & K)` recovers `x ^ K`. The body chains an ADD-style
+/// expansion into a final SUB; the proof obligation mixes
+/// arithmetic with bitwise reasoning.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_add_minus_and();
+
 } // namespace factories
 } // namespace mx::mutation::mba
