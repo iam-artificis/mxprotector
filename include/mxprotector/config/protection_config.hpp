@@ -105,17 +105,35 @@ struct ProtectionConfig {
                                           ///< multi-step boolean+arithmetic body,
                                           ///< plus `mov r32, imm32` → permutation
                                           ///< polynomial). Defeats SMT solvers and
-                                          ///< angr/Triton symbolic tactics. Default
-                                          ///< OFF: the rewriters end with a final
-                                          ///< arithmetic op whose OF/AF differ from
-                                          ///< the original instruction's, so
-                                          ///< flag-sensitive callers (signed JCC
-                                          ///< right after the rewritten op) miscompile.
-                                          ///< Opt in for binaries that have been
-                                          ///< profiled and confirmed flag-insensitive
-                                          ///< at the rewrite sites — typically by
-                                          ///< placing markers around hot loops that
-                                          ///< don't immediately consume OF/AF.
+                                          ///< angr/Triton symbolic tactics.
+                                          ///<
+                                          ///< OFF by default — the rewriter is
+                                          ///< the first user of the size-changing
+                                          ///< redirect path through the expansion
+                                          ///< sink, and that path does not yet
+                                          ///< play with `CfgFlatteningPass`: CFF
+                                          ///< rearranges the source function and
+                                          ///< the sink's `JMP rel32` back to
+                                          ///< `site + site_size` lands in the
+                                          ///< re-flattened layout instead of the
+                                          ///< original "next instruction". Two
+                                          ///< guards already help: `analysis::
+                                          ///< safe_to_clobber_flags_after`
+                                          ///< suppresses MBA when the next
+                                          ///< instruction reads EFLAGS, and
+                                          ///< `MutationEngine::set_excluded_
+                                          ///< redirect_ranges` excludes VM /
+                                          ///< Guard regions so their lifters see
+                                          ///< the original ops. CFF interaction
+                                          ///< is the remaining hardening.
+                                          ///<
+                                          ///< Enable explicitly via
+                                          ///< `--mba-substitution`. For binaries
+                                          ///< where CFF is also off
+                                          ///< (`--no-cfg-flattening`) the
+                                          ///< current rewriter set is correct
+                                          ///< and the obfuscation strength
+                                          ///< holds.
     bool enable_packer          = false;  ///< Self-unpacking packer (multi-section XOR)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)

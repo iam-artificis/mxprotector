@@ -56,6 +56,29 @@ public:
      */
     [[nodiscard]] virtual ByteBuffer apply(
         const analysis::Instruction& insn, Randomizer& rng) const = 0;
+
+    /**
+     * @brief Whether the rewrite leaves EFLAGS in a state that
+     *        differs from the original instruction's effect.
+     *
+     * Default: `false` — most rules are size-preserving and produce
+     * the same flag side-effects as the original (`xor`↔`sub`-same-reg,
+     * direction flips, semantic transforms on flag-equivalent forms).
+     *
+     * MBA rewriters override this to `true`: their final ALU op
+     * produces a different OF/AF (sometimes CF) than the original
+     * `<op> reg, imm32`. The engine consults the predicate together
+     * with `analysis::safe_to_clobber_flags_after` to skip flag-
+     * affecting rules at sites where the next instruction reads
+     * EFLAGS — see `mutation_engine.cpp`.
+     *
+     * Returning `false` is the safe default: a rule is "honest" by
+     * claiming it doesn't preserve flags only if it actually
+     * doesn't, otherwise the engine misses the lookahead guard.
+     */
+    [[nodiscard]] virtual bool affects_observable_flags() const noexcept {
+        return false;
+    }
 };
 
 /**

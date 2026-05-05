@@ -581,6 +581,23 @@ TEST(MbaSubstitutionRule, DoesNotMatchInstructionsWithoutMbaCoverage) {
     }
 }
 
+TEST(MbaSubstitutionRule, ReportsAffectingObservableFlags) {
+    auto registry = mx::SubstitutionRuleRegistry::create_default();
+    mx::mutation::rules::register_mba_rules(registry);
+
+    const mx::ISubstitutionRule* mba_rule = nullptr;
+    for (const auto& r : registry.rules()) {
+        if (r->name() == "mba-substitution") {
+            mba_rule = r.get();
+            break;
+        }
+    }
+    ASSERT_NE(mba_rule, nullptr);
+    EXPECT_TRUE(mba_rule->affects_observable_flags())
+        << "MBA rewrites change OF/AF/CF — engine relies on this "
+        << "flag to skip MBA at flag-consuming sites";
+}
+
 TEST(MbaSubstitutionRule, ApplyEmitsLongerThanOriginalForAdd) {
     auto registry = mx::SubstitutionRuleRegistry::create_default();
     mx::mutation::rules::register_mba_rules(registry);

@@ -58,6 +58,15 @@ public:
         return "mba-substitution";
     }
 
+    [[nodiscard]] bool affects_observable_flags() const noexcept override {
+        // MBA bodies end in an arithmetic op whose OF/AF (and
+        // sometimes CF) differ from the original `<op> reg, imm32`.
+        // The mutation engine consults this flag together with
+        // `analysis::safe_to_clobber_flags_after` to skip MBA at
+        // sites where the next instruction consumes EFLAGS.
+        return true;
+    }
+
     [[nodiscard]] bool matches(
         const analysis::Instruction& insn) const override
     {

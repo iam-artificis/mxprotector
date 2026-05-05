@@ -23,6 +23,7 @@
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 
 #include "mxprotector/analysis/disassembler.hpp"
+#include "mxprotector/analysis/flag_consumer.hpp"
 #include "mxprotector/core/context.hpp"
 #include "mxprotector/protection/mutation/overflow/expansion_sink.hpp"
 #include "mxprotector/protection/mutation/overflow/jmp_emit.hpp"
@@ -117,13 +118,30 @@ MxResult<uint32_t> MutationEngine::mutate_region(
     uint32_t mutations_applied = 0;
     uint32_t junk_inserted = 0;
 
-    for (const auto& insn : instructions) {
+    for (std::size_t insn_idx = 0; insn_idx < instructions.size(); ++insn_idx) {
+        const auto& insn = instructions[insn_idx];
         if (insn.is_branch() || insn.is_call() || insn.is_return()) {
             continue;
         }
 
         auto matching_rules = rules_.find_matching(insn);
         if (matching_rules.empty()) continue;
+
+        // Flag-aware filter: rules that change EFLAGS observably (the
+        // MBA family in particular) must not run at sites where the
+        // next instruction reads EFLAGS — the mismatched OF/AF/CF
+        // would miscompile the consumer. `safe_to_clobber_flags_after`
+        // walks forward up to its lookahead limit; when a flag-writer
+        // kills the prior state before any consumer / control-flow
+        // boundary, the flag-affecting rules stay in. Otherwise they
+        // are stripped and the engine picks from what remains.
+        if (!analysis::safe_to_clobber_flags_after(instructions, insn_idx)) {
+            std::erase_if(matching_rules,
+                [](const ISubstitutionRule* rule) noexcept {
+                    return rule->affects_observable_flags();
+                });
+            if (matching_rules.empty()) continue;
+        }
 
         if (!rng_.next_bool(substitution_probability_)) continue;
 
@@ -162,11 +180,26 @@ MxResult<uint32_t> MutationEngine::mutate_region(
         //      handled (skip).
         //   2. Replacement longer + no sink + slot < 5 — cannot fit
         //      `JMP rel32`; skip.
-        //   3. Replacement longer + sink + slot ≥ 5 + replacement is
+        //   3. Replacement longer + site VA inside an excluded range
+        //      (a marked VM / Guard region) — the downstream lifter
+        //      parses the post-mutation byte stream and would mis-
+        //      lift `JMP rel32 + NOPs` instead of the original op.
+        //      Refuse the redirect; same-size substitutions are
+        //      still applied so the rest of the mutation set runs.
+        //   4. Replacement longer + sink + slot ≥ 5 + replacement is
         //      position-independent — redirect via sink.
+        const Va  site_va = insn.address();
+        const bool site_excluded = std::any_of(
+            excluded_redirect_ranges_.begin(),
+            excluded_redirect_ranges_.end(),
+            [site_va](const AddressRange& r) noexcept {
+                return r.contains(site_va);
+            });
+
         if (replacement.size() < insn.length() ||
             expansion_sink_ == nullptr      ||
-            insn.length() < mx::mutation::overflow::kJmpRel32Size)
+            insn.length() < mx::mutation::overflow::kJmpRel32Size ||
+            site_excluded)
         {
             ctx.log_fmt("  MutationEngine: правило '{}' вернуло {} байт вместо {} для '{}' по VA 0x{:016X} — пропуск",
                 rule->name(), replacement.size(), insn.length(),

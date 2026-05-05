@@ -103,6 +103,35 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
     mutation::overflow::FallbackExpansionSink chain{primary, fallback};
     engine.set_expansion_sink(&chain);
 
+    // Downstream code-rewriting passes (VM lifter, Guard relocator)
+    // parse the post-mutation byte stream of their own marked regions
+    // and assume original instruction shapes are still in place. A
+    // size-changing rule that plants `JMP rel32 + NOPs` would break
+    // those lifters. We fold every VM/Guard region into a single
+    // exclusion list so the engine refuses redirects there — same-
+    // size substitutions still apply and stay invisible to the
+    // lifters via Zydis decoding.
+    {
+        std::vector<AddressRange> excluded;
+        const auto image_base = ctx.pe_image().image_base();
+        for (const auto& m : ctx.markers()) {
+            if (m.type != MarkerType::vm_begin &&
+                m.type != MarkerType::guard_begin)
+            {
+                continue;
+            }
+            const Va start_va = image_base + m.start_rva;
+            const auto size = static_cast<std::uint64_t>(
+                m.end_rva - m.start_rva);
+            excluded.push_back(AddressRange{start_va, size});
+        }
+        if (!excluded.empty()) {
+            ctx.log_fmt("MutationPass: {} VM/Guard regions excluded "
+                        "from size-changing redirects", excluded.size());
+            engine.set_excluded_redirect_ranges(std::move(excluded));
+        }
+    }
+
     uint32_t total_mutations = 0;
 
     // ====================================================================

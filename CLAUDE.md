@@ -26,7 +26,7 @@ for i in $(seq 1 15); do ../build/.../mxprotector_builder.exe -i in.exe -o t.exe
 ```
 
 ## Pipeline
-1. `MutationPass` (100): Substitutions, junk, splitting, register reassignment. Optional MBA rewriting via `enable_mba_substitution` (defeats SMT/symbolic; OF/AF differ from original — opt-in only).
+1. `MutationPass` (100): Substitutions, junk, splitting, register reassignment. Optional MBA rewriting via `enable_mba_substitution` / `--mba-substitution`. Engine has two safety guards now in place: `analysis::safe_to_clobber_flags_after` skips flag-affecting rules at sites where the next instruction reads EFLAGS, and `set_excluded_redirect_ranges` excludes VM/Guard regions from size-changing redirects. MBA stays opt-in until the size-changing redirect path is fully integrated with `CfgFlatteningPass`'s function rearrangement (current blocker — the sink's JMP-back lands in re-flattened layout).
 2. `ObfuscationPass` (200): Opaque predicates, MBA, constant unfolding.
 3. `VirtualizationPass` (300): Lifts `MX_VM_BEGIN/END` to VM bytecode.
 4. `GuardPass` (350): Relocates `MX_GUARD_BEGIN/END` to `.mxguard`, VEH dispatch, VM-lifted decrypt.

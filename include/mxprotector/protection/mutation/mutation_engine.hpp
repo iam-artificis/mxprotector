@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "mxprotector/core/types.hpp"
 #include "mxprotector/core/result.hpp"
@@ -91,6 +93,31 @@ public:
     }
 
     /**
+     * @brief Mark VA ranges where size-changing rules must NOT redirect.
+     *
+     * Downstream passes (`VirtualizationPass`, `GuardPass`) parse the
+     * post-mutation byte stream of their own marked regions and
+     * assume the **original instruction shapes are still there**.
+     * Same-size substitutions are fine — Zydis decodes them
+     * identically. A redirect, however, replaces the original
+     * instruction with `JMP rel32` + NOP padding, which the
+     * downstream lifter cannot translate.
+     *
+     * `MutationPass` calls this with the union of VM/Guard marker
+     * ranges (in VA). For any candidate instruction whose
+     * `address()` falls inside one of these ranges, the engine
+     * still applies in-place substitutions (size-preserving) but
+     * refuses the expansion-sink redirect path.
+     *
+     * Default: empty — all redirects allowed everywhere.
+     */
+    void set_excluded_redirect_ranges(
+        std::vector<AddressRange> ranges) noexcept
+    {
+        excluded_redirect_ranges_ = std::move(ranges);
+    }
+
+    /**
      * @brief Install (or clear) the expansion sink used when a rule
      *        produces longer bytes than the substituted instruction.
      *
@@ -126,6 +153,10 @@ private:
     /// Optional expansion sink — see `set_expansion_sink`. The engine
     /// borrows the pointer; ownership stays with the caller.
     mx::mutation::IExpansionSink* expansion_sink_ = nullptr;
+
+    /// VA ranges that must not receive size-changing redirects — see
+    /// `set_excluded_redirect_ranges`. Empty by default.
+    std::vector<AddressRange> excluded_redirect_ranges_;
 
     static constexpr double substitution_probability_ = 1.0;  ///< Вероятность подстановки
     static constexpr double junk_probability_ = 0.3;          ///< Вероятность вставки junk

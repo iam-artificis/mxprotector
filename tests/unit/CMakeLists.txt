@@ -14,6 +14,7 @@ cmake_minimum_required(VERSION 3.20)
 set(TEST_SOURCES
     mutation_engine_test.cpp
     mba_rewriter_test.cpp
+    flag_consumer_test.cpp
     cfg_flattening_test.cpp
     vm_stack_layout_test.cpp
     anti_emulation_check_test.cpp
