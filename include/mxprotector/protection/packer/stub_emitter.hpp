@@ -1,33 +1,31 @@
 /**
  * @file stub_emitter.hpp
- * @brief Stub emitter policy types + build_*_stub_bytes drivers.
+ * @brief Per-shape `build_*_stub_bytes` byte-level drivers.
  *
- * The packer assembles one of two stub shapes depending on whether
- * the target PE is an executable or a full DLL: both wrap the shared
- * `emit_decrypt_body` cipher body in a save/restore shell, but the
- * DLL variant also gates on `reason == DLL_PROCESS_ATTACH` and
- * preserves the DllMain ABI registers so the real entry point sees
- * unchanged arguments.
+ * The packer assembles one of four stub shapes depending on the
+ * target's PE subsystem (EXE, full-DLL, kernel-driver, EFI). All
+ * four wrap the shared `emit_decrypt_body` (or `emit_driver_decrypt_body`)
+ * cipher body in a save/restore shell tuned for the target ABI:
+ * different register save sets, different reason gates, different
+ * jmp-tail destinations.
  *
  * This header owns the "stub framing" concern: register save order,
- * stolen-bytes inlining, the trailing `jmp rel32` back to the real
- * entry, and the emitter policy classes that expose each shape
- * through the uniform `StubEmitter` concept the packer orchestration
- * uses.
+ * stolen-bytes inlining, and the trailing `jmp rel32` back to the
+ * real entry. Each builder returns a per-shape patch descriptor that
+ * inherits both `CommonStubPatches` (common rel32 slots every stub
+ * must produce) and `CipherBodyPatches` (per-layer key LEAs,
+ * per-section loop slots, reprotect / IAT / ImageBase metadata).
  *
- * The patch descriptors returned by each builder inherit both
- * `CommonStubPatches` (common rel32 slots every stub must produce)
- * and `CipherBodyPatches` (per-layer key LEAs, per-section loop
- * slots, reprotect / IAT / ImageBase metadata). This lets the
- * packer's `finalize_packer_stub` + `execute_encrypted_stub`
- * pipeline patch both concerns through one pointer without
- * branching on stub shape.
+ * The runtime backend (`X64PeStubBackend` in `x64_pe_stub_backend.hpp`)
+ * dispatches over `PackerStubKind` and calls the matching driver
+ * here; consumers (`packer_pass.cpp`) talk only through
+ * `IPackerStubBackend` and never instantiate per-shape emitter
+ * policy types.
  */
 
 #pragma once
 
 #include <array>
-#include <concepts>
 #include <cstdint>
 #include <utility>
 
@@ -93,37 +91,19 @@ struct DriverStubPatches : CommonStubPatches, CipherBodyPatches {};
  * @brief UEFI stub patches.
  *
  * Structurally identical to `DriverStubPatches` — UEFI applications
- * have the same calling convention (MS x64), no Win32 import table to
- * wipe, no anti-debug user-mode tricks, no TLS, and the relocation
- * partitioning + inline applier story is the same as the driver path.
+ * have the same calling convention (MS x64), no Win32 import table
+ * to wipe, no anti-debug user-mode tricks, no TLS, and the
+ * relocation partitioning + inline applier story is the same as the
+ * driver path.
  *
- * Kept as a *distinct* type so the templated post-inject dispatch in
- * `packer_pass.cpp` can branch on `std::is_same_v<Emitter,
- * EfiStubEmitter>` without confusing EFI bytes with driver bytes in
+ * Kept as a *distinct* type so the runtime backend's `PackerStubKind`
+ * dispatch can route EFI without confusing it with driver bytes in
  * future refactors that want to add EFI-specific logic.
  */
 struct EfiStubPatches : CommonStubPatches, CipherBodyPatches {};
 
 /**
- * @brief Contract every StubEmitter policy must satisfy.
- *
- * A StubEmitter is a stateless (or cheaply copyable) type that turns
- * `(rng, stolen_bytes_view)` into a concrete stub buffer + a
- * patch descriptor. The patch descriptor must derive from
- * `CommonStubPatches` so the shared packer runtime can patch the
- * common rel32 slots (jmp-to-OEP, stolen CALL fix-ups) uniformly.
- */
-template <class T>
-concept StubEmitter = requires(T& t, Randomizer& rng, ByteView stolen) {
-    typename T::patches_type;
-    requires std::derived_from<typename T::patches_type, CommonStubPatches>;
-    { t.emit(rng, stolen) } ->
-        std::same_as<std::pair<ByteBuffer, typename T::patches_type>>;
-};
-
-/**
- * @brief Per-stub emission parameters shared by EXE and full-DLL
- *        stubs.
+ * @brief Per-stub emission parameters shared by every shape.
  *
  *   * `section_count`   — number of target sections the decrypt loops
  *                        iterate over.
@@ -174,6 +154,8 @@ build_exe_stub_bytes(Randomizer& rng,
                      uint32_t    layer_count,
                      bool        enable_veh_trap,
                      bool        apply_relocs_inline);
+// `enable_veh_trap` is honoured by the EXE stub only — DLLs cannot
+// safely install a Vectored Exception Handler.
 
 /**
  * @brief Build the full-DLL stub code bytes (pre-patch).
@@ -217,54 +199,6 @@ build_dll_full_stub_bytes(Randomizer& rng,
 // primary use case).
 
 /**
- * @brief StubEmitter policy for the EXE shape.
- *
- * `ExeStubEmitter{{section_count, layer_count}}` captures the
- * emission parameters at construction; `emit(rng, stolen)` produces
- * the stub buffer and its patch descriptor.
- */
-class ExeStubEmitter {
-public:
-    using patches_type = ExeStubPatches;
-
-    explicit ExeStubEmitter(StubEmissionParams params) noexcept
-        : params_(params) {}
-
-    [[nodiscard]] std::pair<ByteBuffer, ExeStubPatches>
-    emit(Randomizer& rng, ByteView stolen_bytes) {
-        return build_exe_stub_bytes(rng, stolen_bytes,
-                                    params_.section_count,
-                                    params_.layer_count,
-                                    params_.enable_veh_trap,
-                                    params_.apply_relocs_inline);
-    }
-
-private:
-    StubEmissionParams params_;
-};
-
-/// StubEmitter policy for the full-DLL shape. Same interface as
-/// `ExeStubEmitter`, different wire layout.
-class DllFullStubEmitter {
-public:
-    using patches_type = DllFullStubPatches;
-
-    explicit DllFullStubEmitter(StubEmissionParams params) noexcept
-        : params_(params) {}
-
-    [[nodiscard]] std::pair<ByteBuffer, DllFullStubPatches>
-    emit(Randomizer& rng, ByteView stolen_bytes) {
-        return build_dll_full_stub_bytes(rng, stolen_bytes,
-                                         params_.section_count,
-                                         params_.layer_count,
-                                         params_.apply_relocs_inline);
-    }
-
-private:
-    StubEmissionParams params_;
-};
-
-/**
  * @brief Build the kernel-driver stub code bytes (pre-patch).
  *
  * Layout:
@@ -300,28 +234,6 @@ build_driver_stub_bytes(Randomizer& rng,
 // no ring0 analogue. Drivers never install one.
 
 /**
- * @brief StubEmitter policy for the kernel-driver shape.
- */
-class DriverStubEmitter {
-public:
-    using patches_type = DriverStubPatches;
-
-    explicit DriverStubEmitter(StubEmissionParams params) noexcept
-        : params_(params) {}
-
-    [[nodiscard]] std::pair<ByteBuffer, DriverStubPatches>
-    emit(Randomizer& rng, ByteView stolen_bytes) {
-        return build_driver_stub_bytes(rng, stolen_bytes,
-                                       params_.section_count,
-                                       params_.layer_count,
-                                       params_.apply_relocs_inline);
-    }
-
-private:
-    StubEmissionParams params_;
-};
-
-/**
  * @brief Build the UEFI application stub code bytes (pre-patch).
  *
  * UEFI applications share the driver-stub byte layout exactly:
@@ -346,37 +258,5 @@ build_efi_stub_bytes(Randomizer& rng,
                      uint32_t    section_count,
                      uint32_t    layer_count,
                      bool        apply_relocs_inline);
-
-/**
- * @brief StubEmitter policy for UEFI applications and runtime
- *        drivers.
- */
-class EfiStubEmitter {
-public:
-    using patches_type = EfiStubPatches;
-
-    explicit EfiStubEmitter(StubEmissionParams params) noexcept
-        : params_(params) {}
-
-    [[nodiscard]] std::pair<ByteBuffer, EfiStubPatches>
-    emit(Randomizer& rng, ByteView stolen_bytes) {
-        return build_efi_stub_bytes(rng, stolen_bytes,
-                                    params_.section_count,
-                                    params_.layer_count,
-                                    params_.apply_relocs_inline);
-    }
-
-private:
-    StubEmissionParams params_;
-};
-
-static_assert(StubEmitter<ExeStubEmitter>,
-    "ExeStubEmitter must satisfy the StubEmitter concept");
-static_assert(StubEmitter<DllFullStubEmitter>,
-    "DllFullStubEmitter must satisfy the StubEmitter concept");
-static_assert(StubEmitter<DriverStubEmitter>,
-    "DriverStubEmitter must satisfy the StubEmitter concept");
-static_assert(StubEmitter<EfiStubEmitter>,
-    "EfiStubEmitter must satisfy the StubEmitter concept");
 
 } // namespace mx::packer
