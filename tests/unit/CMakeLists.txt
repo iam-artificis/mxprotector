@@ -135,6 +135,8 @@ set(STRING_PROTECT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_xref_finder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_encryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_decryptor_codegen.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_decryptor_ephemeral.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_trampoline_codegen.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_protection_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_protection_pipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/string/string_candidate_gather.cpp

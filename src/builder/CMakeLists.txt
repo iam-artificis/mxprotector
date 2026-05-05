@@ -211,6 +211,8 @@ set(BUILDER_SOURCES
     protection/string/string_xref_finder.cpp
     protection/string/string_encryptor.cpp
     protection/string/string_decryptor_codegen.cpp
+    protection/string/string_decryptor_ephemeral.cpp
+    protection/string/string_trampoline_codegen.cpp
     protection/string/string_protection_pass.cpp
     protection/string/string_protection_pipeline.cpp
     protection/string/string_candidate_gather.cpp
