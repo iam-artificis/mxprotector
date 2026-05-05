@@ -2,34 +2,52 @@
  * @file vm_runtime_gen.cpp
  * @brief [BUILDER] Public facade for the VM runtime generator.
  *
- * After the Phase 2 arch refactor this file is a thin facade. The
- * actual byte emission machinery (entry stub, handlers, vEFLAGS
- * scrambling, native-escape handlers, table assembly, patching) lives
- * under `src/builder/protection/vm/x64/` and is owned by
- * `mx::vm::x64::X64VmBackend`. `VmRuntimeGenerator` exists only to
- * give external callers (currently `VirtualizationPass`) a stable
- * `mx::vm::*` entry point that does not pull in arch-specific
- * headers.
+ * `VmRuntimeGenerator::generate` constructs a backend through the
+ * `arch::IVmBackendFactory` registered for the target architecture and
+ * forwards the call. Today only `vm::x64::X64VmBackendFactory` is wired
+ * in (and selected when no factory override is provided), so the runtime
+ * behaviour is identical to the previous direct call into `X64VmBackend`.
  *
- * When a second backend lands (Arm64VmBackend), this facade will pick
- * the right one based on `ctx.target().arch` rather than hard-coding
- * x64. The interface that lets backends compose into the engine is
- * sketched in `include/mxprotector/arch/vm_backend.hpp`.
+ * When an arm64 backend ships, the factory selector here grows one
+ * branch on `arch::ArchFamily` — every other call site in the pipeline
+ * already speaks `arch::IVmBackend`.
  */
 
 #include "mxprotector/protection/vm/vm_runtime_gen.hpp"
 
+#include "mxprotector/arch/arch_info.hpp"
+#include "mxprotector/arch/vm_backend.hpp"
 #include "mxprotector/protection/vm/x64/x64_vm_backend.hpp"
 
 namespace mx::vm {
+
+namespace {
+
+/// Pick the right backend factory for `arch_family`.
+/// Today only x64 is implemented; future arches register here as siblings.
+[[nodiscard]] MxResult<std::unique_ptr<arch::IVmBackend>>
+make_backend_for(arch::ArchFamily family) {
+    if (family == arch::ArchFamily::x64) {
+        x64::X64VmBackendFactory factory;
+        return factory.create(arch::ArchInfo::x64_baseline());
+    }
+    return std::unexpected(MxError(
+        ProtectionErrorCode::pass_failed,
+        "VmRuntimeGenerator: no VM backend registered for this arch"));
+}
+
+} // namespace
 
 MxResult<VmRuntime> VmRuntimeGenerator::generate(
     const std::vector<VmInstruction>& instructions,
     Randomizer& rng,
     VmGenOptions opts)
 {
-    x64::X64VmBackend backend;
-    return backend.generate(instructions, rng, opts);
+    auto backend = make_backend_for(arch::ArchFamily::x64);
+    if (!backend) {
+        return std::unexpected(backend.error());
+    }
+    return (*backend)->generate(instructions, rng, opts);
 }
 
 } // namespace mx::vm

@@ -49,6 +49,8 @@
 
 #include <vector>
 
+#include "mxprotector/arch/arch_info.hpp"
+#include "mxprotector/arch/vm_backend.hpp"
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/protection/vm/vm_bytecode.hpp"
@@ -56,15 +58,49 @@
 
 namespace mx::vm::x64 {
 
-class X64VmBackend final {
+/**
+ * @brief x64 implementation of `arch::IVmBackend`.
+ *
+ * This is the only backend that ships today. The class is an empty value
+ * type — all per-call state lives in `GenerationSession` inside the
+ * implementation file — so it is cheap to instantiate one per region.
+ *
+ * Implementing `arch::IVmBackend` lets the rest of the pipeline (today
+ * `vm::VmRuntimeGenerator`, tomorrow virtualization-pass / packer-VM-lifter
+ * factories) talk to backends through the abstract interface. Adding an
+ * arm64 backend will be a sibling class implementing the same interface;
+ * no caller has to special-case x64.
+ */
+class X64VmBackend final : public arch::IVmBackend {
 public:
+    [[nodiscard]] arch::ArchInfo arch() const noexcept override {
+        return arch::ArchInfo::x64_baseline();
+    }
+
     /// Generate a complete VM runtime blob for the given lifted
     /// instructions. The signature mirrors `VmRuntimeGenerator::generate`
     /// so the facade can forward without touching the result.
     [[nodiscard]] MxResult<VmRuntime> generate(
         const std::vector<VmInstruction>& instructions,
         Randomizer& rng,
-        VmGenOptions opts);
+        VmGenOptions opts) override;
+};
+
+/**
+ * @brief Factory that produces `X64VmBackend` for the x64 family.
+ *
+ * Selected by `vm::VmRuntimeGenerator` based on `ctx.target().arch`. Future
+ * arm64 / Cortex-M factories will sit alongside this one and the pipeline's
+ * factory selector picks the right one.
+ */
+class X64VmBackendFactory final : public arch::IVmBackendFactory {
+public:
+    [[nodiscard]] arch::ArchFamily supported_family() const noexcept override {
+        return arch::ArchFamily::x64;
+    }
+
+    [[nodiscard]] MxResult<std::unique_ptr<arch::IVmBackend>>
+        create(arch::ArchInfo info) override;
 };
 
 } // namespace mx::vm::x64

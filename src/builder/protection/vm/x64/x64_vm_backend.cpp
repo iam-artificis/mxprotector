@@ -573,4 +573,23 @@ MxResult<VmRuntime> X64VmBackend::generate(
     return session.run();
 }
 
+// ============================================================================
+//                          X64VmBackendFactory
+// ============================================================================
+//
+// Single-impl factory today. The pipeline picks `X64VmBackendFactory` when
+// `ctx.target().arch == arch::ArchFamily::x64`. Future arm64 / Cortex-M
+// factories register alongside without changing this one.
+// ============================================================================
+
+MxResult<std::unique_ptr<arch::IVmBackend>>
+X64VmBackendFactory::create(arch::ArchInfo info) {
+    if (info.family != arch::ArchFamily::x64) {
+        return std::unexpected(MxError(
+            ProtectionErrorCode::pass_failed,
+            "X64VmBackendFactory: requested arch family is not x64"));
+    }
+    return std::make_unique<X64VmBackend>();
+}
+
 } // namespace mx::vm::x64

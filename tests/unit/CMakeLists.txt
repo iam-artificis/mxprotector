@@ -82,6 +82,7 @@ set(TEST_SOURCES
     relocation_injector_test.cpp
     pass_applicability_test.cpp
     vm_kernel_safety_test.cpp
+    x64_vm_backend_arch_test.cpp
     reloc_applier_test.cpp
     driver_cipher_body_test.cpp
     reloc_partition_test.cpp
