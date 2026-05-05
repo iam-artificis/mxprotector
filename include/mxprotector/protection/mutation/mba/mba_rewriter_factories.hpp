@@ -210,6 +210,18 @@ namespace factories {
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_neg_rm_not_add1();
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_neg_rm_zero_sub();
 
+// 2-step deep-chain unary shapes — same `[REX] F7 /<2|3>` match
+// surface as the single-layer unary shapes, but every immediate (K,
+// ~K, K-1, …) is materialised through a per-site random MOV-imm MBA
+// shape (modular-inverse / xor-blind / rotate-blind) before the
+// outer body runs. Stacks two MBA proofs in series.
+//
+// Constraint: 32-bit operand only. Same zero-extension contract as
+// the imm32 deep-affine shapes — REX.W support roadmapped.
+
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_not_rm_deep_xor();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_neg_rm_deep_add();
+
 // ---------------------------------------------------------------------------
 // MOV r32, imm32 shapes — `[REX.B] B8+rd id` (5/6 bytes).
 // ---------------------------------------------------------------------------

@@ -1124,6 +1124,13 @@ mx::ByteBuffer encode_unary_rax(std::uint8_t reg_field) {
     return {0x48, 0xF7, static_cast<std::uint8_t>(0xC0 | (reg_field << 3))};
 }
 
+/// Encode `<op> eax` as `F7 /<reg>` with mod=3, rm=eax(0). 32-bit
+/// operand size, no REX. Used by the deep-chain unary tests, which
+/// reject `view->is_64bit`.
+mx::ByteBuffer encode_unary_eax(std::uint8_t reg_field) {
+    return {0xF7, static_cast<std::uint8_t>(0xC0 | (reg_field << 3))};
+}
+
 TEST(MbaUnaryDecoder, AcceptsNotRax) {
     auto insn = make_insn(encode_unary_rax(2), "not", "rax");
     auto view = mx::mutation::mba::decode_unary(insn);
@@ -1226,6 +1233,81 @@ TEST(MbaRewriter, NegRmNotAdd1PreservesSemantics) {
 TEST(MbaRewriter, NegRmZeroSubPreservesSemantics) {
     check_unary_rewriter_semantics(
         mx::mutation::mba::UnaryOp::neg, "neg-rm-zero-sub", 0xDDDD4u);
+}
+
+void check_deep_unary_rewriter_semantics(
+    mx::mutation::mba::UnaryOp op,
+    std::string_view           rewriter_name,
+    std::uint32_t              seed)
+{
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(rewriter_name);
+    ASSERT_NE(rewriter, nullptr) << rewriter_name;
+
+    constexpr std::array<std::uint64_t, 5> kSampleX = {
+        0x0000000000000000ULL,
+        0x0000000000000001ULL,
+        0x000000007FFFFFFFULL,
+        0x0123456789ABCDEFULL,
+        0xFFFFFFFFFFFFFFFFULL,
+    };
+
+    mx::Randomizer rng(seed);
+    for (auto x : kSampleX) {
+        auto insn = make_insn(
+            encode_unary_eax(static_cast<std::uint8_t>(op)),
+            (op == mx::mutation::mba::UnaryOp::not_) ? "not" : "neg",
+            "eax");
+        ASSERT_TRUE(rewriter->matches(insn))
+            << rewriter_name << " did not match the 32-bit form";
+
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value()) << rewriter_name << " emit failed";
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, x);
+        sim.set_reg(mx::x86::Reg::r11, 0xDEADBEEF11223344ULL);
+        const auto pre_scratch = sim.get_reg(mx::x86::Reg::r11);
+
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << rewriter_name << " simulator stalled";
+
+        const std::uint64_t expected =
+            ((op == mx::mutation::mba::UnaryOp::not_) ? ~x
+                                                      : (0ULL - x))
+            & 0xFFFFFFFFu; // 32-bit op zero-extends high half.
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), expected)
+            << rewriter_name << " mismatch for x=" << std::hex << x;
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::r11), pre_scratch)
+            << rewriter_name << " did not restore scratch";
+    }
+}
+
+TEST(MbaRewriter, NotRmDeepXorPreservesSemantics) {
+    check_deep_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::not_, "not-rm-deep-xor", 0xEEEE5u);
+}
+
+TEST(MbaRewriter, NegRmDeepAddPreservesSemantics) {
+    check_deep_unary_rewriter_semantics(
+        mx::mutation::mba::UnaryOp::neg, "neg-rm-deep-add", 0xFFFF6u);
+}
+
+TEST(MbaRewriter, DeepUnaryRejectsRexWSites) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    for (const auto* name : {"not-rm-deep-xor", "neg-rm-deep-add"}) {
+        const auto* rewriter = registry.find(name);
+        ASSERT_NE(rewriter, nullptr) << name;
+        const std::uint8_t reg_field =
+            std::string_view{name}.starts_with("not") ? 2u : 3u;
+        auto insn = make_insn(
+            encode_unary_rax(reg_field),
+            (reg_field == 2) ? "not" : "neg", "rax");
+        EXPECT_FALSE(rewriter->matches(insn))
+            << name << " must skip 64-bit sites — the K-materialiser "
+            << "would zero-extend instead of sign-extend";
+    }
 }
 
 TEST(MbaRewriter, ModularInversePreservesMovImmSemantics) {
@@ -1430,7 +1512,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 43u);
+    EXPECT_EQ(registry.size(), 45u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -1474,6 +1556,8 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("xor-imm-deep-affine"), nullptr);
     EXPECT_NE(registry.find("or-imm-deep-affine"), nullptr);
     EXPECT_NE(registry.find("and-imm-deep-affine"), nullptr);
+    EXPECT_NE(registry.find("not-rm-deep-xor"), nullptr);
+    EXPECT_NE(registry.find("neg-rm-deep-add"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {

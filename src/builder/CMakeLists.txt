@@ -167,6 +167,8 @@ set(BUILDER_SOURCES
     protection/mutation/mba/rewriters/not_rm_xor_cancel_rewriter.cpp
     protection/mutation/mba/rewriters/neg_rm_not_add1_rewriter.cpp
     protection/mutation/mba/rewriters/neg_rm_zero_sub_rewriter.cpp
+    protection/mutation/mba/rewriters/not_rm_deep_xor_rewriter.cpp
+    protection/mutation/mba/rewriters/neg_rm_deep_add_rewriter.cpp
     protection/mutation/mba/rewriters/unary_aggregator.cpp
     protection/mutation/mba/mba_alu_rr_decoder.cpp
     protection/mutation/mba/mba_unary_decoder.cpp

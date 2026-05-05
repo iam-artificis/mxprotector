@@ -32,6 +32,12 @@ void register_unary_rewriters(MbaRewriterRegistry& registry) {
     // -x) and zero-sub (MOV + XOR + SUB, no unary ops at all).
     registry.register_rewriter(factories::make_neg_rm_not_add1());
     registry.register_rewriter(factories::make_neg_rm_zero_sub());
+
+    // Deep-chain unary shapes (32-bit operand only). Materialise every
+    // immediate through a per-site random MOV-imm MBA layer; xor-cancel
+    // for NOT, `+K -(K-1)` for NEG. Stacks two MBA proofs in series.
+    registry.register_rewriter(factories::make_not_rm_deep_xor());
+    registry.register_rewriter(factories::make_neg_rm_deep_add());
 }
 
 } // namespace mx::mutation::mba
