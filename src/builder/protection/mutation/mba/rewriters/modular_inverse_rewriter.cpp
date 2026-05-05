@@ -29,31 +29,17 @@
 
 #include "mxprotector/protection/mutation/mba/mba_rewriter_groups.hpp"
 
-#include <cstdint>
 #include <memory>
 
 #include "mxprotector/analysis/assembler.hpp"
-#include "mxprotector/analysis/x86_encoding.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 #include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_emit.hpp"
 
 namespace mx::mutation::mba {
 
 namespace {
-
-/// 32-bit modular inverse of an odd value via the Newton-Hensel
-/// recursion. Doubles the number of correct bits per iteration;
-/// six iterations cover all 32 bits. Pre-condition: `value & 1 == 1`.
-[[nodiscard]] constexpr std::uint32_t modular_inverse_u32(
-    std::uint32_t value) noexcept
-{
-    std::uint32_t inverse = value; // matches at the low 3 bits
-    for (int i = 0; i < 5; ++i) {
-        inverse = inverse * (2u - value * inverse);
-    }
-    return inverse;
-}
 
 class ModularInverseRewriter final : public IMbaRewriter {
 public:
@@ -79,22 +65,11 @@ public:
                 "mov-imm-modular-inverse: instruction not in B8+rd id form"));
         }
 
-        // Pick an odd `P` so `inv(P) mod 2^32` exists. The lowest
-        // bit forced to 1 — every other bit is fully random.
-        const std::uint32_t p =
-            (rng.next_u32() | 1u);
-        const std::uint32_t inv_p = modular_inverse_u32(p);
-        const std::uint32_t k_prime =
-            static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(view->imm) *
-                static_cast<std::uint64_t>(inv_p));
-
         // Run the body in 32-bit operand-size mode so the high 32
         // bits of `view->dst` get zero-extended exactly like the
         // original `mov r32, imm32` does.
         analysis::X86CodeEmitter em(/*is_64bit=*/false);
-        em.mov(view->dst, static_cast<std::uint64_t>(k_prime));
-        em.imul(view->dst, view->dst, static_cast<std::int32_t>(p));
+        emit_modular_inverse_step(em, view->dst, view->imm, rng);
 
         auto code = em.build();
         if (!code) return std::unexpected(code.error());
@@ -123,6 +98,16 @@ void register_mov_imm_rewriters(MbaRewriterRegistry& registry) {
     registry.register_rewriter(factories::make_mov_imm_modular_inverse());
     registry.register_rewriter(factories::make_mov_imm_xor_blind());
     registry.register_rewriter(factories::make_mov_imm_rotate_blind());
+
+    // 32-bit MOV-imm 2-step deep chains. Each composes two MBA
+    // layers at the abstract-operation level: outer shape
+    // determines the finalizer, inner shape (picked per site)
+    // materialises the leading immediate. Three deep shapes ×
+    // 2 inner choices = 6 distinct emit-byte sequences on top of
+    // the per-shape parameter randomness.
+    registry.register_rewriter(factories::make_mov_imm_deep_modular());
+    registry.register_rewriter(factories::make_mov_imm_deep_xor());
+    registry.register_rewriter(factories::make_mov_imm_deep_rotate());
 
     // 64-bit MOV-imm shapes — share the `[REX.W (.B)] B8+rd iq`
     // encoding. Their bodies use `mov_abs64` to lock in the 10-byte

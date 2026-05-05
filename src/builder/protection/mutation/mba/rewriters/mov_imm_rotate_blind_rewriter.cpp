@@ -25,27 +25,16 @@
 
 #include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 
-#include <cstdint>
 #include <memory>
 
 #include "mxprotector/analysis/assembler.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
 #include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_emit.hpp"
 
 namespace mx::mutation::mba {
 
 namespace {
-
-/// Rotate `value` right by `count` bits (count in [1, 31]).
-/// `(value >> count) | (value << (32 - count))` is the canonical
-/// 32-bit ROR. Pre-condition `count != 0` keeps the shift count in
-/// the well-defined [1, 31] range — a 32-bit shift by 32 is UB on
-/// some compilers.
-[[nodiscard]] constexpr std::uint32_t ror32(
-    std::uint32_t value, std::uint8_t count) noexcept
-{
-    return (value >> count) | (value << (32u - count));
-}
 
 class MovImmRotateBlindRewriter final : public IMbaRewriter {
 public:
@@ -71,16 +60,8 @@ public:
                 "mov-imm-rotate-blind: instruction not in B8+rd id form"));
         }
 
-        // Random rotation count in [1, 31]. A count of 0 would
-        // collapse the chain to the bare `mov`; 32 is UB for
-        // 32-bit shifts.
-        const auto count = static_cast<std::uint8_t>(
-            rng.next_range(1u, 31u));
-        const std::uint32_t rotated = ror32(view->imm, count);
-
         analysis::X86CodeEmitter em(/*is_64bit=*/false);
-        em.mov(view->dst, static_cast<std::uint64_t>(rotated));
-        em.rol(view->dst, count);
+        emit_rotate_blind_step(em, view->dst, view->imm, rng);
 
         auto code = em.build();
         if (!code) return std::unexpected(code.error());

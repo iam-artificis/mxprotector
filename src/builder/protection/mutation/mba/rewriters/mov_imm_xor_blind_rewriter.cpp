@@ -27,12 +27,12 @@
 
 #include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 
-#include <cstdint>
 #include <memory>
 
 #include "mxprotector/analysis/assembler.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
 #include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_emit.hpp"
 
 namespace mx::mutation::mba {
 
@@ -62,15 +62,8 @@ public:
                 "mov-imm-xor-blind: instruction not in B8+rd id form"));
         }
 
-        // Force `A != 0` and `A != K` so neither half of the chain
-        // collapses to a no-op or to the bare original constant.
-        std::uint32_t a = rng.next_u32();
-        if (a == 0u || a == view->imm) a ^= 0xA5A5A5A5u;
-        const std::uint32_t b = a ^ view->imm;
-
         analysis::X86CodeEmitter em(/*is_64bit=*/false);
-        em.mov(view->dst, static_cast<std::uint64_t>(a));
-        em.xor_(view->dst, static_cast<std::int32_t>(b));
+        emit_xor_blind_step(em, view->dst, view->imm, rng);
 
         auto code = em.build();
         if (!code) return std::unexpected(code.error());

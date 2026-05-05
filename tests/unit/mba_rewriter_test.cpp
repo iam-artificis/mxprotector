@@ -319,15 +319,46 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         return off - pos + 2;
     }
 
-    // D1 /4 SHL r/m, 1 (count = 1)
+    // D1 /op — single-bit shift/rotate r/m, 1 (implicit count = 1).
+    // Same `op` field semantics as C1 (/0 ROL, /1 ROR, /4 SHL, /5
+    // SHR); the encoder picks D1 over C1 whenever the count is
+    // exactly 1 to save a byte. The MOV-imm rotate-blind shape's
+    // inner step lands on this form whenever the rotation count
+    // happens to be 1.
     if (op == 0xD1) {
         if (off + 2 > bytes.size()) return 0;
         const std::uint8_t modrm = bytes[off + 1];
         if (mx::x86::modrm_mod(modrm) != 3) return 0;
-        if (mx::x86::modrm_reg(modrm) != 4) return 0;
+        const std::uint8_t reg_field = mx::x86::modrm_reg(modrm);
         std::uint8_t rm = mx::x86::modrm_rm(modrm);
         if (rex_b) rm |= 0x08;
-        regs_[rm] <<= 1;
+        const std::uint32_t width = rex_w ? 64u : 32u;
+        std::uint64_t v = regs_[rm];
+        if (!rex_w) v &= 0xFFFFFFFFu;
+        switch (reg_field) {
+            case 0: { // ROL by 1
+                if (rex_w) {
+                    v = (v << 1) | (v >> (width - 1));
+                } else {
+                    const std::uint32_t v32 = static_cast<std::uint32_t>(v);
+                    v = static_cast<std::uint64_t>((v32 << 1) | (v32 >> 31));
+                }
+                break;
+            }
+            case 1: { // ROR by 1
+                if (rex_w) {
+                    v = (v >> 1) | (v << (width - 1));
+                } else {
+                    const std::uint32_t v32 = static_cast<std::uint32_t>(v);
+                    v = static_cast<std::uint64_t>((v32 >> 1) | (v32 << 31));
+                }
+                break;
+            }
+            case 4: v <<= 1; break; // SHL
+            case 5: v >>= 1; break; // SHR (logical)
+            default: return 0;
+        }
+        regs_[rm] = v;
         if (!rex_w) regs_[rm] &= 0xFFFFFFFFu;
         return off - pos + 2;
     }
@@ -854,6 +885,63 @@ TEST(MbaRewriter, MovImmRotateBlindPreservesSemantics) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 32-bit MOV-imm 2-step deep-chain semantic tests. Each deep-chain
+// shape composes two MBA layers — verify that for every sample K
+// the emitted body still materialises K in rax exactly. The
+// `MbaSimulator` already understands every instruction these shapes
+// emit (mov, imul, xor, rol).
+// ---------------------------------------------------------------------------
+
+void check_mov_imm32_deep_chain(std::string_view name, std::uint32_t seed) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(name);
+    ASSERT_NE(rewriter, nullptr) << name;
+
+    mx::Randomizer rng(seed);
+    for (auto k : kSampleK) {
+        auto insn = make_insn(
+            encode_mov_eax_imm32(k), "mov", "eax, K");
+        ASSERT_TRUE(rewriter->matches(insn)) << name;
+
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value()) << name << " emit failed";
+
+        // Build a byte-dump string so a sim stall/mismatch surfaces
+        // the offending body in the test output rather than just
+        // "stalled".
+        std::string hex_dump;
+        for (auto b : emitted->bytes) {
+            char buf[4];
+            std::snprintf(buf, sizeof(buf), "%02X ", b);
+            hex_dump += buf;
+        }
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, 0xCCCCCCCCCCCCCCCCULL);
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << name << " simulator stalled on emitted bytes "
+            << "[k=0x" << std::hex << k << "] body: " << hex_dump;
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax),
+                  static_cast<std::uint64_t>(k))
+            << name << " mismatch for k=" << std::hex << k
+            << " body: " << hex_dump;
+    }
+}
+
+TEST(MbaRewriter, MovImmDeepModularPreservesSemantics) {
+    check_mov_imm32_deep_chain("mov-imm-deep-modular", 0xDEEDDEEDu);
+}
+
+TEST(MbaRewriter, MovImmDeepXorPreservesSemantics) {
+    check_mov_imm32_deep_chain("mov-imm-deep-xor", 0xC0FFEE42u);
+}
+
+TEST(MbaRewriter, MovImmDeepRotatePreservesSemantics) {
+    check_mov_imm32_deep_chain("mov-imm-deep-rotate", 0xBABEFACEu);
+}
+
 TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
     const auto* rewriter = registry.find("mov-imm-modular-inverse");
@@ -930,7 +1018,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 26u);
+    EXPECT_EQ(registry.size(), 29u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -957,6 +1045,9 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("xor-imm-affine"), nullptr);
     EXPECT_NE(registry.find("or-imm-affine"), nullptr);
     EXPECT_NE(registry.find("and-imm-affine"), nullptr);
+    EXPECT_NE(registry.find("mov-imm-deep-modular"), nullptr);
+    EXPECT_NE(registry.find("mov-imm-deep-xor"), nullptr);
+    EXPECT_NE(registry.find("mov-imm-deep-rotate"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {

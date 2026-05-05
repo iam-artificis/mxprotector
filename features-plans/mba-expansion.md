@@ -1,6 +1,6 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–9 merged on master, all stress green.
+**Status:** shipped — phases 1–10 merged on master, all stress green.
 
 ## What this is
 
@@ -44,6 +44,47 @@ or 6 (with REX.W), fitting the JMP rel32 redirect threshold.
 Coverage uplift on `test_vm_showcase.exe` at strong: redirect count
 180 → 195 (**+8.3%**). On binaries with more RAX-bound arithmetic
 (syscall stubs, ABI shims) the uplift will be larger.
+
+### Phase 10: Multi-step deep MBA chains
+
+Three new MOV-imm rewriter shapes that compose two MBA layers at
+the abstract-operation level — *no byte-level surgery*. Each shape
+runs an outer single-layer body but materialises the leading
+immediate via a different MBA shape's full body, picked uniformly
+at random per call site:
+
+| Shape (name)             | Outer            | Inner pool                       |
+| ------------------------ | ---------------- | -------------------------------- |
+| `mov-imm-deep-modular`   | modular-inverse  | {xor-blind, rotate-blind}        |
+| `mov-imm-deep-xor`       | xor-blind        | {modular-inverse, rotate-blind}  |
+| `mov-imm-deep-rotate`    | rotate-blind     | {modular-inverse, xor-blind}     |
+
+The composition is wired through a new `MovImmEmitter` typedef +
+shared step functions in `mov_imm_emit.hpp`:
+
+```cpp
+emit_modular_inverse_step(em, dst, K, rng,
+    inner = direct_mov_imm32);  // single-layer
+emit_modular_inverse_step(em, dst, K, rng,
+    inner = &emit_xor_blind);    // 2-layer deep chain
+```
+
+Each per-shape rewriter is a thin adapter — decode, pick inner,
+call the step, build. The existing single-layer rewriters were
+refactored to call the shared step functions with the default
+`direct_mov_imm32` inner, so 100% of the per-shape semantic
+coverage survives unchanged.
+
+Body length: 3 instructions (≈ 11–17 bytes). SMT defeat: stacks
+two proofs in series — the outer finalizer proof must hand off to
+the inner-shape proof, doubling the per-site solver-time cost
+relative to the single-layer shapes.
+
+Why no ALU multi-step in this phase: the imm32 ALU bodies have
+3-scratch-register affine-MBA shapes that already span the
+0..16 range of distinct identities per `t`. Composing those
+across layers would require a more invasive refactor of the
+affine-emit path. Roadmap'd for a future expansion.
 
 ### Phase 9: Affine MBA basis combinator (Tigress-style)
 
@@ -166,17 +207,17 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Baseline | Phase 7 | Phase 8 | Phase 9 |
-| ---------------------------- | -------- | ------- | ------- | ------- |
-| MBA rewriters in registry    | 6        | 18      | 21      | 26      |
-| MBA-redirected sites         | 180      | 195     | 195     | 195     |
-| Per-ALU shape options        | 1        | 3       | 3       | 4       |
-| Per-MOV-imm shape options    | 1        | 3       | 3 + 3   | 3 + 3   |
-| Affine `t` choices per site  | n/a      | n/a     | n/a     | 14      |
-| MBA tests                    | 21       | 38      | 49      | 54      |
-| Total ctest                  | 894      | 909     | 920     | 925     |
-| Stress (strong, 15 runs)     | 15/15    | 15/15   | 15/15   | 15/15   |
-| Stress (maximum, 15 runs)    | 15/15    | 15/15   | 15/15   | 15/15   |
+| Metric                       | Phase 7 | Phase 8 | Phase 9 | Phase 10 |
+| ---------------------------- | ------- | ------- | ------- | -------- |
+| MBA rewriters in registry    | 18      | 21      | 26      | 29       |
+| Per-ALU shape options        | 3       | 3       | 4       | 4        |
+| Per-MOV-imm32 shape options  | 3       | 3       | 3       | 3 + 3    |
+| Per-MOV-imm64 shape options  | n/a     | 3       | 3       | 3        |
+| Affine `t` choices per site  | n/a     | n/a     | 14      | 14       |
+| MBA tests                    | 38      | 49      | 54      | 57       |
+| Total ctest                  | 909     | 920     | 925     | 928      |
+| Stress (strong, 15 runs)     | 15/15   | 15/15   | 15/15   | 15/15    |
+| Stress (maximum, 15 runs)    | 15/15   | 15/15   | 15/15   | 15/15    |
 
 Phase 8 does not change redirect-site count on the showcase binary
 because that input is compiled with `mov r32, imm32` for all 32-bit
@@ -198,11 +239,14 @@ attempted in this pass:
    (x^y) + 2*(x&y)`). Requires multi-instruction redirect because
    r-r encodings are 2–3 bytes — below the JMP rel32 threshold.
 
-2. **Multi-step deep chains**: re-apply the rewriter pipeline to
-   the output of one MBA body, producing nested expansions. Cheap
-   to wire (one extra pass invocation), but increases binary size
-   significantly.
-
-3. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
+2. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
    below the JMP rel32 threshold. Same multi-instruction-redirect
    prerequisite as r-r forms.
+
+3. **ALU multi-step deep chains**: extend the Phase-10 deep-chain
+   pattern to imm32 ALU rewriters by routing each basis-prep
+   `or/and/xor reg, K` in the affine body through a recursive MBA
+   layer. Requires a small refactor of `emit_affine_alu_body` to
+   accept per-term `MovImmEmitter`-style overrides for the K-
+   materialization. Mostly mechanical once the contract is in
+   place; saved for a future MBA expansion.

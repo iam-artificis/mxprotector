@@ -188,6 +188,28 @@ namespace factories {
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_rotate_blind();
 
 // ---------------------------------------------------------------------------
+// MOV r32, imm32 — 2-step deep chains.
+//
+// Each deep-chain shape composes two MBA layers at the abstract-
+// operation level. The outer layer is a familiar single-shape
+// rewrite (modular_inverse / xor_blind / rotate_blind); the inner
+// layer is one of the *other two* shapes, picked uniformly at
+// random per call site, used to materialise the leading immediate
+// the outer layer would otherwise emit via a bare `mov`. The result
+// is a 3-instruction body that stacks two MBA proofs in series —
+// SMT solvers must apply tactics from both layers to fold the chain.
+// ---------------------------------------------------------------------------
+
+/// Outer modular-inverse + inner ∈ {xor-blind, rotate-blind}.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_deep_modular();
+
+/// Outer xor-blind + inner ∈ {modular-inverse, rotate-blind}.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_deep_xor();
+
+/// Outer rotate-blind + inner ∈ {modular-inverse, xor-blind}.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_deep_rotate();
+
+// ---------------------------------------------------------------------------
 // MOV r64, imm64 shapes — `[REX.W (.B)] B8+rd iq` (10/11 bytes).
 //
 // 64-bit twins of the imm32 MOV shapes above. Their bodies emit the
