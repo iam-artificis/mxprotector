@@ -119,5 +119,23 @@ namespace factories {
 /// Pure Boolean, no carry, no arithmetic.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_xor_or_and();
 
+// ---------------------------------------------------------------------------
+// AND r, K shapes — `81 /4 id` (and REX.W variant).
+// ---------------------------------------------------------------------------
+
+/// `(x | K) - (x ^ K)` — symmetric-difference inverse (existing).
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_or_minus_xor();
+
+/// `(x + K) - (x | K)` — additive identity minus union.
+/// Derivation: `x + K = (x^K) + 2*(x&K)` and `x | K = (x^K) + (x&K)`,
+/// so `(x + K) - (x | K) = (x^K) + 2*(x&K) - (x^K) - (x&K) = x & K`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_add_minus_or();
+
+/// `~(~x | ~K)` — De Morgan's law, pure Boolean.
+/// `~(~x | ~K) = x & K` directly. Body chains three NOT ops with
+/// one OR — the AND is materialised entirely from negation, with
+/// no arithmetic and no SUB.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_demorgan();
+
 } // namespace factories
 } // namespace mx::mutation::mba

@@ -144,6 +144,8 @@ set(BUILDER_SOURCES
     protection/mutation/mba/rewriters/or_imm_add_minus_and_rewriter.cpp
     protection/mutation/mba/rewriters/or_imm_xor_or_and_rewriter.cpp
     protection/mutation/mba/rewriters/and_imm_or_xor_rewriter.cpp
+    protection/mutation/mba/rewriters/and_imm_add_minus_or_rewriter.cpp
+    protection/mutation/mba/rewriters/and_imm_demorgan_rewriter.cpp
     protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     protection/mutation/register_reassignment.cpp
     protection/mutation/junk_generator.cpp
