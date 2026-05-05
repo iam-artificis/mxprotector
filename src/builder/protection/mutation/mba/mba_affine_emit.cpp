@@ -120,6 +120,74 @@ MxResult<void> emit_affine_alu_body(
     return {};
 }
 
+MxResult<void> emit_affine_alu_deep_body(
+    analysis::X86CodeEmitter& em,
+    const AluImm32View&       view,
+    AffineCoefficients        coefficients,
+    const MovImmEmitter&      k_emitter,
+    Randomizer&               rng)
+{
+    if (view.is_64bit) {
+        // The deep-chain path materialises K via 32-bit ops that
+        // zero-extend the high 32 bits of the destination scratch. A
+        // 64-bit ALU site needs K sign-extended to 64 — caller must
+        // gate on `view.is_64bit == false`.
+        return std::unexpected(error::protection(
+            ProtectionErrorCode::pass_failed,
+            "emit_affine_alu_deep_body: 64-bit operand size not "
+            "supported by the 32-bit deep-chain path"));
+    }
+
+    const auto scratches = pick_three_scratches_for(view.dst);
+    const x86::Reg s_or  = scratches[0];
+    const x86::Reg s_and = scratches[1];
+    const x86::Reg s_xor = scratches[2];
+    const auto k = view.imm;
+
+    wrap_with_push_pop_3(em, scratches,
+        [&](analysis::X86CodeEmitter& e) {
+            // Materialise K into s_or via the chosen MBA layer. The
+            // emitter writes a 32-bit value, which auto-zero-extends
+            // s_or to 64 bits. The 32-bit basis prep below stays in
+            // 32-bit operand space, preserving the zero high half.
+            k_emitter(e, s_or, k, rng);
+
+            // Replicate K into the other two scratches in one byte
+            // each (3-byte mov r/r). This is cheaper than re-running
+            // the K-emitter for each basis term and keeps the
+            // composition cost linear in the number of basis terms.
+            e.mov(s_and, s_or);
+            e.mov(s_xor, s_or);
+
+            // Basis prep — exploit op commutativity so the operand
+            // already in the scratch (K) plus dst gives the same
+            // result as the imm32 form `op s, k`.
+            e.or_(s_or,  view.dst);
+            e.and_(s_and, view.dst);
+            e.xor_(s_xor, view.dst);
+
+            // Apply per-term coefficients; emit_imul_const folds 0/1/-1.
+            emit_imul_const(e, s_or,  coefficients.c_or);
+            emit_imul_const(e, s_and, coefficients.c_and);
+            emit_imul_const(e, s_xor, coefficients.c_xor);
+
+            // Combine: dst = c_or*OR + c_and*AND + c_xor*XOR.
+            e.mov(view.dst, s_or);
+            e.add(view.dst, s_and);
+            e.add(view.dst, s_xor);
+
+            // SUB post-correction: -2K, encoded as two `sub dst, K`
+            // for the same overflow-safety reason as the imm32 path.
+            if (view.op == AluImm32Op::sub) {
+                const auto k_signed = static_cast<std::int32_t>(k);
+                e.sub(view.dst, k_signed);
+                e.sub(view.dst, k_signed);
+            }
+        });
+
+    return {};
+}
+
 MxResult<void> emit_affine_alu_rr_body(
     analysis::X86CodeEmitter& em,
     const AluRrView&          view,

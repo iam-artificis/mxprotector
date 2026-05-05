@@ -165,6 +165,24 @@ namespace factories {
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_affine();
 
 // ---------------------------------------------------------------------------
+// imm32 ALU 2-step deep-chain shapes — same `81 /op id` (and short-form)
+// match surface as the affine shapes, but K is materialised through a
+// random MOV-imm MBA layer (modular-inverse / xor-blind / rotate-blind)
+// before the affine basis prep runs. Stacks two MBA proofs in series.
+//
+// Constraint: 32-bit operand only (`is_64bit == false`). The MOV-imm
+// step functions emit 32-bit ops that zero-extend their destination —
+// 64-bit sign-extension of K would need an explicit `movsxd` after
+// materialisation, which is roadmapped, not shipped here.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_add_imm_deep_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_deep_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_xor_imm_deep_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_or_imm_deep_affine();
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_deep_affine();
+
+// ---------------------------------------------------------------------------
 // ALU r-r (register-register) shapes — `01/03/09/0B/21/23/29/2B/31/33 /r`
 // with mod = 3. Two encoding directions per op fold into one normalised
 // `(dst, src)` view at decode time. All five affine shapes share the

@@ -135,4 +135,12 @@ void emit_rotate_blind(
     emit_rotate_blind_step(em, dst, k, rng);
 }
 
+MovImmEmitter pick_random_mov_imm_emitter(Randomizer& rng) {
+    switch (rng.next_range(0u, 2u)) {
+        case 0:  return MovImmEmitter{&emit_modular_inverse};
+        case 1:  return MovImmEmitter{&emit_xor_blind};
+        default: return MovImmEmitter{&emit_rotate_blind};
+    }
+}
+
 } // namespace mx::mutation::mba

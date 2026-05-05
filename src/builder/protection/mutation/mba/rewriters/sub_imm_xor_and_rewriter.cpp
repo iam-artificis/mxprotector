@@ -108,6 +108,8 @@ void register_sub_imm_rewriters(MbaRewriterRegistry& registry) {
     registry.register_rewriter(factories::make_sub_imm_neg_add());
     registry.register_rewriter(factories::make_sub_imm_offset());
     registry.register_rewriter(factories::make_sub_imm_affine());
+    // Deep-affine: 32-bit SUB only, K through a random MOV-imm layer.
+    registry.register_rewriter(factories::make_sub_imm_deep_affine());
 }
 
 } // namespace mx::mutation::mba

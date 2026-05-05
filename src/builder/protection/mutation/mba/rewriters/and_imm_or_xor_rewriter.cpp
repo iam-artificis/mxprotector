@@ -94,6 +94,8 @@ void register_and_imm_rewriters(MbaRewriterRegistry& registry) {
     registry.register_rewriter(factories::make_and_imm_add_minus_or());
     registry.register_rewriter(factories::make_and_imm_demorgan());
     registry.register_rewriter(factories::make_and_imm_affine());
+    // Deep-affine: 32-bit AND only, K through a random MOV-imm layer.
+    registry.register_rewriter(factories::make_and_imm_deep_affine());
 }
 
 } // namespace mx::mutation::mba

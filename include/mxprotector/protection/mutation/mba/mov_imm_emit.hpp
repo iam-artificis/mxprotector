@@ -123,4 +123,11 @@ void emit_rotate_blind(
     std::uint32_t             k,
     Randomizer&               rng);
 
+/// Pick one of the three `MovImmEmitter`-compatible MOV-imm shapes at
+/// random. Used by deep-chain rewriters that materialise a leading
+/// immediate via a fresh MBA layer — the per-site uniform pick gives
+/// 3-fold variety inside each deep-chain shape without forcing the
+/// caller to re-implement the picking logic.
+[[nodiscard]] MovImmEmitter pick_random_mov_imm_emitter(Randomizer& rng);
+
 } // namespace mx::mutation::mba

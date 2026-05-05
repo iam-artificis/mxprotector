@@ -119,6 +119,9 @@ void register_add_imm_rewriters(MbaRewriterRegistry& registry) {
     registry.register_rewriter(factories::make_add_imm_or_and());
     registry.register_rewriter(factories::make_add_imm_shift_or_xor());
     registry.register_rewriter(factories::make_add_imm_affine());
+    // Deep-affine: 32-bit ADD only, K materialised through a per-site
+    // random MOV-imm MBA layer. Stacks two MBA proofs in series.
+    registry.register_rewriter(factories::make_add_imm_deep_affine());
 }
 
 } // namespace mx::mutation::mba

@@ -54,6 +54,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/core/result.hpp"
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_emit.hpp"
 
 namespace mx::mutation::mba {
 
@@ -99,6 +100,43 @@ MxResult<void> emit_affine_alu_body(
     analysis::X86CodeEmitter& em,
     const AluImm32View&       view,
     AffineCoefficients        coefficients);
+
+/// Emit the affine-MBA body with K *materialised through another MBA
+/// layer* — the multi-step deep-chain variant.
+///
+/// Body skeleton (s_or/s_and/s_xor are scratches; K is `view.imm`):
+///
+///   push s_or; push s_and; push s_xor
+///   k_emitter(em, s_or, K, rng)   // 1..3 instructions writing K
+///   mov   s_and, s_or
+///   mov   s_xor, s_or
+///   or    s_or,  dst              // (K | dst) — OR is commutative
+///   and   s_and, dst              // (K & dst) — AND is commutative
+///   xor   s_xor, dst              // (K ^ dst) — XOR is commutative
+///   <coefficient muls + combine + SUB post-correction>
+///   pop  s_xor; pop s_and; pop s_or
+///
+/// `k_emitter` may be `direct_mov_imm32` (single layer; equivalent to
+/// `emit_affine_alu_body` shape) or one of the MOV-imm step functions
+/// (modular-inverse / xor-blind / rotate-blind) for a genuine 2-layer
+/// deep chain. The composition stacks two MBA proofs in series — the
+/// SMT solver must fold both layers to recover `K`.
+///
+/// **Operand size** — deep-affine emit is constrained to 32-bit
+/// destination operands. The `MovImmEmitter` step functions emit
+/// 32-bit ops that auto-zero-extend the high 32 bits of their
+/// destination, which matches the natural operand width of `81 /op id`
+/// without REX.W. For 64-bit ALU sites (`REX.W 81 /op id`), K would
+/// need explicit sign-extension after materialisation; that's a
+/// roadmap extension. Callers must decode with `view.is_64bit ==
+/// false` before invoking this helper — passing a REX.W view is a
+/// programmer error and yields a `pass_failed` result.
+MxResult<void> emit_affine_alu_deep_body(
+    analysis::X86CodeEmitter& em,
+    const AluImm32View&       view,
+    AffineCoefficients        coefficients,
+    const MovImmEmitter&      k_emitter,
+    Randomizer&               rng);
 
 } // namespace mx::mutation::mba
 

@@ -223,6 +223,11 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/or_imm_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/add_imm_deep_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/sub_imm_deep_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_imm_deep_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/or_imm_deep_affine_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_deep_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/add_rr_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/sub_rr_affine_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/xor_rr_affine_rewriter.cpp

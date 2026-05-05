@@ -88,6 +88,27 @@ mx::ByteBuffer encode_alu_imm32_rax(
     return bytes;
 }
 
+/// Encode `<op> eax, imm32` general form (no REX) — 6 bytes:
+/// `81 /op id` with `mod=3, reg=op, rm=eax(0)`. 32-bit operand size,
+/// no REX prefix. Used by the deep-affine tests, which target the
+/// 32-bit ALU sites only (the 64-bit `REX.W 81 /op id` form is
+/// covered by the affine path that does not need the deep-chain
+/// K-materialiser's zero-extension contract).
+mx::ByteBuffer encode_alu_imm32_eax(
+    mx::mutation::mba::AluImm32Op op,
+    std::uint32_t                 imm)
+{
+    mx::ByteBuffer bytes;
+    bytes.reserve(6);
+    bytes.push_back(0x81);                                  // group-1
+    bytes.push_back(static_cast<std::uint8_t>(
+        0xC0 | (static_cast<std::uint8_t>(op) << 3)));      // mod=3, reg=op, rm=eax(0)
+    for (int i = 0; i < 4; ++i) {
+        bytes.push_back(static_cast<std::uint8_t>((imm >> (i * 8)) & 0xFF));
+    }
+    return bytes;
+}
+
 /// Encode `<op> EAX, imm32` short form (no REX) — 5 bytes:
 /// opcode byte from `(reg << 3) | 0x05`, then 4 imm bytes.
 mx::ByteBuffer encode_alu_imm32_short_eax(
@@ -888,6 +909,106 @@ TEST(MbaRewriter, AndImmAffinePreservesSemantics) {
 }
 
 // ---------------------------------------------------------------------------
+// Deep-affine semantic tests (32-bit imm32 ALU sites only).
+//
+// The deep-chain rewriters reject `view->is_64bit`, so we feed them
+// `81 /op id` without REX.W (`encode_alu_imm32_eax`) — the dst is
+// `eax` and the result high 32 bits are zero per `add eax, K`
+// semantics. The simulator's `if (!rex_w) dst &= 0xFFFFFFFFu` already
+// masks correctly. The expected value is the 64-bit answer truncated
+// to 32 bits, which matches what the simulator produces after
+// running an all-32-bit body.
+// ---------------------------------------------------------------------------
+
+void check_deep_affine_semantics(const AluCase& c) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(c.rewriter_name);
+    ASSERT_NE(rewriter, nullptr) << c.rewriter_name;
+
+    mx::Randomizer rng(0xDEEF0042);
+
+    for (auto x : kSampleX) {
+        for (auto k : kSampleK) {
+            auto insn = make_insn(
+                encode_alu_imm32_eax(c.op, k), c.mnemonic, "eax, K");
+
+            ASSERT_TRUE(rewriter->matches(insn))
+                << c.rewriter_name << " did not match the 32-bit form";
+
+            auto emitted = rewriter->rewrite(insn, rng);
+            ASSERT_TRUE(emitted.has_value())
+                << c.rewriter_name << " emit failed";
+
+            MbaSimulator sim;
+            sim.set_reg(mx::x86::Reg::rax, x);
+            // Pre-fill scratches with poison so a missed pop surfaces.
+            sim.set_reg(mx::x86::Reg::r10, 0xAAAAAAAAAAAAAAAAULL);
+            sim.set_reg(mx::x86::Reg::r11, 0xBBBBBBBBBBBBBBBBULL);
+            sim.set_reg(mx::x86::Reg::r12, 0xCCCCCCCCCCCCCCCCULL);
+
+            ASSERT_TRUE(sim.run(mx::ByteView{
+                emitted->bytes.data(), emitted->bytes.size()}))
+                << c.rewriter_name
+                << " simulator stalled on emitted bytes";
+
+            const auto expected = apply_alu64(c.op, x, k) & 0xFFFFFFFFu;
+            EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), expected)
+                << c.rewriter_name
+                << " mismatch for x=" << std::hex << x << " k=" << k;
+            EXPECT_EQ(sim.get_reg(mx::x86::Reg::r10),
+                      0xAAAAAAAAAAAAAAAAULL)
+                << c.rewriter_name << " did not restore r10";
+            EXPECT_EQ(sim.get_reg(mx::x86::Reg::r11),
+                      0xBBBBBBBBBBBBBBBBULL)
+                << c.rewriter_name << " did not restore r11";
+            EXPECT_EQ(sim.get_reg(mx::x86::Reg::r12),
+                      0xCCCCCCCCCCCCCCCCULL)
+                << c.rewriter_name << " did not restore r12";
+        }
+    }
+}
+
+TEST(MbaRewriter, AddImmDeepAffinePreservesSemantics) {
+    check_deep_affine_semantics({
+        mx::mutation::mba::AluImm32Op::add, "add-imm-deep-affine", "add"});
+}
+
+TEST(MbaRewriter, SubImmDeepAffinePreservesSemantics) {
+    check_deep_affine_semantics({
+        mx::mutation::mba::AluImm32Op::sub, "sub-imm-deep-affine", "sub"});
+}
+
+TEST(MbaRewriter, XorImmDeepAffinePreservesSemantics) {
+    check_deep_affine_semantics({
+        mx::mutation::mba::AluImm32Op::xor_, "xor-imm-deep-affine", "xor"});
+}
+
+TEST(MbaRewriter, OrImmDeepAffinePreservesSemantics) {
+    check_deep_affine_semantics({
+        mx::mutation::mba::AluImm32Op::or_, "or-imm-deep-affine", "or"});
+}
+
+TEST(MbaRewriter, AndImmDeepAffinePreservesSemantics) {
+    check_deep_affine_semantics({
+        mx::mutation::mba::AluImm32Op::and_, "and-imm-deep-affine", "and"});
+}
+
+TEST(MbaRewriter, DeepAffineRejectsRexWSites) {
+    // Sanity: deep-affine is gated on `!is_64bit`. A REX.W site must
+    // not match — the existing affine shape covers the 64-bit path.
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find("add-imm-deep-affine");
+    ASSERT_NE(rewriter, nullptr);
+
+    auto insn = make_insn(
+        encode_alu_imm32_rax(mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
+        "add", "rax, K");
+    EXPECT_FALSE(rewriter->matches(insn))
+        << "deep-affine must skip 64-bit sites — the K-materialiser "
+        << "would zero-extend instead of sign-extend";
+}
+
+// ---------------------------------------------------------------------------
 // r-r affine semantic tests. The decoder normalises (dst, src) so the
 // rewriter sees the same view shape regardless of which encoding
 // direction the compiler picked. The simulator already understands
@@ -1309,7 +1430,7 @@ TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 38u);
+    EXPECT_EQ(registry.size(), 43u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -1348,6 +1469,11 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("not-rm-xor-cancel"), nullptr);
     EXPECT_NE(registry.find("neg-rm-not-add1"), nullptr);
     EXPECT_NE(registry.find("neg-rm-zero-sub"), nullptr);
+    EXPECT_NE(registry.find("add-imm-deep-affine"), nullptr);
+    EXPECT_NE(registry.find("sub-imm-deep-affine"), nullptr);
+    EXPECT_NE(registry.find("xor-imm-deep-affine"), nullptr);
+    EXPECT_NE(registry.find("or-imm-deep-affine"), nullptr);
+    EXPECT_NE(registry.find("and-imm-deep-affine"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {
@@ -1390,10 +1516,11 @@ TEST(MbaRewriterRegistry, ShortFormAddEaxMatchesAllAddShapes) {
             mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
         "add", "eax, 0xDEADBEEF");
     auto matching = registry.find_matching(insn);
-    EXPECT_EQ(matching.size(), 4u)
-        << "every ADD-imm shape (3 fixed + 1 affine) must accept the "
-        << "5-byte EAX,imm32 short form (`05 id`) — same coverage as "
-        << "`81 /0 id`";
+    EXPECT_EQ(matching.size(), 5u)
+        << "every ADD-imm shape (3 fixed + 1 affine + 1 deep-affine) "
+        << "must accept the 5-byte EAX,imm32 short form (`05 id`) — "
+        << "the deep-affine shape additionally requires `!is_64bit` "
+        << "which the no-REX short form satisfies";
 }
 
 TEST(MbaRewriterRegistry, ShortFormSubRaxMatchesAllSubShapes) {
