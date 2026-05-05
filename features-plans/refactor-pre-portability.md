@@ -463,6 +463,82 @@ under `~/build-mxprotector-linux/` — required because CMake's
   * CMake preset / CI lane (the manual WSL recipe is captured
     in the commit message; preset can land alongside CI).
 
+### R10 — Mid-size monolith split (>400 LOC, non-future-port files)
+
+**Status as of 2026-05-05:** **shipped** — four files split by
+responsibility, two files audited and intentionally left intact
+with documented rationale.
+
+The R2 pass cleared the >500 LOC monoliths. R10 went after the
+remaining 300-500 LOC files that are *not* in the path of any
+follow-up port branch (R11/R12/R13 will retype several 400-500 LOC
+files in their own ports — splitting them now would force a second
+churn and is not done).
+
+**Shipped splits (each its own commit, byte-for-byte identical
+behaviour, full ctest + 15-run stress):**
+
+  * R10.1 — `cipher_body.cpp` 689 → 293 LOC. Extracted
+    `emit_multi_layer_decrypt` to `cipher_body_multi_layer.cpp`
+    (242 LOC; reused by `driver_cipher_body.cpp`) and
+    `emit_reprotect_block` to `cipher_body_reprotect.{hpp,cpp}`
+    (53 + 198 LOC; user-mode-only Hell's-Gate-driven
+    NtProtectVirtualMemory loop). Also factored
+    `emit_anti_debug_probe` into the same-file anonymous
+    namespace.
+  * R10.2 — `sub_block_planner.cpp` 479 → 217 LOC. Extracted
+    `collect_pdata_entries` + `scan_function` (the read-only
+    input gathering) to `sub_block_planner_function_scan.{hpp,cpp}`.
+    Removed dead `ZydisX64Decoder` class and unused
+    `harvest_split_points` wrapper while at it.
+  * R10.3 — `import_table.cpp` 423 → 208 LOC. Split parse-side
+    (`parse_imports`, `parse_thunks`, `read_ascii_string`,
+    plus the private `safe_read<T>` template) to
+    `import_table_parser.cpp`. Modify + rebuild stay in
+    `import_table.cpp`. Both files contribute methods to the
+    same `ImportTableManager` class.
+  * R10.4 — `obfuscated_jt_scanner.cpp` 400 → 115 LOC.
+    Extracted dispatcher matchers and `find_dispatchers` to
+    `obfuscated_jt_dispatcher_matcher.{hpp,cpp}`. The kept
+    file owns jump-table-entry walking and the public
+    `scan()` orchestrator.
+
+**Audited and left intact (documented):**
+
+  * `guard_veh_emitter.cpp` (436 LOC) — single cohesive
+    function emitting one 234-byte VEH handler. Every sub-block
+    depends on shared label slots stored in local variables;
+    splitting would create artificial cuts in label dataflow
+    and require returning a label-slot bag from each helper,
+    which costs more than it gains.
+  * `atomic_chunk_planner.cpp` (401 LOC) — every helper is
+    10-30 LOC and tightly coupled through the file-private
+    `Range` / `PlanChunk` types and the `kChunkAlignment`
+    constant. Splitting them would push these types into a
+    private header + force naming the helpers' coupling
+    explicitly with no readability gain.
+
+**Out of R10 scope (deferred to follow-up port branches):**
+
+  * `x64_vm_backend.cpp`, `x64_inner_vm.cpp`,
+    `x64_bytecode_encoder.cpp`, `vm_lifter.cpp`,
+    `virtualization_pipeline.cpp`, `x64_entry_stub.cpp` →
+    R13 `port-vm-engine` will reshape them when extracting
+    `vm::VmRuntimeEngine`.
+  * `x86_code_emitter.cpp` → R12 `port-code-emitter-adoption`
+    wraps it (does not split it).
+  * `packer_pass.cpp` → R11 `port-packer-pipeline` retypes it
+    around `IPackerStubBackend`.
+
+  Splitting any of those now would force a second churn when
+  the corresponding port lands. The R11/R12/R13 commits will
+  carry the splits where they make sense.
+
+**Acceptance:** ✅ all four shipped splits keep tests green
+(847/847 on Linux + Windows after every commit) and stress green
+(15/15 on `mx_test_target` × `-l strong`). Two skipped files
+documented as cohesive-by-design.
+
 ## Out of scope for this branch
 
   * Implementing arm64 backends.
