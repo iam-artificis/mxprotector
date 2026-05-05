@@ -21,6 +21,10 @@
  *   xor   dst, K              ; dst = x ^ K
  *   sub   dst, scratch        ; dst = (x ^ K) - 2*(~x & K) = x - K
  *   pop   scratch
+ *
+ * Per-family aggregator: this TU also hosts
+ * `register_sub_imm_rewriters`, which registers all SUB-r,K MBA
+ * shapes via the factory functions in `mba_rewriter_factories.hpp`.
  */
 
 #include "mxprotector/protection/mutation/mba/mba_rewriter_groups.hpp"
@@ -31,6 +35,7 @@
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_emit_helpers.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
+#include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
 
 namespace mx::mutation::mba {
 
@@ -85,8 +90,21 @@ public:
 
 } // namespace
 
+namespace factories {
+
+std::unique_ptr<IMbaRewriter> make_sub_imm_xor_not_and() {
+    return std::make_unique<SubImmXorAndRewriter>();
+}
+
+} // namespace factories
+
 void register_sub_imm_rewriters(MbaRewriterRegistry& registry) {
-    registry.register_rewriter(std::make_unique<SubImmXorAndRewriter>());
+    // Three subtractive identities cover the same `81 /5 id` site;
+    // the MBA adapter picks one uniformly per call so two
+    // `sub r, K` instructions in the same binary look different.
+    registry.register_rewriter(factories::make_sub_imm_xor_not_and());
+    registry.register_rewriter(factories::make_sub_imm_neg_add());
+    registry.register_rewriter(factories::make_sub_imm_offset());
 }
 
 } // namespace mx::mutation::mba

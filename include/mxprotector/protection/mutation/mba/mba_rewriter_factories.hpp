@@ -57,5 +57,27 @@ namespace factories {
 /// the other two.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_add_imm_shift_or_xor();
 
+// ---------------------------------------------------------------------------
+// SUB r, K shapes — `81 /5 id` (and REX.W variant).
+// ---------------------------------------------------------------------------
+
+/// `(x ^ K) - 2*(~x & K)` — Knuth subtractive identity (with NOT).
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_xor_not_and();
+
+/// `x + (~K + 1)` — two's-complement negation, computed at runtime.
+/// Derivation: `-K = ~K + 1` (mod 2^n), so `x - K = x + (~K + 1)`.
+/// Forces the solver to chase the NOT through a +1, then prove the
+/// resulting addition equals the original subtraction; cached
+/// linear-arithmetic tactics on `sub r, K` do not apply.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_neg_add();
+
+/// `(x ^ K) + 2*(x & K) - 2K` — offset form, reusing the ADD
+/// identity then subtracting `2K` to recover `x - K`.
+/// Derivation: `(x^K) + 2*(x&K) = x + K`; subtracting `2K` yields
+/// `x - K` over Z/2^n. The body chains an ADD-style MBA expansion
+/// into a final SUB, exposing the solver to a longer arithmetic
+/// chain than either pure additive or pure subtractive identity.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_sub_imm_offset();
+
 } // namespace factories
 } // namespace mx::mutation::mba

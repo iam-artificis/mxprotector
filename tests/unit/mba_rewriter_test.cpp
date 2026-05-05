@@ -178,11 +178,25 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         return off - pos + 1;
     }
 
-    // MOV r32/r64, imm32 short form (B8+rd id)
+    // MOV r32, imm32 / MOV r64, imm64 (B8+rd id|iq).
+    // Without REX.W the immediate is 32-bit zero-extended; with
+    // REX.W it is a full 64-bit immediate. The MBA family's
+    // `mov scratch, sign-extended-K` emits the 64-bit form whenever
+    // K's int64 representation exceeds 0xFFFFFFFF (i.e. K is
+    // negative as int32), so the simulator must accept both.
     if (op >= 0xB8 && op <= 0xBF) {
-        if (off + 5 > bytes.size()) return 0;
         std::uint8_t reg_id = op - 0xB8;
         if (rex_b) reg_id |= 0x08;
+        if (rex_w) {
+            if (off + 9 > bytes.size()) return 0;
+            std::uint64_t imm = 0;
+            for (int i = 0; i < 8; ++i) {
+                imm |= static_cast<std::uint64_t>(bytes[off + 1 + i]) << (i * 8);
+            }
+            regs_[reg_id] = imm;
+            return off - pos + 9;
+        }
+        if (off + 5 > bytes.size()) return 0;
         const std::uint32_t imm = read_imm32(bytes, off + 1);
         regs_[reg_id] = static_cast<std::uint64_t>(imm);
         return off - pos + 5;
@@ -221,7 +235,8 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
 
     // mov r/m32, imm32 (C7 /0 id) — emitted by ConstantUnfolder + by
     // the modular-inverse rewriter when destination is rax-rdi in
-    // 32-bit operand-size mode.
+    // 32-bit operand-size mode. With REX.W, the immediate is
+    // sign-extended to 64 bits per the Intel SDM.
     if (op == 0xC7) {
         if (off + 6 > bytes.size()) return 0;
         const std::uint8_t modrm = bytes[off + 1];
@@ -230,7 +245,14 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         std::uint8_t rm = mx::x86::modrm_rm(modrm);
         if (rex_b) rm |= 0x08;
         const std::uint32_t imm = read_imm32(bytes, off + 2);
-        regs_[rm] = static_cast<std::uint64_t>(imm); // zero-extend
+        if (rex_w) {
+            regs_[rm] = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(
+                    static_cast<std::int32_t>(imm)));
+        } else {
+            regs_[rm] = static_cast<std::uint64_t>(imm); // zero-extend
+            regs_[rm] &= 0xFFFFFFFFu;
+        }
         return off - pos + 6;
     }
 
@@ -459,6 +481,16 @@ TEST(MbaRewriter, SubImmXorAndPreservesSemantics) {
         mx::mutation::mba::AluImm32Op::sub, "sub-imm-xor-and", "sub"});
 }
 
+TEST(MbaRewriter, SubImmNegAddPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::sub, "sub-imm-neg-add", "sub"});
+}
+
+TEST(MbaRewriter, SubImmOffsetPreservesSemantics) {
+    check_rewriter_semantics({
+        mx::mutation::mba::AluImm32Op::sub, "sub-imm-offset", "sub"});
+}
+
 TEST(MbaRewriter, XorImmOrAndPreservesSemantics) {
     check_rewriter_semantics({
         mx::mutation::mba::AluImm32Op::xor_, "xor-imm-or-and", "xor"});
@@ -514,11 +546,13 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 8u);
+    EXPECT_EQ(registry.size(), 10u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
     EXPECT_NE(registry.find("sub-imm-xor-and"), nullptr);
+    EXPECT_NE(registry.find("sub-imm-neg-add"), nullptr);
+    EXPECT_NE(registry.find("sub-imm-offset"), nullptr);
     EXPECT_NE(registry.find("xor-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("or-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("and-imm-or-xor"), nullptr);
