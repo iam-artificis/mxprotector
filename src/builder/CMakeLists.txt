@@ -77,6 +77,9 @@ set(BUILDER_SOURCES
     pe/chaos/basic_block_atom_source.cpp
     pe/chaos/sub_block_planner.cpp
     pe/chaos/pdata_chain_emitter.cpp
+    pe/chaos/chain_pdata_reader.cpp
+    pe/chaos/chain_blob_builder.cpp
+    pe/chaos/mxpdat_builder.cpp
     pe/chaos/instruction_atom_source.cpp
     pe/chaos/instruction_cluster_atom_source.cpp
     pe/chaos/string_atom_source.cpp

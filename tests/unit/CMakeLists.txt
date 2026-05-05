@@ -270,6 +270,9 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/basic_block_atom_source.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/sub_block_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/pdata_chain_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chain_pdata_reader.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chain_blob_builder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/mxpdat_builder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/atomic_chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/core/context.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/cfg/cfg_flattening_pass.cpp
