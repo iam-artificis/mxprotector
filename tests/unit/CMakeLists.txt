@@ -247,6 +247,7 @@ set(CFF_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/switch_jump_table_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/vm_call_pop_trampoline_scanner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/obfuscated_jt_scanner.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/obfuscated_jt_dispatcher_matcher.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/refmap/reference_overlap_filter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/chunk_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/pe/chaos/section_movable_block_atom_source.cpp

@@ -58,6 +58,7 @@ set(BUILDER_SOURCES
     pe/refmap/switch_jump_table_scanner.cpp
     pe/refmap/vm_call_pop_trampoline_scanner.cpp
     pe/refmap/obfuscated_jt_scanner.cpp
+    pe/refmap/obfuscated_jt_dispatcher_matcher.cpp
     pe/refmap/reference_overlap_filter.cpp
     pe/chaos/chunk_planner.cpp
     pe/chaos/section_movable_block_atom_source.cpp
