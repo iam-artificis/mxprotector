@@ -201,6 +201,7 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/inc_dec_rules.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/rules/mba_substitution_rule.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/mba_alu_imm_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/mov_imm_decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/mba_rewriter_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/add_imm_xor_and_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/add_imm_or_and_rewriter.cpp
@@ -218,6 +219,8 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_add_minus_or_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/and_imm_demorgan_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm_rotate_blind_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp

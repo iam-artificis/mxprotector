@@ -317,6 +317,59 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         return off - pos + 2;
     }
 
+    // C1 /op ib — ROL/ROR/SHL/SHR r/m, imm8.
+    // The shipped MBA shapes use only ROL (/0), but the simulator
+    // covers the related shifts/rotates in case future shapes mix
+    // them. Operand size is 32 unless REX.W is set; the rotate
+    // count is masked to 5 bits per Intel SDM (32-bit op width).
+    if (op == 0xC1) {
+        if (off + 3 > bytes.size()) return 0;
+        const std::uint8_t modrm = bytes[off + 1];
+        if (mx::x86::modrm_mod(modrm) != 3) return 0;
+        const std::uint8_t reg_field = mx::x86::modrm_reg(modrm);
+        std::uint8_t rm = mx::x86::modrm_rm(modrm);
+        if (rex_b) rm |= 0x08;
+        const std::uint8_t imm8 = bytes[off + 2];
+        const std::uint32_t width = rex_w ? 64u : 32u;
+        const std::uint8_t  cnt = imm8 & (rex_w ? 0x3F : 0x1F);
+        std::uint64_t v = regs_[rm];
+        if (!rex_w) v &= 0xFFFFFFFFu;
+        switch (reg_field) {
+            case 0: { // ROL
+                if (cnt != 0) {
+                    if (rex_w) {
+                        v = (v << cnt) | (v >> (width - cnt));
+                    } else {
+                        const std::uint32_t v32 = static_cast<std::uint32_t>(v);
+                        const std::uint32_t r = (v32 << cnt) |
+                                                (v32 >> (32u - cnt));
+                        v = static_cast<std::uint64_t>(r);
+                    }
+                }
+                break;
+            }
+            case 1: { // ROR
+                if (cnt != 0) {
+                    if (rex_w) {
+                        v = (v >> cnt) | (v << (width - cnt));
+                    } else {
+                        const std::uint32_t v32 = static_cast<std::uint32_t>(v);
+                        const std::uint32_t r = (v32 >> cnt) |
+                                                (v32 << (32u - cnt));
+                        v = static_cast<std::uint64_t>(r);
+                    }
+                }
+                break;
+            }
+            case 4: v <<= cnt; break; // SHL
+            case 5: v >>= cnt; break; // SHR (logical, 32-bit width below)
+            default: return 0;
+        }
+        regs_[rm] = v;
+        if (!rex_w) regs_[rm] &= 0xFFFFFFFFu;
+        return off - pos + 3;
+    }
+
     // ALU r/m, r reg-reg encodings (mod=3): 01 ADD, 09 OR, 21 AND,
     // 29 SUB, 31 XOR, 89 MOV. Two-byte instruction.
     auto is_alu_rmr = [](std::uint8_t b) {
@@ -635,6 +688,50 @@ TEST(MbaRewriter, ModularInversePreservesMovImmSemantics) {
     }
 }
 
+TEST(MbaRewriter, MovImmXorBlindPreservesSemantics) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find("mov-imm-xor-blind");
+    ASSERT_NE(rewriter, nullptr);
+
+    mx::Randomizer rng(0xBEEF);
+    for (auto k : kSampleK) {
+        auto insn = make_insn(
+            encode_mov_eax_imm32(k), "mov", "eax, K");
+        ASSERT_TRUE(rewriter->matches(insn));
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value());
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, 0xCCCCCCCCCCCCCCCCULL);
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}));
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax),
+                  static_cast<std::uint64_t>(k));
+    }
+}
+
+TEST(MbaRewriter, MovImmRotateBlindPreservesSemantics) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find("mov-imm-rotate-blind");
+    ASSERT_NE(rewriter, nullptr);
+
+    mx::Randomizer rng(0xC0DE);
+    for (auto k : kSampleK) {
+        auto insn = make_insn(
+            encode_mov_eax_imm32(k), "mov", "eax, K");
+        ASSERT_TRUE(rewriter->matches(insn));
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value());
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, 0xCCCCCCCCCCCCCCCCULL);
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}));
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax),
+                  static_cast<std::uint64_t>(k));
+    }
+}
+
 TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
     const auto* rewriter = registry.find("mov-imm-modular-inverse");
@@ -650,7 +747,7 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 16u);
+    EXPECT_EQ(registry.size(), 18u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -667,6 +764,8 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("and-imm-add-minus-or"), nullptr);
     EXPECT_NE(registry.find("and-imm-demorgan"), nullptr);
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
+    EXPECT_NE(registry.find("mov-imm-xor-blind"), nullptr);
+    EXPECT_NE(registry.find("mov-imm-rotate-blind"), nullptr);
 }
 
 TEST(MbaRewriterRegistry, ShortFormAddEaxMatchesAllAddShapes) {

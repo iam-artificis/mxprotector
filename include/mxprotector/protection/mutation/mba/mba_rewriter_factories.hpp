@@ -137,5 +137,28 @@ namespace factories {
 /// no arithmetic and no SUB.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_and_imm_demorgan();
 
+// ---------------------------------------------------------------------------
+// MOV r32, imm32 shapes — `[REX.B] B8+rd id` (5/6 bytes).
+// ---------------------------------------------------------------------------
+
+/// Permutation polynomial: `mov r, K' ; imul r, r, P` with
+/// `K' * P ≡ K (mod 2^32)` (existing). Strongest of the three —
+/// SMT solvers must invert modular multiplication symbolically.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_modular_inverse();
+
+/// XOR blinding: `mov r, A ; xor r, A ^ K` for random `A`.
+/// At runtime `A ^ (A ^ K) = K`. Per-site polymorphism comes from
+/// `A` — two MOV-imm sites with the same target K get visibly
+/// different bytes. Cheap (2 instructions); SMT-friendly tactic
+/// would still need to evaluate the XOR symbolically.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_xor_blind();
+
+/// Rotation blinding: `mov r, ror(K, n) ; rol r, n` for random
+/// `n` in [1, 31]. The rotation undoes the pre-rotated immediate;
+/// resulting r == K. Body is 2 instructions and emits a ROL — an
+/// opcode the modular-inverse and XOR shapes don't use, expanding
+/// the per-site instruction-vocabulary at MOV-imm sites.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_rotate_blind();
+
 } // namespace factories
 } // namespace mx::mutation::mba

@@ -35,6 +35,8 @@
 #include "mxprotector/analysis/assembler.hpp"
 #include "mxprotector/analysis/x86_encoding.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
+#include "mxprotector/protection/mutation/mba/mba_rewriter_factories.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
 
 namespace mx::mutation::mba {
 
@@ -51,53 +53,6 @@ namespace {
         inverse = inverse * (2u - value * inverse);
     }
     return inverse;
-}
-
-/// Decoded view of `[REX.B] B8+rd id` (`mov r32, imm32`).
-struct MovR32Imm32View {
-    x86::Reg      dst;
-    std::uint32_t imm;
-};
-
-[[nodiscard]] std::optional<MovR32Imm32View> decode_mov_r32_imm32(
-    const analysis::Instruction& insn) noexcept
-{
-    const auto bytes = insn.raw_bytes();
-    if (bytes.size() < 5) return std::nullopt;
-
-    std::size_t cursor = 0;
-    if (x86::is_legacy_prefix(bytes[cursor])) return std::nullopt;
-
-    bool rex_b = false;
-    if (x86::is_rex(bytes[cursor])) {
-        // REX.W means the encoding becomes `48 C7 C0 id` — out of
-        // scope. Only accept REX with W=0 (extended low-3-bit
-        // register) here.
-        if (x86::rex_w(bytes[cursor])) return std::nullopt;
-        rex_b = x86::rex_b(bytes[cursor]);
-        ++cursor;
-    }
-
-    if (cursor >= bytes.size()) return std::nullopt;
-    const std::uint8_t op = bytes[cursor];
-    if (op < 0xB8 || op > 0xBF) return std::nullopt;
-    ++cursor;
-
-    if (cursor + 4 > bytes.size()) return std::nullopt;
-
-    std::uint32_t imm = 0;
-    for (std::uint8_t i = 0; i < 4; ++i) {
-        imm |= static_cast<std::uint32_t>(bytes[cursor + i]) << (i * 8);
-    }
-    if (imm == 0) return std::nullopt; // zeroing is a different idiom
-
-    std::uint8_t reg_id = static_cast<std::uint8_t>(op - 0xB8);
-    if (rex_b) reg_id |= 0x08;
-
-    MovR32Imm32View view{};
-    view.dst = static_cast<x86::Reg>(reg_id);
-    view.imm = imm;
-    return view;
 }
 
 class ModularInverseRewriter final : public IMbaRewriter {
@@ -153,8 +108,21 @@ public:
 
 } // namespace
 
+namespace factories {
+
+std::unique_ptr<IMbaRewriter> make_mov_imm_modular_inverse() {
+    return std::make_unique<ModularInverseRewriter>();
+}
+
+} // namespace factories
+
 void register_modular_inverse_rewriters(MbaRewriterRegistry& registry) {
-    registry.register_rewriter(std::make_unique<ModularInverseRewriter>());
+    // Three MOV-imm shapes share the same `B8+rd id` encoding. The
+    // adapter picks one uniformly per call so a 32-bit constant
+    // initialisation looks different at every site.
+    registry.register_rewriter(factories::make_mov_imm_modular_inverse());
+    registry.register_rewriter(factories::make_mov_imm_xor_blind());
+    registry.register_rewriter(factories::make_mov_imm_rotate_blind());
 }
 
 } // namespace mx::mutation::mba
