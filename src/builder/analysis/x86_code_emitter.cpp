@@ -133,6 +133,18 @@ X86CodeEmitter& X86CodeEmitter::mov(x86::Reg dst, uint64_t imm) {
     return *this;
 }
 
+X86CodeEmitter& X86CodeEmitter::mov_abs64(x86::Reg dst, uint64_t imm) {
+    // Always emit `[REX.W (.B)] B8+rd iq` (10 bytes). Used by the
+    // 64-bit MBA MOV-imm rewriters where the encoded value must
+    // round-trip the full 64 bits without sign-extension downgrade.
+    const uint8_t dst_3bit = static_cast<uint8_t>(dst) & 0x07;
+    const bool dst_ext = static_cast<uint8_t>(dst) >= 8;
+    emit_rex(true, false, false, dst_ext);
+    emit_byte(0xB8 + dst_3bit);
+    emit_qword(imm);
+    return *this;
+}
+
 X86CodeEmitter& X86CodeEmitter::mov(x86::Reg dst, x86::Reg src) {
     emit_rex_if_needed(true, src, dst);
     emit_byte(0x89);

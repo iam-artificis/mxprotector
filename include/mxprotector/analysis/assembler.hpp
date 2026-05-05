@@ -157,6 +157,29 @@ public:
     // ====================================================================
 
     X86CodeEmitter& mov(x86::Reg dst, uint64_t imm);
+
+    /**
+     * @brief Forces the 10-byte `[REX.W (.B)] B8+rd iq` MOV-imm
+     *        encoding regardless of whether `imm` fits in 32 bits.
+     *
+     * @details The default `mov(reg, uint64_t)` is size-optimal: it
+     *          downgrades to the 7-byte `[REX.W] C7 /0 id` form when
+     *          the immediate fits in 32 bits. That form
+     *          *sign-extends* its imm32 to 64 bits, which silently
+     *          breaks any 64-bit MBA body that picked an immediate
+     *          with bit 31 set but bit 63 clear (or vice-versa).
+     *
+     *          MBA bodies that genuinely depend on the encoded value
+     *          surviving as a full 64-bit constant (modular-inverse,
+     *          xor-blind, rotate-blind for `mov r64, imm64` sites)
+     *          call this method to lock in the 10-byte shape.
+     *
+     *          Pre-condition: `is_64bit() == true`. The 10-byte form
+     *          is x64-only; calling in 32-bit mode is a programming
+     *          error and emits the same bytes as `mov(reg, imm)`.
+     */
+    X86CodeEmitter& mov_abs64(x86::Reg dst, uint64_t imm);
+
     X86CodeEmitter& mov(x86::Reg dst, x86::Reg src);
     X86CodeEmitter& mov(x86::Reg dst, MemOperand src);
     X86CodeEmitter& mov(MemOperand dst, x86::Reg src);

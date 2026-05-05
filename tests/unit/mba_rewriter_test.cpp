@@ -34,6 +34,7 @@
 #include "mxprotector/core/randomizer.hpp"
 #include "mxprotector/protection/mutation/mba/mba_alu_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/mba/mba_rewriter.hpp"
+#include "mxprotector/protection/mutation/mba/mov_imm_decoder.hpp"
 #include "mxprotector/protection/mutation/substitution_rule_groups.hpp"
 #include "mxprotector/protection/mutation/substitution_rules.hpp"
 
@@ -122,6 +123,20 @@ mx::ByteBuffer encode_mov_eax_imm32(std::uint32_t imm) {
     bytes.reserve(5);
     bytes.push_back(0xB8);
     for (int i = 0; i < 4; ++i) {
+        bytes.push_back(static_cast<std::uint8_t>((imm >> (i * 8)) & 0xFF));
+    }
+    return bytes;
+}
+
+/// Encode `mov rax, imm64` 10-byte form (`48 B8+rd iq`) — REX.W
+/// without REX.B (target = rax). Used by the 64-bit MOV-imm
+/// rewriter tests.
+mx::ByteBuffer encode_mov_rax_imm64(std::uint64_t imm) {
+    mx::ByteBuffer bytes;
+    bytes.reserve(10);
+    bytes.push_back(0x48); // REX.W
+    bytes.push_back(0xB8); // mov rax (B8 + 0)
+    for (int i = 0; i < 8; ++i) {
         bytes.push_back(static_cast<std::uint8_t>((imm >> (i * 8)) & 0xFF));
     }
     return bytes;
@@ -398,7 +413,13 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         return off - pos + 2;
     }
 
-    // 69 /r id — IMUL r32/r64, r/m, imm32
+    // 69 /r id — IMUL r32/r64, r/m, imm32. Hardware sign-extends
+    // the imm32 to the operand width: in 64-bit mode the actual
+    // multiplier is `sext64(imm32)`, which is what the 64-bit
+    // modular-inverse rewriter relies on (it picks `K' = K *
+    // inv(sext64(P32))` so the runtime product reduces to `K`).
+    // In 32-bit mode the high bits are masked away anyway, so the
+    // sign-extension is invisible.
     if (op == 0x69) {
         if (off + 6 > bytes.size()) return 0;
         const std::uint8_t modrm = bytes[off + 1];
@@ -408,10 +429,10 @@ std::size_t MbaSimulator::step(mx::ByteView bytes, std::size_t pos) {
         if (rex_b) rm  |= 0x08;
         if (rex_r) reg |= 0x08;
         const std::uint32_t imm = read_imm32(bytes, off + 2);
-        const auto product =
-            static_cast<std::uint64_t>(regs_[rm]) *
-            static_cast<std::uint64_t>(static_cast<std::uint32_t>(imm));
-        regs_[reg] = product;
+        const std::uint64_t multiplier = rex_w
+            ? static_cast<std::uint64_t>(sign_extend_imm32(imm))
+            : static_cast<std::uint64_t>(imm);
+        regs_[reg] = regs_[rm] * multiplier;
         if (!rex_w) regs_[reg] &= 0xFFFFFFFFu;
         return off - pos + 6;
     }
@@ -506,6 +527,59 @@ TEST(MbaAluImm32Decoder, RejectsForeignShortFormOps) {
     mx::ByteBuffer sbb_bytes{0x1D, 0, 0, 0, 0};
     EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(
         make_insn(std::move(sbb_bytes), "sbb", "eax, 0")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// `decode_mov_r64_imm64` decoder tests — covers the 10-byte
+// `[REX.W (.B)] B8+rd iq` form with extended-register and
+// negative-shape rejection cases.
+// ---------------------------------------------------------------------------
+
+TEST(MbaMovR64Imm64Decoder, AcceptsRaxImm64) {
+    auto insn = make_insn(
+        encode_mov_rax_imm64(0x0123456789ABCDEFULL),
+        "mov", "rax, 0x0123456789ABCDEF");
+    auto view = mx::mutation::mba::decode_mov_r64_imm64(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_EQ(view->imm, 0x0123456789ABCDEFULL);
+}
+
+TEST(MbaMovR64Imm64Decoder, ParsesRexBExtendedRegister) {
+    // mov r11, imm64 → REX.W|REX.B B8+rd iq.
+    mx::ByteBuffer bytes{
+        0x49,                                  // REX.W | REX.B
+        0xBB,                                  // mov r11 (B8 + 3)
+        0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+    };
+    auto insn = make_insn(std::move(bytes), "mov", "r11, ...");
+    auto view = mx::mutation::mba::decode_mov_r64_imm64(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->dst, mx::x86::Reg::r11);
+    EXPECT_EQ(view->imm, 0x0123456789ABCDEFULL);
+}
+
+TEST(MbaMovR64Imm64Decoder, RejectsImm32Form) {
+    // 5-byte `B8 id` belongs to the imm32 decoder, not this one.
+    auto insn = make_insn(
+        encode_mov_eax_imm32(0xDEADBEEFu), "mov", "eax, 0xDEADBEEF");
+    EXPECT_FALSE(mx::mutation::mba::decode_mov_r64_imm64(insn).has_value());
+}
+
+TEST(MbaMovR64Imm64Decoder, RejectsRexWC7SignExtendedForm) {
+    // `48 C7 C0 id` is `mov r64, sext(imm32)` — out of scope (the
+    // shipped 64-bit MOV-imm rewriters only target the 10-byte
+    // `B8+rd iq` form so the encoded value survives as a full
+    // 64-bit constant).
+    mx::ByteBuffer bytes{0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00};
+    auto insn = make_insn(std::move(bytes), "mov", "rax, 1");
+    EXPECT_FALSE(mx::mutation::mba::decode_mov_r64_imm64(insn).has_value());
+}
+
+TEST(MbaMovR64Imm64Decoder, RejectsZeroImmediate) {
+    auto insn = make_insn(
+        encode_mov_rax_imm64(0ULL), "mov", "rax, 0");
+    EXPECT_FALSE(mx::mutation::mba::decode_mov_r64_imm64(insn).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -742,12 +816,73 @@ TEST(MbaRewriter, ModularInverseRejectsZeroImmediate) {
 }
 
 // ---------------------------------------------------------------------------
+// 64-bit MOV-imm rewriter semantic tests. A small property-style
+// sweep across `kSampleK64` reuses the same simulator harness as the
+// 32-bit MOV-imm tests; each shape must round-trip every sample K
+// regardless of which bits are set.
+// ---------------------------------------------------------------------------
+
+constexpr std::array<std::uint64_t, 6> kSampleK64 = {
+    0x0000000000000001ULL,
+    0x0000000080000000ULL, // bit-31 set, high half clear — sign-extension trap
+    0x00000000FFFFFFFFULL,
+    0x0123456789ABCDEFULL,
+    0xDEADBEEFCAFEBABEULL,
+    0xFFFFFFFFFFFFFFFFULL,
+};
+
+void check_mov_imm64_rewriter(std::string_view name) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find(name);
+    ASSERT_NE(rewriter, nullptr) << name;
+
+    mx::Randomizer rng(0x64640042);
+    for (auto k : kSampleK64) {
+        auto insn = make_insn(
+            encode_mov_rax_imm64(k), "mov", "rax, K64");
+        ASSERT_TRUE(rewriter->matches(insn)) << name;
+
+        auto emitted = rewriter->rewrite(insn, rng);
+        ASSERT_TRUE(emitted.has_value()) << name << " emit failed";
+
+        MbaSimulator sim;
+        sim.set_reg(mx::x86::Reg::rax, 0xCCCCCCCCCCCCCCCCULL);
+        ASSERT_TRUE(sim.run(mx::ByteView{
+            emitted->bytes.data(), emitted->bytes.size()}))
+            << name << " simulator stalled on emitted bytes";
+        EXPECT_EQ(sim.get_reg(mx::x86::Reg::rax), k)
+            << name << " mismatch for k=" << std::hex << k;
+    }
+}
+
+TEST(MbaRewriter, MovImm64ModularInversePreservesSemantics) {
+    check_mov_imm64_rewriter("mov-imm64-modular-inverse");
+}
+
+TEST(MbaRewriter, MovImm64XorBlindPreservesSemantics) {
+    check_mov_imm64_rewriter("mov-imm64-xor-blind");
+}
+
+TEST(MbaRewriter, MovImm64RotateBlindPreservesSemantics) {
+    check_mov_imm64_rewriter("mov-imm64-rotate-blind");
+}
+
+TEST(MbaRewriter, MovImm64ModularInverseRejectsZeroImmediate) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    const auto* rewriter = registry.find("mov-imm64-modular-inverse");
+    ASSERT_NE(rewriter, nullptr);
+    auto insn = make_insn(
+        encode_mov_rax_imm64(0ULL), "mov", "rax, 0");
+    EXPECT_FALSE(rewriter->matches(insn));
+}
+
+// ---------------------------------------------------------------------------
 // Registry tests
 // ---------------------------------------------------------------------------
 
 TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
-    EXPECT_EQ(registry.size(), 18u);
+    EXPECT_EQ(registry.size(), 21u);
     EXPECT_NE(registry.find("add-imm-xor-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-or-and"), nullptr);
     EXPECT_NE(registry.find("add-imm-shift-or-xor"), nullptr);
@@ -766,6 +901,42 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
     EXPECT_NE(registry.find("mov-imm-xor-blind"), nullptr);
     EXPECT_NE(registry.find("mov-imm-rotate-blind"), nullptr);
+    EXPECT_NE(registry.find("mov-imm64-modular-inverse"), nullptr);
+    EXPECT_NE(registry.find("mov-imm64-xor-blind"), nullptr);
+    EXPECT_NE(registry.find("mov-imm64-rotate-blind"), nullptr);
+}
+
+TEST(MbaRewriterRegistry, MovImm64SiteMatchesAllImm64Shapes) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    auto insn = make_insn(
+        encode_mov_rax_imm64(0xDEADBEEFCAFEBABEULL),
+        "mov", "rax, ...");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 3u)
+        << "every MOV-imm64 shape must accept the 10-byte "
+        << "`REX.W B8+rd iq` form";
+    // The 32-bit MOV-imm shapes must NOT match a 10-byte site —
+    // their decoder rejects REX.W. Verify by name.
+    for (const auto* r : matching) {
+        EXPECT_TRUE(r->name() == "mov-imm64-modular-inverse" ||
+                    r->name() == "mov-imm64-xor-blind"      ||
+                    r->name() == "mov-imm64-rotate-blind")
+            << "unexpected matcher: " << r->name();
+    }
+}
+
+TEST(MbaRewriterRegistry, MovImm32SiteDoesNotMatchImm64Shapes) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    auto insn = make_insn(
+        encode_mov_eax_imm32(0xDEADBEEFu), "mov", "eax, 0xDEADBEEF");
+    auto matching = registry.find_matching(insn);
+    for (const auto* r : matching) {
+        EXPECT_FALSE(r->name() == "mov-imm64-modular-inverse" ||
+                     r->name() == "mov-imm64-xor-blind"      ||
+                     r->name() == "mov-imm64-rotate-blind")
+            << "MOV-imm64 shape leaked onto a 5-byte mov r32, imm32 "
+            << "site: " << r->name();
+    }
 }
 
 TEST(MbaRewriterRegistry, ShortFormAddEaxMatchesAllAddShapes) {

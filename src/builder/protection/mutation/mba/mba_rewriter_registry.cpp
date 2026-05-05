@@ -61,10 +61,10 @@ MbaRewriterRegistry MbaRewriterRegistry::create_default() {
     register_or_imm_rewriters(registry);
     register_and_imm_rewriters(registry);
 
-    // Permutation-polynomial obfuscation for `mov r32, imm32`.
-    // Different shape from the imm32 ALU set — targets the
-    // 5-byte `B8 id` short form.
-    register_modular_inverse_rewriters(registry);
+    // MOV-imm family covers both the 5/6-byte `mov r32, imm32`
+    // (`B8+rd id`) and the 10/11-byte `mov r64, imm64`
+    // (`REX.W B8+rd iq`) encodings — three shapes per width.
+    register_mov_imm_rewriters(registry);
 
     return registry;
 }

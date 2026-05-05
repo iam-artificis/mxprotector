@@ -160,5 +160,34 @@ namespace factories {
 /// the per-site instruction-vocabulary at MOV-imm sites.
 [[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm_rotate_blind();
 
+// ---------------------------------------------------------------------------
+// MOV r64, imm64 shapes — `[REX.W (.B)] B8+rd iq` (10/11 bytes).
+//
+// 64-bit twins of the imm32 MOV shapes above. Their bodies emit the
+// 10-byte `mov r64, imm64` form (via `X86CodeEmitter::mov_abs64`)
+// rather than the size-optimal default that would silently downgrade
+// to the 7-byte sign-extended `48 C7 C0 id` shape, which inverts
+// the high 32 bits whenever bit 31 of the encoded value is set.
+// ---------------------------------------------------------------------------
+
+/// 64-bit permutation polynomial: `mov r64, K' ; imul r64, r64, P32`
+/// with `K' * sext64(P32) ≡ K (mod 2^64)` for a per-site random odd
+/// `P32`. Strongest 64-bit MOV-imm shape — SMT solvers must invert
+/// 64-bit modular multiplication symbolically, a known-hard tactic
+/// for bit-vector and linear-arithmetic backends.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm64_modular_inverse();
+
+/// 64-bit XOR blinding: `mov r64, A ; xor r64, B32` for random
+/// `B32` (sign-extended to 64 bits by hardware) and
+/// `A = K ^ sext64(B32)`. Per-site polymorphism comes entirely from
+/// `B32` — `A` is fully determined by `K` and `B32`.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm64_xor_blind();
+
+/// 64-bit rotation blinding: `mov r64, ror64(K, n) ; rol r64, n` for
+/// random `n` in [1, 63]. Body emits ROL — an opcode neither the
+/// 64-bit modular-inverse nor the xor-blind shape uses, broadening
+/// the per-site MOV-imm64 instruction vocabulary.
+[[nodiscard]] std::unique_ptr<IMbaRewriter> make_mov_imm64_rotate_blind();
+
 } // namespace factories
 } // namespace mx::mutation::mba

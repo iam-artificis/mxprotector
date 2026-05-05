@@ -1,6 +1,6 @@
 # MBA Expansion — Multi-Shape Rewriter Set
 
-**Status:** shipped — phases 1–7 merged on master, all stress green.
+**Status:** shipped — phases 1–8 merged on master, all stress green.
 
 ## What this is
 
@@ -44,6 +44,34 @@ or 6 (with REX.W), fitting the JMP rel32 redirect threshold.
 Coverage uplift on `test_vm_showcase.exe` at strong: redirect count
 180 → 195 (**+8.3%**). On binaries with more RAX-bound arithmetic
 (syscall stubs, ABI shims) the uplift will be larger.
+
+### Phase 8: REX.W full 64-bit MOV-imm
+
+The `mov r64, imm64` 10-byte form (`[REX.W (.B)] B8+rd iq`) is now
+matched by a parallel set of three rewriter shapes — one-to-one with
+the 32-bit MOV-imm set. A new decoder
+(`decode_mov_r64_imm64`) handles the 10-byte encoding; bodies use a
+new `X86CodeEmitter::mov_abs64` helper that locks in the 10-byte
+shape regardless of how many high bits of the encoded value are set
+(the size-optimal default downgrades to the 7-byte sign-extended
+shape, which silently inverts the high half of the value when bit 31
+is set).
+
+| Shape (name)                  | Identity                              | SMT cost     |
+| ----------------------------- | ------------------------------------- | ------------ |
+| `mov-imm64-modular-inverse`   | `mov K' ; imul P32`                   | High         |
+|                               | `K' = K · inv(sext64(P32))`           |              |
+| `mov-imm64-xor-blind`         | `mov A ; xor B32`                     | Trivial fold |
+|                               | `A = K ^ sext64(B32)`                 |              |
+| `mov-imm64-rotate-blind`      | `mov ror64(K, n) ; rol n`             | Trivial fold |
+
+Why a separate shape set instead of generalising the imm32 path:
+the 64-bit body shapes have to navigate around imm32 sign-extension
+in `imul r64,r/m64,imm32` and `xor r/m64,imm32` — pulling all of
+that into the 32-bit rewriters would double their per-shape branch
+density.  Single-responsibility per rewriter file kept the change
+mechanical: 3 new files, 1 decoder addition, 1 emitter helper, 0
+edits to existing 32-bit rewriters.
 
 ### Phase 7: Multi-shape MOV imm32 rewriters
 
@@ -103,16 +131,26 @@ aggregator call. No edits to existing rewriter files.
 
 ## Numbers (test_vm_showcase.exe at strong)
 
-| Metric                       | Baseline | After phase 7 |
-| ---------------------------- | -------- | ------------- |
-| MBA rewriters in registry    | 6        | 18            |
-| MBA-redirected sites         | 180      | 195 (+8.3%)   |
-| Total substitutions          | 5105     | 5120          |
-| Per-family shape options     | 1        | 3             |
-| MBA tests                    | 21       | 38            |
-| Total ctest                  | 894      | 909           |
-| Stress (strong, 15 runs)     | 15/15    | 15/15         |
-| Stress (maximum, 15 runs)    | 15/15    | 15/15         |
+| Metric                       | Baseline | After phase 7 | After phase 8 |
+| ---------------------------- | -------- | ------------- | ------------- |
+| MBA rewriters in registry    | 6        | 18            | 21            |
+| MBA-redirected sites         | 180      | 195 (+8.3%)   | 195           |
+| Total substitutions          | 5105     | 5120          | 5120          |
+| Per-family shape options     | 1        | 3             | 3             |
+| MBA tests                    | 21       | 38            | 49            |
+| Total ctest                  | 894      | 909           | 920           |
+| Stress (strong, 15 runs)     | 15/15    | 15/15         | 15/15         |
+| Stress (maximum, 15 runs)    | 15/15    | 15/15         | 15/15         |
+
+Phase 8 does not change redirect-site count on the showcase binary
+because that input is compiled with `mov r32, imm32` for all 32-bit
+constants — the 64-bit `mov r64, imm64` form is a compiler choice
+driven by 64-bit-typed constants larger than `INT32_MAX` (or marked
+`uint64_t`). On binaries that genuinely use `mov r64, imm64` (signed
+64-bit table indices, Windows handle constants, AES round-key
+loaders), the new shapes contribute additional polymorphism. The
+infrastructure cost is paid up front: future MBA work that targets
+64-bit constants now has a working decoder + emitter contract.
 
 ## Roadmap (not in this expansion)
 
@@ -124,22 +162,16 @@ attempted in this pass:
    (x^y) + 2*(x&y)`). Requires multi-instruction redirect because
    r-r encodings are 2–3 bytes — below the JMP rel32 threshold.
 
-2. **REX.W full 64-bit operand**: today `is_64bit` propagates
-   correctly through the emitter, but the body still treats `K` as
-   sign-extended 32-bit. Genuine 64-bit immediates need `mov r64,
-   imm64` (10-byte) bodies and a new emit path for 64-bit ALU with
-   non-imm32 constants.
-
-3. **Affine MBA over a 16-element bitwise basis**: the Tigress-
+2. **Affine MBA over a 16-element bitwise basis**: the Tigress-
    style technique. Requires a builder that emits a random linear
    combination of basis expressions, with per-site coefficients.
    Complex but very strong against SMT.
 
-4. **Multi-step deep chains**: re-apply the rewriter pipeline to
+3. **Multi-step deep chains**: re-apply the rewriter pipeline to
    the output of one MBA body, producing nested expansions. Cheap
    to wire (one extra pass invocation), but increases binary size
    significantly.
 
-5. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
+4. **NOT/NEG MBA**: `not r/m` is 3 bytes, `neg r/m` is 3 bytes —
    below the JMP rel32 threshold. Same multi-instruction-redirect
    prerequisite as r-r forms.

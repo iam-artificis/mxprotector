@@ -116,13 +116,24 @@ std::unique_ptr<IMbaRewriter> make_mov_imm_modular_inverse() {
 
 } // namespace factories
 
-void register_modular_inverse_rewriters(MbaRewriterRegistry& registry) {
-    // Three MOV-imm shapes share the same `B8+rd id` encoding. The
-    // adapter picks one uniformly per call so a 32-bit constant
-    // initialisation looks different at every site.
+void register_mov_imm_rewriters(MbaRewriterRegistry& registry) {
+    // 32-bit MOV-imm shapes — share the `[REX.B] B8+rd id` encoding.
+    // The MBA adapter picks one uniformly per `mov r32, imm32` site
+    // so a 32-bit constant init looks different at every call.
     registry.register_rewriter(factories::make_mov_imm_modular_inverse());
     registry.register_rewriter(factories::make_mov_imm_xor_blind());
     registry.register_rewriter(factories::make_mov_imm_rotate_blind());
+
+    // 64-bit MOV-imm shapes — share the `[REX.W (.B)] B8+rd iq`
+    // encoding. Their bodies use `mov_abs64` to lock in the 10-byte
+    // form regardless of how many high bits of the encoded value are
+    // set (the size-optimal default would silently downgrade to the
+    // 7-byte sign-extended shape). Three shapes per width keeps the
+    // 64-bit MOV-imm site population polymorphic in lockstep with
+    // the 32-bit set.
+    registry.register_rewriter(factories::make_mov_imm64_modular_inverse());
+    registry.register_rewriter(factories::make_mov_imm64_xor_blind());
+    registry.register_rewriter(factories::make_mov_imm64_rotate_blind());
 }
 
 } // namespace mx::mutation::mba

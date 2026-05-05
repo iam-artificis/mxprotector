@@ -150,6 +150,9 @@ set(BUILDER_SOURCES
     protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp
     protection/mutation/mba/rewriters/mov_imm_rotate_blind_rewriter.cpp
+    protection/mutation/mba/rewriters/mov_imm64_modular_inverse_rewriter.cpp
+    protection/mutation/mba/rewriters/mov_imm64_xor_blind_rewriter.cpp
+    protection/mutation/mba/rewriters/mov_imm64_rotate_blind_rewriter.cpp
     protection/mutation/register_reassignment.cpp
     protection/mutation/junk_generator.cpp
 

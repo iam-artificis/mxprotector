@@ -62,17 +62,23 @@ void register_or_imm_rewriters(MbaRewriterRegistry& registry);
 void register_and_imm_rewriters(MbaRewriterRegistry& registry);
 
 /**
- * @brief `MOV r32, imm32` → `mov reg, K' ; imul reg, reg, P`
- *        where `P * K' ≡ K (mod 2^32)`.
+ * @brief `MOV r, imm` MBA family — covers both the 5/6-byte
+ *        `[REX.B] B8+rd id` (mov r32, imm32) and the 10/11-byte
+ *        `[REX.W (.B)] B8+rd iq` (mov r64, imm64) encodings.
  *
- * Permutation-polynomial obfuscation: `P` is an odd (hence
- * invertible) constant; `K'` is `K * inv(P) mod 2^32`. The runtime
- * arithmetic is purely modular, so the chain is provably
- * equivalent — but SMT solvers must perform integer modular
- * multiplication symbolically, which is much slower than constant
- * folding. Targets the 5-byte `B8 id` short form (32-bit operand
- * size) where `imm32 != 0`.
+ * Three shapes per encoding width (modular-inverse, xor-blind,
+ * rotate-blind). Each shape is a separate translation unit under
+ * `rewriters/` exposing exactly one factory; this aggregator wires
+ * all six into the registry.
+ *
+ * Strongest defeat (modular-inverse) emits a permutation-polynomial
+ * chain `mov K' ; imul P` with `P * K' ≡ K`, forcing the SMT
+ * solver to invert modular multiplication symbolically. The two
+ * blinding shapes (xor / rotate) are visually polymorphic but
+ * trivially foldable; they widen the per-site instruction
+ * vocabulary at MOV-imm sites so opcode-frequency tooling cannot
+ * fingerprint the chain.
  */
-void register_modular_inverse_rewriters(MbaRewriterRegistry& registry);
+void register_mov_imm_rewriters(MbaRewriterRegistry& registry);
 
 } // namespace mx::mutation::mba

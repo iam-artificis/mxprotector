@@ -221,6 +221,9 @@ set(MUTATION_SOURCES
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/modular_inverse_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm_xor_blind_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm_rotate_blind_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm64_modular_inverse_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm64_xor_blind_rewriter.cpp
+    ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/mba/rewriters/mov_imm64_rotate_blind_rewriter.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/junk_generator.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/register_reassignment.cpp
     ${CMAKE_SOURCE_DIR}/src/builder/protection/mutation/instruction_splitter.cpp
