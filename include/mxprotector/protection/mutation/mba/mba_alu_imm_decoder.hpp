@@ -21,11 +21,19 @@
  *     where `op` is the ModR/M.reg field:
  *       0=ADD, 1=OR, 4=AND, 5=SUB, 6=XOR (we cover all five).
  *
- * Smaller forms (`83 /op ib`, the AL/AX/EAX/RAX `<op> imm32` short
- * forms `05/0D/25/2D/35`, …) are out of scope — they are either
- * shorter than the `JMP rel32` redirect needs (`83`) or rare in
- * compiler output worth a dedicated rewriter slot. Adding them is
- * a new helper later if profiling justifies it.
+ *   * `[REX.W] {05|0D|25|2D|35} id` — EAX/RAX-only short forms
+ *     (5 bytes without REX, 6 with REX.W). Same five ops, no
+ *     ModR/M; destination is hardcoded to RAX/EAX. Compilers emit
+ *     these aggressively for syscall-arg setup, indexing into
+ *     globals, and any RAX-bound arithmetic with a non-imm8 K.
+ *     They are exactly 5 bytes — fits the `JMP rel32` redirect
+ *     boundary, so the engine can route them through the overflow
+ *     sink alongside the general `81 /op id` form.
+ *
+ * Smaller forms (`83 /op ib`, 4 bytes max — too short for the
+ * 5-byte `JMP rel32` redirect) remain out of scope. Adding them
+ * would require a multi-instruction redirect mechanism; that's a
+ * roadmap item, not a decoder extension.
  */
 
 #pragma once
@@ -70,16 +78,20 @@ struct AluImm32View {
 };
 
 /**
- * @brief Try to decode `insn` as a `81 /<op> id` instruction.
+ * @brief Try to decode `insn` as one of the imm32 ALU encodings.
+ *
+ * Accepts two encoding shapes:
+ *   * `[REX] 81 /op id` — general r/m32 or r/m64, any GPR dst.
+ *   * `[REX.W] {05|0D|25|2D|35} id` — EAX/RAX-only short form.
  *
  * Returns `std::nullopt` when:
- *   * length is < 6 (no room for the encoding),
- *   * any legacy prefix other than nothing is present (the rewriter
- *     family does not target `66h` operand-size or segment-prefixed
- *     variants),
- *   * the opcode byte is not `0x81`,
- *   * the ModR/M `mod` field is not 3 (memory operand),
- *   * the ModR/M.reg field is not one of {0, 1, 4, 5, 6}.
+ *   * length is < 5 (no room for any imm32 ALU encoding),
+ *   * any legacy prefix is present (the rewriter family does not
+ *     target `66h` operand-size or segment-prefixed variants),
+ *   * the opcode is neither `0x81` nor a recognised short-form
+ *     opcode,
+ *   * for `0x81`: ModR/M `mod` field is not 3 (memory operand) or
+ *     `reg` field is not one of {0, 1, 4, 5, 6}.
  *
  * @param insn       Instruction to inspect.
  * @param expected_op If set, also requires the decoded op to match.

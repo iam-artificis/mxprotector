@@ -31,6 +31,36 @@ namespace {
     }
 }
 
+/// Map an EAX/RAX-only short-form opcode byte to its op. Returns
+/// `std::nullopt` for any other opcode.
+///
+/// Pattern: short opcode = `(reg_field << 3) | 0x05`, so:
+///   0x05 → ADD (0), 0x0D → OR (1), 0x25 → AND (4),
+///   0x2D → SUB (5), 0x35 → XOR (6).
+/// Foreign opcodes (e.g. 0x15 = ADC, 0x1D = SBB, 0x3D = CMP) share
+/// the `(x << 3) | 0x05` shape but encode unsupported ops; we
+/// reject them via `is_supported_op`.
+[[nodiscard]] std::optional<AluImm32Op> short_form_op(
+    std::uint8_t opcode) noexcept
+{
+    if ((opcode & 0x07) != 0x05) return std::nullopt;
+    const std::uint8_t reg_field = (opcode - 0x05) >> 3;
+    if (!is_supported_op(reg_field)) return std::nullopt;
+    return static_cast<AluImm32Op>(reg_field);
+}
+
+/// Read 4 little-endian bytes as a uint32_t starting at `bytes[at]`.
+/// Caller must guarantee `at + 4 <= bytes.size()`.
+[[nodiscard]] std::uint32_t read_imm32_le(
+    ByteView bytes, std::size_t at) noexcept
+{
+    std::uint32_t imm = 0;
+    for (std::uint8_t i = 0; i < 4; ++i) {
+        imm |= static_cast<std::uint32_t>(bytes[at + i]) << (i * 8);
+    }
+    return imm;
+}
+
 } // namespace
 
 std::optional<AluImm32View> decode_alu_imm32(
@@ -38,7 +68,10 @@ std::optional<AluImm32View> decode_alu_imm32(
     std::optional<AluImm32Op>    expected_op) noexcept
 {
     const auto bytes = insn.raw_bytes();
-    if (bytes.size() < 6) return std::nullopt;
+    // 5 bytes is the smallest accepted encoding (`<op> EAX, imm32`
+    // with no REX). Anything shorter cannot possibly be one of the
+    // imm32 forms we cover.
+    if (bytes.size() < 5) return std::nullopt;
 
     std::size_t cursor = 0;
 
@@ -56,10 +89,27 @@ std::optional<AluImm32View> decode_alu_imm32(
         ++cursor;
     }
 
-    if (cursor >= bytes.size() || bytes[cursor] != 0x81) {
-        return std::nullopt;
+    if (cursor >= bytes.size()) return std::nullopt;
+    const std::uint8_t opcode = bytes[cursor++];
+
+    // Short form: `[REX.W] {05|0D|25|2D|35} id` — EAX/RAX-only.
+    // No ModR/M, dst is hardcoded; REX.B has no register-extension
+    // role here (no /rm field), so we ignore it. REX.W still
+    // selects 64-bit operand size.
+    if (auto op = short_form_op(opcode); op.has_value()) {
+        if (expected_op && *expected_op != *op) return std::nullopt;
+        if (cursor + 4 > bytes.size()) return std::nullopt;
+
+        AluImm32View view{};
+        view.op       = *op;
+        view.dst      = x86::Reg::rax;
+        view.imm      = read_imm32_le(bytes, cursor);
+        view.is_64bit = rex_w;
+        return view;
     }
-    ++cursor;
+
+    // General form: `[REX] 81 /op id`.
+    if (opcode != 0x81) return std::nullopt;
 
     if (cursor >= bytes.size()) return std::nullopt;
     const std::uint8_t modrm = bytes[cursor++];
@@ -73,18 +123,13 @@ std::optional<AluImm32View> decode_alu_imm32(
 
     if (cursor + 4 > bytes.size()) return std::nullopt;
 
-    std::uint32_t imm = 0;
-    for (std::uint8_t i = 0; i < 4; ++i) {
-        imm |= static_cast<std::uint32_t>(bytes[cursor + i]) << (i * 8);
-    }
-
     std::uint8_t reg_id = x86::modrm_rm(modrm);
     if (rex_b) reg_id |= 0x08;
 
     AluImm32View view{};
     view.op       = decoded_op;
     view.dst      = static_cast<x86::Reg>(reg_id);
-    view.imm      = imm;
+    view.imm      = read_imm32_le(bytes, cursor);
     view.is_64bit = rex_w;
     return view;
 }

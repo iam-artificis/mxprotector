@@ -85,6 +85,38 @@ mx::ByteBuffer encode_alu_imm32_rax(
     return bytes;
 }
 
+/// Encode `<op> EAX, imm32` short form (no REX) — 5 bytes:
+/// opcode byte from `(reg << 3) | 0x05`, then 4 imm bytes.
+mx::ByteBuffer encode_alu_imm32_short_eax(
+    mx::mutation::mba::AluImm32Op op,
+    std::uint32_t                 imm)
+{
+    mx::ByteBuffer bytes;
+    bytes.reserve(5);
+    bytes.push_back(static_cast<std::uint8_t>(
+        (static_cast<std::uint8_t>(op) << 3) | 0x05));
+    for (int i = 0; i < 4; ++i) {
+        bytes.push_back(static_cast<std::uint8_t>((imm >> (i * 8)) & 0xFF));
+    }
+    return bytes;
+}
+
+/// Encode `<op> RAX, imm32` short form (REX.W) — 6 bytes.
+mx::ByteBuffer encode_alu_imm32_short_rax(
+    mx::mutation::mba::AluImm32Op op,
+    std::uint32_t                 imm)
+{
+    mx::ByteBuffer bytes;
+    bytes.reserve(6);
+    bytes.push_back(0x48); // REX.W
+    bytes.push_back(static_cast<std::uint8_t>(
+        (static_cast<std::uint8_t>(op) << 3) | 0x05));
+    for (int i = 0; i < 4; ++i) {
+        bytes.push_back(static_cast<std::uint8_t>((imm >> (i * 8)) & 0xFF));
+    }
+    return bytes;
+}
+
 mx::ByteBuffer encode_mov_eax_imm32(std::uint32_t imm) {
     mx::ByteBuffer bytes;
     bytes.reserve(5);
@@ -381,6 +413,48 @@ TEST(MbaAluImm32Decoder, ParsesRexBExtendedRegister) {
     EXPECT_EQ(view->dst, mx::x86::Reg::r11);
 }
 
+TEST(MbaAluImm32Decoder, ParsesShortFormAddEax) {
+    // ADD EAX, imm32 short form: 05 id (5 bytes, no REX).
+    auto insn = make_insn(
+        encode_alu_imm32_short_eax(
+            mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
+        "add", "eax, 0xDEADBEEF");
+    auto view = mx::mutation::mba::decode_alu_imm32(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op, mx::mutation::mba::AluImm32Op::add);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_EQ(view->imm, 0xDEADBEEFu);
+    EXPECT_FALSE(view->is_64bit);
+}
+
+TEST(MbaAluImm32Decoder, ParsesShortFormSubRax) {
+    // SUB RAX, imm32 short form: 48 2D id (6 bytes, REX.W).
+    auto insn = make_insn(
+        encode_alu_imm32_short_rax(
+            mx::mutation::mba::AluImm32Op::sub, 0x12345678),
+        "sub", "rax, 0x12345678");
+    auto view = mx::mutation::mba::decode_alu_imm32(insn);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->op, mx::mutation::mba::AluImm32Op::sub);
+    EXPECT_EQ(view->dst, mx::x86::Reg::rax);
+    EXPECT_TRUE(view->is_64bit);
+}
+
+TEST(MbaAluImm32Decoder, RejectsForeignShortFormOps) {
+    // CMP EAX, imm32 short form: 0x3D id — not in the supported set.
+    mx::ByteBuffer bytes{0x3D, 0x00, 0x00, 0x00, 0x00};
+    auto insn = make_insn(std::move(bytes), "cmp", "eax, 0");
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(insn).has_value());
+    // ADC EAX (0x15) and SBB EAX (0x1D) match the (x<<3)|0x05 shape
+    // but encode unsupported ops; both must be rejected too.
+    mx::ByteBuffer adc_bytes{0x15, 0, 0, 0, 0};
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(
+        make_insn(std::move(adc_bytes), "adc", "eax, 0")).has_value());
+    mx::ByteBuffer sbb_bytes{0x1D, 0, 0, 0, 0};
+    EXPECT_FALSE(mx::mutation::mba::decode_alu_imm32(
+        make_insn(std::move(sbb_bytes), "sbb", "eax, 0")).has_value());
+}
+
 // ---------------------------------------------------------------------------
 // Per-family rewriter tests (matches + semantic equivalence)
 // ---------------------------------------------------------------------------
@@ -593,6 +667,30 @@ TEST(MbaRewriterRegistry, DefaultPopulationContainsAllShippedFamilies) {
     EXPECT_NE(registry.find("and-imm-add-minus-or"), nullptr);
     EXPECT_NE(registry.find("and-imm-demorgan"), nullptr);
     EXPECT_NE(registry.find("mov-imm-modular-inverse"), nullptr);
+}
+
+TEST(MbaRewriterRegistry, ShortFormAddEaxMatchesAllAddShapes) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    auto insn = make_insn(
+        encode_alu_imm32_short_eax(
+            mx::mutation::mba::AluImm32Op::add, 0xDEADBEEF),
+        "add", "eax, 0xDEADBEEF");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 3u)
+        << "every ADD-imm shape must accept the 5-byte EAX,imm32 "
+        << "short form (`05 id`) — same coverage as `81 /0 id`";
+}
+
+TEST(MbaRewriterRegistry, ShortFormSubRaxMatchesAllSubShapes) {
+    auto registry = mx::mutation::mba::MbaRewriterRegistry::create_default();
+    auto insn = make_insn(
+        encode_alu_imm32_short_rax(
+            mx::mutation::mba::AluImm32Op::sub, 0x12345678),
+        "sub", "rax, 0x12345678");
+    auto matching = registry.find_matching(insn);
+    EXPECT_EQ(matching.size(), 3u)
+        << "every SUB-imm shape must accept the 6-byte RAX,imm32 "
+        << "short form (`REX.W 2D id`)";
 }
 
 TEST(MbaRewriterRegistry, FindMatchingReturnsAllAddShapesForAddSite) {
