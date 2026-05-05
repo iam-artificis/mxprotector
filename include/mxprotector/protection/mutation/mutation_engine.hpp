@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -64,15 +65,41 @@ public:
     MutationEngine& operator=(const MutationEngine&) = delete;
 
     /**
+     * @brief Closure that returns the current writable view of the
+     *        region under mutation.
+     *
+     * The mutation engine cannot hold a `MutableByteView` across
+     * `IExpansionSink::plant` calls — `GrowSourceSectionSink` (the
+     * default primary in the chain) `append`s to the same source
+     * section, which can reallocate the underlying `std::vector` and
+     * invalidate any pointer captured before the call. The same
+     * applies when a fallback sink lazily creates a new section: the
+     * `PeImage::sections()` vector itself may grow, invalidating any
+     * stable reference into it.
+     *
+     * `ViewRefresher` is invoked by the engine immediately before
+     * any write to the region, so the returned span always points
+     * at the current heap allocation. The closure typically captures
+     * the section's index inside `PeImage` and returns
+     * `{section.data.data(), section_size}` on each call.
+     */
+    using ViewRefresher = std::function<MutableByteView()>;
+
+    /**
      * @brief Мутирует регион кода in-place.
-     * @param code Буфер кода для мутации (модифицируется).
+     *
+     * @param refresh_view Closure returning the current writable
+     *        view of the region. The engine calls it once for the
+     *        initial decode and re-calls it after every sink plant
+     *        to recover from any source-section growth — see
+     *        `ViewRefresher` for the rationale.
      * @param base_address Виртуальный адрес начала буфера.
      * @param disasm Дизассемблер для декодирования.
      * @param ctx Контекст (для логирования).
      * @return Количество применённых мутаций или ошибка.
      */
     [[nodiscard]] MxResult<uint32_t> mutate_region(
-        MutableByteView code,
+        ViewRefresher refresh_view,
         Va base_address,
         analysis::IDisassembler& disasm,
         ProtectionContext& ctx);

@@ -90,11 +90,18 @@ void patch_jmp_with_nop_pad(MutableByteView code,
 } // anonymous namespace
 
 MxResult<uint32_t> MutationEngine::mutate_region(
-    MutableByteView code,
+    ViewRefresher refresh_view,
     Va base_address,
     analysis::IDisassembler& disasm,
     ProtectionContext& ctx)
 {
+    if (!refresh_view) {
+        return std::unexpected(error::protection(
+            ProtectionErrorCode::pass_failed,
+            "MutationEngine: пустой ViewRefresher"));
+    }
+
+    MutableByteView code = refresh_view();
     if (code.empty()) {
         ctx.log("  MutationEngine: пустой регион, пропуск");
         return uint32_t{0};
@@ -152,6 +159,11 @@ MxResult<uint32_t> MutationEngine::mutate_region(
         auto replacement = rule->apply(insn, rng_);
 
         const auto offset = static_cast<size_t>(insn.address() - base_address);
+        // The view may have been invalidated by a previous iteration's
+        // `plant` (when the chain's primary `GrowSourceSectionSink`
+        // grew the source section). Refresh before bounds check + any
+        // write so we never touch stale storage.
+        code = refresh_view();
         if (offset + insn.length() > code.size()) {
             ctx.log_fmt("  MutationEngine: запись за пределами буфера для '{}' по VA 0x{:016X}",
                 insn.to_string(), insn.address());
@@ -231,6 +243,20 @@ MxResult<uint32_t> MutationEngine::mutate_region(
             ctx.log_fmt("  MutationEngine: expansion sink '{}' отклонил redirect '{}': {}",
                 expansion_sink_->name(), insn.to_string(),
                 plan.error().message());
+            continue;
+        }
+
+        // CRITICAL: `plant` may have grown the source section's data
+        // vector (`GrowSourceSectionSink`) or grown the outer
+        // `PeImage::sections()` vector (`ExtendInPlaceSink` lazily
+        // creating its overflow section). Either path can invalidate
+        // the `code` view captured before the call. Refresh now —
+        // the bytes in [0, region_size) are preserved across the
+        // realloc, only the address has moved.
+        code = refresh_view();
+        if (offset + insn.length() > code.size()) {
+            ctx.log_fmt("  MutationEngine: post-plant view shrunk for '{}' — пропуск patch",
+                insn.to_string());
             continue;
         }
 

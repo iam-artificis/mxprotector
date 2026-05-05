@@ -100,40 +100,33 @@ struct ProtectionConfig {
                                           ///< while the encoder set is curated; once
                                           ///< stable across all binaries the level
                                           ///< presets will switch it on for `strong`+.
-    bool enable_mba_substitution = false; ///< Mixed-Boolean-Arithmetic rewriting
+    bool enable_mba_substitution = true;  ///< Mixed-Boolean-Arithmetic rewriting
                                           ///< (`add/sub/xor/or/and r, imm32` →
                                           ///< multi-step boolean+arithmetic body,
                                           ///< plus `mov r32, imm32` → permutation
                                           ///< polynomial). Defeats SMT solvers and
                                           ///< angr/Triton symbolic tactics.
                                           ///<
-                                          ///< OFF by default — the rewriter is
-                                          ///< the first user of the size-changing
-                                          ///< redirect path through the expansion
-                                          ///< sink, and that path does not yet
-                                          ///< play with `CfgFlatteningPass`: CFF
-                                          ///< rearranges the source function and
-                                          ///< the sink's `JMP rel32` back to
-                                          ///< `site + site_size` lands in the
-                                          ///< re-flattened layout instead of the
-                                          ///< original "next instruction". Two
-                                          ///< guards already help: `analysis::
-                                          ///< safe_to_clobber_flags_after`
+                                          ///< Safe by default — three engine-level
+                                          ///< guards align: (1) the mutation
+                                          ///< engine's lookahead
+                                          ///< (`analysis::safe_to_clobber_flags_after`)
                                           ///< suppresses MBA when the next
-                                          ///< instruction reads EFLAGS, and
+                                          ///< instruction reads EFLAGS, (2)
                                           ///< `MutationEngine::set_excluded_
-                                          ///< redirect_ranges` excludes VM /
-                                          ///< Guard regions so their lifters see
-                                          ///< the original ops. CFF interaction
-                                          ///< is the remaining hardening.
-                                          ///<
-                                          ///< Enable explicitly via
-                                          ///< `--mba-substitution`. For binaries
-                                          ///< where CFF is also off
-                                          ///< (`--no-cfg-flattening`) the
-                                          ///< current rewriter set is correct
-                                          ///< and the obfuscation strength
-                                          ///< holds.
+                                          ///< redirect_ranges` excludes
+                                          ///< VM / Guard regions so their
+                                          ///< lifters see original ops, and (3)
+                                          ///< the sink chain plants spilled
+                                          ///< bytes in a dedicated overflow
+                                          ///< section so the source `.text`
+                                          ///< never grows past its alignment
+                                          ///< slack — RIP-relative references
+                                          ///< from `.text` to `.rdata`/`.data`
+                                          ///< stay valid. Disable via
+                                          ///< `--no-mba-substitution` for A/B
+                                          ///< measurement of the obfuscation
+                                          ///< strength versus binary size.
     bool enable_packer          = false;  ///< Self-unpacking packer (multi-section XOR)
     bool enable_nanomites       = false;  ///< Наномиты (только maximum)
     bool enable_code_interleaving = false;///< Перемешивание кода (только maximum)

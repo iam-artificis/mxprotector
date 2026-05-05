@@ -20,8 +20,6 @@
 
 #include "mxprotector/protection/mutation/mutation_engine.hpp"
 #include "mxprotector/protection/mutation/overflow/extend_in_place_sink.hpp"
-#include "mxprotector/protection/mutation/overflow/fallback_expansion_sink.hpp"
-#include "mxprotector/protection/mutation/overflow/grow_source_section_sink.hpp"
 #include "mxprotector/protection/mutation/padding_filler.hpp"
 #include "mxprotector/protection/mutation/substitution_rule_groups.hpp"
 #include "mxprotector/protection/obfuscation/opaque_predicates.hpp"
@@ -95,13 +93,23 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
     // slack is exhausted. Lifetimes are scoped to this `execute`
     // body — the engine borrows the sink pointer and never outlives
     // these stack objects.
+    // The expansion sink chain places spilled bytes outside the
+    // original instruction's slot. We deliberately use only the
+    // shared-section sink (`ExtendInPlaceSink`) and skip
+    // `GrowSourceSectionSink`: growing the source section past its
+    // alignment slack pushes every subsequent section's VA forward,
+    // and nothing in this pass walks the post-mutation byte stream
+    // to update RIP-relative references that targeted those moved
+    // sections — a silently-malformed PE rejected by the loader.
+    // The shared overflow section appended at the tail of
+    // `sections()` adds capacity without shifting any existing
+    // section, so RIP-relative references in `.text` keep pointing
+    // at the right `.rdata` / `.data` content.
     SectionManager     sec_mgr(ctx.pe_image());
     pe::SectionEmitter emitter{sec_mgr, ctx.layout_policy()};
-    mutation::overflow::GrowSourceSectionSink primary{emitter};
-    mutation::overflow::ExtendInPlaceSink     fallback{
+    mutation::overflow::ExtendInPlaceSink shared_overflow{
         emitter, ctx.section_names().mut};
-    mutation::overflow::FallbackExpansionSink chain{primary, fallback};
-    engine.set_expansion_sink(&chain);
+    engine.set_expansion_sink(&shared_overflow);
 
     // Downstream code-rewriting passes (VM lifter, Guard relocator)
     // parse the post-mutation byte stream of their own marked regions
@@ -156,20 +164,40 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
 
         ctx.log("MutationPass: мутация всех кодовых секций (нет маркеров)");
 
-        for (auto& sec : ctx.pe_image().sections()) {
+        // Capture each section's identity (name + VA) so the
+        // refresher can re-find it across `IExpansionSink::plant`
+        // calls — those may grow the source section's data vector
+        // *or* the outer `sections()` vector (when a fallback sink
+        // lazily adds an overflow section), invalidating any
+        // pre-captured `&sec` reference.
+        std::vector<std::pair<std::string, Va>> code_section_keys;
+        for (const auto& sec : ctx.pe_image().sections()) {
             if (!sec.is_code() || sec.data.empty()) continue;
+            code_section_keys.emplace_back(sec.name, sec.virtual_address);
+        }
 
-            const Va section_va = ctx.pe_image().image_base() + sec.virtual_address;
-            MutableByteView code_view(sec.data.data(), sec.data.size());
+        for (const auto& [sec_name, sec_va] : code_section_keys) {
+            const Va section_va = ctx.pe_image().image_base() + sec_va;
+
+            auto refresher = [&img = ctx.pe_image(),
+                              name = sec_name,
+                              va = sec_va]() noexcept -> MutableByteView {
+                for (auto& s : img.sections()) {
+                    if (s.name == name && s.virtual_address == va) {
+                        return MutableByteView{s.data.data(), s.data.size()};
+                    }
+                }
+                return MutableByteView{};
+            };
 
             auto result = engine.mutate_region(
-                code_view, section_va, *ctx.disassembler(), ctx);
+                std::move(refresher), section_va, *ctx.disassembler(), ctx);
 
             if (result) {
                 total_mutations += *result;
             } else {
                 ctx.log_fmt("MutationPass: ошибка мутации секции '{}': {}",
-                    sec.name, result.error().message());
+                    sec_name, result.error().message());
             }
         }
     } else {
@@ -202,28 +230,33 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
                 continue;
             }
 
-            auto& mutable_sections = ctx.pe_image().sections();
-            pe::SectionInfo* mutable_section = nullptr;
-            for (auto& s : mutable_sections) {
-                if (s.name == section->name && s.virtual_address == section->virtual_address) {
-                    mutable_section = &s;
-                    break;
+            // Refresher rebinds the byte view on every call so a
+            // realloc inside `plant` cannot leave the engine writing
+            // through a dangling pointer. Captures the section's name
+            // + VA + the per-region offset/size so it can re-derive
+            // the writable span fresh each time.
+            auto refresher = [&img = ctx.pe_image(),
+                              name = section->name,
+                              sec_va = section->virtual_address,
+                              offset_in_section,
+                              region_size]() noexcept -> MutableByteView {
+                for (auto& s : img.sections()) {
+                    if (s.name != name || s.virtual_address != sec_va) {
+                        continue;
+                    }
+                    if (offset_in_section + region_size > s.data.size()) {
+                        return MutableByteView{};
+                    }
+                    return MutableByteView{
+                        s.data.data() + offset_in_section, region_size};
                 }
-            }
-
-            if (!mutable_section) {
-                ctx.log_fmt("MutationPass: ОШИБКА: не найдена мутабельная секция '{}'",
-                    section->name);
-                continue;
-            }
-
-            MutableByteView code_view(
-                mutable_section->data.data() + offset_in_section,
-                region_size);
+                return MutableByteView{};
+            };
 
             const Va region_va = ctx.pe_image().image_base() + start_rva;
 
-            auto result = engine.mutate_region(code_view, region_va, *ctx.disassembler(), ctx);
+            auto result = engine.mutate_region(
+                std::move(refresher), region_va, *ctx.disassembler(), ctx);
 
             if (result) {
                 total_mutations += *result;
@@ -277,10 +310,9 @@ MxStatus MutationPass::execute(ProtectionContext& ctx) {
 
     if (engine.total_redirected_expansions() > 0) {
         ctx.log_fmt("MutationPass: {} расширенных подстановок направлено в "
-                    "overflow chain (primary={} grow-source, fallback={} shared-section)",
+                    "shared-section overflow ('{}')",
             engine.total_redirected_expansions(),
-            chain.primary_plant_count(),
-            chain.fallback_plant_count());
+            ctx.section_names().mut);
     }
 
     return {};
