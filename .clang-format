@@ -1,0 +1,135 @@
+# clang-format configuration for mxprotector
+# Requires clang-format >= 17.
+---
+Language: Cpp
+Standard: c++20
+BasedOnStyle: LLVM
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+NamespaceIndentation: None
+
+# Line width
+ColumnLimit: 100
+
+# Pointers / references bind to the type
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# Braces on the same line
+BreakBeforeBraces: Attach
+Cpp11BracedListStyle: true
+
+# Short-form allowances
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+AllowShortEnumsOnASingleLine: false
+
+# Alignment of consecutive declarations / assignments
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+  AlignCompound: true
+  PadOperators: true
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AlignAfterOpenBracket: Align
+AlignEscapedNewlines: Left
+AlignOperands: Align
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+
+# Includes: regroup into
+#   0. main-header (matched via IncludeIsMainRegex)
+#   1. C system headers   (<foo.h>)
+#   2. C++ system headers (<foo>)
+#   3. Third-party        (<zydis/...>, <Zydis/...>, <lief/...>, <asmjit/...>, <fmt/...>, <spdlog/...>, <nlohmann/...>, <gtest/...>, <catch2/...>)
+#   4. Project            (<mxprotector/...> and "...")
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeIsMainRegex: '(_test|_unittest)?$'
+IncludeCategories:
+  - Regex:    '^<(Zydis|zydis|LIEF|lief|asmjit|fmt|spdlog|nlohmann|gtest|gmock|catch2)/'
+    Priority: 3
+  - Regex:    '^<mxprotector/'
+    Priority: 4
+  - Regex:    '^".*"'
+    Priority: 4
+  - Regex:    '^<[a-z0-9_]+\.h>$'
+    Priority: 1
+  - Regex:    '^<[a-z0-9_/]+>$'
+    Priority: 2
+  - Regex:    '^<.*>$'
+    Priority: 3
+
+# Namespaces
+FixNamespaceComments: true
+ShortNamespaceLines: 0
+CompactNamespaces: false
+
+# Wrapping / breaking behaviour
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackArguments: true
+BinPackParameters: true
+AlwaysBreakTemplateDeclarations: Yes
+AlwaysBreakAfterReturnType: None
+AlwaysBreakBeforeMultilineStrings: false
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeColon
+BreakInheritanceList: BeforeColon
+BreakStringLiterals: true
+PackConstructorInitializers: NextLine
+ConstructorInitializerIndentWidth: 4
+PenaltyReturnTypeOnItsOwnLine: 1000
+
+# Spacing
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 1
+SpacesInAngles: Never
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# Misc
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+ReflowComments: true
+IndentCaseLabels: false
+IndentPPDirectives: None
+InsertBraces: false
+InsertNewlineAtEOF: true
+RemoveSemicolon: false
+SeparateDefinitionBlocks: Leave
+QualifierAlignment: Leave
+LambdaBodyIndentation: Signature
+EmptyLineBeforeAccessModifier: LogicalBlock
+EmptyLineAfterAccessModifier: Never

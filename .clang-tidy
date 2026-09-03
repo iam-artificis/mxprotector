@@ -1,0 +1,178 @@
+# MxProtector clang-tidy configuration.
+#
+# Aligned with the HARD REQUIREMENTS in CLAUDE.md (rules 1-10) but
+# tuned to be pragmatic: warnings only (no -Werror), so it can be
+# adopted incrementally in CI without blocking existing code.
+#
+# Notable enabled checks:
+#   * bugprone-empty-catch          -> rule #8 (fail-closed, never silent)
+#   * cppcoreguidelines-init-variables,
+#     bugprone-uninitialized-*      -> catch uninitialized reads
+#   * modernize-* (selective)       -> C++20/23 idioms
+#   * readability-*, performance-*  -> style + perf hygiene
+#
+# Disabled families are either irrelevant to this project (fuchsia,
+# llvmlibc, abseil, altera, android, darwin, mpi, objc, zircon) or
+# too noisy for this codebase (signed-bitwise, header-guard, google
+# runtime references, easily-swappable parameters, magic numbers).
+
+Checks: >
+  -*,
+  bugprone-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  misc-*,
+  cert-*,
+  -abseil-*,
+  -altera-*,
+  -android-*,
+  -darwin-*,
+  -fuchsia-*,
+  -google-runtime-references,
+  -hicpp-signed-bitwise,
+  -llvm-header-guard,
+  -llvmlibc-*,
+  -mpi-*,
+  -objc-*,
+  -zircon-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-branch-clone,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-type-cstyle-cast,
+  -cppcoreguidelines-narrowing-conversions,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-avoid-const-or-ref-data-members,
+  -cppcoreguidelines-special-member-functions,
+  -cppcoreguidelines-rvalue-reference-param-not-moved,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-nodiscard,
+  -modernize-use-designated-initializers,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-implicit-bool-conversion,
+  -readability-named-parameter,
+  -readability-uppercase-literal-suffix,
+  -readability-braces-around-statements,
+  -readability-else-after-return,
+  -readability-redundant-access-specifiers,
+  -readability-convert-member-functions-to-static,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -misc-include-cleaner,
+  -misc-const-correctness,
+  -misc-use-anonymous-namespace,
+  -cert-err58-cpp,
+  -cert-dcl21-cpp,
+  -cert-msc32-c,
+  -cert-msc51-cpp,
+  -hicpp-*,
+  -google-*,
+  bugprone-empty-catch,
+  bugprone-uninitialized-*,
+  cppcoreguidelines-init-variables,
+  modernize-use-auto,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-ranges,
+  modernize-use-using,
+  modernize-use-emplace,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-loop-convert,
+  modernize-raw-string-literal,
+  performance-unnecessary-copy-initialization,
+  performance-unnecessary-value-param,
+  performance-for-range-copy,
+  performance-move-const-arg,
+  performance-inefficient-string-concatenation,
+  performance-inefficient-vector-operation,
+  readability-avoid-const-params-in-decls,
+  readability-redundant-declaration,
+  readability-redundant-string-init,
+  readability-redundant-smartptr-get,
+  readability-redundant-control-flow,
+  readability-redundant-member-init,
+  readability-simplify-boolean-expr,
+  readability-container-size-empty,
+  readability-identifier-naming
+
+# Warnings only. Do NOT promote to errors here — that gate should be
+# added in CI once the existing tree is clean, not up-front.
+WarningsAsErrors: ''
+
+# Only lint first-party headers. Skips third_party/, build/, and any
+# system headers pulled in transitively.
+HeaderFilterRegex: '^(include|src)/'
+
+# Defer formatting to the repo's .clang-format so tidy fixups match
+# the surrounding style.
+FormatStyle: file
+
+# Light identifier-naming rules. These describe the dominant style in
+# the existing code so the check does not spam pre-existing symbols.
+# Anything not listed is left unchecked.
+CheckOptions:
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.MethodCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: _
+  - key: readability-identifier-naming.ProtectedMemberSuffix
+    value: _
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstexprVariablePrefix
+    value: k
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantPrefix
+    value: k
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.GlobalConstantPrefix
+    value: k
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.TemplateParameterCase
+    value: CamelCase
+  # Modernize: prefer trailing const, keep transformations conservative.
+  - key: modernize-use-auto.MinTypeNameLength
+    value: '5'
+  - key: modernize-use-emplace.IgnoreImplicitConstructors
+    value: 'true'
+  # Performance: mirror the project's move-heavy style.
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'std::shared_ptr;std::function'
+  - key: performance-move-const-arg.CheckTriviallyCopyableMove
+    value: 'false'

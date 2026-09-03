@@ -1,0 +1,20 @@
+# gitleaks config for mxprotector.
+# Extends the default ruleset; only adds allowlist entries for
+# known-false-positive test crypto constants.
+#
+# See https://github.com/gitleaks/gitleaks for full syntax.
+
+title = "mxprotector"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore rules that fire on test-only crypto constants."
+paths = [
+  # Test file for mx::EncryptedString<> uses two hex literals named
+  # `key` which the default `generic-api-key` heuristic misreads.
+  # The values are 0x123456789ABCDEF0 and 0xABCD1234FEDC5678 - both
+  # obviously synthetic test vectors, not real secrets.
+  '''tests/unit/mx_string_test\.cpp''',
+]

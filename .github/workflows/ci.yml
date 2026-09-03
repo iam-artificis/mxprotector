@@ -1,0 +1,160 @@
+name: CI
+
+# Trigger on any branch push and on pull requests.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Cancel any in-progress run for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # Main C++ build + test matrix.
+  # Windows is the fully supported target today. Ubuntu is
+  # informational — the tree still contains Windows-specific code,
+  # so the Linux build step is marked continue-on-error until the
+  # Linux port lands. The rest of the ubuntu job (deps, configure,
+  # tests) still runs so failures are visible in the logs.
+  # ---------------------------------------------------------------
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # -----------------------------------------------------------
+      # Toolchain setup
+      # -----------------------------------------------------------
+      - name: Install GCC 13, CMake, Ninja (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build gcc-13 g++-13
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Activate MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # -----------------------------------------------------------
+      # Python (for the MCP subsystem run below).
+      # -----------------------------------------------------------
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # -----------------------------------------------------------
+      # Cache the CMake build directory so incremental CI is fast.
+      # Key on the OS + a hash of the top-level CMake files so a
+      # config change invalidates the cache automatically.
+      # -----------------------------------------------------------
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-
+
+      # -----------------------------------------------------------
+      # Configure + build + test.
+      # -----------------------------------------------------------
+      - name: CMake configure (Release, tests on)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMXPROTECTOR_BUILD_TESTS=ON
+
+      # NOTE: mxprotector today may not compile on Linux (much
+      # Windows-specific code). We still ATTEMPT the build so the
+      # exact failure is visible in logs, but mark ONLY the Linux
+      # build step continue-on-error so the ubuntu run stays
+      # informational until the Linux port lands. Windows is NOT
+      # allowed to fail.
+      - name: Build mxprotector_builder (Ubuntu — informational)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cmake --build build --config Release --target mxprotector_builder --parallel
+
+      - name: Build mxprotector_builder (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --target mxprotector_builder --parallel
+
+      - name: Build all tests (Ubuntu — informational)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cmake --build build --config Release --parallel
+
+      - name: Build all tests (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --parallel
+
+      - name: Run ctest
+        working-directory: build
+        run: ctest --output-on-failure --parallel --build-config Release
+
+      # -----------------------------------------------------------
+      # Python MCP subsystem — install and test in the same job so
+      # a future integration test can drive the freshly built
+      # mxprotector_builder without rebuilding.
+      # Frida is dynamic-only and does not install on every CI
+      # runner; on Ubuntu we allow the frida extra to fail with
+      # `|| true` and continue.
+      # -----------------------------------------------------------
+      - name: Install MCP package (Ubuntu — frida optional)
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./mcp[dev,full]" || pip install -e "./mcp[dev]"
+
+      - name: Install MCP package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./mcp[dev,full]"
+
+      - name: Run MCP pytest
+        run: pytest mcp/tests/ -v
+
+  # ---------------------------------------------------------------
+  # Standalone MCP test job — decoupled from the C++ build so the
+  # Python subsystem is exercised even when the native build is
+  # broken on Linux. Runs on Ubuntu only.
+  # ---------------------------------------------------------------
+  mcp-tests:
+    name: mcp-tests (ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install MCP package (frida optional)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./mcp[dev,full]" || pip install -e "./mcp[dev]"
+
+      - name: Run MCP pytest
+        run: pytest mcp/tests/ -v
