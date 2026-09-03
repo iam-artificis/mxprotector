@@ -261,7 +261,7 @@ void HandlerEmitter::emit_native_handlers() {
             const auto p = emit_tail_dispatch(rt, in_.rolling_key_disp, in_.rolling,
                                               false, sinks_.table_key_patches,
                                               in_.vflags_key, in_.vflags_rol,
-                                              in_.rflags_disp, &in_.rng,
+                                              in_.rflags_disp, in_.rng,
                                               in_.imagebase_key_disp);
             sinks_.table_patches.push_back({p.rel32_offset, p.instruction_end});
         }
@@ -408,7 +408,7 @@ void HandlerEmitter::end_handler_tail() {
     const auto p = emit_tail_dispatch(in_.rt, in_.rolling_key_disp, in_.rolling,
                                       in_.has_branches, sinks_.table_key_patches,
                                       in_.vflags_key, in_.vflags_rol,
-                                      in_.rflags_disp, &in_.rng,
+                                      in_.rflags_disp, in_.rng,
                                       in_.imagebase_key_disp);
     sinks_.table_patches.push_back({p.rel32_offset, p.instruction_end});
     finish_handler_chain();
@@ -463,7 +463,7 @@ void HandlerEmitter::emit_inline_tail_no_save_() {
                                        /*save_rflags=*/false,
                                        sinks_.table_key_patches,
                                        in_.vflags_key, in_.vflags_rol,
-                                       in_.rflags_disp, &in_.rng,
+                                       in_.rflags_disp, in_.rng,
                                        in_.imagebase_key_disp);
     sinks_.table_patches.push_back({p.rel32_offset, p.instruction_end});
     finish_handler_chain();

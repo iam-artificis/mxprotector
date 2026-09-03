@@ -211,7 +211,13 @@ MxResult<MapParseResult> MapParser::parse(const std::filesystem::path& map_path)
             if (pos != std::string::npos) {
                 try {
                     result.image_base = std::stoull(trimmed.substr(pos + 1), nullptr, 16);
-                } catch (...) {}
+                } catch (const std::exception&) {
+                    // Malformed "Preferred load address is <hex>" line —
+                    // leave image_base at its zero default so downstream
+                    // RVA arithmetic surfaces the parse failure loudly
+                    // instead of silently misinterpreting the hex.
+                    result.image_base = 0;
+                }
             }
             continue;
         }
