@@ -1,21 +1,22 @@
 /**
  * @file main.cpp
- * @brief [BUILDER] Точка входа MxProtector Builder.
+ * @brief [BUILDER] MxProtector Builder entry point.
  *
- * @details Основной пайплайн:
- *          1. Парсинг аргументов CLI → ProtectionConfig
- *          2. Чтение входного PE-файла → ByteBuffer
- *          3. PeParser::parse() → PeImage
- *          4. Создание ProtectionContext (PeImage + конфиг + дизассемблер)
- *          5. MarkerScanner::find_markers() → маркированные регионы
- *          6. PassManager::execute_all() — выполнение зарегистрированных проходов
- *          7. PeBuilder::build() → ByteBuffer
- *          8. Запись выходного файла с именем .mx.ext
- *          9. Вывод итоговой сводки
+ * @details Main pipeline:
+ *          1. Parse CLI args -> ProtectionConfig
+ *          2. Read input PE file -> ByteBuffer
+ *          3. PeParser::parse() -> PeImage
+ *          4. Build ProtectionContext (PeImage + config + disassembler)
+ *          5. MarkerScanner::find_markers() -> marked regions
+ *          6. PassManager::execute_all() -> run every registered pass
+ *          7. PeBuilder::build() -> ByteBuffer
+ *          8. Write output file as <name>.mx.<ext>
+ *          9. Print summary
  *
- * @note Малые помощники (read_file/write_file/iso8601/print_summary/
- *       trace-hints sidecar) вынесены в `cli/main_helpers.{hpp,cpp}`
- *       (R5.1) — этот файл оркестратор пайплайна.
+ * @note The small helpers (read_file / write_file / iso8601 /
+ *       print_summary / trace-hints sidecar) live in
+ *       `cli/main_helpers.{hpp,cpp}` (R5.1) so this file stays a
+ *       thin pipeline orchestrator.
  */
 
 #include "cli/cli_handler.hpp"
@@ -59,7 +60,7 @@ int main(int argc, char** argv) {
         if (err.message() == "--help" || err.message() == "--version") {
             return 0;
         }
-        std::cerr << std::format("[ОШИБКА] {}\n", err.message());
+        std::cerr << std::format("[ERROR] {}\n", err.message());
         return 1;
     }
 
@@ -73,8 +74,8 @@ int main(int argc, char** argv) {
         !config.enable_vm)
     {
         std::cout <<
-            "[!] --strings=vm требует включённый VM, но VM отключён — "
-            "откат на --strings=stub\n";
+            "[!] --strings=vm requires VM enabled, but VM is off - "
+            "falling back to --strings=stub\n";
         config.string_protection = mx::StringProtectionMode::stub;
     }
 
@@ -88,34 +89,34 @@ int main(int argc, char** argv) {
     // requested (B.4.10.5).
     if (config.chaos_shuffle && config.enable_packer) {
         std::cout <<
-            "[!] --chaos-shuffle несовместим с self-unpacking packer — "
-            "packer отключён\n";
+            "[!] --chaos-shuffle is incompatible with the self-unpacking packer - "
+            "packer disabled\n";
         config.enable_packer = false;
     }
 
     const auto pipeline_start = std::chrono::high_resolution_clock::now();
 
-    std::cout << std::format("[*] Чтение файла: {}\n", config.input_path.string());
+    std::cout << std::format("[*] Reading file: {}\n", config.input_path.string());
     auto file_data = mx::cli::read_file(config.input_path);
     if (!file_data) {
-        std::cerr << std::format("[ОШИБКА] {}\n", file_data.error().message());
+        std::cerr << std::format("[ERROR] {}\n", file_data.error().message());
         return 1;
     }
 
     const std::size_t input_size = file_data->size();
-    std::cout << std::format("[*] Размер файла: {} байт\n", input_size);
+    std::cout << std::format("[*] File size: {} bytes\n", input_size);
 
-    std::cout << "[*] Парсинг PE-файла...\n";
+    std::cout << "[*] Parsing PE...\n";
     auto pe_result = mx::PeParser::parse(
         mx::ByteView{file_data->data(), file_data->size()});
     if (!pe_result) {
-        std::cerr << std::format("[ОШИБКА] Парсинг PE: {}\n",
+        std::cerr << std::format("[ERROR] PE parse: {}\n",
             pe_result.error().format());
         return 1;
     }
 
     auto pe_image = std::make_unique<mx::PeImage>(std::move(*pe_result));
-    std::cout << std::format("[*] PE: {} ({}), {} секций, entry_point=0x{:08X}\n",
+    std::cout << std::format("[*] PE: {} ({}), {} sections, entry_point=0x{:08X}\n",
         pe_image->is_64bit() ? "PE32+" : "PE32",
         pe_image->pe_type() == mx::PeType::executable      ? "EXE" :
         pe_image->pe_type() == mx::PeType::dynamic_library ? "DLL" :
@@ -176,24 +177,24 @@ int main(int argc, char** argv) {
             ctx.config().debug_section_names,
             name_rng);
         std::cout << std::format(
-            "[*] Секции: vm='{}' cff='{}' pack='{}' "
+            "[*] Sections: vm='{}' cff='{}' pack='{}' "
             "str='{}' guard='{}' mut='{}'\n",
             names.vm, names.cff, names.packer,
             names.str, names.guard, names.mut);
         ctx.set_section_names(std::move(names));
     }
 
-    std::cout << "[*] Сканирование SDK-маркеров...\n";
+    std::cout << "[*] Scanning SDK markers...\n";
     auto markers_result = mx::analysis::MarkerScanner::find_markers(
         ctx.pe_image());
     if (!markers_result) {
-        std::cerr << std::format("[ОШИБКА] Маркеры: {}\n",
+        std::cerr << std::format("[ERROR] Markers: {}\n",
             markers_result.error().format());
         return 1;
     }
 
     ctx.set_markers(std::move(*markers_result));
-    std::cout << std::format("[*] Найдено маркированных регионов: {}\n",
+    std::cout << std::format("[*] Marked regions found: {}\n",
         ctx.markers().size());
 
     for (const auto& region : ctx.markers()) {
@@ -205,12 +206,12 @@ int main(int argc, char** argv) {
             case mx::MarkerType::guard_begin:     type_name = "GUARD"; break;
             default: break;
         }
-        std::cout << std::format("    {} : RVA [0x{:08X} - 0x{:08X}] ({} байт)\n",
+        std::cout << std::format("    {} : RVA [0x{:08X} - 0x{:08X}] ({} bytes)\n",
             type_name, region.start_rva, region.end_rva,
             region.end_rva - region.start_rva);
     }
 
-    std::cout << std::format("[*] Запуск пайплайна защиты (уровень: {})...\n",
+    std::cout << std::format("[*] Running protection pipeline (level: {})...\n",
         config.level_name());
 
     mx::PassManager pass_manager;
@@ -226,28 +227,28 @@ int main(int argc, char** argv) {
 
     auto pass_result = pass_manager.execute_all(ctx);
     if (!pass_result) {
-        std::cerr << std::format("[ОШИБКА] Пайплайн: {}\n",
+        std::cerr << std::format("[ERROR] Pipeline: {}\n",
             pass_result.error().format());
         return 1;
     }
 
-    std::cout << "[*] Сборка выходного PE-файла...\n";
+    std::cout << "[*] Assembling output PE...\n";
     auto build_result = mx::PeBuilder::build(
         ctx.pe_image(), ctx.layout_policy());
     if (!build_result) {
-        std::cerr << std::format("[ОШИБКА] Сборка PE: {}\n",
+        std::cerr << std::format("[ERROR] PE assemble: {}\n",
             build_result.error().format());
         return 1;
     }
 
     const std::size_t output_size = build_result->size();
 
-    std::cout << std::format("[*] Запись: {}\n", config.output_path.string());
+    std::cout << std::format("[*] Writing: {}\n", config.output_path.string());
     auto write_result = mx::cli::write_file(
         config.output_path,
         mx::ByteView{build_result->data(), build_result->size()});
     if (!write_result) {
-        std::cerr << std::format("[ОШИБКА] {}\n",
+        std::cerr << std::format("[ERROR] {}\n",
             write_result.error().message());
         return 1;
     }
@@ -282,7 +283,7 @@ int main(int argc, char** argv) {
                 config.output_path, hints.to_json());
             !sidecar_result)
         {
-            std::cerr << std::format("[ОШИБКА] {}\n",
+            std::cerr << std::format("[ERROR] {}\n",
                 sidecar_result.error().message());
             return 1;
         }
@@ -296,6 +297,6 @@ int main(int argc, char** argv) {
     mx::cli::print_summary(
         config, ctx, input_size, output_size, elapsed_ms);
 
-    std::cout << "[+] Защита выполнена успешно!\n\n";
+    std::cout << "[+] Protection completed successfully!\n\n";
     return 0;
 }
