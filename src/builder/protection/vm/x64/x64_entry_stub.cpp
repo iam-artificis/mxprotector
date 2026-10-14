@@ -375,7 +375,7 @@ EntryStubOutputs emit_entry_stub(
         rt, in.rolling_key_disp, in.rolling,
         /*save_rflags=*/false, sinks.table_key_patches,
         in.vflags_key, in.vflags_rol,
-        in.rflags_disp, &in.rng,
+        in.rflags_disp, in.rng,
         out.imagebase_key_disp);
     sinks.table_patches.push_back({entry_tail.rel32_offset, entry_tail.instruction_end});
 

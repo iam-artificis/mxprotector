@@ -112,7 +112,7 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      uint32_t vflags_key,
                                      uint32_t vflags_rol,
                                      int32_t rflags_disp,
-                                     Randomizer* rng,
+                                     Randomizer& rng,
                                      int32_t imagebase_key_disp = -1);
 
 // ----------------------------------------------------------------------------

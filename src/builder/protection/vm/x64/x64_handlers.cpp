@@ -146,7 +146,7 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
                                      uint32_t vflags_key,
                                      uint32_t vflags_rol,
                                      int32_t rflags_disp,
-                                     Randomizer* rng,
+                                     Randomizer& rng,
                                      int32_t imagebase_key_disp)
 {
     // Optionally save CPU rflags into the VM context BEFORE clobbering them
@@ -154,9 +154,8 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     // for flag preservation — every handler's body has just finished, and the
     // CPU flags still reflect the last ALU/native operation.
     if (save_rflags) {
-        const auto v = (rng != nullptr) ? pick_store_variant(*rng)
-                                         : VflagsStoreV::RaxRolFirst;
-        emit_vflags_store(e, v, vflags_key, vflags_rol, rflags_disp);
+        emit_vflags_store(e, pick_store_variant(rng),
+                          vflags_key, vflags_rol, rflags_disp);
     }
 
     emit_movzx_r32_byte_mem(e, 0 /*rax*/, 11, 0);
@@ -166,11 +165,12 @@ TailDispatchPatch emit_tail_dispatch(RawEmitter& e, int32_t key_disp,
     }
     emit_inc_r11(e);
 
-    // Pick polymorphism variants. When rng is null (deprecated callers that
-    // predate polymorphism) fall back to the original rcx+jmp shape.
-    const uint8_t       base_reg = (rng != nullptr) ? pick_table_base_reg(*rng) : 1;
-    const DispatchShape shape    = (rng != nullptr) ? pick_dispatch_shape(*rng)
-                                                     : DispatchShape::JmpReg;
+    // Pick polymorphism variants for the table-base register and the
+    // final indirect-branch shape. Every caller now owns a live
+    // Randomizer, so the previous "rng == nullptr" fallback path
+    // (which returned rcx + JmpReg unconditionally) has been removed.
+    const uint8_t       base_reg = pick_table_base_reg(rng);
+    const DispatchShape shape    = pick_dispatch_shape(rng);
 
     // lea <base>, [rip + rel32]  — rel32 patched to point at the handler_table
     const auto patch_off = emit_lea_reg_rip_rel32(e, base_reg);

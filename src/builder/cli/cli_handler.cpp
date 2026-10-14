@@ -1,14 +1,15 @@
 /**
  * @file cli_handler.cpp
- * @brief [BUILDER] Реализация обработчика аргументов командной строки.
+ * @brief [BUILDER] Command-line argument handler implementation.
  *
- * @details Содержит парсинг CLI-аргументов, вывод баннера, справки и версии.
- *          Аргументы обрабатываются последовательно с поддержкой коротких
- *          (-i, -o, -l) и длинных (--input, --output, --level) форм.
- *          Флаги --no-* отключают конкретные проходы защиты.
+ * @details Parses CLI arguments and prints the banner, usage, and
+ *          version. Arguments are processed sequentially with both
+ *          short (-i, -o, -l) and long (--input, --output, --level)
+ *          forms. The --no-* flags disable individual protection
+ *          passes.
  *
- * @note При отсутствии обязательного --input возвращается ошибка.
- *       При отсутствии --output путь генерируется автоматически.
+ * @note A missing --input returns an error. A missing --output is
+ *       filled in automatically from the input path.
  */
 
 #include "cli_handler.hpp"
@@ -22,7 +23,7 @@
 namespace mx {
 
 // ============================================================================
-// Константы версии
+// Version constants
 // ============================================================================
 
 static constexpr std::string_view kVersion   = "1.0.0";
@@ -35,7 +36,7 @@ static constexpr std::string_view kBuildDate = __DATE__;
 MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
     if (argc < 2) {
         return std::unexpected(error::config(
-            "Не указаны аргументы. Используйте --help для справки."));
+            "No arguments given. Use --help for usage."));
     }
 
     // Pass 1 — find `-l <level>`. The level seeds the per-pass
@@ -128,7 +129,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
                 continue;
             }
             return std::unexpected(error::config(
-                std::format("--load-mode: ожидается os|manual, получено '{}'",
+                std::format("--load-mode: expected os|manual, got '{}'",
                             mode_str)));
         }
 
@@ -151,7 +152,7 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
                 continue;
             }
             return std::unexpected(error::config(
-                std::format("--strings: ожидается off|stub|vm|ephemeral, получено '{}'",
+                std::format("--strings: expected off|stub|vm|ephemeral, got '{}'",
                             mode_str)));
         }
 
@@ -161,25 +162,25 @@ MxResult<ProtectionConfig> CliHandler::parse_args(int argc, char** argv) {
             for (const auto c : depth_str) {
                 if (c < '0' || c > '9') {
                     return std::unexpected(error::config(
-                        std::format("Невалидное значение --vm-depth: '{}'", depth_str)));
+                        std::format("Invalid --vm-depth value: '{}'", depth_str)));
                 }
                 depth = depth * 10 + static_cast<uint32_t>(c - '0');
             }
             if (depth == 0 || depth > 5) {
                 return std::unexpected(error::config(
-                    std::format("Глубина VM должна быть от 1 до 5, получено: {}", depth)));
+                    std::format("VM depth must be 1..5, got: {}", depth)));
             }
             config.vm_nesting_depth = depth;
             continue;
         }
 
         return std::unexpected(error::config(
-            std::format("Неизвестный аргумент: '{}'", arg)));
+            std::format("Unknown argument: '{}'", arg)));
     }
 
     if (!has_input) {
         return std::unexpected(error::config(
-            "Не указан входной файл. Используйте --input <путь> или -i <путь>."));
+            "No input file. Use --input <path> or -i <path>."));
     }
 
     if (config.output_path.empty()) {
@@ -209,33 +210,33 @@ void CliHandler::print_banner() {
 
 void CliHandler::print_usage() {
     std::cout <<
-        "Использование: mxprotector_builder [опции]\n"
+        "Usage: mxprotector_builder [options]\n"
         "\n"
-        "Обязательные:\n"
-        "  -i, --input <путь>          Входной PE-файл (.exe, .dll, .sys)\n"
+        "Required:\n"
+        "  -i, --input <path>          Input PE file (.exe, .dll, .sys)\n"
         "\n"
-        "Опциональные:\n"
-        "  -o, --output <путь>         Выходной файл (по умолчанию: file.mx.ext)\n"
-        "  -m, --map <путь>            .map файл (MSVC) для точной фильтрации CFF\n"
-        "  -l, --level <уровень>       Уровень защиты:\n"
-        "                                minimal  — только мутация инструкций\n"
-        "                                standard — + обфускация + CFG flattening\n"
-        "                                strong   — + VM + packer + anti-debug/anti-sandbox\n"
-        "                                maximum  — все проходы (по умолчанию: standard)\n"
+        "Optional:\n"
+        "  -o, --output <path>         Output file (default: file.mx.ext)\n"
+        "  -m, --map <path>            .map file (MSVC) for precise CFF filtering\n"
+        "  -l, --level <level>         Protection level:\n"
+        "                                minimal  - instruction mutation only\n"
+        "                                standard - + obfuscation + CFG flattening\n"
+        "                                strong   - + VM + packer + anti-debug/anti-sandbox\n"
+        "                                maximum  - every pass (default: standard)\n"
         "\n"
-        "Управление проходами:\n"
-        "  --no-vm                     Отключить виртуализацию\n"
-        "  --no-mutation               Отключить мутацию инструкций\n"
-        "  --no-obfuscation            Отключить обфускацию\n"
-        "  --no-cfg-flattening         Отключить CFG flattening\n"
-        "  --no-anti-debug             Отключить анти-отладку в packer stub\n"
-        "  --no-anti-sandbox           Отключить анти-песочницу\n"
-        "  --packer                    Включить self-unpacking packer\n"
-        "  --no-packer                 Отключить self-unpacking packer\n"
-        "  --no-strip-debug            Не удалять отладочную информацию\n"
-        "  --nanomites                 Включить наномиты\n"
-        "  --code-interleaving         Включить перемешивание кода\n"
-        "  --no-header-erasure         Не стирать PE-заголовки (anti-dump)\n"
+        "Pass toggles:\n"
+        "  --no-vm                     Disable virtualization\n"
+        "  --no-mutation               Disable instruction mutation\n"
+        "  --no-obfuscation            Disable obfuscation\n"
+        "  --no-cfg-flattening         Disable CFG flattening\n"
+        "  --no-anti-debug             Disable anti-debug in the packer stub\n"
+        "  --no-anti-sandbox           Disable anti-sandbox\n"
+        "  --packer                    Enable the self-unpacking packer\n"
+        "  --no-packer                 Disable the self-unpacking packer\n"
+        "  --no-strip-debug            Keep debug information\n"
+        "  --nanomites                 Enable nanomites\n"
+        "  --code-interleaving         Enable code interleaving\n"
+        "  --no-header-erasure         Keep PE headers (anti-dump off)\n"
         "  --debug-sections            Use fixed section names (.mxvm/.mxprot1/.mxpack)\n"
         "  --anti-tamper-veh           Install VEH INT3 trap in packer stub (EXE-only, G3 Phase 2)\n"
         "  --chaos                     Force every section to RWX / mixed code+data (Feature B)\n"
@@ -246,21 +247,21 @@ void CliHandler::print_usage() {
         "                                 50-100 B chunks, every PE-format structure stays\n"
         "                                 pinned. Auto-disables --packer (incompatible).\n"
         "  --trace-hints               Emit <output>.mxtrace.json sidecar for the tracing MCP\n"
-        "                                (test-only — must not ship in production builds)\n"
-        "  --strings=<режим>           Защита строк в .rdata:\n"
-        "                                off       — оставить plaintext\n"
-        "                                stub      — decryptor как обычный x64 asm\n"
-        "                                vm        — decryptor лифтится в VM bytecode\n"
-        "                                ephemeral — S3 scratch-ring, no sticky cache\n"
-        "                                (auto-fallback vm→stub при --no-vm)\n"
-        "  --vm-depth=<N>              Глубина VM-вложенности (1-5, по умолчанию: 1)\n"
-        "  --load-mode=<режим>         Как загружается защищённый бинарь:\n"
-        "                                os     — стандартный OS-loader (по умолчанию)\n"
-        "                                manual — manual-map (kdmapper / DLL-инжектор)\n"
+        "                                (test-only - must not ship in production builds)\n"
+        "  --strings=<mode>            .rdata string protection:\n"
+        "                                off       - leave strings plaintext\n"
+        "                                stub      - decryptor emitted as plain x64 asm\n"
+        "                                vm        - decryptor lifted into VM bytecode\n"
+        "                                ephemeral - S3 scratch-ring, no sticky cache\n"
+        "                                (auto-fallback vm->stub when --no-vm is set)\n"
+        "  --vm-depth=<N>              VM nesting depth (1-5, default: 1)\n"
+        "  --load-mode=<mode>          How the protected binary is loaded:\n"
+        "                                os     - standard OS loader (default)\n"
+        "                                manual - manual-map (kdmapper / DLL injector)\n"
         "\n"
-        "Информация:\n"
-        "  -h, --help                  Показать эту справку\n"
-        "  -v, --version               Показать версию\n"
+        "Info:\n"
+        "  -h, --help                  Show this help\n"
+        "  -v, --version               Show version\n"
         "\n";
 }
 
@@ -269,7 +270,7 @@ void CliHandler::print_usage() {
 // ============================================================================
 
 void CliHandler::print_version() {
-    std::cout << std::format("MxProtector Builder v{} (сборка: {})\n", kVersion, kBuildDate);
+    std::cout << std::format("MxProtector Builder v{} (build: {})\n", kVersion, kBuildDate);
 }
 
 // ============================================================================
@@ -283,8 +284,8 @@ MxResult<ProtectionLevel> CliHandler::parse_level(std::string_view level_str) {
     if (level_str == "maximum")  return ProtectionLevel::maximum;
 
     return std::unexpected(error::config(
-        std::format("Неизвестный уровень защиты: '{}'. "
-                    "Допустимые: minimal, standard, strong, maximum", level_str)));
+        std::format("Unknown protection level: '{}'. "
+                    "Allowed: minimal, standard, strong, maximum", level_str)));
 }
 
 } // namespace mx

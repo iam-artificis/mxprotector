@@ -20,13 +20,13 @@ MxResult<ByteBuffer> read_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return std::unexpected(error::io(
-            std::format("Не удалось открыть файл: '{}'", path.string())));
+            std::format("Cannot open file: '{}'", path.string())));
     }
 
     const auto file_size = static_cast<std::size_t>(file.tellg());
     if (file_size == 0) {
         return std::unexpected(error::io(
-            std::format("Файл пуст: '{}'", path.string())));
+            std::format("File is empty: '{}'", path.string())));
     }
 
     file.seekg(0, std::ios::beg);
@@ -36,7 +36,7 @@ MxResult<ByteBuffer> read_file(const std::filesystem::path& path) {
                    static_cast<std::streamsize>(file_size)))
     {
         return std::unexpected(error::io(
-            std::format("Ошибка чтения файла: '{}'", path.string())));
+            std::format("Read error on file: '{}'", path.string())));
     }
 
     return buffer;
@@ -48,7 +48,7 @@ MxStatus write_file(const std::filesystem::path& path, ByteView data) {
         std::filesystem::create_directories(parent, ec);
         if (ec) {
             return std::unexpected(error::io(
-                std::format("Не удалось создать директорию '{}': {}",
+                std::format("Cannot create directory '{}': {}",
                     parent.string(), ec.message())));
         }
     }
@@ -56,14 +56,14 @@ MxStatus write_file(const std::filesystem::path& path, ByteView data) {
     std::ofstream file(path, std::ios::binary);
     if (!file.is_open()) {
         return std::unexpected(error::io(
-            std::format("Не удалось создать выходной файл: '{}'", path.string())));
+            std::format("Cannot create output file: '{}'", path.string())));
     }
 
     if (!file.write(reinterpret_cast<const char*>(data.data()),
                     static_cast<std::streamsize>(data.size())))
     {
         return std::unexpected(error::io(
-            std::format("Ошибка записи в файл: '{}'", path.string())));
+            std::format("Write error on file: '{}'", path.string())));
     }
 
     return {};
@@ -100,14 +100,14 @@ MxStatus write_trace_hints_sidecar(
     std::ofstream file(sidecar_path, std::ios::binary);
     if (!file.is_open()) {
         return std::unexpected(error::io(std::format(
-            "Не удалось создать sidecar: '{}'", sidecar_path.string())));
+            "Cannot create sidecar: '{}'", sidecar_path.string())));
     }
 
     if (!file.write(json.data(),
                     static_cast<std::streamsize>(json.size())))
     {
         return std::unexpected(error::io(std::format(
-            "Ошибка записи sidecar: '{}'", sidecar_path.string())));
+            "Write error on sidecar: '{}'", sidecar_path.string())));
     }
 
     std::cout << std::format("[*] Trace hints: {}\n", sidecar_path.string());
@@ -121,22 +121,22 @@ void print_summary(const ProtectionConfig&  config,
                    std::int64_t             elapsed_ms)
 {
     std::cout << "\n";
-    std::cout << "═══════════════════════════════════════════════\n";
-    std::cout << "  Итоги защиты\n";
-    std::cout << "═══════════════════════════════════════════════\n";
-    std::cout << std::format("  Входной файл:   {}\n", config.input_path.string());
-    std::cout << std::format("  Выходной файл:  {}\n", config.output_path.string());
-    std::cout << std::format("  Уровень:        {}\n", config.level_name());
-    std::cout << std::format("  Архитектура:    {}\n",
+    std::cout << "===============================================\n";
+    std::cout << "  Protection summary\n";
+    std::cout << "===============================================\n";
+    std::cout << std::format("  Input:          {}\n", config.input_path.string());
+    std::cout << std::format("  Output:         {}\n", config.output_path.string());
+    std::cout << std::format("  Level:          {}\n", config.level_name());
+    std::cout << std::format("  Architecture:   {}\n",
         ctx.pe_image().is_64bit() ? "x64 (PE32+)" : "x86 (PE32)");
-    std::cout << std::format("  Маркеров:       {}\n", ctx.markers().size());
-    std::cout << std::format("  Размер (вход):  {} байт\n", input_size);
-    std::cout << std::format("  Размер (выход): {} байт\n", output_size);
-    std::cout << std::format("  Время:          {} мс\n", elapsed_ms);
-    std::cout << "═══════════════════════════════════════════════\n";
+    std::cout << std::format("  Markers:        {}\n", ctx.markers().size());
+    std::cout << std::format("  Size in:        {} bytes\n", input_size);
+    std::cout << std::format("  Size out:       {} bytes\n", output_size);
+    std::cout << std::format("  Elapsed:        {} ms\n", elapsed_ms);
+    std::cout << "===============================================\n";
 
     if (!ctx.log_messages().empty()) {
-        std::cout << "\n  Журнал:\n";
+        std::cout << "\n  Log:\n";
         for (const auto& msg : ctx.log_messages()) {
             std::cout << "    " << msg << "\n";
         }

@@ -5,7 +5,6 @@
 
 #include "mxprotector/pe/layout/chaos_atom_source_registry.hpp"
 
-#include <cstdio>
 #include <cstdlib>
 #include <memory>
 
@@ -78,9 +77,12 @@ std::uint64_t fresh_seed() {
             else { ok = false; }
         }
         if (ok) {
-            std::fprintf(stderr,
-                "[chaos] MX_CHAOS_SEED override: 0x%016llx\n",
-                static_cast<unsigned long long>(parsed));
+            // MX_CHAOS_SEED override applied. The value was chosen by
+            // the caller; echoing it back through stderr adds no
+            // signal and would violate the "no raw std::cerr in
+            // shipped code" rule (see CLAUDE.md rule #6). Callers
+            // that need to record the seed for reproducibility can
+            // read the same env var themselves.
             return parsed;
         }
     }
