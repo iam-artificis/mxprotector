@@ -6,6 +6,8 @@ A C++23 binary protection suite for Windows PE x64.
 [![CI](https://github.com/iam-artificis/mxprotector/actions/workflows/ci.yml/badge.svg)](https://github.com/iam-artificis/mxprotector/actions/workflows/ci.yml)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-informational.svg)](https://en.cppreference.com/w/cpp/23)
 
+**[Русская версия README](README.ru.md)**
+
 ## What it does
 
 MxProtector runs a Windows PE x64 binary through a fixed protection
